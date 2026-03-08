@@ -1,0 +1,5 @@
+/target
+/_reference
+*.log
+.DS_Store
+.claude/
