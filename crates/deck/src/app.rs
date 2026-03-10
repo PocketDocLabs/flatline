@@ -19,14 +19,15 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph},
     Terminal as RatatuiTerminal,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use construct::permissions::Permissions;
+use construct::prompt::{DomainModule, InterfaceMode};
 use construct::session::{Session, SessionEvent};
 use construct::shell::{ShellIo, spawnShell};
 
@@ -53,6 +54,11 @@ pub async fn run() -> Result<()> {
         EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
         crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        ),
+        crossterm::cursor::SetCursorStyle::SteadyBar,
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
@@ -72,8 +78,10 @@ pub async fn run() -> Result<()> {
     let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
     let (permitTx, permitRx) = mpsc::channel::<bool>(1);
     let (userInputTx, mut userInputRx) = mpsc::channel::<String>(16);
+    let (cancelTx, cancelRx) = watch::channel(false);
 
     // Spawn the agent session task.
+    let mut cancelRx = cancelRx;
     tokio::spawn(async move {
         let config = match construct::config::load() {
             Ok(c) => c,
@@ -88,7 +96,14 @@ pub async fn run() -> Result<()> {
         // Default: ask for permission on every tool call.
         let permissions = Permissions::askForEverything();
 
-        let mut session = match Session::new(&config, permissions, shell) {
+        // Deck is the shared terminal harness — SWE domain by default.
+        let mut session = match Session::new(
+            &config,
+            permissions,
+            shell,
+            InterfaceMode::SharedTerminal,
+            &[DomainModule::Swe],
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = eventTx
@@ -101,7 +116,9 @@ pub async fn run() -> Result<()> {
         let mut permitRx = permitRx;
 
         while let Some(msg) = userInputRx.recv().await {
-            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx).await {
+            // Clear any stale cancel notification from a previous turn.
+            cancelRx.borrow_and_update();
+            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx).await {
                 let _ = eventTx
                     .send(SessionEvent::Error(format!("Agent error: {e}")))
                     .await;
@@ -119,12 +136,15 @@ pub async fn run() -> Result<()> {
         &mut eventRx,
         &permitTx,
         &userInputTx,
+        &cancelTx,
     )
     .await;
 
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
         LeaveAlternateScreen,
@@ -145,6 +165,7 @@ async fn runLoop(
     eventRx: &mut mpsc::Receiver<SessionEvent>,
     permitTx: &mpsc::Sender<bool>,
     userInputTx: &mpsc::Sender<String>,
+    cancelTx: &watch::Sender<bool>,
 ) -> Result<()> {
     loop {
         // Draw.
@@ -186,15 +207,29 @@ async fn runLoop(
 
             // Agent panel.
             let agentChatArea = agentPanel.render(hChunks[1], frame.buffer_mut(), *focus == Focus::Agent);
-            selState.agentContentRect = agentChatArea;
+            // Full chat area for hit-testing (includes prefix columns).
+            selState.agentPanelRect = agentChatArea;
+            // Content rect offset past the 2-column prefix for selection/highlight.
+            let agentContentArea = Rect {
+                x: agentChatArea.x + 2,
+                y: agentChatArea.y,
+                width: agentChatArea.width.saturating_sub(2),
+                height: agentChatArea.height,
+            };
+            selState.agentContentRect = agentContentArea;
+            selState.inputContentRect = agentPanel.lastInputRect;
 
             // Expand selection for double/triple/quad click (needs Buffer).
             let termOffset = termState.displayOffset() as u16;
             let agentOffset = agentPanel.displayOffset();
             if let Some((panel, clickCount)) = selState.pendingExpand.take() {
+                if panel == PanelId::Input {
+                    // Input selection expansion not supported.
+                } else {
                 let (sel, rect, offset) = match panel {
                     PanelId::Terminal => (&mut selState.termSelection, termInner, termOffset),
-                    PanelId::Agent => (&mut selState.agentSelection, agentChatArea, agentOffset),
+                    PanelId::Agent => (&mut selState.agentSelection, agentContentArea, agentOffset),
+                    PanelId::Input => unreachable!(),
                 };
                 if let Some(sel) = sel {
                     if clickCount == 4 {
@@ -226,6 +261,7 @@ async fn runLoop(
                                     sel.setBounds(0, startGrid, rect.width, endGrid);
                                 }
                             }
+                            PanelId::Input => unreachable!(),
                         }
                     } else {
                         selection::expandSelection(
@@ -240,6 +276,7 @@ async fn runLoop(
                     selState.pendingCopy = Some(panel);
                     selState.selectingIn = None;
                 }
+                }
             }
 
             // Apply selection highlights after widgets have rendered.
@@ -247,18 +284,32 @@ async fn runLoop(
                 selection::applyHighlight(sel, termInner, frame.buffer_mut(), termOffset);
             }
             if let Some(ref sel) = selState.agentSelection {
-                selection::applyHighlight(sel, agentChatArea, frame.buffer_mut(), agentOffset);
+                selection::applyHighlight(sel, agentContentArea, frame.buffer_mut(), agentOffset);
             }
 
             // Deferred clipboard copy (Buffer only available during draw).
             if let Some(panel) = selState.pendingCopy.take() {
-                let (sel, rect, offset) = match panel {
-                    PanelId::Terminal => (&selState.termSelection, termInner, termOffset),
-                    PanelId::Agent => (&selState.agentSelection, agentChatArea, agentOffset),
-                };
-                if let Some(sel) = sel {
-                    let text = selection::extractText(sel, rect, frame.buffer_mut(), offset);
-                    selection::copyToClipboard(&text);
+                match panel {
+                    PanelId::Terminal => {
+                        if let Some(sel) = &selState.termSelection {
+                            let text = extractTerminalUnwrapped(sel, termInner, frame.buffer_mut(), termOffset, termState);
+                            selection::copyToClipboard(&text);
+                        }
+                    }
+                    PanelId::Agent => {
+                        if let Some(sel) = &selState.agentSelection {
+                            let text = agentPanel.extractUnwrappedText(sel, agentContentArea, frame.buffer_mut(), agentOffset);
+                            selection::copyToClipboard(&text);
+                        }
+                    }
+                    PanelId::Input => {}
+                }
+            }
+
+            // Hardware cursor for agent text input (hidden during permission prompt).
+            if *focus == Focus::Agent && !agentPanel.pendingPermit {
+                if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
+                    frame.set_cursor_position(ratatui::layout::Position::new(col, row));
                 }
             }
 
@@ -267,7 +318,11 @@ async fn runLoop(
                 Focus::Terminal => "terminal",
                 Focus::Agent => "agent",
             };
-            let statusText = format!(" [{modeStr}]  Tab: switch  Ctrl+Q: quit");
+            let statusText = if agentPanel.isActive() {
+                format!(" [{modeStr}]  Esc: cancel  Ctrl+Q: quit")
+            } else {
+                format!(" [{modeStr}]  Tab: switch  Ctrl+Q: quit")
+            };
             let statusBar = Paragraph::new(statusText)
                 .style(Style::default().bg(Color::DarkGray).fg(Color::White));
             frame.render_widget(statusBar, vChunks[1]);
@@ -301,11 +356,17 @@ async fn runLoop(
                 SessionEvent::TurnComplete => {
                     agentPanel.finalizeStreaming();
                 }
+                SessionEvent::TurnCancelled => {
+                    agentPanel.finalizeCancelled();
+                }
                 SessionEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
                 }
             }
         }
+
+        // Tick throbber animation.
+        agentPanel.tickThrobber();
 
         // Handle input.
         if handleInput(
@@ -316,6 +377,7 @@ async fn runLoop(
             selState,
             permitTx,
             userInputTx,
+            cancelTx,
         )
         .await?
         {
@@ -338,6 +400,7 @@ async fn handleInput(
     selState: &mut SelectionState,
     permitTx: &mpsc::Sender<bool>,
     userInputTx: &mpsc::Sender<String>,
+    cancelTx: &watch::Sender<bool>,
 ) -> Result<bool> {
     if !event::poll(Duration::from_millis(16))? {
         return Ok(false);
@@ -345,13 +408,29 @@ async fn handleInput(
 
     match event::read()? {
         Event::Key(key) => {
-            // Any keypress clears selections.
-            selState.termSelection = None;
-            selState.agentSelection = None;
+            // With REPORT_EVENT_TYPES, crossterm sends Press, Repeat, and Release.
+            // Only handle Press and Repeat.
+            if key.kind == event::KeyEventKind::Release {
+                return Ok(false);
+            }
+
+            // Clear selections on content/navigation keys, but not system
+            // shortcuts (Cmd+key on macOS) so Cmd+C doesn't nuke the highlight.
+            if !key.modifiers.contains(KeyModifiers::SUPER) {
+                selState.termSelection = None;
+                selState.agentSelection = None;
+                agentPanel.textArea.clearSelection();
+            }
 
             // Global keybindings.
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                 return Ok(true);
+            }
+
+            // Cancel running turn with Escape.
+            if key.code == KeyCode::Esc && agentPanel.isActive() {
+                let _ = cancelTx.send(true);
+                return Ok(false);
             }
 
             if key.code == KeyCode::Tab {
@@ -359,6 +438,19 @@ async fn handleInput(
                     Focus::Terminal => Focus::Agent,
                     Focus::Agent => Focus::Terminal,
                 };
+                return Ok(false);
+            }
+
+            // Cmd+C: copy active selection to clipboard.
+            if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('c') {
+                // Input field selection is copied directly (no Buffer needed).
+                if let Some(text) = agentPanel.textArea.selectedText() {
+                    selection::copyToClipboard(&text);
+                } else if selState.agentSelection.is_some() {
+                    selState.pendingCopy = Some(PanelId::Agent);
+                } else if selState.termSelection.is_some() {
+                    selState.pendingCopy = Some(PanelId::Terminal);
+                }
                 return Ok(false);
             }
 
@@ -380,6 +472,10 @@ async fn handleInput(
 
             match focus {
                 Focus::Terminal => {
+                    // Don't forward macOS Cmd shortcuts to the PTY.
+                    if key.modifiers.contains(KeyModifiers::SUPER) {
+                        return Ok(false);
+                    }
                     if let Some(bytes) = keyToBytes(&key) {
                         // Snap to bottom on user input.
                         if termState.displayOffset() > 0 {
@@ -389,30 +485,76 @@ async fn handleInput(
                     }
                 }
                 Focus::Agent => {
+                    let ta = &mut agentPanel.textArea;
+                    let mods = key.modifiers;
+                    let ctrl = mods.contains(KeyModifiers::CONTROL);
+                    let shift = mods.contains(KeyModifiers::SHIFT);
+
+                    let supr = mods.contains(KeyModifiers::SUPER);
+                    let alt = mods.contains(KeyModifiers::ALT);
+
                     match key.code {
+                        KeyCode::Enter if shift => {
+                            ta.insert('\n');
+                        }
                         KeyCode::Enter => {
-                            if !agentPanel.inputBuf.is_empty() {
-                                let msg = std::mem::take(&mut agentPanel.inputBuf);
+                            if let Some(msg) = ta.submit() {
+                                // Reset cancel flag for the new turn.
+                                let _ = cancelTx.send(false);
+                                agentPanel.history.push(&msg);
                                 agentPanel.pushUser(&msg);
                                 let _ = userInputTx.send(msg).await;
                             }
                         }
-                        KeyCode::Char(c) => {
-                            agentPanel.inputBuf.push(c);
+                        // Emacs keybinds.
+                        KeyCode::Char('a') if ctrl => ta.moveHome(),
+                        KeyCode::Char('e') if ctrl => ta.moveEnd(),
+                        KeyCode::Char('k') if ctrl => ta.killToEnd(),
+                        KeyCode::Char('u') if ctrl => ta.killToStart(),
+                        KeyCode::Char('y') if ctrl => ta.yank(),
+                        KeyCode::Char('t') if ctrl => {
+                            agentPanel.toggleThinking();
                         }
-                        KeyCode::Backspace => {
-                            if agentPanel.isLargePaste() {
-                                agentPanel.inputBuf.clear();
+                        KeyCode::Char(c) if !supr => ta.insert(c),
+                        // macOS Cmd keybinds.
+                        KeyCode::Backspace if supr => ta.killToStart(),
+                        KeyCode::Backspace if alt => ta.deleteWordLeft(),
+                        KeyCode::Backspace => ta.backspace(),
+                        KeyCode::Delete => ta.delete(),
+                        KeyCode::Left if supr => ta.moveHome(),
+                        KeyCode::Right if supr => ta.moveEnd(),
+                        KeyCode::Left if alt => ta.moveWordLeft(),
+                        KeyCode::Right if alt => ta.moveWordRight(),
+                        KeyCode::Left if ctrl => ta.moveWordLeft(),
+                        KeyCode::Right if ctrl => ta.moveWordRight(),
+                        KeyCode::Left => ta.moveLeft(),
+                        KeyCode::Right => ta.moveRight(),
+                        KeyCode::Home => ta.moveHome(),
+                        KeyCode::End => ta.moveEnd(),
+                        KeyCode::Up => {
+                            // History navigation when empty or single-line.
+                            if ta.isEmpty() || ta.lineCount() == 1 {
+                                let currentText = ta.text().to_string();
+                                if let Some(entry) = agentPanel.history.navigateUp(&currentText) {
+                                    let entry = entry.to_string();
+                                    ta.setText(&entry);
+                                }
                             } else {
-                                agentPanel.inputBuf.pop();
+                                ta.moveUp();
                             }
                         }
-                        KeyCode::Up => {
-                            agentPanel.scrollUp(3);
-                        }
                         KeyCode::Down => {
-                            agentPanel.scrollDown(3);
+                            if ta.isEmpty() || ta.lineCount() == 1 {
+                                if let Some(entry) = agentPanel.history.navigateDown() {
+                                    let entry = entry.to_string();
+                                    ta.setText(&entry);
+                                }
+                            } else {
+                                ta.moveDown();
+                            }
                         }
+                        KeyCode::PageUp => agentPanel.scrollUp(10),
+                        KeyCode::PageDown => agentPanel.scrollDown(10),
                         _ => {}
                     }
                 }
@@ -424,7 +566,7 @@ async fn handleInput(
         Event::Paste(text) => {
             if *focus == Focus::Agent && !agentPanel.pendingPermit {
                 let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                agentPanel.inputBuf.push_str(&normalized);
+                agentPanel.textArea.insertStr(&normalized);
             }
         }
         Event::Resize(cols, rows) => {
@@ -448,25 +590,51 @@ fn handleMouse(
     selState: &mut SelectionState,
     shellIo: &ShellIo,
 ) {
-    // Resolve display offset for coordinate conversion.
-    let displayOffset = |panel: PanelId| -> u16 {
+    // Resolve display offset for the given panel.
+    fn panelOffset(panel: PanelId, termState: &TerminalState, agentPanel: &AgentPanel) -> u16 {
         match panel {
             PanelId::Terminal => termState.displayOffset() as u16,
             PanelId::Agent => agentPanel.displayOffset(),
+            PanelId::Input => 0,
         }
-    };
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Check input area first (not part of panel hit-testing).
+            if selState.inputContentRect.contains((mouse.column, mouse.row).into()) {
+                *focus = Focus::Agent;
+                let localCol = mouse.column.saturating_sub(selState.inputContentRect.x);
+                let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
+                let contentWidth = selState.inputContentRect.width.saturating_sub(2);
+                let contentCol = localCol.saturating_sub(2);
+                agentPanel.textArea.mouseDown(contentCol, localRow, contentWidth);
+                selState.selectingIn = Some(PanelId::Input);
+                selState.termSelection = None;
+                selState.agentSelection = None;
+                return;
+            }
+
+            // Clear input selection when clicking in a panel.
+            agentPanel.textArea.clearSelection();
+
             let panel = selState.hitTest(mouse.column, mouse.row);
             if let Some(panel) = panel {
                 *focus = match panel {
                     PanelId::Terminal => Focus::Terminal,
-                    PanelId::Agent => Focus::Agent,
+                    PanelId::Agent | PanelId::Input => Focus::Agent,
                 };
 
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
-                let gridLine = selection::toGridLine(screenRow, displayOffset(panel));
+                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+
+                // Single click on a reasoning header toggles it.
+                if panel == PanelId::Agent
+                    && agentPanel.toggleReasoningAtGridLine(gridLine)
+                {
+                    return;
+                }
+
                 let isAlt = mouse.modifiers.contains(KeyModifiers::ALT);
 
                 if isAlt {
@@ -485,28 +653,49 @@ fn handleMouse(
                 }
 
                 // Clear selection in the other panel.
-                let other = match panel {
-                    PanelId::Terminal => PanelId::Agent,
-                    PanelId::Agent => PanelId::Terminal,
-                };
-                *selState.selectionForMut(other) = None;
+                match panel {
+                    PanelId::Terminal => {
+                        selState.agentSelection = None;
+                    }
+                    PanelId::Agent => {
+                        selState.termSelection = None;
+                    }
+                    PanelId::Input => {}
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if selState.selectingIn == Some(PanelId::Input) {
+                let localCol = mouse.column.saturating_sub(selState.inputContentRect.x)
+                    .min(selState.inputContentRect.width.saturating_sub(1));
+                let localRow = mouse.row.saturating_sub(selState.inputContentRect.y)
+                    .min(selState.inputContentRect.height.saturating_sub(1));
+                let contentWidth = selState.inputContentRect.width.saturating_sub(2);
+                let contentCol = localCol.saturating_sub(2);
+                agentPanel.textArea.mouseDrag(contentCol, localRow, contentWidth);
+                return;
+            }
             if let Some(panel) = selState.selectingIn {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
-                let gridLine = selection::toGridLine(screenRow, displayOffset(panel));
+                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if selState.selectingIn == Some(PanelId::Input) {
+                selState.selectingIn = None;
+                if let Some(text) = agentPanel.textArea.selectedText() {
+                    selection::copyToClipboard(&text);
+                }
+                return;
+            }
             if let Some(panel) = selState.selectingIn.take() {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
-                let gridLine = selection::toGridLine(screenRow, displayOffset(panel));
+                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
 
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
@@ -535,7 +724,7 @@ fn handleMouse(
                         }
                     }
                 }
-                None => {}
+                Some(PanelId::Input) | None => {}
             }
         }
         MouseEventKind::ScrollDown => {
@@ -552,7 +741,7 @@ fn handleMouse(
                         }
                     }
                 }
-                None => {}
+                Some(PanelId::Input) | None => {}
             }
         }
         _ => {}
@@ -585,4 +774,69 @@ fn keyToBytes(key: &event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
         _ => None,
     }
+}
+
+/// Extract text from the terminal selection, rejoining soft-wrapped lines.
+///
+/// Uses alacritty's WRAPLINE flag on the last cell of each row to detect
+/// lines that were soft-wrapped by the terminal emulator.
+fn extractTerminalUnwrapped(
+    sel: &selection::Selection,
+    area: ratatui::layout::Rect,
+    buf: &ratatui::buffer::Buffer,
+    displayOffset: u16,
+    termState: &TerminalState,
+) -> String {
+    if sel.isEmpty() {
+        return String::new();
+    }
+
+    let ((sc, sr), (ec, er)) = sel.sorted();
+    let mut segments: Vec<(String, bool)> = Vec::new();
+
+    for gridLine in sr..=er {
+        let screenRow = match selection::toScreenRow(gridLine, displayOffset, area.height) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let colStart = if gridLine == sr { sc } else { 0 };
+        let colEnd = if gridLine == er { ec } else { area.width };
+
+        let mut line = String::new();
+        for col in colStart..colEnd {
+            if col >= area.width {
+                break;
+            }
+            if let Some(cell) = buf.cell((area.x + col, area.y + screenRow)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        let trimmed = line.trim_end().to_string();
+
+        // Check if the PREVIOUS line was soft-wrapped (making this a continuation).
+        let isCont = gridLine > sr && termState.isLineWrapped(gridLine - 1);
+        segments.push((trimmed, isCont));
+    }
+
+    // Remove trailing empty lines.
+    while segments.last().is_some_and(|(l, _)| l.is_empty()) {
+        segments.pop();
+    }
+
+    let mut result = String::new();
+    for (i, (line, isCont)) in segments.iter().enumerate() {
+        if i > 0 {
+            if *isCont {
+                // Soft-wrapped continuation — join without newline.
+                result.push_str(line);
+                continue;
+            } else {
+                result.push('\n');
+            }
+        }
+        result.push_str(line);
+    }
+
+    result
 }

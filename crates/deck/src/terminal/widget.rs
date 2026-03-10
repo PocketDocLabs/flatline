@@ -181,6 +181,19 @@ impl TerminalState {
         }
     }
 
+    /// Whether the given grid line is soft-wrapped (continues on the next line).
+    ///
+    /// Checks the WRAPLINE flag on the last cell of the row.
+    pub fn isLineWrapped(&self, gridLine: i32) -> bool {
+        let grid = self.term.grid();
+        let numCols = grid.columns();
+        if numCols == 0 {
+            return false;
+        }
+        let line = &grid[Line(gridLine)];
+        line[Column(numCols - 1)].flags.contains(Flags::WRAPLINE)
+    }
+
     /// Find the command output region containing the given grid line.
     ///
     /// Returns the region's grid line bounds (start inclusive, end exclusive).

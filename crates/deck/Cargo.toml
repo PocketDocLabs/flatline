@@ -22,3 +22,5 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tui-markdown.workspace = true
+unicode-segmentation.workspace = true
+dirs.workspace = true

@@ -4,20 +4,38 @@
 //! output capture. The harness (TUI or headless) receives raw
 //! PTY output for display and can forward user keystrokes.
 //!
+//! Maintains a ring buffer of recent command results so the agent
+//! can recall and search past output without re-running commands.
+//!
 //! # Public API
 //! - [`Shell`] — command execution handle
 //! - [`ShellIo`] — I/O channels for the harness
+//! - [`CommandRecord`] — stored command result
 //! - [`spawnShell`] — create a shell session
 //!
 //! # Dependencies
 //! `portable-pty`, `tokio`
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+
+const MAX_HISTORY: usize = 50;
+const MAX_SCROLLBACK_BYTES: usize = 512_000;
+
+/// A stored command result.
+#[derive(Debug, Clone)]
+pub struct CommandRecord {
+    pub command: String,
+    pub output: String,
+    pub exitCode: Option<i32>,
+    pub lineCount: usize,
+}
 
 /// Command execution handle — send commands, get output.
 ///
@@ -25,9 +43,17 @@ use tokio::task;
 /// so `cd`, env vars, etc. persist across calls.
 pub struct Shell {
     cmdTx: mpsc::Sender<ShellRequest>,
+    inputTx: mpsc::Sender<Vec<u8>>,
+    history: Arc<Mutex<Vec<CommandRecord>>>,
+    scrollback: Arc<Mutex<VecDeque<u8>>>,
 }
 
 impl Shell {
+    /// Send Ctrl+C to the shell to interrupt any running command.
+    pub fn interrupt(&self) {
+        let _ = self.inputTx.try_send(vec![0x03]);
+    }
+
     /// Execute a command in the shell and return captured output.
     pub async fn execute(&self, command: &str) -> String {
         let (tx, rx) = oneshot::channel();
@@ -39,6 +65,105 @@ impl Shell {
             return "Shell closed.".into();
         }
         rx.await.unwrap_or_else(|_| "Shell disconnected.".into())
+    }
+
+    /// Number of stored command records.
+    pub fn historyLen(&self) -> usize {
+        self.history.lock().unwrap().len()
+    }
+
+    /// Get a command record by index (0-indexed, oldest first).
+    pub fn getRecord(&self, index: usize) -> Option<CommandRecord> {
+        self.history.lock().unwrap().get(index).cloned()
+    }
+
+    /// List all command records (index, command, exit code, line count).
+    pub fn listHistory(&self) -> Vec<(usize, String, Option<i32>, usize)> {
+        self.history
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, r.command.clone(), r.exitCode, r.lineCount))
+            .collect()
+    }
+
+    /// Search a command's output for a pattern, returning matching lines with context.
+    pub fn searchOutput(
+        &self,
+        index: usize,
+        pattern: &str,
+        contextLines: usize,
+    ) -> Option<String> {
+        let history = self.history.lock().unwrap();
+        let record = history.get(index)?;
+
+        let regex = regex::Regex::new(pattern).ok();
+        let lines: Vec<&str> = record.output.lines().collect();
+        let totalLines = lines.len();
+
+        // Find matching line indices.
+        let mut matchIndices: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let matched = if let Some(ref re) = regex {
+                re.is_match(line)
+            } else {
+                line.contains(pattern)
+            };
+            if matched {
+                matchIndices.push(i);
+            }
+        }
+
+        if matchIndices.is_empty() {
+            return Some(format!("No matches for \"{pattern}\" in command {index} output."));
+        }
+
+        // Build context windows around matches, merging overlaps.
+        let mut included = vec![false; totalLines];
+        for &mi in &matchIndices {
+            let start = mi.saturating_sub(contextLines);
+            let end = (mi + contextLines + 1).min(totalLines);
+            for j in start..end {
+                included[j] = true;
+            }
+        }
+
+        let mut output = String::new();
+        let mut inBlock = false;
+        for (i, line) in lines.iter().enumerate() {
+            if included[i] {
+                if !inBlock && !output.is_empty() {
+                    output.push_str("  ...\n");
+                }
+                inBlock = true;
+                let marker = if matchIndices.contains(&i) { ">" } else { " " };
+                output.push_str(&format!("{marker}{:>5}\t{line}\n", i + 1));
+            } else {
+                inBlock = false;
+            }
+        }
+
+        output.push_str(&format!(
+            "\n{} matches in {} lines.",
+            matchIndices.len(),
+            totalLines
+        ));
+
+        Some(output)
+    }
+
+    /// Read the last N lines from the terminal scrollback.
+    /// This includes everything visible in the terminal — user commands,
+    /// agent commands, and all output.
+    pub fn readTerminal(&self, lines: usize) -> String {
+        let scrollback = self.scrollback.lock().unwrap();
+        let raw = Vec::from(scrollback.clone());
+        let text = stripAnsi(&String::from_utf8_lossy(&raw));
+
+        let allLines: Vec<&str> = text.lines().collect();
+        let start = allLines.len().saturating_sub(lines);
+        allLines[start..].join("\n")
     }
 }
 
@@ -74,13 +199,16 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         })
         .context("Failed to open PTY")?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
-    let mut cmd = CommandBuilder::new(&shell);
+    let shellBin = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+    let mut cmd = CommandBuilder::new(&shellBin);
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 
     // Inject OSC 133 shell integration for command boundary tracking.
-    injectShellIntegration(&shell, &mut cmd)?;
+    injectShellIntegration(&shellBin, &mut cmd)?;
 
     slave
         .spawn_command(cmd)
@@ -117,9 +245,27 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     let (resizeTx, mut resizeRx) = mpsc::channel::<(u16, u16)>(4);
     let (cmdTx, mut cmdRx) = mpsc::channel::<ShellRequest>(4);
 
+    let history: Arc<Mutex<Vec<CommandRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let historyRef = Arc::clone(&history);
+    let scrollback: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let scrollbackRef = Arc::clone(&scrollback);
+
     // Background task — central hub for all PTY I/O.
     tokio::spawn(async move {
         let mut captureState: Option<CaptureState> = None;
+
+        // Append bytes to the scrollback ring buffer.
+        let appendScrollback = |bytes: &[u8]| {
+            let mut sb = scrollbackRef.lock().unwrap();
+            sb.extend(bytes);
+            // Trim from front if over capacity, on a line boundary.
+            while sb.len() > MAX_SCROLLBACK_BYTES {
+                match sb.iter().position(|&b| b == b'\n') {
+                    Some(pos) => { sb.drain(..=pos); }
+                    None => { sb.drain(..1024); }
+                }
+            }
+        };
 
         loop {
             tokio::select! {
@@ -132,17 +278,19 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         // Filtered bytes go to harness (no sentinels in display).
                         let filtered = cap.filter.process(&bytes);
                         if !filtered.is_empty() {
+                            appendScrollback(&filtered);
                             let _ = outputTx.send(filtered).await;
                         }
                     } else {
+                        appendScrollback(&bytes);
                         let _ = outputTx.send(bytes).await;
                     }
 
-                    // Check for end marker (separate borrow scope).
+                    // Check for end marker. The echo can't contain the exact
+                    // pattern (it has printf %s, not the uuid), so no \n prefix needed.
                     let done = if let Some(ref cap) = captureState {
                         let bufStr = String::from_utf8_lossy(&cap.buffer);
-                        bufStr.contains(&format!("__FLATLINE_END_{}__", cap.uuid))
-                            || bufStr.contains(&format!("__FLATLINE_END_{}_", cap.uuid))
+                        bufStr.contains(&format!("__FLATLINE_END_{}_", cap.uuid))
                     } else {
                         false
                     };
@@ -151,10 +299,37 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         let mut cap = captureState.take().unwrap();
                         let remaining = cap.filter.flush();
                         if !remaining.is_empty() {
+                            appendScrollback(&remaining);
                             let _ = outputTx.send(remaining).await;
                         }
-                        let output = extractOutput(&cap.buffer, &cap.uuid);
-                        let _ = cap.respondTo.send(output);
+                        let result = extractResult(&cap.buffer, &cap.uuid);
+
+                        // Store in history ring buffer.
+                        {
+                            let mut hist = historyRef.lock().unwrap();
+                            hist.push(CommandRecord {
+                                command: cap.command.clone(),
+                                output: result.output.clone(),
+                                exitCode: result.exitCode,
+                                lineCount: result.output.lines().count(),
+                            });
+                            // Evict oldest if over capacity.
+                            if hist.len() > MAX_HISTORY {
+                                hist.remove(0);
+                            }
+                        }
+
+                        // Return output to caller (with exit code baked in).
+                        let response = if let Some(code) = result.exitCode {
+                            if code != 0 {
+                                format!("{}\n(exit code: {code})", result.output)
+                            } else {
+                                result.output
+                            }
+                        } else {
+                            result.output
+                        };
+                        let _ = cap.respondTo.send(response);
                     }
                 }
 
@@ -167,16 +342,29 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                 // Command execution request from session.
                 Some(req) = cmdRx.recv() => {
                     let uuid = generateUuid();
-                    // Emit OSC 133 C/D markers so the terminal widget can track
-                    // command output regions for entity selection (quad-click).
+
+                    // Echo the command in the terminal so the user sees what ran.
+                    // Sent directly on outputTx, bypassing the PTY/filter.
+                    // Dim cyan to distinguish agent commands from user input.
+                    let cmdEcho = format!("\x1b[2;36m\u{25B8} {}\x1b[0m\r\n", req.command);
+                    let echoBytes = cmdEcho.into_bytes();
+                    appendScrollback(&echoBytes);
+                    let _ = outputTx.send(echoBytes).await;
+
+                    // NOTE: Markers use printf with %s so the shell's command
+                    // echo never contains the exact uuid pattern. This prevents
+                    // PTY line-wrapping from creating false marker matches.
+                    // The DisplayFilter mutes all output until the actual start
+                    // marker appears, hiding the echoed command text.
                     let wrapped = format!(
-                        "echo __FLATLINE_START_{uuid}__; printf '\\e]133;C\\a'; {}; __flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; echo __FLATLINE_END_{uuid}_${{__flatline_ec}}__\n",
+                        "printf '__FLATLINE_START_%s__\\n' '{uuid}'; printf '\\e]133;C\\a'; {}; __flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; printf '\\n__FLATLINE_END_%s_%s__\\n' '{uuid}' \"$__flatline_ec\"\n",
                         req.command,
                     );
                     let _ = writer.write_all(wrapped.as_bytes());
                     let _ = writer.flush();
                     captureState = Some(CaptureState {
                         uuid: uuid.clone(),
+                        command: req.command,
                         buffer: Vec::new(),
                         filter: DisplayFilter::new(&uuid),
                         respondTo: req.respondTo,
@@ -199,7 +387,12 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         }
     });
 
-    let shell = Shell { cmdTx };
+    let shell = Shell {
+        cmdTx,
+        inputTx: inputTx.clone(),
+        history,
+        scrollback,
+    };
     let io = ShellIo {
         outputRx,
         inputTx,
@@ -218,20 +411,32 @@ struct ShellRequest {
 
 struct CaptureState {
     uuid: String,
+    command: String,
     buffer: Vec<u8>,
     filter: DisplayFilter,
     respondTo: oneshot::Sender<String>,
 }
 
-/// Line-based filter that suppresses sentinel markers from display output.
+/// Extracted result from the capture buffer.
+struct ExtractedResult {
+    output: String,
+    exitCode: Option<i32>,
+}
+
+/// Line-based filter that suppresses sentinel markers and the shell's
+/// command echo from display output.
 ///
-/// Buffers partial lines until a newline arrives, then checks if the
-/// complete line contains a sentinel pattern. Matching lines are dropped;
-/// everything else passes through to the harness.
+/// Buffers partial lines until a newline arrives. All output is muted
+/// until the actual start marker appears (suppressing the PTY echo of
+/// the wrapped command). After the start marker, sentinel lines are
+/// dropped and everything else passes through to the harness.
 struct DisplayFilter {
     lineBuf: Vec<u8>,
     startPattern: String,
     endPattern: String,
+    /// Whether the actual start marker output has been seen.
+    /// Before this, all lines are suppressed (they're command echo).
+    seenStart: bool,
 }
 
 impl DisplayFilter {
@@ -240,17 +445,25 @@ impl DisplayFilter {
             lineBuf: Vec::new(),
             startPattern: format!("__FLATLINE_START_{uuid}"),
             endPattern: format!("__FLATLINE_END_{uuid}"),
+            seenStart: false,
         }
     }
 
-    /// Process a chunk of bytes, returning only non-sentinel lines.
+    /// Process a chunk of bytes, returning only command output lines.
     fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         for &b in bytes {
             self.lineBuf.push(b);
             if b == b'\n' {
                 let line = String::from_utf8_lossy(&self.lineBuf);
-                if !line.contains(&self.startPattern) && !line.contains(&self.endPattern) {
+                if !self.seenStart {
+                    // Muted phase: suppress everything until start marker.
+                    if line.contains(&self.startPattern) {
+                        self.seenStart = true;
+                    }
+                } else if !line.contains(&self.startPattern)
+                    && !line.contains(&self.endPattern)
+                {
                     output.extend_from_slice(&self.lineBuf);
                 }
                 self.lineBuf.clear();
@@ -262,7 +475,7 @@ impl DisplayFilter {
     /// Flush any remaining partial line (when capture ends).
     fn flush(&mut self) -> Vec<u8> {
         let line = String::from_utf8_lossy(&self.lineBuf);
-        if line.contains("__FLATLINE_") {
+        if !self.seenStart || line.contains("__FLATLINE_") {
             self.lineBuf.clear();
             Vec::new()
         } else {
@@ -273,31 +486,33 @@ impl DisplayFilter {
 
 // --- Output extraction ---
 
-/// Extract command output from the capture buffer using sentinel markers.
+/// Extract command output and exit code from the capture buffer.
 ///
 /// The buffer contains raw PTY output with command echoes, ANSI codes,
-/// and sentinel markers. We use rfind for the start marker to skip past
-/// the shell's input echo (which also contains the marker text).
-fn extractOutput(buffer: &[u8], uuid: &str) -> String {
+/// and sentinel markers. The wrapped command uses printf with %s for the
+/// uuid, so the echo never contains the exact marker strings — only the
+/// actual output does. This makes rfind unambiguous.
+fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
     let text = String::from_utf8_lossy(buffer);
     let startMarker = format!("__FLATLINE_START_{uuid}__");
     let endPrefix = format!("__FLATLINE_END_{uuid}_");
 
-    // Use rfind to get the LAST start marker — the actual echo output,
-    // not the shell's input echo of the wrapped command.
     let afterStart = match text.rfind(&startMarker) {
         Some(pos) => {
             let rest = &text[pos + startMarker.len()..];
-            // Skip past the newline after the marker.
             match rest.find('\n') {
                 Some(nl) => &rest[nl + 1..],
                 None => rest,
             }
         }
-        None => return stripAnsi(&text),
+        None => {
+            return ExtractedResult {
+                output: stripAnsi(&text),
+                exitCode: None,
+            };
+        }
     };
 
-    // Everything between start and end markers is command output.
     let output = match afterStart.find(&endPrefix) {
         Some(pos) => afterStart[..pos]
             .trim_end_matches('\n')
@@ -308,18 +523,15 @@ fn extractOutput(buffer: &[u8], uuid: &str) -> String {
     let cleaned = stripAnsi(output);
 
     // Extract exit code from end marker.
-    if let Some(endPos) = text.rfind(&endPrefix) {
+    let exitCode = text.rfind(&endPrefix).and_then(|endPos| {
         let afterPrefix = &text[endPos + endPrefix.len()..];
-        if let Some(codeStr) = afterPrefix.split("__").next() {
-            if let Ok(code) = codeStr.parse::<i32>() {
-                if code != 0 {
-                    return format!("{cleaned}\n(exit code: {code})");
-                }
-            }
-        }
-    }
+        afterPrefix.split("__").next()?.parse::<i32>().ok()
+    });
 
-    cleaned
+    ExtractedResult {
+        output: cleaned,
+        exitCode,
+    }
 }
 
 /// Strip ANSI escape sequences from text.

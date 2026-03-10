@@ -16,7 +16,7 @@
 //! `tokio`, `serde_json`
 
 use anyhow::{Result, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::api;
 use crate::config::Config;
@@ -24,6 +24,7 @@ use crate::message::{
     FunctionCall, Message, ReasoningConfig, StreamEvent, ToolCall, ToolDef,
 };
 use crate::permissions::{PermitMode, Permissions, Verdict};
+use crate::prompt::{self, DomainModule, InterfaceMode};
 use crate::shell::Shell;
 use crate::tool;
 
@@ -59,6 +60,9 @@ pub enum SessionEvent {
     /// The full turn is complete.
     TurnComplete,
 
+    /// The turn was cancelled by the user.
+    TurnCancelled,
+
     /// An error occurred.
     Error(String),
 }
@@ -80,7 +84,15 @@ impl Session {
     ///     config: Application config (API settings, etc).
     ///     permissions: Permission rules for tool execution.
     ///     shell: Stateful shell session for command execution.
-    pub fn new(config: &Config, permissions: Permissions, shell: Shell) -> Result<Self> {
+    ///     interface: How the agent is being driven.
+    ///     domains: Task-specific skill modules to include.
+    pub fn new(
+        config: &Config,
+        permissions: Permissions,
+        shell: Shell,
+        interface: InterfaceMode,
+        domains: &[DomainModule],
+    ) -> Result<Self> {
         let client = api::Client::new(&config.api)?;
         let tools = tool::builtinDefs();
 
@@ -89,7 +101,7 @@ impl Session {
             summary: r.summary.clone(),
         });
 
-        let systemPrompt = buildSystemPrompt();
+        let systemPrompt = prompt::build(interface, domains);
 
         let history = vec![Message::System {
             content: systemPrompt,
@@ -120,33 +132,73 @@ impl Session {
         userMessage: &str,
         eventTx: &mpsc::Sender<SessionEvent>,
         permitRx: &mut mpsc::Receiver<bool>,
+        cancelRx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
+        tracing::info!(len = userMessage.len(), "user message received");
         self.history.push(Message::User {
             content: userMessage.into(),
         });
 
         loop {
-            let turnResult = self.streamOneTurn(eventTx).await?;
+            // Check for cancellation between turns.
+            if *cancelRx.borrow() {
+                tracing::info!("turn cancelled before streaming");
+                let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                return Ok(());
+            }
+
+            tracing::debug!(historyLen = self.history.len(), "starting turn");
+            let turnResult = self.streamOneTurn(eventTx, cancelRx).await?;
 
             match turnResult {
                 TurnResult::Done => {
+                    tracing::info!("turn complete (no tool calls)");
                     let _ = eventTx.send(SessionEvent::TurnComplete).await;
                     return Ok(());
                 }
-                TurnResult::ToolCalls(calls) => {
+                TurnResult::Cancelled => {
+                    tracing::info!("turn cancelled during streaming");
+                    let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                    return Ok(());
+                }
+                TurnResult::ToolCalls { calls, reasoning } => {
+                    tracing::info!(
+                        callCount = calls.len(),
+                        hasReasoning = reasoning.is_some(),
+                        "turn produced tool calls"
+                    );
                     self.history.push(Message::Assistant {
                         content: None,
                         tool_calls: Some(calls.clone()),
-                        reasoning: None,
+                        reasoning,
                     });
 
                     let mut aborted = false;
 
-                    for call in &calls {
+                    for (callIdx, call) in calls.iter().enumerate() {
+                        // Check for cancellation between tool calls.
+                        if *cancelRx.borrow() {
+                            tracing::info!("cancelled between tool calls");
+                            for remaining in &calls[callIdx..] {
+                                self.history.push(Message::Tool {
+                                    tool_call_id: remaining.id.clone(),
+                                    content: "Cancelled by user.".into(),
+                                });
+                            }
+                            let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                            return Ok(());
+                        }
+
                         let action =
                             tool::parse(&call.function.name, &call.function.arguments);
                         let summary = tool::summarize(&action);
                         let verdict = self.permissions.check(&action);
+
+                        tracing::debug!(
+                            tool = %call.function.name,
+                            verdict = ?verdict,
+                            "checking tool permission"
+                        );
 
                         let approved = match verdict {
                             Verdict::Allow => {
@@ -177,8 +229,23 @@ impl Session {
                                             })
                                             .await;
 
-                                        // Wait for supervisor response.
-                                        permitRx.recv().await.unwrap_or(false)
+                                        // Wait for supervisor response or cancellation.
+                                        tokio::select! {
+                                            permit = permitRx.recv() => {
+                                                permit.unwrap_or(false)
+                                            }
+                                            _ = cancelRx.changed() => {
+                                                tracing::info!("cancelled during permission wait");
+                                                for remaining in &calls[callIdx..] {
+                                                    self.history.push(Message::Tool {
+                                                        tool_call_id: remaining.id.clone(),
+                                                        content: "Cancelled by user.".into(),
+                                                    });
+                                                }
+                                                let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                                                return Ok(());
+                                            }
+                                        }
                                     }
                                     PermitMode::Deny => {
                                         let _ = eventTx
@@ -202,7 +269,6 @@ impl Session {
                         };
 
                         if aborted {
-                            // Push denial for this call and stop processing.
                             self.history.push(Message::Tool {
                                 tool_call_id: call.id.clone(),
                                 content: "Turn aborted: tool call not permitted.".into(),
@@ -210,15 +276,74 @@ impl Session {
                             break;
                         }
 
+                        // Guard: editFile/writeFile require a prior readFile of the same path.
+                        if approved {
+                            if let Some(rejection) = self.checkReadBeforeWrite(&action) {
+                                tracing::info!(
+                                    tool = %call.function.name,
+                                    "rejected: file not read first"
+                                );
+                                self.history.push(Message::Tool {
+                                    tool_call_id: call.id.clone(),
+                                    content: rejection,
+                                });
+                                continue;
+                            }
+                        }
+
                         let output = if approved {
-                            let result = tool::execute(&action, &self.shell).await;
-                            let _ = eventTx
-                                .send(SessionEvent::ToolResult {
-                                    name: call.function.name.clone(),
-                                    output: result.clone(),
-                                })
-                                .await;
-                            result
+                            tracing::info!(tool = %call.function.name, "executing tool");
+
+                            // Race tool execution against cancellation for shell commands.
+                            if matches!(action, tool::ToolAction::Shell { .. }) {
+                                tokio::select! {
+                                    result = tool::execute(&action, &self.shell) => {
+                                        tracing::debug!(
+                                            tool = %call.function.name,
+                                            outputLen = result.len(),
+                                            "tool execution complete"
+                                        );
+                                        let _ = eventTx
+                                            .send(SessionEvent::ToolResult {
+                                                name: call.function.name.clone(),
+                                                output: result.clone(),
+                                            })
+                                            .await;
+                                        result
+                                    }
+                                    _ = cancelRx.changed() => {
+                                        tracing::info!(tool = %call.function.name, "cancelled during shell execution");
+                                        self.shell.interrupt();
+                                        self.history.push(Message::Tool {
+                                            tool_call_id: call.id.clone(),
+                                            content: "Cancelled by user.".into(),
+                                        });
+                                        for remaining in &calls[callIdx + 1..] {
+                                            self.history.push(Message::Tool {
+                                                tool_call_id: remaining.id.clone(),
+                                                content: "Cancelled by user.".into(),
+                                            });
+                                        }
+                                        let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                // File operations are fast — no cancel race needed.
+                                let result = tool::execute(&action, &self.shell).await;
+                                tracing::debug!(
+                                    tool = %call.function.name,
+                                    outputLen = result.len(),
+                                    "tool execution complete"
+                                );
+                                let _ = eventTx
+                                    .send(SessionEvent::ToolResult {
+                                        name: call.function.name.clone(),
+                                        output: result.clone(),
+                                    })
+                                    .await;
+                                result
+                            }
                         } else {
                             let _ = eventTx
                                 .send(SessionEvent::ToolDenied {
@@ -247,6 +372,7 @@ impl Session {
     async fn streamOneTurn(
         &mut self,
         tx: &mpsc::Sender<SessionEvent>,
+        cancelRx: &mut watch::Receiver<bool>,
     ) -> Result<TurnResult> {
         let mut rx = self
             .client
@@ -257,38 +383,72 @@ impl Session {
         let mut reasoningBuf = String::new();
         let mut toolAccum = ToolCallAccumulator::new();
 
-        while let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::ContentDelta(text) => {
-                    contentBuf.push_str(&text);
-                    let _ = tx.send(SessionEvent::ContentDelta(text)).await;
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(StreamEvent::ContentDelta(text)) => {
+                            contentBuf.push_str(&text);
+                            let _ = tx.send(SessionEvent::ContentDelta(text)).await;
+                        }
+                        Some(StreamEvent::ReasoningDelta(text)) => {
+                            reasoningBuf.push_str(&text);
+                            let _ = tx.send(SessionEvent::ReasoningDelta(text)).await;
+                        }
+                        Some(StreamEvent::ToolCallDelta {
+                            index,
+                            id,
+                            name,
+                            arguments,
+                        }) => {
+                            toolAccum.accumulate(index, id, name, arguments);
+                        }
+                        Some(StreamEvent::Done { .. }) | None => {
+                            break;
+                        }
+                        Some(StreamEvent::Error(msg)) => {
+                            let _ = tx.send(SessionEvent::Error(msg.clone())).await;
+                            bail!("Stream error: {msg}");
+                        }
+                    }
                 }
-                StreamEvent::ReasoningDelta(text) => {
-                    reasoningBuf.push_str(&text);
-                    let _ = tx.send(SessionEvent::ReasoningDelta(text)).await;
-                }
-                StreamEvent::ToolCallDelta {
-                    index,
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    toolAccum.accumulate(index, id, name, arguments);
-                }
-                StreamEvent::Done { .. } => {
-                    break;
-                }
-                StreamEvent::Error(msg) => {
-                    let _ = tx.send(SessionEvent::Error(msg.clone())).await;
-                    bail!("Stream error: {msg}");
+                _ = cancelRx.changed() => {
+                    if *cancelRx.borrow() {
+                        tracing::info!("stream cancelled, committing partial content");
+                        // Drop rx — kills the SSE background task.
+                        drop(rx);
+                        // Commit partial content to history (skip if nothing was streamed).
+                        if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
+                            let content = if contentBuf.is_empty() { None } else { Some(contentBuf) };
+                            let reasoning = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf) };
+                            self.history.push(Message::Assistant {
+                                content,
+                                tool_calls: None,
+                                reasoning,
+                            });
+                        }
+                        return Ok(TurnResult::Cancelled);
+                    }
                 }
             }
         }
 
         let calls = toolAccum.finish();
 
+        tracing::debug!(
+            contentLen = contentBuf.len(),
+            reasoningLen = reasoningBuf.len(),
+            toolCalls = calls.len(),
+            "turn stream complete"
+        );
+
         if !calls.is_empty() {
-            Ok(TurnResult::ToolCalls(calls))
+            let reasoning = if reasoningBuf.is_empty() {
+                None
+            } else {
+                Some(reasoningBuf)
+            };
+            Ok(TurnResult::ToolCalls { calls, reasoning })
         } else {
             let content = if contentBuf.is_empty() {
                 None
@@ -310,12 +470,66 @@ impl Session {
             Ok(TurnResult::Done)
         }
     }
+
+    /// Check if a write/edit action targets a file that was previously read.
+    /// Returns an error message if the file hasn't been read, None if OK.
+    fn checkReadBeforeWrite(&self, action: &tool::ToolAction) -> Option<String> {
+        let targetPath = match action {
+            tool::ToolAction::EditFile { path, .. } => path,
+            tool::ToolAction::WriteFile { path, .. } => {
+                // writeFile to a new file is fine — no read needed.
+                if !std::path::Path::new(path).exists() {
+                    return None;
+                }
+                path
+            }
+            _ => return None,
+        };
+
+        // Normalize to absolute for comparison.
+        let targetNorm = normalizePath(targetPath);
+
+        // Scan history for a readFile tool call with a matching path.
+        for msg in &self.history {
+            if let Message::Assistant { tool_calls: Some(calls), .. } = msg {
+                for call in calls {
+                    if call.function.name == "readFile" {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                            &call.function.arguments,
+                        ) {
+                            if let Some(readPath) = args["path"].as_str() {
+                                if normalizePath(readPath) == targetNorm {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(format!(
+            "You must read \"{targetPath}\" with readFile before editing or overwriting it."
+        ))
+    }
+}
+
+/// Best-effort path normalization for read-before-write comparison.
+fn normalizePath(path: &str) -> String {
+    std::path::Path::new(path)
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Outcome of a single API call.
 enum TurnResult {
     Done,
-    ToolCalls(Vec<ToolCall>),
+    ToolCalls {
+        calls: Vec<ToolCall>,
+        reasoning: Option<String>,
+    },
+    Cancelled,
 }
 
 /// Accumulates streaming tool call deltas into complete tool calls.
@@ -379,19 +593,3 @@ impl ToolCallAccumulator {
     }
 }
 
-fn buildSystemPrompt() -> String {
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-
-    // NOTE: Tool descriptions are sent via the native `tools` API parameter.
-    // Don't duplicate them here — models work better with native tool schemas.
-    format!(
-        "You are Flatline, a general-purpose agent running in a terminal.\n\
-         \n\
-         Working directory: {cwd}\n\
-         \n\
-         Be direct and concise. Execute tasks rather than explaining how to do them. \
-         When you need information, use your tools to get it rather than guessing."
-    )
-}

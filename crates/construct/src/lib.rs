@@ -18,6 +18,7 @@ pub mod api;
 pub mod config;
 pub mod message;
 pub mod permissions;
+pub mod prompt;
 pub mod session;
 pub mod shell;
 pub mod tool;

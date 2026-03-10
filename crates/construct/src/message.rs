@@ -133,8 +133,19 @@ pub(crate) struct StreamChoice {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChunkDelta {
     pub content: Option<String>,
+    /// Simple reasoning string (used by some providers like DeepSeek/Kimi).
     pub reasoning: Option<String>,
+    /// Structured reasoning details (used by Claude via OpenRouter).
+    pub reasoning_details: Option<Vec<ReasoningDetail>>,
     pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+/// A single reasoning detail entry from structured reasoning.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReasoningDetail {
+    #[serde(rename = "type")]
+    pub detailType: Option<String>,
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -81,6 +81,22 @@ impl Client {
             body["reasoning"] = serde_json::to_value(r)?;
         }
 
+        if !self.config.providerOrder.is_empty() {
+            body["provider"] = serde_json::json!({
+                "order": self.config.providerOrder,
+                "allow_fallbacks": false,
+            });
+        }
+
+        tracing::debug!(
+            model = %self.config.model,
+            messageCount = messages.len(),
+            toolCount = tools.len(),
+            hasReasoning = reasoning.is_some(),
+            "sending API request"
+        );
+        tracing::trace!(body = %body, "request body");
+
         let response = self
             .http
             .post(&url)
@@ -92,8 +108,11 @@ impl Client {
         if !response.status().is_success() {
             let status = response.status();
             let errorBody = response.text().await.unwrap_or_default();
+            tracing::error!(%status, body = %errorBody, "API error");
             bail!("API error {status}: {errorBody}");
         }
+
+        tracing::debug!(status = %response.status(), "stream started");
 
         let (tx, rx) = mpsc::channel(256);
 
@@ -150,7 +169,7 @@ async fn readStream(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse SSE chunk: {e}");
+                        tracing::warn!(data = %data, "failed to parse SSE chunk: {e}");
                     }
                 }
             }
@@ -165,9 +184,9 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     if let Some(error) = chunk.error {
-        events.push(StreamEvent::Error(
-            error.message.unwrap_or_else(|| "Unknown error".into()),
-        ));
+        let msg = error.message.unwrap_or_else(|| "Unknown error".into());
+        tracing::error!(error = %msg, "stream error from API");
+        events.push(StreamEvent::Error(msg));
         return events;
     }
 
@@ -176,17 +195,45 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
             if let Some(delta) = choice.delta {
                 if let Some(content) = delta.content {
                     if !content.is_empty() {
+                        tracing::trace!(len = content.len(), "content delta");
                         events.push(StreamEvent::ContentDelta(content));
                     }
                 }
 
+                // Prefer simple reasoning field (DeepSeek, Kimi).
+                // Fall back to structured reasoning_details (Claude via OpenRouter).
+                // Only use one to avoid duplicate output.
+                let mut hadReasoning = false;
                 if let Some(reasoning) = delta.reasoning {
                     if !reasoning.is_empty() {
+                        tracing::trace!(len = reasoning.len(), "reasoning delta (simple)");
                         events.push(StreamEvent::ReasoningDelta(reasoning));
+                        hadReasoning = true;
+                    }
+                }
+
+                if !hadReasoning {
+                    if let Some(details) = delta.reasoning_details {
+                        for detail in details {
+                            if let Some(text) = detail.text {
+                                if !text.is_empty() {
+                                    tracing::trace!(len = text.len(), "reasoning delta (structured)");
+                                    events.push(StreamEvent::ReasoningDelta(text));
+                                }
+                            }
+                        }
                     }
                 }
 
                 if let Some(toolCalls) = delta.tool_calls {
+                    for tc in &toolCalls {
+                        tracing::debug!(
+                            index = tc.index,
+                            id = ?tc.id,
+                            name = ?tc.function.as_ref().and_then(|f| f.name.as_ref()),
+                            "tool call delta"
+                        );
+                    }
                     for tc in toolCalls {
                         events.push(StreamEvent::ToolCallDelta {
                             index: tc.index.unwrap_or(0),
@@ -199,6 +246,7 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
             }
 
             if let Some(reason) = choice.finish_reason {
+                tracing::debug!(reason = %reason, "stream finished");
                 events.push(StreamEvent::Done {
                     finishReason: Some(reason),
                 });

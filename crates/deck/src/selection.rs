@@ -31,6 +31,7 @@ const SELECTION_FG: Color = Color::White;
 pub enum PanelId {
     Terminal,
     Agent,
+    Input,
 }
 
 /// Text selection within a panel's content area.
@@ -186,8 +187,12 @@ pub struct SelectionState {
     pub click: Click,
     /// Terminal panel content rect (updated each frame).
     pub termContentRect: Rect,
-    /// Agent panel content rect (updated each frame).
+    /// Agent panel full rect for hit-testing (includes prefix columns).
+    pub agentPanelRect: Rect,
+    /// Agent panel content rect (offset past prefix, for selection/highlight).
     pub agentContentRect: Rect,
+    /// Input area content rect (updated each frame).
+    pub inputContentRect: Rect,
     /// Panel whose selection needs clipboard copy on the next draw.
     pub pendingCopy: Option<PanelId>,
     /// Expand selection to word/line/block boundaries on next draw (panel, click count).
@@ -202,7 +207,9 @@ impl SelectionState {
             agentSelection: None,
             click: Click::new(),
             termContentRect: Rect::default(),
+            agentPanelRect: Rect::default(),
             agentContentRect: Rect::default(),
+            inputContentRect: Rect::default(),
             pendingCopy: None,
             pendingExpand: None,
         }
@@ -213,6 +220,7 @@ impl SelectionState {
         match panel {
             PanelId::Terminal => &mut self.termSelection,
             PanelId::Agent => &mut self.agentSelection,
+            PanelId::Input => unreachable!("Input selection handled by TextArea"),
         }
     }
 
@@ -220,7 +228,7 @@ impl SelectionState {
     pub fn hitTest(&self, col: u16, row: u16) -> Option<PanelId> {
         if self.termContentRect.contains((col, row).into()) {
             Some(PanelId::Terminal)
-        } else if self.agentContentRect.contains((col, row).into()) {
+        } else if self.agentPanelRect.contains((col, row).into()) {
             Some(PanelId::Agent)
         } else {
             None
@@ -232,6 +240,7 @@ impl SelectionState {
         let rect = match panel {
             PanelId::Terminal => self.termContentRect,
             PanelId::Agent => self.agentContentRect,
+            PanelId::Input => self.inputContentRect,
         };
         (col.saturating_sub(rect.x), row.saturating_sub(rect.y))
     }
@@ -241,6 +250,7 @@ impl SelectionState {
         let rect = match panel {
             PanelId::Terminal => self.termContentRect,
             PanelId::Agent => self.agentContentRect,
+            PanelId::Input => self.inputContentRect,
         };
         (col.min(rect.width.saturating_sub(1)), row.min(rect.height.saturating_sub(1)))
     }
@@ -254,7 +264,7 @@ pub fn toGridLine(screenRow: u16, displayOffset: u16) -> i32 {
 }
 
 /// Convert a grid line back to a screen row. Returns None if off-screen.
-fn toScreenRow(gridLine: i32, displayOffset: u16, height: u16) -> Option<u16> {
+pub fn toScreenRow(gridLine: i32, displayOffset: u16, height: u16) -> Option<u16> {
     let sr = gridLine + displayOffset as i32;
     if sr >= 0 && sr < height as i32 {
         Some(sr as u16)

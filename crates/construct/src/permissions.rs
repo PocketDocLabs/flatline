@@ -134,8 +134,13 @@ impl Permissions {
 fn actionKey(action: &ToolAction) -> (&str, &str) {
     match action {
         ToolAction::Shell { command } => ("shell", command),
-        ToolAction::ReadFile { path } => ("readFile", path),
+        ToolAction::ReadFile { path, .. } => ("readFile", path),
         ToolAction::WriteFile { path, .. } => ("writeFile", path),
+        ToolAction::EditFile { path, .. } => ("editFile", path),
+        ToolAction::ShellHistory => ("shellHistory", ""),
+        ToolAction::ReadOutput { .. } => ("readOutput", ""),
+        ToolAction::SearchOutput { pattern, .. } => ("searchOutput", pattern),
+        ToolAction::ReadTerminal { .. } => ("readTerminal", ""),
         ToolAction::Unknown { name, args } => (name, args),
     }
 }

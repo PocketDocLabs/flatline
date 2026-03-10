@@ -45,6 +45,11 @@ pub struct ApiConfig {
     /// Reasoning config for thinking models.
     #[serde(default)]
     pub reasoning: Option<ReasoningSettings>,
+
+    /// Preferred OpenRouter providers in priority order (e.g. ["Fireworks", "Moonshot"]).
+    /// When set, disables fallbacks automatically.
+    #[serde(default)]
+    pub providerOrder: Vec<String>,
 }
 
 /// Reasoning/thinking settings.
@@ -64,6 +69,7 @@ mod defaults {
             model: model(),
             baseUrl: baseUrl(),
             reasoning: None,
+            providerOrder: Vec::new(),
         }
     }
 
