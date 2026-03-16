@@ -39,7 +39,7 @@ use crate::selection::{self, PanelId, SelectionState};
 use crate::session_picker::{PickerAction, SessionPicker};
 use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
 
-use std::io;
+use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
 fn mainAgentPermissions() -> Permissions {
@@ -98,6 +98,22 @@ impl ScrollAxisLock {
     }
 }
 
+/// Set the host terminal's window title via OSC 2.
+fn setTerminalTitle(topic: Option<&str>) {
+    let title = match topic {
+        Some(t) if !t.is_empty() => format!("\u{25c6}\u{fe0e} {t}"),
+        _ => "flatline".to_string(),
+    };
+    let _ = write!(io::stdout(), "\x1b]2;{title}\x07");
+    let _ = io::stdout().flush();
+}
+
+/// Restore the terminal title to whatever it was (best-effort reset).
+fn resetTerminalTitle() {
+    let _ = write!(io::stdout(), "\x1b]2;\x07");
+    let _ = io::stdout().flush();
+}
+
 /// Run the deck TUI.
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
@@ -113,6 +129,8 @@ pub async fn run() -> Result<()> {
         ),
         crossterm::cursor::SetCursorStyle::SteadyBar,
     )?;
+    setTerminalTitle(None);
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
 
@@ -367,6 +385,7 @@ pub async fn run() -> Result<()> {
         LeaveAlternateScreen,
     )?;
     terminal.show_cursor()?;
+    resetTerminalTitle();
 
     result
 }
@@ -651,6 +670,9 @@ async fn runLoop(
                 SessionEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
                 }
+                SessionEvent::TopicChanged { label } => {
+                    setTerminalTitle(Some(&label));
+                }
                 SessionEvent::TokenUpdate {
                     contextTokens,
                     ..
@@ -682,6 +704,7 @@ async fn runLoop(
                 SessionEvent::Cleared => {
                     agentPanel.clearDisplay();
                     tokenCount = 0;
+                    setTerminalTitle(None);
                 }
                 SessionEvent::Rewound { targetTurnId } => {
                     rewindPicker = None;

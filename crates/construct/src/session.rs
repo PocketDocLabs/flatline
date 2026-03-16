@@ -123,6 +123,9 @@ pub enum SessionEvent {
         configPath: String,
     },
 
+    /// The current topic label changed (for title bar updates).
+    TopicChanged { label: String },
+
     /// Conversation was rewound to a prior turn.
     Rewound { targetTurnId: String },
 
@@ -696,6 +699,11 @@ impl Session {
                         "new topic segment"
                     );
                 }
+                let _ = eventTx
+                    .send(SessionEvent::TopicChanged {
+                        label: result.label.clone(),
+                    })
+                    .await;
             }
             Err(e) => {
                 tracing::warn!("topic evaluation failed: {e}");

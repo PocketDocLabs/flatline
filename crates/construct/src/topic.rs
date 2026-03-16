@@ -107,6 +107,11 @@ impl TopicTracker {
         &self.currentTopicId
     }
 
+    /// Current topic label.
+    pub fn currentLabel(&self) -> &str {
+        &self.currentLabel
+    }
+
     /// Restore state from saved topic infos (for session resume).
     pub fn restoreState(&mut self, topics: Vec<TopicInfo>) {
         if let Some(last) = topics.last() {
