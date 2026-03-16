@@ -15,10 +15,24 @@
 //! `reqwest`, `tokio`, `serde`, `serde_json`
 
 pub mod api;
+pub mod checkpoint;
+pub mod compaction;
+pub mod compaction_trigger;
 pub mod config;
+pub mod context;
+pub mod mcp;
 pub mod message;
 pub mod permissions;
 pub mod prompt;
+pub mod runner;
+pub mod s1;
+pub mod s2;
+pub mod s3;
+pub mod s4;
 pub mod session;
 pub mod shell;
+pub mod text;
 pub mod tool;
+pub mod topic;
+pub mod transcript;
+pub mod web;

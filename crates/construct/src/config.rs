@@ -1,17 +1,21 @@
-//! User configuration — loaded from ~/.config/flatline/config.toml.
+//! User configuration — loaded from ~/Library/Application Support/flatline/config.toml.
 //!
 //! # Public API
 //! - [`Config`] — the full configuration struct
+//! - [`ModelConfig`] — per-model API settings (main and utility)
 //! - [`load`] — load config from disk, creating defaults if missing
 //!
 //! # Dependencies
 //! `serde`, `toml`, `dirs`
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::mcp::config::ServerConfig;
 
 const CONFIG_DIR: &str = "flatline";
 const CONFIG_FILE: &str = "config.toml";
@@ -19,13 +23,38 @@ const CONFIG_FILE: &str = "config.toml";
 /// Full application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default = "defaults::api")]
-    pub api: ApiConfig,
+    /// Main conversation model settings.
+    #[serde(default = "defaults::mainModel")]
+    pub main: ModelConfig,
+
+    /// Utility model settings (topic tracking, compaction, web summaries).
+    #[serde(default = "defaults::utilityModel")]
+    pub utility: ModelConfig,
+
+    /// Context usage ratio (0.0–1.0) at which to trigger compaction.
+    #[serde(default = "defaults::compactRatio")]
+    pub compactRatio: f64,
+
+    /// Web tool settings (Exa API).
+    #[serde(default)]
+    pub web: WebConfig,
+
+    /// MCP server configurations. Keys are server names.
+    #[serde(default)]
+    pub mcp: HashMap<String, ServerConfig>,
 }
 
-/// API provider settings.
+/// Web tool settings (Exa API).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Exa API key for web search/fetch/similar.
+    #[serde(default)]
+    pub searchKey: String,
+}
+
+/// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
+pub struct ModelConfig {
     /// API provider. Currently only "openrouter".
     #[serde(default = "defaults::provider")]
     pub provider: String,
@@ -34,7 +63,7 @@ pub struct ApiConfig {
     #[serde(default)]
     pub key: String,
 
-    /// Default model identifier.
+    /// Model identifier.
     #[serde(default = "defaults::model")]
     pub model: String,
 
@@ -46,10 +75,23 @@ pub struct ApiConfig {
     #[serde(default)]
     pub reasoning: Option<ReasoningSettings>,
 
-    /// Preferred OpenRouter providers in priority order (e.g. ["Fireworks", "Moonshot"]).
+    /// Prompt-injected thinking — tells the model to reason in <thinking> blocks
+    /// instead of using the official thinking API. Avoids reasoning summarization.
+    #[serde(default = "defaults::promptThinkingDefault")]
+    pub promptThinking: bool,
+
+    /// Preferred OpenRouter providers in priority order (e.g. ["Moonshot", "Fireworks"]).
     /// When set, disables fallbacks automatically.
-    #[serde(default)]
+    #[serde(default = "defaults::providerOrder")]
     pub providerOrder: Vec<String>,
+
+    /// Maximum completion tokens per response.
+    #[serde(default)]
+    pub maxTokens: Option<usize>,
+
+    /// Model context window size in tokens.
+    #[serde(default = "defaults::contextWindow")]
+    pub contextWindow: usize,
 }
 
 /// Reasoning/thinking settings.
@@ -60,16 +102,33 @@ pub struct ReasoningSettings {
 }
 
 mod defaults {
-    use super::ApiConfig;
+    use super::ModelConfig;
 
-    pub fn api() -> ApiConfig {
-        ApiConfig {
+    pub fn mainModel() -> ModelConfig {
+        ModelConfig {
             provider: provider(),
             key: String::new(),
             model: model(),
             baseUrl: baseUrl(),
             reasoning: None,
-            providerOrder: Vec::new(),
+            promptThinking: promptThinkingDefault(),
+            providerOrder: providerOrder(),
+            maxTokens: maxTokens(),
+            contextWindow: contextWindow(),
+        }
+    }
+
+    pub fn utilityModel() -> ModelConfig {
+        ModelConfig {
+            provider: provider(),
+            key: String::new(),
+            model: model(),
+            baseUrl: baseUrl(),
+            reasoning: None,
+            promptThinking: promptThinkingDefault(),
+            providerOrder: providerOrder(),
+            maxTokens: maxTokens(),
+            contextWindow: contextWindow(),
         }
     }
 
@@ -78,11 +137,31 @@ mod defaults {
     }
 
     pub fn model() -> String {
-        "moonshotai/kimi-k2.5".into()
+        "anthropic/claude-sonnet-4-6".into()
     }
 
     pub fn baseUrl() -> String {
         "https://openrouter.ai/api/v1".into()
+    }
+
+    pub fn contextWindow() -> usize {
+        1_000_000
+    }
+
+    pub fn maxTokens() -> Option<usize> {
+        Some(100_000)
+    }
+
+    pub fn compactRatio() -> f64 {
+        0.8
+    }
+
+    pub fn promptThinkingDefault() -> bool {
+        true
+    }
+
+    pub fn providerOrder() -> Vec<String> {
+        vec!["Anthropic".into()]
     }
 }
 
@@ -95,9 +174,9 @@ pub fn configDir() -> PathBuf {
 
 /// Load config from disk. Creates a default config file if none exists.
 ///
-/// The API key is resolved in priority order:
-/// 1. `OPENROUTER_API_KEY` env var
-/// 2. `key` field in config.toml
+/// API keys are resolved in priority order:
+/// 1. `OPENROUTER_API_KEY` env var (applied to both main and utility)
+/// 2. `key` field in each model's config section
 pub fn load() -> Result<Config> {
     let dir = configDir();
     let path = dir.join(CONFIG_FILE);
@@ -108,7 +187,11 @@ pub fn load() -> Result<Config> {
         toml::from_str(&contents).context("Failed to parse config.toml")?
     } else {
         let config = Config {
-            api: defaults::api(),
+            main: defaults::mainModel(),
+            utility: defaults::utilityModel(),
+            compactRatio: defaults::compactRatio(),
+            web: WebConfig::default(),
+            mcp: HashMap::new(),
         };
 
         // Write default config so the user can edit it.
@@ -121,11 +204,46 @@ pub fn load() -> Result<Config> {
         config
     };
 
-    // Env var overrides config file.
+    // Env var overrides config file for both models.
     if let Ok(envKey) = std::env::var("OPENROUTER_API_KEY") {
         if !envKey.is_empty() {
-            config.api.key = envKey;
+            if config.main.key.is_empty() {
+                config.main.key = envKey.clone();
+            }
+            if config.utility.key.is_empty() {
+                config.utility.key = envKey;
+            }
         }
+    }
+
+    if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
+        if !exaKey.is_empty() {
+            config.web.searchKey = exaKey;
+        }
+    }
+
+    // Merge project-scoped MCP config if present.
+    if let Ok(cwd) = std::env::current_dir() {
+        match crate::mcp::config::loadProjectMcp(&cwd) {
+            Ok(projectServers) if !projectServers.is_empty() => {
+                config.mcp =
+                    crate::mcp::config::mergeConfigs(config.mcp, projectServers);
+                tracing::debug!("merged project MCP config from .flatline/mcp.toml");
+            }
+            Err(e) => {
+                tracing::warn!("failed to load project MCP config: {e}");
+            }
+            _ => {}
+        }
+    }
+
+    // Validate server names.
+    if let Err(e) = crate::mcp::config::validateServerNames(&config.mcp) {
+        tracing::error!("invalid MCP server name: {e}");
+        // Remove invalid entries rather than failing hard.
+        config.mcp.retain(|name, _| {
+            crate::mcp::schema::validateServerName(name).is_ok()
+        });
     }
 
     Ok(config)

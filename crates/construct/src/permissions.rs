@@ -12,11 +12,143 @@
 //! - [`Permissions`] — permission configuration
 //! - [`PermitMode`] — what to do when a permit is needed
 //! - [`Verdict`] — result of a permission check
+//! - [`PermitResponse`] — supervisor response to a permission prompt
+//! - [`suggestPatterns`] — generate scoped "always allow" patterns
 //!
 //! # Dependencies
 //! None.
 
 use crate::tool::ToolAction;
+
+/// Response from the supervisor (TUI or parent agent) to a permission prompt.
+#[derive(Debug, Clone)]
+pub enum PermitResponse {
+    /// Allow this one invocation.
+    Allow,
+    /// Allow and add a session rule for the given pattern.
+    AlwaysAllow { pattern: String },
+    /// Deny this invocation.
+    Deny,
+}
+
+/// Generate suggested "always allow" patterns for a tool action.
+///
+/// Returns a list from most specific to broadest scope. The TUI presents
+/// these as selectable options when the user presses 'a' (always allow).
+pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
+    match action {
+        // File tools: parent dir → grandparent → project root.
+        ToolAction::ReadFile { path, .. }
+        | ToolAction::WriteFile { path, .. }
+        | ToolAction::EditFile { path, .. }
+        | ToolAction::MultiEdit { path, .. }
+        | ToolAction::FileOutline { path }
+        | ToolAction::ViewSymbol { file: path, .. }
+        | ToolAction::RelatedFiles { path } => pathPatterns(path),
+
+        ToolAction::Glob { path, .. } => {
+            if let Some(p) = path {
+                pathPatterns(p)
+            } else {
+                vec!["./".into()]
+            }
+        }
+        ToolAction::Grep { path, .. } => {
+            if let Some(p) = path {
+                pathPatterns(p)
+            } else {
+                vec!["./".into()]
+            }
+        }
+        ToolAction::ListDir { path, .. } => pathPatterns(path),
+
+        // Shell: progressively shorter token prefixes.
+        ToolAction::Shell { command, .. } => shellPatterns(command),
+
+        // Web: subdomain → domain → any.
+        ToolAction::WebFetch { url, .. } | ToolAction::WebSimilar { url, .. } => urlPatterns(url),
+        ToolAction::WebSearch { query, .. } => vec![query.clone()],
+
+        // MCP: specific tool → server wildcard.
+        ToolAction::Mcp { qualifiedName, .. } => {
+            let mut patterns = vec![qualifiedName.clone()];
+            // Extract server prefix for wildcard.
+            if let Some(pos) = qualifiedName.rfind("__") {
+                let serverPrefix = &qualifiedName[..pos + 2];
+                patterns.push(format!("{serverPrefix}*"));
+            }
+            patterns
+        }
+
+        ToolAction::Task { .. } => vec!["task".into()],
+
+        _ => Vec::new(),
+    }
+}
+
+/// Generate directory-based patterns from a file path.
+fn pathPatterns(path: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let normalized = path.replace('\\', "/");
+
+    // Parent directory.
+    if let Some(pos) = normalized.rfind('/') {
+        let parent = &normalized[..=pos];
+        patterns.push(parent.to_string());
+
+        // Grandparent.
+        if pos > 0 {
+            if let Some(gpos) = normalized[..pos].rfind('/') {
+                patterns.push(normalized[..=gpos].to_string());
+            }
+        }
+    }
+
+    // Project root.
+    patterns.push("./".into());
+    patterns.dedup();
+    patterns
+}
+
+/// Generate token-prefix patterns from a shell command.
+fn shellPatterns(command: &str) -> Vec<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut patterns = Vec::new();
+
+    // First 3, 2, 1 tokens as prefixes.
+    for n in (1..=3.min(tokens.len())).rev() {
+        let prefix = tokens[..n].join(" ");
+        patterns.push(prefix);
+    }
+
+    patterns.dedup();
+    patterns
+}
+
+/// Generate domain-based patterns from a URL.
+fn urlPatterns(url: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+
+    // Extract host from URL.
+    let host = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(url);
+
+    patterns.push(host.to_string());
+
+    // Domain without subdomain (if has subdomain).
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 2 {
+        let domain = parts[parts.len() - 2..].join(".");
+        patterns.push(format!("*.{domain}"));
+    }
+
+    patterns.push("*".into());
+    patterns.dedup();
+    patterns
+}
 
 /// What to do when a tool call isn't pre-approved.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,17 +219,28 @@ impl Permissions {
         }
     }
 
+    /// Create permissions that auto-approve everything.
+    pub fn allowAll() -> Self {
+        Self {
+            defaultMode: PermitMode::Deny,
+            rules: vec![Rule { tool: "*".into(), pattern: None, allow: true }],
+        }
+    }
+
     /// Create permissions that auto-approve read-only tools.
     pub fn allowReadOnly() -> Self {
+        let readOnlyTools = [
+            "readFile", "glob", "grep", "listDir", "structSearch", "diff",
+            "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
+            "shellHistory", "readOutput", "searchOutput", "readTerminal",
+            "webSearch", "webFetch", "webSimilar",
+        ];
         Self {
             defaultMode: PermitMode::Ask,
-            rules: vec![
-                Rule {
-                    tool: "readFile".into(),
-                    pattern: None,
-                    allow: true,
-                },
-            ],
+            rules: readOnlyTools
+                .iter()
+                .map(|&tool| Rule { tool: tool.into(), pattern: None, allow: true })
+                .collect(),
         }
     }
 
@@ -131,21 +274,141 @@ impl Permissions {
 }
 
 /// Extract the tool name and key argument from an action.
-fn actionKey(action: &ToolAction) -> (&str, &str) {
+pub fn actionKey(action: &ToolAction) -> (&str, &str) {
     match action {
-        ToolAction::Shell { command } => ("shell", command),
+        ToolAction::Shell { command, .. } => ("shell", command),
         ToolAction::ReadFile { path, .. } => ("readFile", path),
         ToolAction::WriteFile { path, .. } => ("writeFile", path),
         ToolAction::EditFile { path, .. } => ("editFile", path),
+        ToolAction::MultiEdit { path, .. } => ("multiEdit", path),
         ToolAction::ShellHistory => ("shellHistory", ""),
         ToolAction::ReadOutput { .. } => ("readOutput", ""),
         ToolAction::SearchOutput { pattern, .. } => ("searchOutput", pattern),
         ToolAction::ReadTerminal { .. } => ("readTerminal", ""),
+        ToolAction::Glob { pattern, .. } => ("glob", pattern),
+        ToolAction::Grep { pattern, .. } => ("grep", pattern),
+        ToolAction::ListDir { path, .. } => ("listDir", path),
+        ToolAction::StructSearch { pattern, .. } => ("structSearch", pattern),
+        ToolAction::Diff { path, pathA, .. } => {
+            ("diff", path.as_deref().or(pathA.as_deref()).unwrap_or(""))
+        }
+        ToolAction::FuzzyFind { query, .. } => ("fuzzyFind", query),
+        ToolAction::FileOutline { path } => ("fileOutline", path),
+        ToolAction::ViewSymbol { file, .. } => ("viewSymbol", file),
+        ToolAction::RelatedFiles { path } => ("relatedFiles", path),
+        ToolAction::WebSearch { query, .. } => ("webSearch", query),
+        ToolAction::WebFetch { url, .. } => ("webFetch", url),
+        ToolAction::WebSimilar { url, .. } => ("webSimilar", url),
+        ToolAction::HistoryFetch { blockId } => ("historyFetch", blockId),
+        ToolAction::HistorySearch { query } => ("historySearch", query),
+        ToolAction::Task { prompt, .. } => ("task", prompt),
+        ToolAction::Mcp { qualifiedName, args } => (qualifiedName, args),
         ToolAction::Unknown { name, args } => (name, args),
     }
 }
 
 /// Check if a rule's tool field matches a tool name.
+///
+/// Supports exact match, global wildcard `"*"`, and prefix wildcards
+/// like `"mcp__github__*"` to match all tools from a server.
 fn matchesTool(rulePattern: &str, toolName: &str) -> bool {
-    rulePattern == "*" || rulePattern == toolName
+    if rulePattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = rulePattern.strip_suffix('*') {
+        return toolName.starts_with(prefix);
+    }
+    rulePattern == toolName
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matchesToolExact() {
+        assert!(matchesTool("shell", "shell"));
+        assert!(!matchesTool("shell", "readFile"));
+    }
+
+    #[test]
+    fn matchesToolGlobalWildcard() {
+        assert!(matchesTool("*", "shell"));
+        assert!(matchesTool("*", "mcp__github__search"));
+    }
+
+    #[test]
+    fn matchesToolPrefixWildcard() {
+        assert!(matchesTool("mcp__github__*", "mcp__github__search_repos"));
+        assert!(matchesTool("mcp__github__*", "mcp__github__create_issue"));
+        assert!(!matchesTool("mcp__github__*", "mcp__jira__search"));
+        assert!(!matchesTool("mcp__github__*", "shell"));
+    }
+
+    #[test]
+    fn mcpToolPermissionCheck() {
+        let mut perms = Permissions::default();
+        perms.addRule(Rule {
+            tool: "mcp__github__*".into(),
+            pattern: None,
+            allow: true,
+        });
+
+        let action = ToolAction::Mcp {
+            qualifiedName: "mcp__github__search_repos".into(),
+            args: "{}".into(),
+        };
+        assert_eq!(perms.check(&action), Verdict::Allow);
+
+        let action2 = ToolAction::Mcp {
+            qualifiedName: "mcp__jira__search".into(),
+            args: "{}".into(),
+        };
+        assert_eq!(perms.check(&action2), Verdict::NeedsApproval);
+    }
+
+    #[test]
+    fn mcpToolExactRule() {
+        let mut perms = Permissions::default();
+        perms.addRule(Rule {
+            tool: "mcp__github__search_repos".into(),
+            pattern: None,
+            allow: true,
+        });
+
+        let action = ToolAction::Mcp {
+            qualifiedName: "mcp__github__search_repos".into(),
+            args: "{}".into(),
+        };
+        assert_eq!(perms.check(&action), Verdict::Allow);
+
+        let action2 = ToolAction::Mcp {
+            qualifiedName: "mcp__github__create_issue".into(),
+            args: "{}".into(),
+        };
+        assert_eq!(perms.check(&action2), Verdict::NeedsApproval);
+    }
+
+    #[test]
+    fn firstMatchWins() {
+        let mut perms = Permissions::default();
+        // Deny all MCP tools, then allow github specifically.
+        // Since first match wins, the deny should take precedence.
+        perms.addRule(Rule {
+            tool: "mcp__*".into(),
+            pattern: None,
+            allow: false,
+        });
+        perms.addRule(Rule {
+            tool: "mcp__github__*".into(),
+            pattern: None,
+            allow: true,
+        });
+
+        let action = ToolAction::Mcp {
+            qualifiedName: "mcp__github__search_repos".into(),
+            args: "{}".into(),
+        };
+        assert_eq!(perms.check(&action), Verdict::Deny);
+    }
 }

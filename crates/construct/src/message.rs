@@ -111,17 +111,34 @@ pub enum StreamEvent {
     /// Stream finished.
     Done {
         finishReason: Option<String>,
+        usage: Option<TokenUsage>,
     },
 
     /// An error mid-stream.
     Error(String),
 }
 
+/// Token usage from an API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub promptTokens: usize,
+    pub completionTokens: usize,
+    pub totalTokens: usize,
+}
+
 /// Raw SSE chunk from the API (for deserialization).
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamChunk {
     pub choices: Option<Vec<StreamChoice>>,
+    pub usage: Option<ChunkUsage>,
     pub error: Option<StreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChunkUsage {
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub total_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

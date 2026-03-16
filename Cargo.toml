@@ -24,7 +24,8 @@ tokio-stream = "0.1"
 futures = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+backon = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -39,16 +40,37 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Markdown
-tui-markdown = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+two-face = "0.4"
+similar = { version = "2", features = ["inline"] }
+ascii-dag = "0.9"
 
 # Clipboard
 arboard = "3"
 
 # Unicode
 unicode-segmentation = "1"
+unicode-width = "0.2"
 
 # Regex
 regex = "1"
 
+# Fuzzy matching
+nucleo-matcher = "0.3"
+
 # Config
 dirs = "6"
+
+# MCP
+rmcp = { version = "1", default-features = false, features = [
+    "client",
+    "server",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "transport-io",
+    "macros",
+    "elicitation",
+] }
+sha1_smol = "1"
+tokio-util = "0.7"

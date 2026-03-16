@@ -3,3 +3,7 @@
 *.log
 .DS_Store
 .claude/
+/bench/
+/research/
+__pycache__/
+*.pyc

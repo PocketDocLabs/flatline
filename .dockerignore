@@ -1,0 +1,8 @@
+target/
+bench/toolchain/
+bench/predictions/
+bench/results/
+bench/logs/
+_reference/
+.git/
+*.log

@@ -28,21 +28,74 @@ use tokio::sync::{mpsc, watch};
 
 use construct::permissions::Permissions;
 use construct::prompt::{DomainModule, InterfaceMode};
-use construct::session::{Session, SessionEvent};
+use construct::session::{CommandAction, Session, SessionEvent};
 use construct::shell::{ShellIo, spawnShell};
 
 use crate::agent_panel::AgentPanel;
+use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
+use crate::fork_picker::{ForkPicker, ForkAction};
+use crate::rewind_picker::{RewindPicker, RewindAction};
 use crate::selection::{self, PanelId, SelectionState};
+use crate::session_picker::{PickerAction, SessionPicker};
 use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn mainAgentPermissions() -> Permissions {
+    Permissions::allowReadOnly()
+}
 
 /// Which panel has input focus.
 #[derive(PartialEq)]
 enum Focus {
     Terminal,
     Agent,
+}
+
+/// Axis lock for trackpad scroll — prevents diagonal scrolling.
+///
+/// Once scrolling starts on one axis, the other axis is ignored until
+/// the gesture pauses (no scroll events for `TIMEOUT`).
+#[derive(PartialEq, Clone, Copy)]
+enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+struct ScrollAxisLock {
+    axis: Option<ScrollAxis>,
+    lastEvent: Instant,
+}
+
+const SCROLL_LOCK_TIMEOUT_MS: u64 = 150;
+
+impl ScrollAxisLock {
+    fn new() -> Self {
+        Self {
+            axis: None,
+            lastEvent: Instant::now(),
+        }
+    }
+
+    /// Returns true if the given axis is allowed right now.
+    fn allow(&mut self, incoming: ScrollAxis) -> bool {
+        let now = Instant::now();
+        let expired = now.duration_since(self.lastEvent).as_millis()
+            > SCROLL_LOCK_TIMEOUT_MS as u128;
+
+        if expired || self.axis.is_none() {
+            self.axis = Some(incoming);
+            self.lastEvent = now;
+            true
+        } else if self.axis == Some(incoming) {
+            self.lastEvent = now;
+            true
+        } else {
+            // Locked to the other axis — swallow this event.
+            false
+        }
+    }
 }
 
 /// Run the deck TUI.
@@ -70,14 +123,18 @@ pub async fn run() -> Result<()> {
     let (shell, mut shellIo) = spawnShell(termCols, termRows)?;
     let mut termState = TerminalState::new(termCols, termRows);
 
+    let config = construct::config::load()?;
+    let contextWindow = config.main.contextWindow;
+
     let mut agentPanel = AgentPanel::new();
     let mut focus = Focus::Terminal;
     let mut selState = SelectionState::new();
-
+    let mut scrollLock = ScrollAxisLock::new();
     // Session channels.
     let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
-    let (permitTx, permitRx) = mpsc::channel::<bool>(1);
+    let (permitTx, permitRx) = mpsc::channel::<construct::permissions::PermitResponse>(1);
     let (userInputTx, mut userInputRx) = mpsc::channel::<String>(16);
+    let (commandTx, mut commandRx) = mpsc::channel::<CommandAction>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
 
     // Spawn the agent session task.
@@ -93,8 +150,8 @@ pub async fn run() -> Result<()> {
             }
         };
 
-        // Default: ask for permission on every tool call.
-        let permissions = Permissions::askForEverything();
+        // Main agent auto-approves read-only tools but still prompts on writes/mutations.
+        let permissions = mainAgentPermissions();
 
         // Deck is the shared terminal harness — SWE domain by default.
         let mut session = match Session::new(
@@ -113,15 +170,172 @@ pub async fn run() -> Result<()> {
             }
         };
 
+        // Initialize MCP servers if configured.
+        if !config.mcp.is_empty() {
+            session.initMcp(config.mcp.clone()).await;
+        }
+
         let mut permitRx = permitRx;
 
-        while let Some(msg) = userInputRx.recv().await {
-            // Clear any stale cancel notification from a previous turn.
-            cancelRx.borrow_and_update();
-            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx).await {
-                let _ = eventTx
-                    .send(SessionEvent::Error(format!("Agent error: {e}")))
-                    .await;
+        loop {
+            tokio::select! {
+                msg = userInputRx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            // Clear any stale cancel notification from a previous turn.
+                            cancelRx.borrow_and_update();
+                            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx).await {
+                                let _ = eventTx
+                                    .send(SessionEvent::Error(format!("Agent error: {e}")))
+                                    .await;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                cmd = commandRx.recv() => {
+                    match cmd {
+                        Some(CommandAction::Resume { sessionId: Some(id) }) => {
+                            // Consume old session, keep the shell.
+                            let shell = session.intoShell();
+                            match Session::resume(
+                                &config,
+                                mainAgentPermissions(),
+                                shell,
+                                InterfaceMode::SharedTerminal,
+                                &[DomainModule::Swe],
+                                &id,
+                            ).await {
+                                Ok(s) => {
+                                    session = s;
+                                    // Re-init MCP for the resumed session.
+                                    if !config.mcp.is_empty() {
+                                        session.initMcp(config.mcp.clone()).await;
+                                    }
+                                    // Load display branch — includes the full un-branched chain
+                                    // past the rewind point until the user sends a new message.
+                                    let turns = session.loadDisplayTurns().unwrap_or_default();
+                                    let markers = session.compactionMarkers();
+                                    let _ = eventTx
+                                        .send(SessionEvent::SessionRestored { turns, markers })
+                                        .await;
+                                    let _ = eventTx
+                                        .send(SessionEvent::ResumeComplete {
+                                            success: true,
+                                            message: format!("Resumed session {id}"),
+                                        })
+                                        .await;
+                                }
+                                Err((e, shell)) => {
+                                    let _ = eventTx
+                                        .send(SessionEvent::ResumeComplete {
+                                            success: false,
+                                            message: format!("Failed to resume {id}: {e}"),
+                                        })
+                                        .await;
+                                    // Shell returned — recreate a fresh session.
+                                    match Session::new(
+                                        &config,
+                                        mainAgentPermissions(),
+                                        shell,
+                                        InterfaceMode::SharedTerminal,
+                                        &[DomainModule::Swe],
+                                    ) {
+                                        Ok(mut s) => {
+                                            if !config.mcp.is_empty() {
+                                                s.initMcp(config.mcp.clone()).await;
+                                            }
+                                            session = s;
+                                        }
+                                        Err(e2) => {
+                                            let _ = eventTx
+                                                .send(SessionEvent::Error(
+                                                    format!("Session lost after failed resume: {e2}"),
+                                                ))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(CommandAction::Clear) => {
+                            let shell = session.intoShell();
+                            match Session::new(
+                                &config,
+                                mainAgentPermissions(),
+                                shell,
+                                InterfaceMode::SharedTerminal,
+                                &[DomainModule::Swe],
+                            ) {
+                                Ok(s) => {
+                                    session = s;
+                                    if !config.mcp.is_empty() {
+                                        session.initMcp(config.mcp.clone()).await;
+                                    }
+                                    let _ = eventTx.send(SessionEvent::Cleared).await;
+                                }
+                                Err(e) => {
+                                    let _ = eventTx
+                                        .send(SessionEvent::Error(
+                                            format!("Failed to create new session: {e}"),
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                        Some(CommandAction::Mcp) => {
+                            let (servers, totalTools, searchMode, configPath) =
+                                session.mcpStatusData().await;
+                            let _ = eventTx
+                                .send(SessionEvent::McpStatus {
+                                    servers,
+                                    totalTools,
+                                    searchMode,
+                                    configPath,
+                                })
+                                .await;
+                        }
+                        Some(CommandAction::Rewind { target }) if target.is_empty() => {
+                            let turns = session.loadDisplayTurns().unwrap_or_default();
+                            let _ = eventTx
+                                .send(SessionEvent::RewindPickerData { turns })
+                                .await;
+                        }
+                        Some(CommandAction::Rewind { target }) => {
+                            let result = session.rewind(&target, false, &eventTx).await;
+                            let _ = eventTx
+                                .send(SessionEvent::CommandResult(result))
+                                .await;
+                        }
+                        Some(CommandAction::ForkAndRewind { target }) => {
+                            let result = session.rewind(&target, true, &eventTx).await;
+                            let _ = eventTx
+                                .send(SessionEvent::CommandResult(result))
+                                .await;
+                        }
+                        Some(CommandAction::Forks { forkId: None }) => {
+                            let forks = session.listForks();
+                            let _ = eventTx
+                                .send(SessionEvent::ForkPickerData { forks })
+                                .await;
+                        }
+                        Some(CommandAction::Forks { forkId: Some(id) }) => {
+                            let result = session.switchFork(&id, &eventTx).await;
+                            let _ = eventTx
+                                .send(SessionEvent::CommandResult(result))
+                                .await;
+                        }
+                        Some(action) => {
+                            let result = session.executeCommand(&action).await;
+                            let _ = eventTx
+                                .send(SessionEvent::CommandResult(result))
+                                .await;
+                        }
+                        None => break,
+                    }
+                }
             }
         }
     });
@@ -133,10 +347,13 @@ pub async fn run() -> Result<()> {
         &mut agentPanel,
         &mut focus,
         &mut selState,
+        &mut scrollLock,
         &mut eventRx,
         &permitTx,
         &userInputTx,
+        &commandTx,
         &cancelTx,
+        contextWindow,
     )
     .await;
 
@@ -162,13 +379,32 @@ async fn runLoop(
     agentPanel: &mut AgentPanel,
     focus: &mut Focus,
     selState: &mut SelectionState,
+    scrollLock: &mut ScrollAxisLock,
     eventRx: &mut mpsc::Receiver<SessionEvent>,
-    permitTx: &mpsc::Sender<bool>,
+    permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
     userInputTx: &mpsc::Sender<String>,
+    commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
+    contextWindow: usize,
 ) -> Result<()> {
+    let mut tokenCount: usize = 0;
+    let mut sessionPicker: Option<SessionPicker> = None;
+    let mut rewindPicker: Option<RewindPicker> = None;
+    let mut forkPicker: Option<ForkPicker> = None;
+    let mut pendingRewindMessage: Option<String> = None;
+    let mut mcpPanel: Option<McpPanel> = None;
+    let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
+    let mut subagentPermitTx: Option<mpsc::Sender<construct::permissions::PermitResponse>> = None;
+    let projectDir = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let mut needsRedraw = true;
+    let mut lastQuitPress: Option<Instant> = None;
+
     loop {
-        // Draw.
+        // Draw only when state has changed.
+        if needsRedraw {
+        needsRedraw = false;
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -318,31 +554,87 @@ async fn runLoop(
                 Focus::Terminal => "terminal",
                 Focus::Agent => "agent",
             };
-            let statusText = if agentPanel.isActive() {
-                format!(" [{modeStr}]  Esc: cancel  Ctrl+Q: quit")
+
+            // Show "press again" hint briefly after a single Ctrl+Q tap.
+            let quitHintActive = lastQuitPress
+                .map(|t| t.elapsed() < Duration::from_secs(1))
+                .unwrap_or(false);
+            let controls = if quitHintActive {
+                "▸ press Ctrl+Q again to quit"
+            } else if agentPanel.isActive() {
+                "Esc: cancel  Ctrl+Q\u{00d7}2: quit"
             } else {
-                format!(" [{modeStr}]  Tab: switch  Ctrl+Q: quit")
+                "Tab: switch  Ctrl+Q\u{00d7}2: quit"
             };
-            let statusBar = Paragraph::new(statusText)
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+            let (barBg, barFg) = if quitHintActive {
+                (Color::Yellow, Color::Black)
+            } else {
+                (Color::DarkGray, Color::White)
+            };
+
+            let leftText = format!(" [{modeStr}]  {controls}");
+            let tokenStr = formatTokens(tokenCount, contextWindow);
+            let barWidth = vChunks[1].width as usize;
+            // Pad between left and right-justified token string.
+            let gap = barWidth.saturating_sub(leftText.len() + tokenStr.len() + 1);
+            let statusLine = format!("{leftText}{:>width$} ", tokenStr, width = gap + tokenStr.len());
+            let statusBar = Paragraph::new(statusLine)
+                .style(Style::default().bg(barBg).fg(barFg));
             frame.render_widget(statusBar, vChunks[1]);
+
+            // Session picker overlay.
+            if let Some(ref mut picker) = sessionPicker {
+                picker.render(area, frame.buffer_mut());
+            }
+
+            // Rewind picker overlay.
+            if let Some(ref mut picker) = rewindPicker {
+                picker.render(area, frame.buffer_mut());
+            }
+
+            // Fork picker overlay.
+            if let Some(ref mut picker) = forkPicker {
+                picker.render(area, frame.buffer_mut());
+            }
+
+            // MCP panel overlay.
+            if let Some(ref mut panel) = mcpPanel {
+                panel.render(area, frame.buffer_mut());
+            }
+
+            // Subagent panel overlay.
+            if let Some(ref mut panel) = subagentPanel {
+                panel.render(area, frame.buffer_mut());
+            }
         })?;
+        }
 
         // Drain PTY output.
         while let Ok(bytes) = shellIo.outputRx.try_recv() {
             termState.process(&bytes);
+            needsRedraw = true;
         }
 
         // Drain session events.
         while let Ok(event) = eventRx.try_recv() {
+            needsRedraw = true;
             match event {
                 SessionEvent::ContentDelta(text) => agentPanel.appendContent(&text),
                 SessionEvent::ReasoningDelta(text) => agentPanel.appendReasoning(&text),
-                SessionEvent::ToolRequest { name, summary, .. } => {
-                    agentPanel.showToolRequest(&name, &summary);
+                SessionEvent::ToolRequest { name, summary, args, diff } => {
+                    agentPanel.showToolRequest(&name, &summary, &args, diff);
                 }
                 SessionEvent::ToolResult { name, output } => {
-                    agentPanel.pushToolResult(&name, &output);
+                    // Task tool results are handled by SubagentComplete — don't double-render.
+                    if name != "task" {
+                        agentPanel.pushToolResult(&name, &output);
+                    }
+                }
+                SessionEvent::ToolStarted { name, summary } => {
+                    if name != "task" {
+                        agentPanel.toolStarted(&name, &summary);
+                    }
                 }
                 SessionEvent::ToolAutoApproved { name, summary } => {
                     agentPanel.toolApproved(&format!("{name}: {summary}"));
@@ -354,34 +646,180 @@ async fn runLoop(
                     agentPanel.pushError(&format!("Turn aborted: {name} not permitted"));
                 }
                 SessionEvent::TurnComplete => {
-                    agentPanel.finalizeStreaming();
+                    agentPanel.finishTurn();
                 }
                 SessionEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
                 }
+                SessionEvent::TokenUpdate {
+                    contextTokens,
+                    ..
+                } => {
+                    tokenCount = contextTokens;
+                }
                 SessionEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
+                }
+                SessionEvent::CommandResult(text) => {
+                    if forkPicker.is_some() {
+                        // Fork switch failed — Rewound would have cleared the picker first.
+                        if let Some(ref mut picker) = forkPicker {
+                            picker.switchFailed(text);
+                        }
+                    } else {
+                        agentPanel.pushCommandResult(&text);
+                    }
+                }
+                SessionEvent::CompactionStarted { stage } => {
+                    tracing::info!(stage = %stage, "compaction started");
+                }
+                SessionEvent::CompactionComplete { stage, reduction, markerBlock } => {
+                    tracing::info!(stage = %stage, reduction = %reduction, "compaction complete");
+                    if let Some(blockIdx) = markerBlock {
+                        agentPanel.pushCompactionMarker(&stage, blockIdx);
+                    }
+                }
+                SessionEvent::Cleared => {
+                    agentPanel.clearDisplay();
+                    tokenCount = 0;
+                }
+                SessionEvent::Rewound { targetTurnId } => {
+                    rewindPicker = None;
+                    forkPicker = None;
+                    agentPanel.clearDisplay();
+                    tokenCount = 0;
+                    if let Some(msg) = pendingRewindMessage.take() {
+                        agentPanel.textArea.setText(&msg);
+                    }
+                    tracing::info!(target = %targetTurnId, "conversation rewound");
+                }
+                SessionEvent::SessionRestored { turns, markers } => {
+                    agentPanel.clearDisplay();
+                    tokenCount = 0;
+                    replayTranscript(agentPanel, &turns);
+                    for (stage, blockIdx) in &markers {
+                        agentPanel.pushCompactionMarker(stage, *blockIdx);
+                    }
+                }
+                SessionEvent::McpStatus { servers, totalTools, searchMode, configPath } => {
+                    mcpPanel = Some(McpPanel::new(servers, totalTools, searchMode, configPath));
+                }
+                SessionEvent::RewindPickerData { turns } => {
+                    rewindPicker = Some(RewindPicker::new(&turns));
+                }
+                SessionEvent::ForkPickerData { forks } => {
+                    forkPicker = Some(ForkPicker::new(&forks));
+                }
+                SessionEvent::ResumeComplete { success, message } => {
+                    if success {
+                        sessionPicker = None;
+                        agentPanel.entries.push(
+                            crate::agent_panel::PanelEntry::SessionNotice(message),
+                        );
+                    } else if let Some(ref mut picker) = sessionPicker {
+                        picker.resumeFailed(message);
+                    } else {
+                        agentPanel.pushError(&message);
+                    }
+                }
+                SessionEvent::SubagentStarted { sessionId, agentType, prompt } => {
+                    tracing::info!(agent = %agentType, "subagent started");
+                    agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
+                }
+                SessionEvent::SubagentEvent { sessionId: _, event } => {
+                    match *event {
+                        SessionEvent::ToolAutoApproved { ref name, ref summary } => {
+                            agentPanel.subagentToolLine(name, summary);
+                        }
+                        SessionEvent::ToolStarted { ref name, ref summary } => {
+                            agentPanel.subagentToolLine(name, summary);
+                        }
+                        SessionEvent::ToolResult { ref name, ref output } => {
+                            // Brief one-liner for the inline block.
+                            let brief = if output.len() > 60 {
+                                format!("{}\u{2026}", &output[..60])
+                            } else {
+                                output.clone()
+                            };
+                            agentPanel.subagentToolLine(name, &brief);
+                            // Full output for the overlay transcript.
+                            agentPanel.subagentToolResult(name, output);
+                        }
+                        SessionEvent::ContentDelta(ref text) => {
+                            agentPanel.subagentContent(text);
+                        }
+                        SessionEvent::Error(ref msg) => {
+                            agentPanel.subagentToolLine("error", msg);
+                        }
+                        _ => {}
+                    }
+                }
+                SessionEvent::SubagentPermitRequest {
+                    sessionId: _, name, summary, args, diff, responseTx,
+                } => {
+                    // Show permission prompt for the subagent (reuse same UI).
+                    agentPanel.showToolRequest(&name, &summary, &args, diff);
+                    subagentPermitTx = Some(responseTx);
+                }
+                SessionEvent::SubagentShellOutput { data, .. } => {
+                    if let Some(ref mut sub) = agentPanel.activeSubagent {
+                        // Cap at 512KB.
+                        const MAX: usize = 512 * 1024;
+                        if sub.shellScrollback.len() + data.len() > MAX {
+                            let excess = (sub.shellScrollback.len() + data.len()) - MAX;
+                            sub.shellScrollback.drain(..excess.min(sub.shellScrollback.len()));
+                        }
+                        sub.shellScrollback.extend_from_slice(&data);
+                    }
+                }
+                SessionEvent::SubagentComplete { agentType, turns, content, .. } => {
+                    tracing::info!(agent = %agentType, turns = turns, "subagent completed");
+                    agentPanel.subagentComplete(&agentType, turns, &content);
                 }
             }
         }
 
-        // Tick throbber animation.
-        agentPanel.tickThrobber();
+        // Tick throbber animation (wall-clock gated).
+        if agentPanel.tickThrobber() {
+            needsRedraw = true;
+        }
+
+        // Clear the quit hint after the double-tap window expires.
+        if let Some(t) = lastQuitPress {
+            if t.elapsed() >= Duration::from_secs(1) {
+                lastQuitPress = None;
+                needsRedraw = true;
+            }
+        }
 
         // Handle input.
-        if handleInput(
+        let (quit, hadInput) = handleInput(
             focus,
             shellIo,
             termState,
             agentPanel,
             selState,
+            scrollLock,
             permitTx,
             userInputTx,
+            commandTx,
             cancelTx,
+            &mut sessionPicker,
+            &mut rewindPicker,
+            &mut forkPicker,
+            &mut pendingRewindMessage,
+            &mut mcpPanel,
+            &mut subagentPanel,
+            &mut subagentPermitTx,
+            &projectDir,
+            &mut lastQuitPress,
         )
-        .await?
-        {
+        .await?;
+        if quit {
             break;
+        }
+        if hadInput {
+            needsRedraw = true;
         }
 
         tokio::task::yield_now().await;
@@ -390,7 +828,7 @@ async fn runLoop(
     Ok(())
 }
 
-/// Handle one input event. Returns true if the user wants to quit.
+/// Drain all pending input events. Returns (quit, hadInput).
 #[allow(clippy::too_many_arguments)]
 async fn handleInput(
     focus: &mut Focus,
@@ -398,190 +836,417 @@ async fn handleInput(
     termState: &mut TerminalState,
     agentPanel: &mut AgentPanel,
     selState: &mut SelectionState,
-    permitTx: &mpsc::Sender<bool>,
+    scrollLock: &mut ScrollAxisLock,
+    permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
     userInputTx: &mpsc::Sender<String>,
+    commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
-) -> Result<bool> {
+    sessionPicker: &mut Option<SessionPicker>,
+    rewindPicker: &mut Option<RewindPicker>,
+    forkPicker: &mut Option<ForkPicker>,
+    pendingRewindMessage: &mut Option<String>,
+    mcpPanel: &mut Option<McpPanel>,
+    subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
+    subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
+    projectDir: &str,
+    lastQuitPress: &mut Option<Instant>,
+) -> Result<(bool, bool)> {
+    // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
-        return Ok(false);
+        return Ok((false, false));
     }
 
-    match event::read()? {
-        Event::Key(key) => {
-            // With REPORT_EVENT_TYPES, crossterm sends Press, Repeat, and Release.
-            // Only handle Press and Repeat.
-            if key.kind == event::KeyEventKind::Release {
-                return Ok(false);
-            }
-
-            // Clear selections on content/navigation keys, but not system
-            // shortcuts (Cmd+key on macOS) so Cmd+C doesn't nuke the highlight.
-            if !key.modifiers.contains(KeyModifiers::SUPER) {
-                selState.termSelection = None;
-                selState.agentSelection = None;
-                agentPanel.textArea.clearSelection();
-            }
-
-            // Global keybindings.
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-                return Ok(true);
-            }
-
-            // Cancel running turn with Escape.
-            if key.code == KeyCode::Esc && agentPanel.isActive() {
-                let _ = cancelTx.send(true);
-                return Ok(false);
-            }
-
-            if key.code == KeyCode::Tab {
-                *focus = match focus {
-                    Focus::Terminal => Focus::Agent,
-                    Focus::Agent => Focus::Terminal,
-                };
-                return Ok(false);
-            }
-
-            // Cmd+C: copy active selection to clipboard.
-            if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('c') {
-                // Input field selection is copied directly (no Buffer needed).
-                if let Some(text) = agentPanel.textArea.selectedText() {
-                    selection::copyToClipboard(&text);
-                } else if selState.agentSelection.is_some() {
-                    selState.pendingCopy = Some(PanelId::Agent);
-                } else if selState.termSelection.is_some() {
-                    selState.pendingCopy = Some(PanelId::Terminal);
+    // Drain all queued events to avoid input lag (especially trackpad momentum).
+    let mut hadInput = false;
+    loop {
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == event::KeyEventKind::Release {
+                    // Poll for more without blocking.
+                    if !event::poll(Duration::ZERO)? { break; }
+                    continue;
                 }
-                return Ok(false);
-            }
 
-            // Permission prompt takes priority regardless of focus.
-            if agentPanel.pendingPermit {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        agentPanel.approvePending();
-                        let _ = permitTx.send(true).await;
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                        agentPanel.denyPending();
-                        let _ = permitTx.send(false).await;
-                    }
-                    _ => {}
+                hadInput = true;
+
+                // Clear selections on content/navigation keys, but not system
+                // shortcuts (Cmd+key on macOS) so Cmd+C doesn't nuke the highlight.
+                if !key.modifiers.contains(KeyModifiers::SUPER) {
+                    selState.termSelection = None;
+                    selState.agentSelection = None;
+                    agentPanel.textArea.clearSelection();
                 }
-                return Ok(false);
-            }
 
-            match focus {
-                Focus::Terminal => {
-                    // Don't forward macOS Cmd shortcuts to the PTY.
-                    if key.modifiers.contains(KeyModifiers::SUPER) {
-                        return Ok(false);
-                    }
-                    if let Some(bytes) = keyToBytes(&key) {
-                        // Snap to bottom on user input.
-                        if termState.displayOffset() > 0 {
-                            termState.scrollToBottom();
+                // Global keybindings.
+                // Double-tap Ctrl+Q to quit — prevents accidental exits.
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('q')
+                {
+                    const DOUBLE_TAP_WINDOW: Duration = Duration::from_secs(1);
+                    if let Some(prev) = *lastQuitPress {
+                        if prev.elapsed() < DOUBLE_TAP_WINDOW {
+                            return Ok((true, true));
                         }
-                        let _ = shellIo.inputTx.try_send(bytes);
+                    }
+                    *lastQuitPress = Some(Instant::now());
+                    break;
+                }
+
+                // Subagent panel overlay intercepts ALL keys when active (including Esc, Tab).
+                if let Some(ref mut panel) = *subagentPanel {
+                    if panel.handleKey(key) {
+                        *subagentPanel = None;
+                    }
+                    break;
+                }
+
+                // Cancel running turn with Escape — immediate visual feedback.
+                if key.code == KeyCode::Esc && agentPanel.isActive() {
+                    let _ = cancelTx.send(true);
+                    agentPanel.finalizeCancelled();
+                    break;
+                }
+
+                if key.code == KeyCode::Tab {
+                    // Don't switch focus when an overlay is active or completion menu is open.
+                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() {
+                        // Let the overlay handle Tab (falls through to overlay dispatch below).
+                    } else if !(*focus == Focus::Agent && agentPanel.completionActive()) {
+                        *focus = match focus {
+                            Focus::Terminal => Focus::Agent,
+                            Focus::Agent => Focus::Terminal,
+                        };
+                        break;
                     }
                 }
-                Focus::Agent => {
-                    let ta = &mut agentPanel.textArea;
-                    let mods = key.modifiers;
-                    let ctrl = mods.contains(KeyModifiers::CONTROL);
-                    let shift = mods.contains(KeyModifiers::SHIFT);
 
-                    let supr = mods.contains(KeyModifiers::SUPER);
-                    let alt = mods.contains(KeyModifiers::ALT);
+                // Cmd+C: copy active selection to clipboard.
+                if key.modifiers.contains(KeyModifiers::SUPER)
+                    && key.code == KeyCode::Char('c')
+                {
+                    if let Some(text) = agentPanel.textArea.selectedText() {
+                        selection::copyToClipboard(&text);
+                    } else if selState.agentSelection.is_some() {
+                        selState.pendingCopy = Some(PanelId::Agent);
+                    } else if selState.termSelection.is_some() {
+                        selState.pendingCopy = Some(PanelId::Terminal);
+                    }
+                    break;
+                }
+
+
+                // Permission prompt takes priority regardless of focus.
+                if agentPanel.pendingPermit {
+                    use construct::permissions::PermitResponse;
+
+                    // Helper: send response to subagent escalation or parent permit channel.
+                    macro_rules! sendPermit {
+                        ($resp:expr) => {
+                            if let Some(tx) = subagentPermitTx.take() {
+                                let _ = tx.send($resp).await;
+                            } else {
+                                let _ = permitTx.send($resp).await;
+                            }
+                        };
+                    }
 
                     match key.code {
-                        KeyCode::Enter if shift => {
-                            ta.insert('\n');
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            agentPanel.approvePending();
+                            sendPermit!(PermitResponse::Allow);
                         }
-                        KeyCode::Enter => {
-                            if let Some(msg) = ta.submit() {
-                                // Reset cancel flag for the new turn.
-                                let _ = cancelTx.send(false);
-                                agentPanel.history.push(&msg);
-                                agentPanel.pushUser(&msg);
-                                let _ = userInputTx.send(msg).await;
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            let pattern = agentPanel.selectedPattern();
+                            agentPanel.approvePending();
+                            sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            agentPanel.denyPending();
+                            sendPermit!(PermitResponse::Deny);
+                        }
+                        KeyCode::Up => agentPanel.prevPattern(),
+                        KeyCode::Down => agentPanel.nextPattern(),
+                        KeyCode::Char('e') | KeyCode::Char('E') => agentPanel.toggleCustomEdit(),
+                        // When editing custom pattern, handle text input.
+                        KeyCode::Char(c) if agentPanel.isEditingCustom() => {
+                            agentPanel.customPatternInsert(c);
+                        }
+                        KeyCode::Backspace if agentPanel.isEditingCustom() => {
+                            agentPanel.customPatternBackspace();
+                        }
+                        KeyCode::Enter if agentPanel.isEditingCustom() => {
+                            let pattern = agentPanel.selectedPattern();
+                            agentPanel.approvePending();
+                            sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                        }
+                        KeyCode::Esc if agentPanel.isEditingCustom() => {
+                            agentPanel.toggleCustomEdit();
+                        }
+                        KeyCode::Char('v') | KeyCode::Char('V') => {
+                            // Open subagent panel if a subagent is active.
+                            if let Some(ref sub) = agentPanel.activeSubagent {
+                                let mut panel = crate::subagent_panel::SubagentPanel::new(
+                                    &sub.agentType, &sub.sessionId,
+                                );
+                                panel.transcript = sub.transcript.clone();
+                                panel.shellScrollback = sub.shellScrollback.clone();
+                                *subagentPanel = Some(panel);
                             }
                         }
-                        // Emacs keybinds.
-                        KeyCode::Char('a') if ctrl => ta.moveHome(),
-                        KeyCode::Char('e') if ctrl => ta.moveEnd(),
-                        KeyCode::Char('k') if ctrl => ta.killToEnd(),
-                        KeyCode::Char('u') if ctrl => ta.killToStart(),
-                        KeyCode::Char('y') if ctrl => ta.yank(),
-                        KeyCode::Char('t') if ctrl => {
-                            agentPanel.toggleThinking();
-                        }
-                        KeyCode::Char(c) if !supr => ta.insert(c),
-                        // macOS Cmd keybinds.
-                        KeyCode::Backspace if supr => ta.killToStart(),
-                        KeyCode::Backspace if alt => ta.deleteWordLeft(),
-                        KeyCode::Backspace => ta.backspace(),
-                        KeyCode::Delete => ta.delete(),
-                        KeyCode::Left if supr => ta.moveHome(),
-                        KeyCode::Right if supr => ta.moveEnd(),
-                        KeyCode::Left if alt => ta.moveWordLeft(),
-                        KeyCode::Right if alt => ta.moveWordRight(),
-                        KeyCode::Left if ctrl => ta.moveWordLeft(),
-                        KeyCode::Right if ctrl => ta.moveWordRight(),
-                        KeyCode::Left => ta.moveLeft(),
-                        KeyCode::Right => ta.moveRight(),
-                        KeyCode::Home => ta.moveHome(),
-                        KeyCode::End => ta.moveEnd(),
-                        KeyCode::Up => {
-                            // History navigation when empty or single-line.
-                            if ta.isEmpty() || ta.lineCount() == 1 {
-                                let currentText = ta.text().to_string();
-                                if let Some(entry) = agentPanel.history.navigateUp(&currentText) {
-                                    let entry = entry.to_string();
-                                    ta.setText(&entry);
-                                }
-                            } else {
-                                ta.moveUp();
-                            }
-                        }
-                        KeyCode::Down => {
-                            if ta.isEmpty() || ta.lineCount() == 1 {
-                                if let Some(entry) = agentPanel.history.navigateDown() {
-                                    let entry = entry.to_string();
-                                    ta.setText(&entry);
-                                }
-                            } else {
-                                ta.moveDown();
-                            }
-                        }
-                        KeyCode::PageUp => agentPanel.scrollUp(10),
-                        KeyCode::PageDown => agentPanel.scrollDown(10),
                         _ => {}
+                    }
+                    break;
+                }
+
+                // Session picker intercepts all keys when active.
+                if let Some(picker) = sessionPicker {
+                    match picker.handleKey(key) {
+                        PickerAction::Close => {
+                            *sessionPicker = None;
+                        }
+                        PickerAction::Select(id) => {
+                            // Picker stays open — closed on ResumeComplete event.
+                            let action = CommandAction::Resume {
+                                sessionId: Some(id),
+                            };
+                            let _ = commandTx.send(action).await;
+                        }
+                        PickerAction::None => {}
+                    }
+                    break;
+                }
+
+                // Rewind picker intercepts all keys when active.
+                if let Some(picker) = rewindPicker {
+                    match picker.handleKey(key) {
+                        RewindAction::Close => {
+                            *rewindPicker = None;
+                        }
+                        RewindAction::Rewind { target, userMessage } => {
+                            *pendingRewindMessage = Some(userMessage);
+                            let action = CommandAction::Rewind { target };
+                            let _ = commandTx.send(action).await;
+                        }
+                        RewindAction::ForkAndRewind { target, userMessage } => {
+                            *pendingRewindMessage = Some(userMessage);
+                            let action = CommandAction::ForkAndRewind { target };
+                            let _ = commandTx.send(action).await;
+                        }
+                        RewindAction::None => {}
+                    }
+                    break;
+                }
+
+                // Fork picker intercepts all keys when active.
+                if let Some(picker) = forkPicker {
+                    match picker.handleKey(key) {
+                        ForkAction::Close => {
+                            *forkPicker = None;
+                        }
+                        ForkAction::Switch(id) => {
+                            let action = CommandAction::Forks { forkId: Some(id) };
+                            let _ = commandTx.send(action).await;
+                        }
+                        ForkAction::None => {}
+                    }
+                    break;
+                }
+
+                // MCP panel intercepts all keys when active.
+                if let Some(panel) = mcpPanel {
+                    match panel.handleKey(key) {
+                        McpPanelAction::Close => {
+                            *mcpPanel = None;
+                        }
+                        McpPanelAction::None => {}
+                    }
+                    break;
+                }
+
+                match focus {
+                    Focus::Terminal => {
+                        if key.modifiers.contains(KeyModifiers::SUPER) {
+                            if !event::poll(Duration::ZERO)? { break; }
+                            continue;
+                        }
+                        if let Some(bytes) = keyToBytes(&key) {
+                            if termState.displayOffset() > 0 {
+                                termState.scrollToBottom();
+                            }
+                            let _ = shellIo.inputTx.try_send(bytes);
+                        }
+                    }
+                    Focus::Agent => {
+                        let mods = key.modifiers;
+                        let ctrl = mods.contains(KeyModifiers::CONTROL);
+                        let shift = mods.contains(KeyModifiers::SHIFT);
+                        let supr = mods.contains(KeyModifiers::SUPER);
+                        let alt = mods.contains(KeyModifiers::ALT);
+
+                        // Completion menu intercepts (before textarea borrow).
+                        let mut completionHandled = false;
+                        if agentPanel.completionActive() {
+                            completionHandled = true;
+                            match key.code {
+                                KeyCode::Tab => {
+                                    if let Some(completed) = agentPanel.completeSelected() {
+                                        agentPanel.textArea.setText(&completed);
+                                    }
+                                }
+                                KeyCode::Up => agentPanel.selectPrev(),
+                                KeyCode::Down => agentPanel.selectNext(),
+                                KeyCode::Esc => agentPanel.dismissCompletion(),
+                                KeyCode::Enter if !shift => {
+                                    // Accept completion then fall through to execute.
+                                    if let Some(completed) = agentPanel.completeSelected() {
+                                        agentPanel.textArea.setText(&completed);
+                                    }
+                                    completionHandled = false;
+                                }
+                                _ => completionHandled = false,
+                            }
+                        }
+
+                        if !completionHandled {
+                            let ta = &mut agentPanel.textArea;
+                            match key.code {
+                                KeyCode::Enter if shift => ta.insert('\n'),
+                                KeyCode::Enter => {
+                                    if let Some(msg) = ta.submit() {
+                                        if let Some(output) = crate::command::tryHandle(&msg) {
+                                            agentPanel.history.push(&msg);
+                                            agentPanel.pushCommand(&msg);
+                                            match output {
+                                                crate::command::CommandOutput::Inline(text) => {
+                                                    agentPanel.pushCommandResult(&text);
+                                                }
+                                                crate::command::CommandOutput::Action(
+                                                    crate::command::CommandAction::Resume { sessionId: None },
+                                                ) => {
+                                                    // Open the interactive picker.
+                                                    *sessionPicker = Some(SessionPicker::new(projectDir));
+                                                }
+                                                crate::command::CommandOutput::Action(action) => {
+                                                    let constructAction = convertAction(action);
+                                                    let _ = commandTx.send(constructAction).await;
+                                                }
+                                            }
+                                        } else {
+                                            let _ = cancelTx.send(false);
+                                            agentPanel.history.push(&msg);
+                                            agentPanel.pushUser(&msg);
+                                            let _ = userInputTx.send(msg).await;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('a') if ctrl => ta.moveHome(),
+                                KeyCode::Char('e') if ctrl => ta.moveEnd(),
+                                KeyCode::Char('k') if ctrl => ta.killToEnd(),
+                                KeyCode::Char('u') if ctrl => ta.killToStart(),
+                                KeyCode::Char('y') if ctrl => ta.yank(),
+                                KeyCode::Char('t') if ctrl => agentPanel.toggleThinking(),
+                                KeyCode::Char(c) if !supr => ta.insert(c),
+                                KeyCode::Backspace if supr => ta.killToStart(),
+                                KeyCode::Backspace if alt => ta.deleteWordLeft(),
+                                KeyCode::Backspace => ta.backspace(),
+                                KeyCode::Delete => ta.delete(),
+                                KeyCode::Left if supr => ta.moveHome(),
+                                KeyCode::Right if supr => ta.moveEnd(),
+                                KeyCode::Left if alt => ta.moveWordLeft(),
+                                KeyCode::Right if alt => ta.moveWordRight(),
+                                KeyCode::Left if ctrl => ta.moveWordLeft(),
+                                KeyCode::Right if ctrl => ta.moveWordRight(),
+                                KeyCode::Left => ta.moveLeft(),
+                                KeyCode::Right => ta.moveRight(),
+                                KeyCode::Home => ta.moveHome(),
+                                KeyCode::End => ta.moveEnd(),
+                                KeyCode::Up => {
+                                    if ta.isEmpty() || ta.lineCount() == 1 {
+                                        let currentText = ta.text().to_string();
+                                        if let Some(entry) =
+                                            agentPanel.history.navigateUp(&currentText)
+                                        {
+                                            let entry = entry.to_string();
+                                            ta.setText(&entry);
+                                        }
+                                    } else {
+                                        ta.moveUp();
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if ta.isEmpty() || ta.lineCount() == 1 {
+                                        if let Some(entry) = agentPanel.history.navigateDown() {
+                                            let entry = entry.to_string();
+                                            ta.setText(&entry);
+                                        }
+                                    } else {
+                                        ta.moveDown();
+                                    }
+                                }
+                                KeyCode::PageUp => agentPanel.scrollUp(10),
+                                KeyCode::PageDown => agentPanel.scrollDown(10),
+                                _ => {}
+                            }
+                        }
+
+                        // Update completion after every keystroke.
+                        let currentText = agentPanel.textArea.text().to_string();
+                        agentPanel.updateCompletion(&currentText);
                     }
                 }
             }
-        }
-        Event::Mouse(mouse) => {
-            handleMouse(mouse, focus, agentPanel, termState, selState, shellIo);
-        }
-        Event::Paste(text) => {
-            if *focus == Focus::Agent && !agentPanel.pendingPermit {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                agentPanel.textArea.insertStr(&normalized);
+            Event::Mouse(mouse) => {
+                // Subagent overlay handles scroll events.
+                if let Some(ref mut panel) = *subagentPanel {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            panel.scrollUp();
+                            hadInput = true;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            panel.scrollDown();
+                            hadInput = true;
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+                // Other overlay panels consume all mouse events to prevent click-through.
+                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() {
+                    break;
+                }
+                if handleMouse(mouse, focus, agentPanel, termState, selState, shellIo, scrollLock, subagentPanel) {
+                    hadInput = true;
+                }
             }
+            Event::Paste(text) => {
+                hadInput = true;
+                if *focus == Focus::Agent && !agentPanel.pendingPermit {
+                    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                    agentPanel.textArea.insertStr(&normalized);
+                }
+            }
+            Event::Resize(cols, rows) => {
+                hadInput = true;
+                let termCols = (cols * 3 / 5).saturating_sub(2);
+                let termRows = rows.saturating_sub(3);
+                let _ = shellIo.resizeTx.try_send((termCols, termRows));
+                termState.resize(termCols, termRows);
+            }
+            _ => {}
         }
-        Event::Resize(cols, rows) => {
-            let termCols = (cols * 3 / 5).saturating_sub(2);
-            let termRows = rows.saturating_sub(3);
-            let _ = shellIo.resizeTx.try_send((termCols, termRows));
-            termState.resize(termCols, termRows);
+
+        // Keep draining if more events are queued.
+        if !event::poll(Duration::ZERO)? {
+            break;
         }
-        _ => {}
     }
 
-    Ok(false)
+    Ok((false, hadInput))
 }
 
 /// Handle mouse events — selection, scroll wheel.
+/// Returns true if the event modified state (needs redraw).
 fn handleMouse(
     mouse: event::MouseEvent,
     focus: &mut Focus,
@@ -589,7 +1254,9 @@ fn handleMouse(
     termState: &mut TerminalState,
     selState: &mut SelectionState,
     shellIo: &ShellIo,
-) {
+    scrollLock: &mut ScrollAxisLock,
+    subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
+) -> bool {
     // Resolve display offset for the given panel.
     fn panelOffset(panel: PanelId, termState: &TerminalState, agentPanel: &AgentPanel) -> u16 {
         match panel {
@@ -612,7 +1279,7 @@ fn handleMouse(
                 selState.selectingIn = Some(PanelId::Input);
                 selState.termSelection = None;
                 selState.agentSelection = None;
-                return;
+                return true;
             }
 
             // Clear input selection when clicking in a panel.
@@ -632,7 +1299,59 @@ fn handleMouse(
                 if panel == PanelId::Agent
                     && agentPanel.toggleReasoningAtGridLine(gridLine)
                 {
-                    return;
+                    return true;
+                }
+
+                // Click on code block "copy" label copies the block content.
+                if panel == PanelId::Agent
+                    && agentPanel.tryCopyCodeBlock(gridLine, col)
+                {
+                    return true;
+                }
+
+                // Click on code block top/bottom border toggles expand/collapse.
+                if panel == PanelId::Agent
+                    && agentPanel.tryToggleCodeBlock(gridLine)
+                {
+                    return true;
+                }
+
+                // Click on subagent header [view] opens the overlay panel.
+                if panel == PanelId::Agent
+                    && agentPanel.isSubagentHeaderLine(gridLine)
+                {
+                    if let Some(ref sub) = agentPanel.activeSubagent {
+                        // Live subagent — use cached transcript.
+                        let mut panel = crate::subagent_panel::SubagentPanel::new(
+                            &sub.agentType, &sub.sessionId,
+                        );
+                        panel.transcript = sub.transcript.clone();
+                        panel.shellScrollback = sub.shellScrollback.clone();
+                        *subagentPanel = Some(panel);
+                        return true;
+                    } else if let Some((agentType, sid)) = agentPanel.lastSubagentSession() {
+                        // Resumed session — load child transcript on demand.
+                        let agentType = agentType.to_string();
+                        let sid = sid.to_string();
+                        if let Ok(transcript) = construct::transcript::Transcript::open(&sid) {
+                            if let Ok(turns) = transcript.loadAll() {
+                                let mut panel = crate::subagent_panel::SubagentPanel::new(
+                                    &agentType, &sid,
+                                );
+                                replayTranscript(&mut panel.transcriptPanel, &turns);
+                                panel.transcript = panel.transcriptPanel.entries.clone();
+                                *subagentPanel = Some(panel);
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                // Click on subagent content toggle (expand/collapse).
+                if panel == PanelId::Agent
+                    && agentPanel.tryToggleSubagentContent(gridLine)
+                {
+                    return true;
                 }
 
                 let isAlt = mouse.modifiers.contains(KeyModifiers::ALT);
@@ -673,7 +1392,7 @@ fn handleMouse(
                 let contentWidth = selState.inputContentRect.width.saturating_sub(2);
                 let contentCol = localCol.saturating_sub(2);
                 agentPanel.textArea.mouseDrag(contentCol, localRow, contentWidth);
-                return;
+                return true;
             }
             if let Some(panel) = selState.selectingIn {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
@@ -690,7 +1409,7 @@ fn handleMouse(
                 if let Some(text) = agentPanel.textArea.selectedText() {
                     selection::copyToClipboard(&text);
                 }
-                return;
+                return true;
             }
             if let Some(panel) = selState.selectingIn.take() {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
@@ -710,8 +1429,22 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollUp => {
+            if !scrollLock.allow(ScrollAxis::Vertical) { return false; }
             match selState.hitTest(mouse.column, mouse.row) {
-                Some(PanelId::Agent) => agentPanel.scrollUp(3),
+                Some(PanelId::Agent) => {
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Shift+ScrollUp = scroll code block left.
+                        let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                        let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
+                        if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
+                            agentPanel.scrollCodeBlockH(blockId, -3);
+                        } else {
+                            agentPanel.scrollUp(3);
+                        }
+                    } else {
+                        agentPanel.scrollUp(3);
+                    }
+                }
                 Some(PanelId::Terminal) => {
                     termState.scrollUp(3);
                     // Extend selection into scrollback during drag.
@@ -728,8 +1461,22 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollDown => {
+            if !scrollLock.allow(ScrollAxis::Vertical) { return false; }
             match selState.hitTest(mouse.column, mouse.row) {
-                Some(PanelId::Agent) => agentPanel.scrollDown(3),
+                Some(PanelId::Agent) => {
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Shift+ScrollDown = scroll code block right.
+                        let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                        let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
+                        if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
+                            agentPanel.scrollCodeBlockH(blockId, 3);
+                        } else {
+                            agentPanel.scrollDown(3);
+                        }
+                    } else {
+                        agentPanel.scrollDown(3);
+                    }
+                }
                 Some(PanelId::Terminal) => {
                     termState.scrollDown(3);
                     if selState.selectingIn == Some(PanelId::Terminal) {
@@ -744,8 +1491,29 @@ fn handleMouse(
                 Some(PanelId::Input) | None => {}
             }
         }
-        _ => {}
+        MouseEventKind::ScrollLeft => {
+            if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
+            if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
+                let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
+                if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
+                    agentPanel.scrollCodeBlockH(blockId, -3);
+                }
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
+            if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
+                let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
+                if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
+                    agentPanel.scrollCodeBlockH(blockId, 3);
+                }
+            }
+        }
+        _ => { return false; }
     }
+    true
 }
 
 /// Convert a crossterm key event to raw bytes for the PTY.
@@ -774,6 +1542,31 @@ fn keyToBytes(key: &event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
         _ => None,
     }
+}
+
+/// Format token usage for the status bar: "42.1k / 256k (16%)".
+fn formatTokens(tokens: usize, window: usize) -> String {
+    if tokens == 0 {
+        return String::new();
+    }
+
+    let fmtK = |n: usize| -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            format!("{n}")
+        }
+    };
+
+    let pct = if window > 0 {
+        (tokens as f64 / window as f64 * 100.0) as usize
+    } else {
+        0
+    };
+
+    format!("{} / {} ({}%)", fmtK(tokens), fmtK(window), pct)
 }
 
 /// Extract text from the terminal selection, rejoining soft-wrapped lines.
@@ -839,4 +1632,200 @@ fn extractTerminalUnwrapped(
     }
 
     result
+}
+
+/// Convert deck's CommandAction to construct's CommandAction.
+/// Replay transcript turns into the agent panel for a resumed session.
+fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn]) {
+    use construct::transcript::TurnRole;
+
+    // Track pending task (subagent) calls: toolCallId -> entry index.
+    let mut pendingTasks: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for turn in turns {
+        match turn.role {
+            TurnRole::User => {
+                panel.entries.push(crate::agent_panel::PanelEntry::User(turn.content.clone()));
+            }
+            TurnRole::Assistant => {
+                if let Some(ref reasoning) = turn.reasoning {
+                    if !reasoning.is_empty() {
+                        panel.entries.push(crate::agent_panel::PanelEntry::Reasoning {
+                            text: reasoning.clone(),
+                            expanded: false,
+                        });
+                    }
+                }
+                if !turn.content.is_empty() {
+                    panel.entries.push(crate::agent_panel::PanelEntry::Assistant(turn.content.clone()));
+                }
+            }
+            TurnRole::ToolCall => {
+                let name = turn.tool.as_deref().unwrap_or("tool");
+
+                if name == "task" {
+                    // Reconstruct SubagentBlock from the task tool call.
+                    let prompt = turn.args.as_ref()
+                        .and_then(|a| a["prompt"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let agentType = turn.args.as_ref()
+                        .and_then(|a| a["agent"].as_str())
+                        .unwrap_or("general")
+                        .to_string();
+
+                    let entryIdx = panel.entries.len();
+                    panel.entries.push(crate::agent_panel::PanelEntry::SubagentBlock {
+                        agentType,
+                        prompt,
+                        toolLines: Vec::new(),
+                        done: true,
+                        turns: 0,
+                        content: None,
+                        contentExpanded: false,
+                        sessionId: None, // Filled when ToolResult arrives.
+                    });
+
+                    if let Some(ref callId) = turn.toolCallId {
+                        pendingTasks.insert(callId.clone(), entryIdx);
+                    }
+                } else {
+                    let summary = turn
+                        .args
+                        .as_ref()
+                        .map(|a| {
+                            let s = a.to_string();
+                            if s.len() > 80 {
+                                format!("{}\u{2026}", &s[..79])
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_default();
+                    panel.entries.push(crate::agent_panel::PanelEntry::ToolApproved {
+                        name: format!("{name}: {summary}"),
+                    });
+                }
+            }
+            TurnRole::ToolResult => {
+                // Check if this result belongs to a pending task.
+                if let Some(ref callId) = turn.toolCallId {
+                    if let Some(entryIdx) = pendingTasks.remove(callId) {
+                        // Extract child session ID and content from
+                        // "[subagent session: {id}]\n\n{content}".
+                        let raw = &turn.content;
+                        let (childSessionId, content) = if let Some(start) = raw.find("[subagent session: ") {
+                            let idStart = start + "[subagent session: ".len();
+                            if let Some(end) = raw[idStart..].find(']') {
+                                let sid = raw[idStart..idStart + end].to_string();
+                                let bodyStart = idStart + end + 1;
+                                let body = if raw[bodyStart..].starts_with("\n\n") {
+                                    raw[bodyStart + 2..].to_string()
+                                } else {
+                                    raw[bodyStart..].to_string()
+                                };
+                                (Some(sid), body)
+                            } else {
+                                (None, raw.clone())
+                            }
+                        } else {
+                            (None, raw.clone())
+                        };
+
+                        // Load the child transcript to reconstruct tool lines and turn count.
+                        let (childToolLines, childTurns) = if let Some(ref csid) = childSessionId {
+                            loadChildToolLines(csid)
+                        } else {
+                            (Vec::new(), 0)
+                        };
+
+                        if let Some(crate::agent_panel::PanelEntry::SubagentBlock {
+                            content: c, sessionId: sid, toolLines: tl, turns: t, ..
+                        }) = panel.entries.get_mut(entryIdx) {
+                            *sid = childSessionId;
+                            *tl = childToolLines;
+                            *t = childTurns;
+                            if !content.is_empty()
+                                && content != "Task completed (no text output)."
+                            {
+                                *c = Some(content);
+                            }
+                        }
+                        // Skip pushing a ToolResult — SubagentBlock handles display.
+                        continue;
+                    }
+                }
+
+                let name = turn.tool.as_deref().unwrap_or("tool");
+                panel.entries.push(crate::agent_panel::PanelEntry::ToolResult {
+                    name: name.to_string(),
+                    output: turn.content.clone(),
+                });
+            }
+            // System turns are ephemeral — never appear in transcript chains.
+            TurnRole::System => {}
+        }
+    }
+}
+
+/// Load tool lines and turn count from a child session transcript.
+fn loadChildToolLines(sessionId: &str) -> (Vec<(String, String)>, usize) {
+    use construct::transcript::TurnRole;
+
+    let transcript = match construct::transcript::Transcript::open(sessionId) {
+        Ok(t) => t,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let turns = match transcript.loadAll() {
+        Ok(t) => t,
+        Err(_) => return (Vec::new(), 0),
+    };
+
+    let mut toolLines: Vec<(String, String)> = Vec::new();
+    let mut turnCount: usize = 0;
+
+    for turn in &turns {
+        match turn.role {
+            TurnRole::Assistant => {
+                turnCount += 1;
+            }
+            TurnRole::ToolCall => {
+                let name = turn.tool.as_deref().unwrap_or("tool");
+                let argsJson = turn.args.as_ref()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let action = construct::tool::parse(name, &argsJson);
+                let summary = construct::tool::summarize(&action);
+                toolLines.push((name.to_string(), summary));
+            }
+            TurnRole::ToolResult => {
+                let name = turn.tool.as_deref().unwrap_or("tool");
+                let output = &turn.content;
+                let brief = if output.len() > 60 {
+                    format!("{}\u{2026}", &output[..60])
+                } else {
+                    output.clone()
+                };
+                toolLines.push((name.to_string(), brief));
+            }
+            _ => {}
+        }
+    }
+
+    (toolLines, turnCount)
+}
+
+fn convertAction(action: crate::command::CommandAction) -> CommandAction {
+    match action {
+        crate::command::CommandAction::ShowContext => CommandAction::ShowContext,
+        crate::command::CommandAction::Undo => CommandAction::Undo,
+        crate::command::CommandAction::Rewind { target } => CommandAction::Rewind { target },
+        crate::command::CommandAction::Forks { forkId } => CommandAction::Forks { forkId },
+        crate::command::CommandAction::Resume { sessionId } => {
+            CommandAction::Resume { sessionId }
+        }
+        crate::command::CommandAction::Clear => CommandAction::Clear,
+        crate::command::CommandAction::Mcp => CommandAction::Mcp,
+    }
 }

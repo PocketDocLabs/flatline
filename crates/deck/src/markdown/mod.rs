@@ -1,48 +1,72 @@
-//! Markdown rendering with streaming support.
+//! Block-based markdown rendering with streaming support.
 //!
-//! Wraps `tui-markdown` (pulldown-cmark) with predictive delimiter
-//! capping so partial streaming content renders correctly.
+//! Parses markdown via pulldown-cmark into structured blocks,
+//! then renders each block type with appropriate styling:
+//! syntax-highlighted code, box-drawn tables, styled headings, etc.
 //!
-//! Before parsing, scans for unclosed delimiters (`**`, `*`, `` ` ``,
-//! `` ``` ``) and appends closers. This means mid-stream bold text
-//! shows as bold rather than raw `**`, unclosed code fences render
-//! as code blocks, etc.
+//! Before parsing, scans for unclosed delimiters and appends closers
+//! so partial streaming content renders correctly.
 //!
 //! # Public API
-//! - [`render`] — convert markdown text to ratatui `Text`
+//! - [`render`] — convert markdown text to rendered blocks
+//! - [`RenderedBlock`] — output block: text (wrappable) or code (scrollable)
+//! - [`renderCodeBlock`] — render a code block with borders and horizontal scroll
+//! - [`renderDiff`] — render a file diff with colored lines
+//!
+//! # Dependencies
+//! `pulldown-cmark`, `syntect`, `two-face`, `similar`, `ratatui`
 
-use std::borrow::Cow;
+mod block;
+mod diff;
+pub mod highlight;
+mod mermaid;
+mod parse;
+mod table;
 
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 
-/// Render markdown text into styled ratatui `Text`.
+pub use diff::renderDiff;
+pub use highlight::renderCodeBlock;
+
+/// A rendered markdown block — either wrappable text or a scrollable code block.
+pub enum RenderedBlock {
+    /// Regular text lines (paragraphs, headings, lists, tables, etc.).
+    ///
+    /// These should be word-wrapped by the caller.
+    Text(Vec<Line<'static>>),
+
+    /// Code block with highlighted content, rendered separately.
+    ///
+    /// Content is stored as untruncated spans per line so the caller
+    /// can render with horizontal scroll and borders.
+    Code {
+        lang: Option<String>,
+        /// Highlighted spans per source line (no borders, no truncation).
+        lines: Vec<Vec<Span<'static>>>,
+        /// Original source text for clipboard copy.
+        code: String,
+    },
+}
+
+/// Render markdown text into structured blocks.
 ///
-/// Caps any unclosed delimiters before parsing so partial
-/// (streaming) content renders correctly.
-pub fn render(text: &str) -> Text<'static> {
+/// Caps any unclosed delimiters for streaming, parses into
+/// structured blocks, then renders each with appropriate styling.
+///
+/// Args:
+///     text: Raw markdown source (may be incomplete/streaming).
+///     width: Available rendering width in columns.
+///
+/// Returns:
+///     Vec<RenderedBlock>: Blocks ready for rendering.
+pub fn render(text: &str, width: u16) -> Vec<RenderedBlock> {
     let capped = capUnclosed(text);
-    let parsed = tui_markdown::from_str(&capped);
-    // Convert borrowed spans to owned so the result outlives `capped`.
-    let ownedLines: Vec<Line<'static>> = parsed
-        .lines
-        .into_iter()
-        .map(|line| {
-            let ownedSpans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .map(|span| Span {
-                    content: Cow::Owned(span.content.into_owned()),
-                    style: span.style,
-                })
-                .collect();
-            Line {
-                spans: ownedSpans,
-                style: line.style,
-                ..Default::default()
-            }
-        })
-        .collect();
-    Text::from(ownedLines)
+    let blocks = parse::parse(&capped);
+    let mut rendered = Vec::new();
+    for mdBlock in &blocks {
+        rendered.extend(mdBlock.renderBlocks(width));
+    }
+    rendered
 }
 
 /// Append closing delimiters for any unclosed markdown markers.

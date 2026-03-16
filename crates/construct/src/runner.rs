@@ -1,0 +1,302 @@
+#![allow(non_snake_case)]
+
+//! Headless execution engine.
+//!
+//! Shared runner for `flatline exec` CLI mode and subagent `task` tool execution.
+//! Creates a session, runs the agentic turn loop to completion, and returns the result.
+//!
+//! # Public API
+//! - [`RunConfig`] — execution parameters
+//! - [`RunResult`] — outcome of a headless run
+//! - [`run`] — create a fresh session and run to completion
+//! - [`runSession`] — run the turn loop on an existing session
+//!
+//! # Dependencies
+//! `session`, `config`, `permissions`, `shell`, `prompt`
+
+use anyhow::Result;
+use tokio::sync::{mpsc, watch};
+
+use crate::config::Config;
+use crate::permissions::Permissions;
+use crate::prompt::{DomainModule, InterfaceMode};
+use crate::session::{Session, SessionEvent};
+use crate::shell;
+
+use crate::tool::ToolSet;
+
+/// Agent preset for subagent execution.
+pub struct AgentPreset {
+    pub toolSet: ToolSet,
+    pub permissions: Permissions,
+    pub interface: InterfaceMode,
+    pub maxTurns: usize,
+    /// If true, use the cheap utility model instead of the parent's model.
+    pub useUtilityModel: bool,
+    /// Appended to the system prompt for role-specific instructions.
+    pub systemSuffix: &'static str,
+}
+
+/// Get the preset for a named agent type.
+pub fn agentPreset(name: &str) -> AgentPreset {
+    match name {
+        "explore" => AgentPreset {
+            toolSet: ToolSet::ReadOnly,
+            permissions: Permissions::allowReadOnly(),
+            interface: InterfaceMode::MultiAgent,
+            maxTurns: 20,
+            useUtilityModel: true,
+            systemSuffix: "You are an exploration agent. \
+                Investigate the codebase and report findings. \
+                You cannot modify files — use read-only tools only.",
+        },
+        _ => AgentPreset {
+            toolSet: ToolSet::All,
+            permissions: Permissions::askForEverything(),
+            interface: InterfaceMode::MultiAgent,
+            maxTurns: 50,
+            useUtilityModel: false,
+            systemSuffix: "You are a subtask agent. \
+                Complete the assigned task and return your result. \
+                Be thorough but focused — do the work, report what you did.",
+        },
+    }
+}
+
+/// How to override the system prompt.
+pub enum SystemPromptOverride {
+    /// Replace the entire system prompt.
+    Replace(String),
+    /// Append to the default system prompt.
+    Append(String),
+}
+
+/// Execution parameters for a headless run.
+pub struct RunConfig {
+    pub maxTurns: usize,
+    pub model: Option<String>,
+    pub systemPrompt: Option<SystemPromptOverride>,
+    pub allowedTools: Option<Vec<String>>,
+    pub tools: Option<Vec<String>>,
+    pub agent: Option<String>,
+    pub mcpConfigPath: Option<std::path::PathBuf>,
+    pub strictMcp: bool,
+    pub ephemeral: bool,
+}
+
+/// Outcome of a headless run.
+pub struct RunResult {
+    /// Final assistant text content.
+    pub content: String,
+    /// Session ID (for transcript lookup).
+    pub sessionId: String,
+    /// Number of agentic turns executed.
+    pub turns: usize,
+    /// Whether the run hit the max turns limit.
+    pub maxTurnsHit: bool,
+}
+
+/// Create a fresh headless session and run to completion.
+///
+/// Args:
+///     config: Application config.
+///     prompt: User prompt to execute.
+///     runConfig: Execution parameters.
+pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result<RunResult> {
+    let (agentShell, shellIo) = shell::spawnShell(120, 40)?;
+
+    // Drain PTY output in the background — headless mode has no terminal display.
+    tokio::spawn(async move {
+        let mut rx = shellIo.outputRx;
+        while rx.recv().await.is_some() {}
+    });
+
+    // Apply model override. Clear provider routing when switching models
+    // since pinned providers are model-specific.
+    let mut config = config.clone();
+    if let Some(ref model) = runConfig.model {
+        config.main.model = model.clone();
+        config.main.providerOrder = Vec::new();
+    }
+
+    // Build permissions based on --allowed-tools or defaults.
+    let permissions = if let Some(ref allowed) = runConfig.allowedTools {
+        let mut perms = Permissions::askForEverything();
+        for toolName in allowed {
+            perms.addRule(crate::permissions::Rule {
+                tool: toolName.clone(),
+                pattern: None,
+                allow: true,
+            });
+        }
+        perms
+    } else {
+        // Headless default: ask for everything. With no TUI to answer,
+        // unapproved tools are denied. User must use --allowed-tools.
+        Permissions::askForEverything()
+    };
+
+    let mut session = Session::new(
+        &config,
+        permissions,
+        agentShell,
+        InterfaceMode::Headless,
+        &[DomainModule::Swe],
+    )?;
+
+    // Apply tool restriction (--tools flag).
+    if let Some(ref toolNames) = runConfig.tools {
+        let allDefs = crate::tool::builtinDefs();
+        let filtered: Vec<_> = allDefs
+            .into_iter()
+            .filter(|d| toolNames.contains(&d.function.name))
+            .collect();
+        session.setTools(filtered);
+    }
+
+    // Initialize MCP servers from config (--mcp-config override is TODO).
+    if !runConfig.strictMcp && !config.mcp.is_empty() {
+        session.initMcp(config.mcp.clone()).await;
+    }
+
+    runSession(&mut session, prompt, runConfig.maxTurns).await
+}
+
+/// Create a fresh headless session and return the event receiver for streaming output.
+///
+/// The session turn loop runs in a spawned task. The caller drains the event
+/// receiver for output formatting while the task runs concurrently.
+///
+/// Args:
+///     config: Application config.
+///     prompt: User prompt to execute.
+///     runConfig: Execution parameters.
+pub async fn runStreaming(
+    config: &Config,
+    prompt: &str,
+    runConfig: &RunConfig,
+) -> Result<(tokio::task::JoinHandle<Result<RunResult>>, mpsc::Receiver<SessionEvent>)> {
+    let (agentShell, shellIo) = shell::spawnShell(120, 40)?;
+
+    // Drain PTY output in the background.
+    tokio::spawn(async move {
+        let mut rx = shellIo.outputRx;
+        while rx.recv().await.is_some() {}
+    });
+
+    let permissions = Permissions::allowAll();
+    let mut session = Session::new(
+        config,
+        permissions,
+        agentShell,
+        InterfaceMode::Headless,
+        &[DomainModule::Swe],
+    )?;
+
+    if !config.mcp.is_empty() {
+        session.initMcp(config.mcp.clone()).await;
+    }
+
+    let sessionId = session.sessionId().to_string();
+    let _maxTurns = runConfig.maxTurns;
+    let prompt = prompt.to_string();
+
+    let (eventTx, eventRx) = mpsc::channel::<SessionEvent>(256);
+    let (_, mut permitRx) = mpsc::channel::<crate::permissions::PermitResponse>(1);
+    let (cancelTx, cancelRx) = watch::channel(false);
+    let mut cancelRx = cancelRx;
+
+    let handle = tokio::spawn(async move {
+        // Keep the sender alive so cancelRx.changed() doesn't resolve immediately.
+        let _cancel = cancelTx;
+
+        let sendResult = session
+            .send(&prompt, &eventTx, &mut permitRx, &mut cancelRx)
+            .await;
+
+        // Drop eventTx so the receiver knows we're done.
+        drop(eventTx);
+
+        sendResult?;
+
+        Ok(RunResult {
+            content: String::new(), // Caller accumulates from events.
+            sessionId,
+            turns: 0,
+            maxTurnsHit: false,
+        })
+    });
+
+    Ok((handle, eventRx))
+}
+
+/// Run the turn loop on an existing session.
+///
+/// Used by both the CLI `exec` command and subagent `task` tool execution.
+/// Calls `session.send()` which handles the full agentic loop internally
+/// (streams one API response, executes tool calls, loops until the model
+/// produces a text-only response).
+///
+/// Args:
+///     session: An initialized session.
+///     prompt: User prompt to send.
+///     maxTurns: Safety limit (currently one send() = one full agentic run).
+pub fn runSession<'a>(
+    session: &'a mut Session,
+    prompt: &'a str,
+    _maxTurns: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RunResult>> + Send + 'a>> {
+    Box::pin(async move {
+    let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
+    let (_, mut permitRx) = mpsc::channel::<crate::permissions::PermitResponse>(1);
+    let (_cancelTx, cancelRx) = watch::channel(false);
+    let mut cancelRx = cancelRx;
+
+    let sessionId = session.sessionId().to_string();
+
+    // Spawn event drain in background. session.send() emits events as it runs,
+    // so we need to consume them concurrently to avoid blocking on a full channel.
+    let drainHandle = tokio::spawn(async move {
+        let mut content = String::new();
+        let mut turns: usize = 0;
+        while let Some(event) = eventRx.recv().await {
+            match event {
+                SessionEvent::ContentDelta(text) => content.push_str(&text),
+                SessionEvent::TurnComplete => turns += 1,
+                SessionEvent::ToolStarted { name, summary } => {
+                    tracing::info!(tool = %name, summary = %summary, "tool started");
+                }
+                SessionEvent::ToolAutoApproved { name, summary } => {
+                    tracing::info!(tool = %name, summary = %summary, "tool auto-approved");
+                }
+                SessionEvent::ToolResult { name, .. } => {
+                    tracing::debug!(tool = %name, "tool result received");
+                }
+                SessionEvent::Error(msg) => tracing::error!("session error: {msg}"),
+                _ => {}
+            }
+        }
+        (content, turns)
+    });
+
+    // Run the agentic turn loop.
+    let sendResult = session
+        .send(prompt, &eventTx, &mut permitRx, &mut cancelRx)
+        .await;
+
+    // Drop the sender so the drain task exits.
+    drop(eventTx);
+
+    let (content, turns) = drainHandle.await?;
+
+    // Propagate errors from the turn loop.
+    sendResult?;
+
+    Ok(RunResult {
+        content,
+        sessionId,
+        turns,
+        maxTurnsHit: false,
+    })
+    })
+}

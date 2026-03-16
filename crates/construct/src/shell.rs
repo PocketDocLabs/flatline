@@ -19,6 +19,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
@@ -27,6 +28,12 @@ use tokio::task;
 
 const MAX_HISTORY: usize = 50;
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
+
+/// Default shell command timeout (seconds). Commands are interrupted after this.
+pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// Grace period between each escalation phase (Ctrl+C → Ctrl+\ → force-extract).
+const SHELL_ESCALATION_SECS: u64 = 3;
 
 /// A stored command result.
 #[derive(Debug, Clone)]
@@ -41,6 +48,7 @@ pub struct CommandRecord {
 ///
 /// Held by the Session. Commands run in the stateful shell,
 /// so `cd`, env vars, etc. persist across calls.
+#[derive(Clone)]
 pub struct Shell {
     cmdTx: mpsc::Sender<ShellRequest>,
     inputTx: mpsc::Sender<Vec<u8>>,
@@ -55,10 +63,14 @@ impl Shell {
     }
 
     /// Execute a command in the shell and return captured output.
-    pub async fn execute(&self, command: &str) -> String {
+    ///
+    /// If `timeout` is Some, the command is interrupted after that duration.
+    /// If None, uses the default timeout (120s).
+    pub async fn execute(&self, command: &str, timeout: Option<Duration>) -> String {
         let (tx, rx) = oneshot::channel();
         let req = ShellRequest {
             command: command.into(),
+            timeout: Some(timeout.unwrap_or(Duration::from_secs(SHELL_DEFAULT_TIMEOUT_SECS))),
             respondTo: tx,
         };
         if self.cmdTx.send(req).await.is_err() {
@@ -206,6 +218,8 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("GIT_PAGER", "cat");
+    cmd.env("PAGER", "cat");
 
     // Inject OSC 133 shell integration for command boundary tracking.
     injectShellIntegration(&shellBin, &mut cmd)?;
@@ -267,7 +281,49 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
             }
         };
 
+        /// Finalize a capture: extract output, store in history, resolve oneshot.
+        fn finalizeCapture(
+            cap: CaptureState,
+            historyRef: &Arc<Mutex<Vec<CommandRecord>>>,
+            timedOut: bool,
+        ) -> (String, Vec<u8>) {
+            let mut cap = cap;
+            let remaining = cap.filter.flush();
+            let result = extractResult(&cap.buffer, &cap.uuid);
+
+            let mut hist = historyRef.lock().unwrap();
+            hist.push(CommandRecord {
+                command: cap.command.clone(),
+                output: result.output.clone(),
+                exitCode: result.exitCode,
+                lineCount: result.output.lines().count(),
+            });
+            if hist.len() > MAX_HISTORY {
+                hist.remove(0);
+            }
+
+            let mut response = if let Some(code) = result.exitCode {
+                if code != 0 {
+                    format!("{}\n(exit code: {code})", result.output)
+                } else {
+                    result.output
+                }
+            } else {
+                result.output
+            };
+
+            if timedOut {
+                response.push_str("\n(command timed out and was interrupted)");
+            }
+
+            let _ = cap.respondTo.send(response);
+            (cap.uuid, remaining)
+        }
+
         loop {
+            // Compute deadline future from capture state.
+            let deadline = captureState.as_ref().and_then(|c| c.deadline);
+
             tokio::select! {
                 // PTY output — forward to harness, capture if active.
                 Some(bytes) = ptyOutputRx.recv() => {
@@ -296,40 +352,57 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     };
 
                     if done {
-                        let mut cap = captureState.take().unwrap();
-                        let remaining = cap.filter.flush();
+                        let cap = captureState.take().unwrap();
+                        let (_, remaining) = finalizeCapture(cap, &historyRef, false);
                         if !remaining.is_empty() {
                             appendScrollback(&remaining);
                             let _ = outputTx.send(remaining).await;
                         }
-                        let result = extractResult(&cap.buffer, &cap.uuid);
+                    }
+                }
 
-                        // Store in history ring buffer.
-                        {
-                            let mut hist = historyRef.lock().unwrap();
-                            hist.push(CommandRecord {
-                                command: cap.command.clone(),
-                                output: result.output.clone(),
-                                exitCode: result.exitCode,
-                                lineCount: result.output.lines().count(),
-                            });
-                            // Evict oldest if over capacity.
-                            if hist.len() > MAX_HISTORY {
-                                hist.remove(0);
+                // Timeout deadline — escalating kill chain.
+                _ = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if let Some(ref mut cap) = captureState {
+                        let nextDeadline = tokio::time::Instant::now()
+                            + Duration::from_secs(SHELL_ESCALATION_SECS);
+
+                        match cap.killPhase {
+                            KillPhase::Running => {
+                                // Phase 1: Ctrl+C (SIGINT).
+                                tracing::info!(command = %cap.command, "shell command timed out, sending SIGINT");
+                                let _ = writer.write_all(&[0x03]);
+                                let _ = writer.flush();
+                                cap.killPhase = KillPhase::SentInterrupt;
+                                cap.deadline = Some(nextDeadline);
+                            }
+                            KillPhase::SentInterrupt => {
+                                // Phase 2: Ctrl+\ (SIGQUIT) — kills most SIGINT-resistant processes.
+                                tracing::warn!(command = %cap.command, "SIGINT ignored, sending SIGQUIT");
+                                let _ = writer.write_all(&[0x1C]);
+                                let _ = writer.flush();
+                                cap.killPhase = KillPhase::SentQuit;
+                                cap.deadline = Some(nextDeadline);
+                            }
+                            KillPhase::SentQuit => {
+                                // Phase 3: give up — force-extract whatever we have.
+                                tracing::error!(command = %cap.command, "kill chain exhausted, force-extracting output");
+                                let cap = captureState.take().unwrap();
+                                let (_, remaining) = finalizeCapture(cap, &historyRef, true);
+                                if !remaining.is_empty() {
+                                    appendScrollback(&remaining);
+                                    let _ = outputTx.send(remaining).await;
+                                }
+                                // Poke the shell with a newline to try to recover the prompt.
+                                let _ = writer.write_all(b"\n");
+                                let _ = writer.flush();
                             }
                         }
-
-                        // Return output to caller (with exit code baked in).
-                        let response = if let Some(code) = result.exitCode {
-                            if code != 0 {
-                                format!("{}\n(exit code: {code})", result.output)
-                            } else {
-                                result.output
-                            }
-                        } else {
-                            result.output
-                        };
-                        let _ = cap.respondTo.send(response);
                     }
                 }
 
@@ -346,7 +419,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     // Echo the command in the terminal so the user sees what ran.
                     // Sent directly on outputTx, bypassing the PTY/filter.
                     // Dim cyan to distinguish agent commands from user input.
-                    let cmdEcho = format!("\x1b[2;36m\u{25B8} {}\x1b[0m\r\n", req.command);
+                    let cmdEcho = format!("\x1b[2;36m{}\x1b[0m\r\n", req.command);
                     let echoBytes = cmdEcho.into_bytes();
                     appendScrollback(&echoBytes);
                     let _ = outputTx.send(echoBytes).await;
@@ -356,18 +429,26 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     // PTY line-wrapping from creating false marker matches.
                     // The DisplayFilter mutes all output until the actual start
                     // marker appears, hiding the echoed command text.
+                    //
+                    // The exit-code capture goes on a NEW LINE after the command.
+                    // A semicolon join would break heredocs — the shell needs the
+                    // delimiter (e.g. EOF) on a line by itself.
+                    let cmd = req.command.trim_end();
                     let wrapped = format!(
-                        "printf '__FLATLINE_START_%s__\\n' '{uuid}'; printf '\\e]133;C\\a'; {}; __flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; printf '\\n__FLATLINE_END_%s_%s__\\n' '{uuid}' \"$__flatline_ec\"\n",
-                        req.command,
+                        "printf '__FLATLINE_START_%s__\\n' '{uuid}'; printf '\\e]133;C\\a'; {cmd}\n__flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; printf '\\n__FLATLINE_END_%s_%s__\\n' '{uuid}' \"$__flatline_ec\"\n",
                     );
                     let _ = writer.write_all(wrapped.as_bytes());
                     let _ = writer.flush();
+
+                    let deadline = req.timeout.map(|d| tokio::time::Instant::now() + d);
                     captureState = Some(CaptureState {
                         uuid: uuid.clone(),
                         command: req.command,
                         buffer: Vec::new(),
                         filter: DisplayFilter::new(&uuid),
                         respondTo: req.respondTo,
+                        deadline,
+                        killPhase: KillPhase::Running,
                     });
                 }
 
@@ -406,7 +487,18 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
 struct ShellRequest {
     command: String,
+    timeout: Option<Duration>,
     respondTo: oneshot::Sender<String>,
+}
+
+/// Escalation phase for timed-out commands.
+enum KillPhase {
+    /// No timeout yet — command is still running normally.
+    Running,
+    /// Ctrl+C (SIGINT) sent, waiting for process to exit.
+    SentInterrupt,
+    /// Ctrl+\ (SIGQUIT) sent — last resort before force-extract.
+    SentQuit,
 }
 
 struct CaptureState {
@@ -415,6 +507,10 @@ struct CaptureState {
     buffer: Vec<u8>,
     filter: DisplayFilter,
     respondTo: oneshot::Sender<String>,
+    /// Absolute deadline for the next escalation phase.
+    deadline: Option<tokio::time::Instant>,
+    /// Current kill escalation phase.
+    killPhase: KillPhase,
 }
 
 /// Extracted result from the capture buffer.
@@ -463,6 +559,7 @@ impl DisplayFilter {
                     }
                 } else if !line.contains(&self.startPattern)
                     && !line.contains(&self.endPattern)
+                    && !line.contains("__flatline_ec")
                 {
                     output.extend_from_slice(&self.lineBuf);
                 }
@@ -520,7 +617,12 @@ fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
         None => afterStart,
     };
 
-    let cleaned = stripAnsi(output);
+    // Strip ANSI escapes and filter out echoed sentinel machinery.
+    let cleaned: String = stripAnsi(output)
+        .lines()
+        .filter(|l| !l.contains("__flatline_ec"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Extract exit code from end marker.
     let exitCode = text.rfind(&endPrefix).and_then(|endPos| {

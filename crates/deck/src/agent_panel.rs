@@ -14,13 +14,15 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
+use crate::command::{self, CommandDef};
 use crate::history::History;
-use crate::markdown;
+use crate::markdown::{self, RenderedBlock};
 use crate::selection::{self, Selection};
 use crate::text_area::{TextArea, unicode_display_width};
 use crate::throbber::Throbber;
@@ -31,24 +33,107 @@ pub enum PanelEntry {
     User(String),
     Assistant(String),
     Reasoning { text: String, expanded: bool },
-    ToolRequest { summary: String },
+    ToolRequest { summary: String, diff: Option<String> },
     ToolApproved { name: String },
     ToolDenied { name: String },
     ToolResult { name: String, output: String },
+    /// A tool is currently executing (shown with throbber + elapsed time).
+    ToolActive { name: String, summary: String },
+    /// Subagent activity — renders as a single bordered panel.
+    SubagentBlock {
+        agentType: String,
+        prompt: String,
+        /// One-liner tool activity entries: (name, summary).
+        toolLines: Vec<(String, String)>,
+        /// Whether the subagent has finished.
+        done: bool,
+        /// Turn count (set on completion).
+        turns: usize,
+        /// Final content from the subagent (set on completion, rendered as markdown).
+        content: Option<String>,
+        /// Whether the content section is expanded.
+        contentExpanded: bool,
+        /// Child session ID (for loading transcript on "view" after resume).
+        sessionId: Option<String>,
+    },
     Error(String),
+    CommandResult(String),
+    /// Non-copyable informational notice (e.g. session resumed).
+    SessionNotice(String),
+    /// Visual marker showing where compaction replaced content.
+    CompactionMarker { stage: String },
     Cancelled,
+}
+
+/// Tracked state for a running subagent (for the overlay panel).
+pub struct ActiveSubagent {
+    pub sessionId: String,
+    pub agentType: String,
+    pub prompt: String,
+    pub startTime: Instant,
+    /// Structured transcript entries for the overlay panel.
+    pub transcript: Vec<PanelEntry>,
+    /// Raw PTY output bytes for the shell tab.
+    pub shellScrollback: Vec<u8>,
+}
+
+/// Slash command completion state.
+struct CompletionState {
+    /// Filtered matches for the current prefix.
+    matches: Vec<&'static CommandDef>,
+    /// Index of the selected item in `matches`.
+    selected: usize,
+}
+
+/// Maximum visible content lines before a code block is collapsed.
+const MAX_CODE_BLOCK_LINES: usize = 20;
+
+/// Metadata for a rendered code block in the visual line buffer.
+struct CodeBlockRange {
+    /// First visual line index (inclusive, includes top border).
+    startLine: usize,
+    /// Last visual line index (inclusive, includes bottom border).
+    endLine: usize,
+    /// Identity: (entry index, code block ordinal within entry).
+    blockId: (usize, usize),
+    /// Maximum content width in display columns.
+    maxContentWidth: usize,
+    /// Available inner width (box width minus 2 border characters).
+    innerWidth: usize,
+    /// Raw highlighted spans per content line (for drag-select copy).
+    contentLines: Vec<Vec<Span<'static>>>,
+    /// Original code text (for click-to-copy).
+    rawCode: String,
+    /// Screen column where the "copy" label starts on the top border.
+    copyLabelCol: u16,
+    /// True if this block has more lines than MAX_CODE_BLOCK_LINES.
+    collapsible: bool,
+    /// Total content line count (before truncation).
+    totalLines: usize,
 }
 
 /// Agent panel state.
 pub struct AgentPanel {
-    entries: Vec<PanelEntry>,
+    pub(crate) entries: Vec<PanelEntry>,
+    /// Active slash command completion, if any.
+    completion: Option<CompletionState>,
     streamingContent: String,
     streamingReasoning: String,
     isStreaming: bool,
+    /// True from pushUser() until TurnComplete/TurnCancelled.
+    turnActive: bool,
     pub textArea: TextArea,
     pub history: History,
     pub pendingPermit: bool,
     pendingToolName: String,
+    /// Suggested "always allow" patterns for the pending permission prompt.
+    permitPatterns: Vec<String>,
+    /// Currently selected pattern index (last = custom).
+    permitSelectedPattern: usize,
+    /// Editable custom pattern text.
+    permitCustomPattern: String,
+    /// Whether the custom pattern field is being edited.
+    permitEditingCustom: bool,
     /// Throbber animation for inline thinking indicator.
     throbber: Throbber,
     /// When reasoning started (for elapsed time display).
@@ -57,10 +142,16 @@ pub struct AgentPanel {
     thinkingExpanded: bool,
     /// Whether reasoning is actively streaming right now.
     reasoningActive: bool,
-    /// Frame counter for throbber tick throttling.
-    throbberTickCounter: u8,
+    /// Whether a tool is currently executing (for throbber).
+    toolActive: bool,
+    /// When the current tool started executing (for elapsed time display).
+    toolStartTime: Option<Instant>,
+    /// Active subagent state (for the overlay panel).
+    pub activeSubagent: Option<ActiveSubagent>,
+    /// Last wall-clock time the throbber was ticked.
+    lastThrobberTick: Instant,
     /// Scroll offset from the bottom (in visual lines).
-    scrollOffset: u16,
+    pub scrollOffset: u16,
     /// ScrollY value from the last render (for visual-line lookups).
     lastScrollY: u16,
     /// Chat area width from the last render (for wrap estimation).
@@ -74,26 +165,49 @@ pub struct AgentPanel {
     lastReasoningHeaders: Vec<(Option<usize>, usize)>,
     /// Plain text of each visual line from the last buildLines (for scrollback copy).
     lastLineTexts: Vec<String>,
+    /// Visual line indices that should copy as empty (e.g. session notices).
+    nonCopyableLines: HashSet<usize>,
     /// Input area rect from the last render (for mouse hit-testing).
     pub lastInputRect: Rect,
+    /// Horizontal scroll offset per code block: (entryIndex, codeBlockOrdinal) -> scrollX.
+    codeScrollX: HashMap<(usize, usize), u16>,
+    /// Code block metadata from the last buildLines (for hit-testing and copy).
+    lastCodeBlockRanges: Vec<CodeBlockRange>,
+    /// Click-to-copy visual feedback: (blockId, when copied).
+    copiedFlash: Option<((usize, usize), Instant)>,
+    /// Code blocks toggled to expanded (shows all lines).
+    codeExpanded: HashSet<(usize, usize)>,
+    /// Visual line index of the last subagent header (for click-to-view).
+    lastSubagentHeaderLine: std::cell::Cell<Option<usize>>,
+    /// Visual line index + entry index of the subagent content toggle border.
+    lastSubagentToggleLine: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 impl AgentPanel {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            completion: None,
             streamingContent: String::new(),
             streamingReasoning: String::new(),
             isStreaming: false,
+            turnActive: false,
             textArea: TextArea::new(),
             history: History::new(),
             pendingPermit: false,
             pendingToolName: String::new(),
+            permitPatterns: Vec::new(),
+            permitSelectedPattern: 0,
+            permitCustomPattern: String::new(),
+            permitEditingCustom: false,
             throbber: Throbber::new(),
             thinkingStartTime: None,
             thinkingExpanded: false,
             reasoningActive: false,
-            throbberTickCounter: 0,
+            toolActive: false,
+            toolStartTime: None,
+            activeSubagent: None,
+            lastThrobberTick: Instant::now(),
             scrollOffset: 0,
             lastScrollY: 0,
             lastChatWidth: 0,
@@ -101,19 +215,59 @@ impl AgentPanel {
             lastContinuationMap: Vec::new(),
             lastReasoningHeaders: Vec::new(),
             lastLineTexts: Vec::new(),
+            nonCopyableLines: HashSet::new(),
             lastInputRect: Rect::default(),
+            codeScrollX: HashMap::new(),
+            lastCodeBlockRanges: Vec::new(),
+            copiedFlash: None,
+            codeExpanded: HashSet::new(),
+            lastSubagentHeaderLine: std::cell::Cell::new(None),
+            lastSubagentToggleLine: std::cell::Cell::new(None),
         }
+    }
+
+    /// Reset the panel to a clean state (new session).
+    pub fn clearDisplay(&mut self) {
+        self.entries.clear();
+        self.streamingContent.clear();
+        self.streamingReasoning.clear();
+        self.isStreaming = false;
+        self.turnActive = false;
+        self.pendingPermit = false;
+        self.pendingToolName.clear();
+        self.thinkingStartTime = None;
+        self.thinkingExpanded = false;
+        self.reasoningActive = false;
+        self.scrollOffset = 0;
+        self.lastScrollY = 0;
+        self.lastMaxScroll = 0;
+        self.lastContinuationMap.clear();
+        self.lastReasoningHeaders.clear();
+        self.lastLineTexts.clear();
+        self.nonCopyableLines.clear();
+        self.codeScrollX.clear();
+        self.lastCodeBlockRanges.clear();
+        self.copiedFlash = None;
+        self.codeExpanded.clear();
     }
 
     pub fn pushUser(&mut self, text: &str) {
         self.entries.push(PanelEntry::User(text.into()));
         self.scrollOffset = 0;
+        self.turnActive = true;
         // Start thinking indicator immediately for responsiveness.
         self.isStreaming = true;
         self.thinkingStartTime = Some(Instant::now());
     }
 
+    /// Display a slash command without activating the turn or throbber.
+    pub fn pushCommand(&mut self, text: &str) {
+        self.entries.push(PanelEntry::User(text.into()));
+        self.scrollOffset = 0;
+    }
+
     pub fn appendContent(&mut self, text: &str) {
+        if !self.turnActive { return; }
         self.isStreaming = true;
         // Content streaming means reasoning phase is over.
         self.reasoningActive = false;
@@ -121,6 +275,7 @@ impl AgentPanel {
     }
 
     pub fn appendReasoning(&mut self, text: &str) {
+        if !self.turnActive { return; }
         self.isStreaming = true;
         self.reasoningActive = true;
         if self.thinkingStartTime.is_none() {
@@ -131,15 +286,29 @@ impl AgentPanel {
 
     pub fn finalizeStreaming(&mut self) {
         if !self.streamingReasoning.is_empty() {
+            let clean = construct::text::sanitizeVariationSelectors(&self.streamingReasoning);
+            self.streamingReasoning.clear();
             self.entries.push(PanelEntry::Reasoning {
-                text: std::mem::take(&mut self.streamingReasoning),
+                text: clean,
                 expanded: false,
             });
         }
         if !self.streamingContent.is_empty() {
-            self.entries.push(PanelEntry::Assistant(
-                std::mem::take(&mut self.streamingContent),
-            ));
+            let clean = construct::text::sanitizeVariationSelectors(&self.streamingContent);
+            self.streamingContent.clear();
+            self.entries.push(PanelEntry::Assistant(clean));
+            // Transfer code block scroll state from streaming (usize::MAX) to real entry index.
+            let realIdx = self.entries.len() - 1;
+            let streamingKeys: Vec<(usize, usize)> = self.codeScrollX
+                .keys()
+                .filter(|(ei, _)| *ei == usize::MAX)
+                .copied()
+                .collect();
+            for (_, ordinal) in streamingKeys {
+                if let Some(scrollX) = self.codeScrollX.remove(&(usize::MAX, ordinal)) {
+                    self.codeScrollX.insert((realIdx, ordinal), scrollX);
+                }
+            }
         }
         self.isStreaming = false;
         self.reasoningActive = false;
@@ -149,58 +318,412 @@ impl AgentPanel {
 
     /// Whether a turn is currently in progress.
     pub fn isActive(&self) -> bool {
-        self.isStreaming || self.pendingPermit
+        self.turnActive
+    }
+
+    /// Finalize the turn completely (TurnComplete).
+    pub fn finishTurn(&mut self) {
+        if !self.turnActive { return; }
+        self.finalizeStreaming();
+        self.turnActive = false;
+        self.toolActive = false;
+        self.toolStartTime = None;
     }
 
     /// Finalize streaming state after a cancellation.
     pub fn finalizeCancelled(&mut self) {
+        if !self.turnActive { return; }
         self.finalizeStreaming();
+        self.turnActive = false;
+        self.toolActive = false;
+        self.toolStartTime = None;
+        self.activeSubagent = None;
         self.pendingPermit = false;
         self.pendingToolName.clear();
+        // Mark any active subagent block as done.
+        for entry in self.entries.iter_mut().rev() {
+            if let PanelEntry::SubagentBlock { done, .. } = entry {
+                if !*done {
+                    *done = true;
+                    break;
+                }
+            }
+        }
         self.entries.push(PanelEntry::Cancelled);
     }
 
-    pub fn showToolRequest(&mut self, name: &str, summary: &str) {
+    pub fn showToolRequest(&mut self, name: &str, summary: &str, args: &str, diff: Option<String>) {
+        if !self.turnActive { return; }
         self.finalizeStreaming();
         self.entries
-            .push(PanelEntry::ToolRequest { summary: summary.into() });
+            .push(PanelEntry::ToolRequest { summary: summary.into(), diff });
         self.pendingPermit = true;
         self.pendingToolName = name.into();
+
+        // Generate "always allow" pattern suggestions from the tool args.
+        let action = construct::tool::parse(name, args);
+        self.permitPatterns = construct::permissions::suggestPatterns(&action);
+        self.permitSelectedPattern = 0;
+        // Pre-fill custom with the second pattern (or first if only one).
+        self.permitCustomPattern = self.permitPatterns
+            .get(1)
+            .or(self.permitPatterns.first())
+            .cloned()
+            .unwrap_or_default();
+        self.permitEditingCustom = false;
+
         self.scrollOffset = 0;
     }
 
     pub fn approvePending(&mut self) {
         self.pendingPermit = false;
         let name = std::mem::take(&mut self.pendingToolName);
-        self.entries.push(PanelEntry::ToolApproved { name });
+        self.permitPatterns.clear();
+        self.permitEditingCustom = false;
+        // Don't push ToolApproved for task — SubagentStarted renders the panel.
+        if name != "task" {
+            self.entries.push(PanelEntry::ToolApproved { name });
+        }
     }
 
     pub fn denyPending(&mut self) {
         self.pendingPermit = false;
         let name = std::mem::take(&mut self.pendingToolName);
+        self.permitPatterns.clear();
+        self.permitEditingCustom = false;
         self.entries.push(PanelEntry::ToolDenied { name });
     }
 
+    /// Get the currently selected "always allow" pattern.
+    pub fn selectedPattern(&self) -> String {
+        if self.permitSelectedPattern >= self.permitPatterns.len() {
+            // Custom field selected.
+            self.permitCustomPattern.clone()
+        } else {
+            self.permitPatterns.get(self.permitSelectedPattern)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Move selection to previous pattern.
+    pub fn prevPattern(&mut self) {
+        if self.permitSelectedPattern > 0 {
+            self.permitSelectedPattern -= 1;
+            self.permitEditingCustom = false;
+        }
+    }
+
+    /// Move selection to next pattern (or to custom field).
+    pub fn nextPattern(&mut self) {
+        // Allow one past the end for the custom field.
+        if self.permitSelectedPattern < self.permitPatterns.len() {
+            self.permitSelectedPattern += 1;
+            if self.permitSelectedPattern >= self.permitPatterns.len() {
+                self.permitEditingCustom = true;
+            }
+        }
+    }
+
+    /// Toggle custom pattern editing.
+    pub fn toggleCustomEdit(&mut self) {
+        self.permitEditingCustom = !self.permitEditingCustom;
+        if self.permitEditingCustom {
+            self.permitSelectedPattern = self.permitPatterns.len();
+        }
+    }
+
+    /// Whether the custom pattern field is being edited.
+    pub fn isEditingCustom(&self) -> bool {
+        self.permitEditingCustom
+    }
+
+    /// Insert a character into the custom pattern.
+    pub fn customPatternInsert(&mut self, c: char) {
+        self.permitCustomPattern.push(c);
+    }
+
+    /// Delete last character from the custom pattern.
+    pub fn customPatternBackspace(&mut self) {
+        self.permitCustomPattern.pop();
+    }
+
+    // -- Subagent lifecycle --
+
+    pub fn subagentStarted(&mut self, sessionId: &str, agentType: &str, prompt: &str) {
+        if !self.turnActive { return; }
+        self.finalizeStreaming();
+        // Remove the preceding ToolRequest for the task tool — the SubagentBlock replaces it.
+        if let Some(PanelEntry::ToolRequest { .. }) = self.entries.last() {
+            self.entries.pop();
+        }
+        self.activeSubagent = Some(ActiveSubagent {
+            sessionId: sessionId.into(),
+            agentType: agentType.into(),
+            prompt: prompt.into(),
+            startTime: Instant::now(),
+            transcript: Vec::new(),
+            shellScrollback: Vec::new(),
+        });
+        self.entries.push(PanelEntry::SubagentBlock {
+            agentType: agentType.into(),
+            prompt: prompt.into(),
+            toolLines: Vec::new(),
+            done: false,
+            turns: 0,
+            content: None,
+            contentExpanded: false,
+            sessionId: Some(sessionId.into()),
+        });
+        self.scrollOffset = 0;
+    }
+
+    pub fn subagentToolLine(&mut self, name: &str, summary: &str) {
+        if !self.turnActive { return; }
+        // Find the active SubagentBlock and append.
+        if let Some(PanelEntry::SubagentBlock { toolLines, .. }) = self.entries.iter_mut().rev()
+            .find(|e| matches!(e, PanelEntry::SubagentBlock { done: false, .. }))
+        {
+            toolLines.push((name.into(), summary.into()));
+        }
+        if let Some(ref mut sub) = self.activeSubagent {
+            sub.transcript.push(PanelEntry::ToolApproved {
+                name: format!("{name}: {summary}"),
+            });
+        }
+        self.scrollOffset = 0;
+    }
+
+    /// Push a full tool result to the subagent's transcript (for the overlay).
+    pub fn subagentToolResult(&mut self, name: &str, output: &str) {
+        if let Some(ref mut sub) = self.activeSubagent {
+            sub.transcript.push(PanelEntry::ToolResult {
+                name: name.into(),
+                output: output.into(),
+            });
+        }
+    }
+
+    pub fn subagentContent(&mut self, text: &str) {
+        // Content goes to transcript for the overlay.
+        if let Some(ref mut sub) = self.activeSubagent {
+            // Append to existing Assistant entry or create new one.
+            if let Some(PanelEntry::Assistant(existing)) = sub.transcript.last_mut() {
+                existing.push_str(text);
+            } else {
+                sub.transcript.push(PanelEntry::Assistant(text.into()));
+            }
+        }
+    }
+
+    pub fn subagentComplete(&mut self, agentType: &str, turns: usize, finalContent: &str) {
+        if !self.turnActive { return; }
+        if let Some(PanelEntry::SubagentBlock { done, turns: t, content, contentExpanded, .. }) = self.entries.iter_mut().rev()
+            .find(|e| matches!(e, PanelEntry::SubagentBlock { done: false, .. }))
+        {
+            *done = true;
+            *t = turns;
+            if !finalContent.is_empty() {
+                *content = Some(finalContent.into());
+            }
+        }
+    }
+
+    /// Toggle the content section of a subagent block (expand/collapse).
+    pub fn toggleSubagentContent(&mut self, entryIndex: usize) {
+        if let Some(PanelEntry::SubagentBlock { contentExpanded, done: true, .. }) = self.entries.get_mut(entryIndex) {
+            *contentExpanded = !*contentExpanded;
+        }
+    }
+
+    /// Try toggling subagent content expand/collapse at the given grid line.
+    /// Returns true if the click was handled.
+    pub fn tryToggleSubagentContent(&mut self, gridLine: i32) -> bool {
+        if let Some((visualLine, entryIdx)) = self.lastSubagentToggleLine.get() {
+            let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+            let clickVisual = (gridLine + maxScroll) as usize;
+            if clickVisual == visualLine {
+                self.toggleSubagentContent(entryIdx);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a grid line (scroll-adjusted) is a subagent header (for click-to-view).
+    pub fn isSubagentHeaderLine(&self, gridLine: i32) -> bool {
+        if let Some(headerLine) = self.lastSubagentHeaderLine.get() {
+            let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+            let visualLine = (gridLine + maxScroll) as usize;
+            headerLine == visualLine
+        } else {
+            false
+        }
+    }
+
+    /// Find the last SubagentBlock's session info (for lazy-loading the overlay).
+    pub fn lastSubagentSession(&self) -> Option<(&str, &str)> {
+        self.entries.iter().rev()
+            .find_map(|e| match e {
+                PanelEntry::SubagentBlock { agentType, sessionId: Some(sid), .. } => {
+                    Some((agentType.as_str(), sid.as_str()))
+                }
+                _ => None,
+            })
+    }
+
     pub fn toolApproved(&mut self, name: &str) {
+        if !self.turnActive { return; }
+        self.finalizeStreaming();
         self.entries
             .push(PanelEntry::ToolApproved { name: name.into() });
     }
 
+    pub fn toolStarted(&mut self, name: &str, summary: &str) {
+        if !self.turnActive { return; }
+        self.finalizeStreaming();
+        self.toolActive = true;
+        self.toolStartTime = Some(Instant::now());
+        self.entries.push(PanelEntry::ToolActive {
+            name: name.into(),
+            summary: summary.into(),
+        });
+        self.scrollOffset = 0;
+    }
+
     pub fn toolDenied(&mut self, name: &str) {
+        if !self.turnActive { return; }
+        self.toolActive = false;
+        self.toolStartTime = None;
         self.entries
             .push(PanelEntry::ToolDenied { name: name.into() });
     }
 
     pub fn pushToolResult(&mut self, name: &str, output: &str) {
+        if !self.turnActive { return; }
+        self.toolActive = false;
+        self.toolStartTime = None;
+        // Replace the ToolActive entry with the result.
+        if let Some(last) = self.entries.last() {
+            if matches!(last, PanelEntry::ToolActive { .. }) {
+                self.entries.pop();
+            }
+        }
+        // Commit any in-flight streaming before the tool result.
+        self.finalizeStreaming();
         self.entries.push(PanelEntry::ToolResult {
             name: name.into(),
             output: output.into(),
         });
         self.scrollOffset = 0;
+        // Restart thinking indicator — model will be called again after tool results.
+        self.isStreaming = true;
+        self.thinkingStartTime = Some(Instant::now());
     }
 
     pub fn pushError(&mut self, msg: &str) {
         self.entries.push(PanelEntry::Error(msg.into()));
+    }
+
+    /// Push a command result and reset turn state.
+    ///
+    /// Called after pushUser() for slash commands, so we undo the
+    /// turnActive/isStreaming flags that pushUser sets.
+    pub fn pushCommandResult(&mut self, text: &str) {
+        self.entries.push(PanelEntry::CommandResult(text.into()));
+        self.turnActive = false;
+        self.isStreaming = false;
+        self.thinkingStartTime = None;
+        self.scrollOffset = 0;
+    }
+
+    /// Insert a compaction marker at the block where compressed content begins.
+    ///
+    /// `blockIdx` is the 0-based block index (each block starts with a User
+    /// entry). Removes any existing marker for the same stage first, since the
+    /// zone may expand across repeated compaction runs.
+    pub fn pushCompactionMarker(&mut self, stage: &str, blockIdx: usize) {
+        // Remove existing marker for this stage.
+        self.entries.retain(|e| {
+            !matches!(e, PanelEntry::CompactionMarker { stage: s } if s == stage)
+        });
+
+        // Find the insert position by counting User entries.
+        let mut userCount = 0;
+        let mut insertAt = 0;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if matches!(entry, PanelEntry::User(_)) {
+                if userCount == blockIdx {
+                    insertAt = i;
+                    break;
+                }
+                userCount += 1;
+            }
+        }
+
+        self.entries.insert(insertAt, PanelEntry::CompactionMarker { stage: stage.into() });
+    }
+
+    // --- Completion ---
+
+    /// Update completion state based on current input text.
+    ///
+    /// Activates when text starts with `/` and has no spaces (still
+    /// typing the command name). Dismisses otherwise.
+    pub fn updateCompletion(&mut self, text: &str) {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with('/') || trimmed.contains(' ') {
+            self.completion = None;
+            return;
+        }
+
+        let prefix = &trimmed[1..];
+        let matches = command::completions(prefix);
+        if matches.is_empty() {
+            self.completion = None;
+            return;
+        }
+
+        // Preserve selection index if still valid.
+        let prevSelected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
+        let selected = if prevSelected < matches.len() { prevSelected } else { 0 };
+        self.completion = Some(CompletionState { matches, selected });
+    }
+
+    /// Accept the currently selected completion.
+    ///
+    /// Returns:
+    ///     Option<String>: The full `/commandname ` string, or None if no completion active.
+    pub fn completeSelected(&self) -> Option<String> {
+        let state = self.completion.as_ref()?;
+        let cmd = state.matches.get(state.selected)?;
+        Some(format!("/{} ", cmd.name))
+    }
+
+    /// Move selection down in the completion menu.
+    pub fn selectNext(&mut self) {
+        if let Some(state) = &mut self.completion {
+            if state.selected + 1 < state.matches.len() {
+                state.selected += 1;
+            }
+        }
+    }
+
+    /// Move selection up in the completion menu.
+    pub fn selectPrev(&mut self) {
+        if let Some(state) = &mut self.completion {
+            state.selected = state.selected.saturating_sub(1);
+        }
+    }
+
+    /// Dismiss the completion menu.
+    pub fn dismissCompletion(&mut self) {
+        self.completion = None;
+    }
+
+    /// Whether completion is currently active.
+    pub fn completionActive(&self) -> bool {
+        self.completion.is_some()
     }
 
     pub fn scrollUp(&mut self, amount: u16) {
@@ -216,15 +739,119 @@ impl AgentPanel {
         self.scrollOffset
     }
 
-    /// Advance the throbber animation. Call from the event loop.
-    /// Ticks while waiting for first token or during reasoning.
-    pub fn tickThrobber(&mut self) {
-        self.throbberTickCounter = self.throbberTickCounter.wrapping_add(1);
+    /// Scroll a code block horizontally.
+    pub fn scrollCodeBlockH(&mut self, blockId: (usize, usize), delta: i16) {
+        let range = match self.lastCodeBlockRanges.iter().find(|r| r.blockId == blockId) {
+            Some(r) => r,
+            None => return,
+        };
+        let maxScroll = range.maxContentWidth.saturating_sub(range.innerWidth) as u16;
+        if maxScroll == 0 {
+            return;
+        }
+        let current = self.codeScrollX.get(&blockId).copied().unwrap_or(0);
+        let new = if delta > 0 {
+            current.saturating_add(delta as u16).min(maxScroll)
+        } else {
+            current.saturating_sub((-delta) as u16)
+        };
+        if new == 0 {
+            self.codeScrollX.remove(&blockId);
+        } else {
+            self.codeScrollX.insert(blockId, new);
+        }
+    }
+
+    /// Find the code block at a given grid line (for mouse hit-testing).
+    pub fn codeBlockAtGridLine(&self, gridLine: i32) -> Option<(usize, usize)> {
+        let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+        let visualLine = (gridLine + maxScroll) as usize;
+        for range in &self.lastCodeBlockRanges {
+            if visualLine >= range.startLine && visualLine <= range.endLine {
+                return Some(range.blockId);
+            }
+        }
+        None
+    }
+
+    /// Try to copy a code block's content via the "copy" label hit-test.
+    ///
+    /// Args:
+    ///     gridLine: Grid line of the click.
+    ///     col: Column relative to agentContentRect (prefix excluded).
+    ///
+    /// Returns true if a copy occurred (caller should skip selection).
+    pub fn tryCopyCodeBlock(&mut self, gridLine: i32, col: u16) -> bool {
+        let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+        let visualLine = (gridLine + maxScroll) as usize;
+        for range in &self.lastCodeBlockRanges {
+            // Only match the top border line.
+            if visualLine != range.startLine {
+                continue;
+            }
+            // The stored copyLabelCol includes the prefix width.
+            // Content-local col needs the prefix added back for comparison.
+            let contentCol = col + 2;
+            if contentCol >= range.copyLabelCol {
+                selection::copyToClipboard(&range.rawCode);
+                self.copiedFlash = Some((range.blockId, Instant::now()));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Toggle a code block between collapsed and expanded.
+    ///
+    /// Expand: click on top border (startLine) of a collapsed block.
+    /// Collapse: click on top border or bottom border of an expanded block.
+    /// Compensates scroll offset so the header stays at its current screen position.
+    ///
+    /// Returns true if a toggle occurred (caller should skip selection).
+    pub fn tryToggleCodeBlock(&mut self, gridLine: i32) -> bool {
+        let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+        let visualLine = (gridLine + maxScroll) as usize;
+        for range in &self.lastCodeBlockRanges {
+            if !range.collapsible {
+                continue;
+            }
+            let isExpanded = self.codeExpanded.contains(&range.blockId);
+            let hiddenLines = range.totalLines.saturating_sub(MAX_CODE_BLOCK_LINES) as u16;
+
+            if !isExpanded && visualLine == range.startLine {
+                self.codeExpanded.insert(range.blockId);
+                self.scrollOffset = self.scrollOffset.saturating_add(hiddenLines);
+                self.lastMaxScroll = self.lastMaxScroll.saturating_add(hiddenLines);
+                return true;
+            }
+            if isExpanded && (visualLine == range.startLine || visualLine == range.endLine) {
+                self.codeExpanded.remove(&range.blockId);
+                self.scrollOffset = self.scrollOffset.saturating_sub(hiddenLines);
+                self.lastMaxScroll = self.lastMaxScroll.saturating_sub(hiddenLines);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Advance the throbber animation on a wall-clock schedule (~8 FPS).
+    /// Returns true if the throbber actually ticked (caller needs redraw).
+    pub fn tickThrobber(&mut self) -> bool {
         let waiting = self.isStreaming
             && self.streamingContent.is_empty()
             && self.streamingReasoning.is_empty();
-        if self.throbberTickCounter % 8 == 0 && (waiting || self.reasoningActive) {
+        let subagentRunning = self.activeSubagent.is_some()
+            && !self.entries.iter().rev().any(|e| matches!(e, PanelEntry::SubagentBlock { done: true, .. }));
+        if !(waiting || self.reasoningActive || self.toolActive || subagentRunning) {
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.lastThrobberTick) >= Duration::from_millis(125) {
+            self.lastThrobberTick = now;
             self.throbber.tick();
+            true
+        } else {
+            false
         }
     }
 
@@ -290,6 +917,8 @@ impl AgentPanel {
     ///
     /// Uses the continuation map to detect lines added by word-wrapping
     /// and joins them back together so the clipboard gets unwrapped text.
+    /// For code blocks, extracts full untruncated content from stored spans
+    /// rather than from the (potentially scrolled/clipped) Buffer.
     pub fn extractUnwrappedText(
         &self,
         sel: &Selection,
@@ -313,35 +942,67 @@ impl AgentPanel {
             let colStart = if gridLine == sr { sc } else { 0 };
             let colEnd = if gridLine == er { ec } else { area.width };
 
-            let text = if let Some(screenRow) =
-                selection::toScreenRow(gridLine, displayOffset, area.height)
-            {
-                // Visible — read from Buffer (handles styled rendering accurately).
-                let mut line = String::new();
-                for col in colStart..colEnd {
-                    if col >= area.width {
-                        break;
-                    }
-                    if let Some(cell) = buf.cell((area.x + col, area.y + screenRow)) {
-                        line.push_str(cell.symbol());
-                    }
+            // Non-copyable lines (session notices) produce empty text.
+            if self.nonCopyableLines.contains(&visualIdx) {
+                segments.push((String::new(), false));
+                continue;
+            }
+
+            // Check if this visual line falls within a code block.
+            let codeBlockHit = self.lastCodeBlockRanges.iter().find(|r| {
+                visualIdx >= r.startLine && visualIdx <= r.endLine
+            });
+
+            if let Some(range) = codeBlockHit {
+                // Inside a code block — extract from stored content, not Buffer.
+                let isBorder = visualIdx == range.startLine || visualIdx == range.endLine;
+                if isBorder {
+                    // Skip border lines entirely.
+                    segments.push((String::new(), false));
+                } else {
+                    // Content line: index into stored contentLines.
+                    let contentIdx = visualIdx - range.startLine - 1;
+                    let text = if contentIdx < range.contentLines.len() {
+                        range.contentLines[contentIdx]
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    segments.push((text, false));
                 }
-                line.trim_end().to_string()
-            } else if visualIdx < self.lastLineTexts.len() {
-                // Off-screen — extract from cached line text.
-                sliceByDisplayColumn(
-                    &self.lastLineTexts[visualIdx],
-                    prefixCols + colStart,
-                    prefixCols + colEnd,
-                )
             } else {
-                String::new()
-            };
+                let text = if let Some(screenRow) =
+                    selection::toScreenRow(gridLine, displayOffset, area.height)
+                {
+                    // Visible — read from Buffer.
+                    let mut line = String::new();
+                    for col in colStart..colEnd {
+                        if col >= area.width {
+                            break;
+                        }
+                        if let Some(cell) = buf.cell((area.x + col, area.y + screenRow)) {
+                            line.push_str(cell.symbol());
+                        }
+                    }
+                    line.trim_end().to_string()
+                } else if visualIdx < self.lastLineTexts.len() {
+                    // Off-screen — extract from cached line text.
+                    sliceByDisplayColumn(
+                        &self.lastLineTexts[visualIdx],
+                        prefixCols + colStart,
+                        prefixCols + colEnd,
+                    )
+                } else {
+                    String::new()
+                };
 
-            let isCont = visualIdx < self.lastContinuationMap.len()
-                && self.lastContinuationMap[visualIdx];
+                let isCont = visualIdx < self.lastContinuationMap.len()
+                    && self.lastContinuationMap[visualIdx];
 
-            segments.push((text, isCont));
+                segments.push((text, isCont));
+            }
         }
 
         // Remove trailing empty lines.
@@ -393,7 +1054,9 @@ impl AgentPanel {
         // Dynamic input height based on content.
         // Width accounts for: 2 right padding + 2 prompt prefix.
         let inputHeight = if self.pendingPermit {
-            1
+            // 1 summary + patterns + 1 custom + 1 key hints = patterns.len() + 3, capped.
+            let patternLines = self.permitPatterns.len() + 1; // +1 for custom field.
+            (patternLines as u16 + 3).min(inner.height / 2).max(3)
         } else {
             self.textArea.desiredHeight(inner.width.saturating_sub(4)).min(8).max(1)
         };
@@ -435,18 +1098,26 @@ impl AgentPanel {
         };
 
         // Build all display lines (pre-wrapped to fit paddedChat width).
-        let (lines, contMap, reasoningHeaders) = self.buildLines(paddedChat.width);
+        let (lines, contMap, reasoningHeaders, cbRanges, nonCopyable) = self.buildLines(paddedChat.width);
         self.lastContinuationMap = contMap;
         self.lastReasoningHeaders = reasoningHeaders;
+        self.lastCodeBlockRanges = cbRanges;
+        // Clear stale copied flash after 2 seconds.
+        if self.copiedFlash.as_ref().is_some_and(|(_, t)| t.elapsed().as_secs() >= 2) {
+            self.copiedFlash = None;
+        }
         // Cache plain text of each visual line for scrollback copy.
         self.lastLineTexts = lines.iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
+        self.nonCopyableLines = nonCopyable;
 
-        // Use ratatui's own word-wrap line counter for exact scroll math.
-        let paragraph = Paragraph::new(lines)
-            .wrap(Wrap { trim: false });
-        let totalWrapped = paragraph.line_count(paddedChat.width) as u16;
+        // buildLines already wraps text to fit paddedChat.width — don't let
+        // Paragraph re-wrap, as that shifts visual line indices and breaks
+        // click targets (code block scroll/copy, subagent toggle, etc.).
+        let totalLines = lines.len() as u16;
+        let paragraph = Paragraph::new(lines);
+        let totalWrapped = totalLines;
         let visible = paddedChat.height;
         let maxScroll = totalWrapped.saturating_sub(visible);
         // Keep view pinned when scrolled up and new content arrives.
@@ -465,24 +1136,216 @@ impl AgentPanel {
             .scroll((scrollY, 0))
             .render(paddedChat, buf);
 
+        // Completion dropdown overlays the chat area above the input.
+        self.renderCompletionDropdown(paddedInput, buf);
+
         paddedChat
+    }
+
+    /// Render just the chat transcript area without input, separator, or border.
+    /// Used by the subagent overlay panel for read-only transcript display.
+    pub fn renderChatOnly(&mut self, area: Rect, buf: &mut Buffer) {
+        let padded = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(2),
+            height: area.height,
+        };
+        if padded.width < 4 || padded.height < 1 { return; }
+
+        let (chatLines, contMap, reasoningHeaders, cbRanges, nonCopyable) =
+            self.buildLines(padded.width);
+        self.lastContinuationMap = contMap;
+        self.lastReasoningHeaders = reasoningHeaders;
+        self.lastCodeBlockRanges = cbRanges;
+        self.lastLineTexts = chatLines.iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        self.nonCopyableLines = nonCopyable;
+
+        let totalLines = chatLines.len() as u16;
+        let paragraph = Paragraph::new(chatLines);
+        let totalWrapped = totalLines;
+        let visible = padded.height;
+        let maxScroll = totalWrapped.saturating_sub(visible);
+        self.scrollOffset = self.scrollOffset.min(maxScroll);
+        let scrollY = maxScroll.saturating_sub(self.scrollOffset);
+        self.lastScrollY = scrollY;
+        self.lastChatWidth = padded.width;
+
+        paragraph
+            .scroll((scrollY, 0))
+            .render(padded, buf);
     }
 
     fn renderInput(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         if self.pendingPermit {
-            let prompt = Line::from(vec![
+            let mut lines: Vec<Line> = Vec::new();
+
+            // Header with tool summary.
+            lines.push(Line::from(vec![
                 Span::styled(
-                    " Allow? ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    "\u{2500} Permission ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("[y]es ", Style::default().fg(Color::Green)),
-                Span::styled("[n]o", Style::default().fg(Color::Red)),
-            ]);
-            Paragraph::new(prompt).render(area, buf);
+                Span::styled(
+                    "\u{2500}".repeat(area.width.saturating_sub(13) as usize),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            // Pattern choices.
+            for (i, pattern) in self.permitPatterns.iter().enumerate() {
+                let selected = i == self.permitSelectedPattern && !self.permitEditingCustom;
+                let marker = if selected { " \u{25b8} " } else { "   " };
+                let style = if selected {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, style),
+                    Span::styled(pattern.clone(), style),
+                ]));
+            }
+
+            // Custom field.
+            let customSelected = self.permitSelectedPattern >= self.permitPatterns.len();
+            let customMarker = if customSelected { " \u{25b8} " } else { "   " };
+            let customStyle = if self.permitEditingCustom {
+                Style::default().fg(Color::White)
+            } else if customSelected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let cursor = if self.permitEditingCustom { "\u{2502}" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(customMarker, customStyle),
+                Span::styled("custom: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}{cursor}", self.permitCustomPattern), customStyle),
+            ]));
+
+            // Key hints.
+            lines.push(Line::from(vec![
+                Span::styled(" [y]", Style::default().fg(Color::Green)),
+                Span::styled(" Once ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" [a]", Style::default().fg(Color::Cyan)),
+                Span::styled(" Always ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" [n]", Style::default().fg(Color::Red)),
+                Span::styled(" Deny ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" [e]", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Edit", Style::default().fg(Color::DarkGray)),
+            ]));
+
+            Paragraph::new(lines).render(area, buf);
         } else {
             self.textArea.render(area, buf, focused);
+            // Ghost text overlay for completion.
+            if let Some(state) = &self.completion {
+                if let Some(cmd) = state.matches.get(state.selected) {
+                    let typed = self.textArea.text().trim_start();
+                    let prefix = if typed.starts_with('/') { &typed[1..] } else { "" };
+                    if cmd.name.starts_with(prefix) && cmd.name.len() > prefix.len() {
+                        let suffix = &cmd.name[prefix.len()..];
+                        // Render ghost text at cursor position.
+                        if let Some((cx, cy)) = self.textArea.cursorScreenPos {
+                            let ghostStyle = Style::default().fg(Color::DarkGray);
+                            for (i, ch) in suffix.chars().enumerate() {
+                                let col = cx + i as u16;
+                                if col < area.x + area.width {
+                                    if let Some(cell) = buf.cell_mut((col, cy)) {
+                                        cell.set_char(ch);
+                                        cell.set_style(ghostStyle);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render the completion dropdown above the input area.
+    fn renderCompletionDropdown(&self, inputArea: Rect, buf: &mut Buffer) {
+        let state = match &self.completion {
+            Some(s) if !s.matches.is_empty() => s,
+            _ => return,
+        };
+
+        let count = state.matches.len().min(8);
+        let menuHeight = count as u16 + 2; // +2 for border
+        let menuWidth = inputArea.width;
+
+        // Position above the input area.
+        let menuY = inputArea.y.saturating_sub(menuHeight);
+        let menuArea = Rect {
+            x: inputArea.x,
+            y: menuY,
+            width: menuWidth,
+            height: menuHeight,
+        };
+
+        // Clear the entire menu area to a solid background.
+        let bgStyle = Style::default().bg(Color::Rgb(20, 20, 30));
+        for row in menuArea.y..menuArea.y + menuArea.height {
+            for col in menuArea.x..menuArea.x + menuArea.width {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    cell.set_char(' ');
+                    cell.set_style(bgStyle);
+                }
+            }
+        }
+
+        let borderStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(borderStyle);
+        let inner = block.inner(menuArea);
+        block.render(menuArea, buf);
+
+        // Render each command row.
+        let normalStyle = Style::default().fg(Color::White).bg(Color::Rgb(20, 20, 30));
+        let selectedStyle = Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 80));
+        let descStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30));
+        let selectedDescStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 80));
+
+        for (i, cmd) in state.matches.iter().take(count).enumerate() {
+            let row = inner.y + i as u16;
+            if row >= inner.y + inner.height {
+                break;
+            }
+            let isSelected = i == state.selected;
+            let (nameStyle, dStyle) = if isSelected {
+                (selectedStyle, selectedDescStyle)
+            } else {
+                (normalStyle, descStyle)
+            };
+
+            let rowArea = Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            };
+
+            // Clear row background for selected item.
+            if isSelected {
+                for col in rowArea.x..rowArea.x + rowArea.width {
+                    if let Some(cell) = buf.cell_mut((col, row)) {
+                        cell.set_char(' ');
+                        cell.set_style(selectedStyle);
+                    }
+                }
+            }
+
+            let line = Line::from(vec![
+                Span::styled(format!(" /{}", cmd.name), nameStyle),
+                Span::styled(format!(" \u{2014} {}", cmd.description), dStyle),
+            ]);
+            // Render truncated to row width.
+            Paragraph::new(line).render(rowArea, buf);
         }
     }
 
@@ -499,10 +1362,11 @@ impl AgentPanel {
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         let mut cursor: u32 = 0;
 
-        for entry in &self.entries {
+        let mut dummyRanges: Vec<CodeBlockRange> = Vec::new();
+        for (idx, entry) in self.entries.iter().enumerate() {
             let mut entryLines: Vec<Line<'static>> = Vec::new();
             let mut entryCont: Vec<bool> = Vec::new();
-            self.renderEntry(entry, &mut entryLines, &mut entryCont, w as u16);
+            self.renderEntry(entry, &mut entryLines, &mut entryCont, w as u16, idx, &mut dummyRanges);
 
             let entryStart = cursor;
             for line in &entryLines {
@@ -549,8 +1413,10 @@ impl AgentPanel {
             }
 
             if !self.streamingContent.is_empty() {
-                let md = markdown::render(&self.streamingContent);
-                for line in &md.lines {
+                // NOTE: Subtract prefix width ("◆ " = 2 cols) so blocks size correctly.
+                let blocks = markdown::render(&self.streamingContent, (w as u16).saturating_sub(2));
+                let md = flattenRenderedBlocks(blocks, (w as u16).saturating_sub(2));
+                for line in &md {
                     let lineWidth = line.width();
                     cursor += if lineWidth == 0 {
                         1
@@ -606,16 +1472,25 @@ impl AgentPanel {
         (ranges[startIdx].0, ranges[endIdx].1)
     }
 
-    fn buildLines(&self, width: u16) -> (Vec<Line<'static>>, Vec<bool>, Vec<(Option<usize>, usize)>) {
+    fn buildLines(&self, width: u16) -> (Vec<Line<'static>>, Vec<bool>, Vec<(Option<usize>, usize)>, Vec<CodeBlockRange>, HashSet<usize>) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cont: Vec<bool> = Vec::new();
         let mut reasoningHeaders: Vec<(Option<usize>, usize)> = Vec::new();
+        let mut codeBlockRanges: Vec<CodeBlockRange> = Vec::new();
 
+        let mut nonCopyable = HashSet::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if matches!(entry, PanelEntry::Reasoning { .. }) {
                 reasoningHeaders.push((Some(i), lines.len()));
             }
-            self.renderEntry(entry, &mut lines, &mut cont, width);
+            let isNotice = matches!(entry, PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. });
+            let linesBefore = lines.len();
+            self.renderEntry(entry, &mut lines, &mut cont, width, i, &mut codeBlockRanges);
+            if isNotice {
+                for idx in linesBefore..lines.len() {
+                    nonCopyable.insert(idx);
+                }
+            }
             lines.push(Line::from(""));
             cont.push(false);
         }
@@ -686,15 +1561,20 @@ impl AgentPanel {
             }
 
             if !self.streamingContent.is_empty() {
-                let md = markdown::render(&self.streamingContent);
-                prefixFirstLine(&mut lines, &mut cont, md.lines, "\u{25C6} ", Style::default().fg(Color::White), width);
+                let mdBlocks = markdown::render(&self.streamingContent, width.saturating_sub(2));
+                prefixRenderedBlocks(
+                    &mut lines, &mut cont, mdBlocks,
+                    "\u{25C6} ", Style::default().fg(Color::White), width,
+                    usize::MAX, &self.codeScrollX, &self.codeExpanded,
+                    &mut codeBlockRanges, &self.copiedFlash,
+                );
             }
         }
 
-        (lines, cont, reasoningHeaders)
+        (lines, cont, reasoningHeaders, codeBlockRanges, nonCopyable)
     }
 
-    fn renderEntry(&self, entry: &PanelEntry, lines: &mut Vec<Line<'static>>, cont: &mut Vec<bool>, width: u16) {
+    fn renderEntry(&self, entry: &PanelEntry, lines: &mut Vec<Line<'static>>, cont: &mut Vec<bool>, width: u16, entryIndex: usize, codeBlockRanges: &mut Vec<CodeBlockRange>) {
         match entry {
             PanelEntry::User(text) => {
                 let style = Style::default().fg(Color::Cyan);
@@ -724,8 +1604,14 @@ impl AgentPanel {
                 }
             }
             PanelEntry::Assistant(text) => {
-                let md = markdown::render(text);
-                prefixFirstLine(lines, cont, md.lines, "\u{25C6} ", Style::default().fg(Color::White), width);
+                // NOTE: Subtract prefix width ("◆ " = 2 cols) so blocks size correctly.
+                let mdBlocks = markdown::render(text, width.saturating_sub(2));
+                prefixRenderedBlocks(
+                    lines, cont, mdBlocks,
+                    "\u{25C6} ", Style::default().fg(Color::White), width,
+                    entryIndex, &self.codeScrollX, &self.codeExpanded,
+                    codeBlockRanges, &self.copiedFlash,
+                );
             }
             PanelEntry::Reasoning { text, expanded } => {
                 let icon = if *expanded { "\u{25BE}" } else { "\u{25B8}" };
@@ -751,10 +1637,42 @@ impl AgentPanel {
                     }
                 }
             }
-            PanelEntry::ToolRequest { summary } => {
-                let style = Style::default().fg(Color::Yellow);
-                let content = vec![Line::from(Span::styled(summary.clone(), style))];
-                prefixFirstLine(lines, cont, content, "\u{2699}\u{FE0E} ", style, width);
+            PanelEntry::ToolRequest { summary, diff } => {
+                if let Some(diffText) = diff {
+                    // Summary line with (+N -M) stats.
+                    let (added, removed) = diffStats(diffText);
+                    let summaryBlock = RenderedBlock::Text(vec![Line::from(vec![
+                        Span::styled(
+                            summary.clone(),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("+{added}"),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("-{removed}"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ])]);
+                    let diffBlock = RenderedBlock::Code {
+                        lang: Some("diff".to_string()),
+                        lines: crate::markdown::highlight::diffLines(diffText),
+                        code: diffText.clone(),
+                    };
+                    prefixRenderedBlocks(
+                        lines, cont, vec![summaryBlock, diffBlock],
+                        "\u{2699}\u{FE0E} ", Style::default().fg(Color::Yellow), width,
+                        entryIndex, &self.codeScrollX, &self.codeExpanded,
+                        codeBlockRanges, &self.copiedFlash,
+                    );
+                } else {
+                    let style = Style::default().fg(Color::Yellow);
+                    let content = vec![Line::from(Span::styled(summary.clone(), style))];
+                    prefixFirstLine(lines, cont, content, "\u{2699}\u{FE0E} ", style, width);
+                }
             }
             PanelEntry::ToolApproved { name } => {
                 let style = Style::default().fg(Color::Green);
@@ -769,38 +1687,380 @@ impl AgentPanel {
                 ))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
             }
-            PanelEntry::ToolResult { name, output } => {
-                lines.push(Line::from(Span::styled(
-                    format!("\u{25C7} {name} result:"),
-                    Style::default().fg(Color::DarkGray),
-                )));
+            PanelEntry::ToolActive { name: _, summary } => {
+                let elapsed = self.toolStartTime
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let style = Style::default().fg(Color::Yellow);
+                let blobLines = self.throbber.renderLines();
+                let statusText = format!("{summary}  ({elapsed}s)");
+                // First line: throbber char + summary + elapsed.
+                lines.push(Line::from(vec![
+                    blobLines[0].spans.first().cloned().unwrap_or_default(),
+                    Span::raw(" "),
+                    Span::styled(statusText, style),
+                ]));
                 cont.push(false);
-                let outputLines: Vec<&str> = output.lines().collect();
-                let showCount = outputLines.len().min(20);
-                let style = Style::default().fg(Color::Green);
-                let textWidth = (width as usize).saturating_sub(2);
-                for line in &outputLines[..showCount] {
-                    let spanLine = Line::from(Span::styled(line.to_string(), style));
-                    let wrapped = wrapSpannedLine(spanLine, textWidth);
-                    for (idx, wLine) in wrapped.into_iter().enumerate() {
-                        cont.push(idx > 0);
-                        let mut spans = vec![Span::styled("  ".to_string(), style)];
-                        spans.extend(wLine.spans);
-                        lines.push(Line::from(spans));
-                    }
-                }
-                if outputLines.len() > 20 {
-                    lines.push(Line::from(Span::styled(
-                        format!("  ... ({} more lines)", outputLines.len() - 20),
+                // Second line: throbber continuation.
+                lines.push(blobLines[1].clone());
+                cont.push(true);
+            }
+            PanelEntry::SubagentBlock { agentType, prompt, toolLines, done, turns, content, contentExpanded, .. } => {
+                let prefixPad: usize = 2; // Match other entries' prefix indent.
+                let w = (width as usize).saturating_sub(prefixPad);
+                let innerW = w.saturating_sub(2); // Inside the left+right borders.
+                let indent = " ".repeat(prefixPad);
+                let borderStyle = Style::default().fg(Color::DarkGray);
+                let headerStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                let toolStyle = Style::default().fg(Color::Cyan);
+
+                // Track header line for click-to-view.
+                self.lastSubagentHeaderLine.set(Some(lines.len()));
+
+                // Top border: ╭ explore ─── prompt... ─── view ╮
+                use unicode_width::UnicodeWidthStr as UWS;
+                let label = format!("{agentType} ");
+                let labelW = UWS::width(label.as_str());
+                let viewLabel = "view";
+                let viewW = UWS::width(viewLabel);
+                let viewStyle = Style::default().fg(Color::Yellow);
+                let fixedParts = labelW + 1 + viewW + 1;
+                let promptSpace = innerW.saturating_sub(fixedParts + 2);
+                let promptW = UWS::width(prompt.as_str());
+                let promptText = if promptW > promptSpace {
+                    truncateToWidth(prompt, promptSpace)
+                } else {
+                    prompt.clone()
+                };
+                let promptW = UWS::width(promptText.as_str());
+                let ruleTotal = innerW.saturating_sub(labelW + 1 + promptW + 1 + 1 + viewW);
+                let leftRule = ruleTotal / 2;
+                let rightRule = ruleTotal.saturating_sub(leftRule);
+                lines.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("\u{256D}", borderStyle),
+                    Span::styled(label, headerStyle),
+                    Span::styled("\u{2500}".repeat(leftRule), borderStyle),
+                    Span::styled(format!(" {promptText} "), Style::default().fg(Color::Cyan)),
+                    Span::styled("\u{2500}".repeat(rightRule), borderStyle),
+                    Span::styled(format!(" {viewLabel}"), viewStyle),
+                    Span::styled("\u{256E}", borderStyle),
+                ]));
+                cont.push(false);
+
+                // Helper: build a fixed-width bordered content line.
+                // Uses truncateToWidth to guarantee content fits exactly in innerW columns.
+                let indentStr = indent.clone();
+                let borderedLine = move |content: &str, contentStyle: Style| -> Line<'static> {
+                    // Truncate content to fit, then pad remainder with spaces.
+                    let truncated = truncateToWidth(content, innerW);
+                    let truncW = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+                    let pad = innerW.saturating_sub(truncW);
+                    // Combine content + padding into one string so wrap can't split them.
+                    let body = format!("{truncated}{}", " ".repeat(pad));
+                    Line::from(vec![
+                        Span::raw(indentStr.clone()),
+                        Span::styled("\u{2502}".to_string(), borderStyle),
+                        Span::styled(body, contentStyle),
+                        Span::styled("\u{2502}".to_string(), borderStyle),
+                    ])
+                };
+
+                // Show only the last 3 tool lines.
+                let maxVisible = 3;
+                let skipCount = toolLines.len().saturating_sub(maxVisible);
+                if skipCount > 0 {
+                    lines.push(borderedLine(
+                        &format!(" ... {skipCount} earlier"),
                         Style::default().fg(Color::DarkGray),
-                    )));
+                    ));
                     cont.push(false);
                 }
+                for (name, summary) in toolLines.iter().skip(skipCount) {
+                    let prefix = format!(" {name}: ");
+                    let prefixW = UWS::width(prefix.as_str());
+                    let maxSummaryW = innerW.saturating_sub(prefixW);
+                    let truncSummary = truncateToWidth(summary, maxSummaryW);
+                    let content = format!("{prefix}{truncSummary}");
+                    lines.push(borderedLine(&content, toolStyle));
+                    cont.push(false);
+                }
+
+                // Show placeholder only while still running.
+                if toolLines.is_empty() && !*done {
+                    lines.push(borderedLine(
+                        " waiting\u{2026}",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    cont.push(false);
+                }
+
+                use unicode_width::UnicodeWidthStr;
+
+                // Helper: render a horizontal border line with a centered label.
+                let makeBorderLine = |leftCorner: &str, rightCorner: &str,
+                                      label: &str, labelStyle: Style,
+                                      indent: &str| -> Line<'static> {
+                    let labelW = UnicodeWidthStr::width(label);
+                    let ruleLen = innerW.saturating_sub(labelW);
+                    let lRule = ruleLen / 2;
+                    let rRule = ruleLen.saturating_sub(lRule);
+                    Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(leftCorner.to_string(), borderStyle),
+                        Span::styled("\u{2500}".repeat(lRule), borderStyle),
+                        Span::styled(label.to_string(), labelStyle),
+                        Span::styled("\u{2500}".repeat(rRule), borderStyle),
+                        Span::styled(rightCorner.to_string(), borderStyle),
+                    ])
+                };
+
+                if *done {
+                    let footerLabel = format!(" \u{2713}\u{FE0E} {agentType} ({turns} turns) ");
+
+                    if let Some(contentText) = content {
+                        // Divider: ├─ ✓ explore (N turns) ─┤
+                        lines.push(makeBorderLine("\u{251C}", "\u{2524}",
+                            &footerLabel, Style::default().fg(Color::Green), &indent));
+                        cont.push(false);
+
+                        let toggleEntryIdx = entryIndex;
+
+                        // Render markdown blocks, then wrap each in │ ... │ borders.
+                        // Code blocks get full renderCodeBlock() treatment (copy, scroll, expand).
+                        let contentInnerW = innerW.saturating_sub(2); // 1 space pad each side.
+                        let mdBlocks = crate::markdown::render(contentText, contentInnerW as u16);
+
+                        let mut contentLines: Vec<Line<'static>> = Vec::new();
+                        let mut contentCont: Vec<bool> = Vec::new();
+                        let mut codeOrdinal: usize = 0;
+                        // Track where new CodeBlockRanges start for global offset fixup.
+                        let codeBlockRangeStart = codeBlockRanges.len();
+
+                        for block in mdBlocks {
+                            match block {
+                                crate::markdown::RenderedBlock::Text(textLines) => {
+                                    for textLine in textLines {
+                                        let wrapped = wrapSpannedLine(textLine, contentInnerW);
+                                        for wLine in wrapped {
+                                            // Measure and pad.
+                                            let lineText: String = wLine.spans.iter()
+                                                .map(|s| s.content.as_ref()).collect();
+                                            let lineW = UnicodeWidthStr::width(lineText.as_str());
+                                            let pad = contentInnerW.saturating_sub(lineW);
+                                            let mut spans = vec![
+                                                Span::styled("\u{2502} ", borderStyle),
+                                            ];
+                                            spans.extend(wLine.spans);
+                                            spans.push(Span::styled(
+                                                format!("{} \u{2502}", " ".repeat(pad)),
+                                                borderStyle,
+                                            ));
+                                            contentLines.push(Line::from(spans));
+                                            contentCont.push(false);
+                                        }
+                                    }
+                                }
+                                crate::markdown::RenderedBlock::Code { lang, lines: codeLines, code } => {
+                                    let blockId = (entryIndex, codeOrdinal);
+                                    codeOrdinal += 1;
+                                    let isExpanded = self.codeExpanded.contains(&blockId);
+                                    let totalCodeLines = codeLines.len();
+                                    let cbCollapsible = totalCodeLines > MAX_CODE_BLOCK_LINES;
+
+                                    let (visibleCodeLines, topExtra, bottomLabel): (
+                                        &[Vec<Span<'static>>], Option<String>, Option<&str>,
+                                    ) = if cbCollapsible && !isExpanded {
+                                        let hidden = totalCodeLines - MAX_CODE_BLOCK_LINES;
+                                        (&codeLines[..MAX_CODE_BLOCK_LINES], Some(format!("\u{25BE}{hidden}")), None)
+                                    } else if cbCollapsible {
+                                        (&codeLines, Some("\u{25B4}".to_string()), Some("\u{25B4}"))
+                                    } else {
+                                        (&codeLines, None, None)
+                                    };
+
+                                    let mcw = crate::markdown::highlight::maxContentWidth(&codeLines);
+                                    let scrollX = self.codeScrollX.get(&blockId).copied().unwrap_or(0);
+                                    let showCopied = self.copiedFlash
+                                        .as_ref()
+                                        .is_some_and(|(bid, t)| *bid == blockId && t.elapsed().as_secs() < 2);
+
+                                    let codeBlockWidth = contentInnerW as u16;
+                                    let startLine = contentLines.len();
+                                    let rendered = crate::markdown::renderCodeBlock(
+                                        visibleCodeLines, lang.as_deref(), codeBlockWidth,
+                                        scrollX, mcw, showCopied,
+                                        topExtra.as_deref(), bottomLabel,
+                                    );
+
+                                    // Wrap each code block line in outer │ ... │ borders.
+                                    for codeLine in &rendered {
+                                        let codeText: String = codeLine.spans.iter()
+                                            .map(|s| s.content.as_ref()).collect();
+                                        let codeW = UnicodeWidthStr::width(codeText.as_str());
+                                        let pad = contentInnerW.saturating_sub(codeW);
+                                        let mut spans = vec![
+                                            Span::styled("\u{2502} ", borderStyle),
+                                        ];
+                                        spans.extend(codeLine.spans.clone());
+                                        spans.push(Span::styled(
+                                            format!("{} \u{2502}", " ".repeat(pad)),
+                                            borderStyle,
+                                        ));
+                                        contentLines.push(Line::from(spans));
+                                        contentCont.push(false);
+                                    }
+                                    let endLine = contentLines.len().saturating_sub(1);
+
+                                    let cbInnerW = (codeBlockWidth as usize).saturating_sub(2);
+                                    let copyLabelCol = codeBlockWidth.saturating_sub(
+                                        if showCopied { 6 } else { 4 } + 1
+                                    );
+
+                                    codeBlockRanges.push(CodeBlockRange {
+                                        startLine,
+                                        endLine,
+                                        blockId,
+                                        maxContentWidth: mcw,
+                                        innerWidth: cbInnerW,
+                                        contentLines: codeLines.clone(),
+                                        rawCode: code,
+                                        // +4 for indent(2) + outer "│ "(2).
+                                        copyLabelCol: copyLabelCol + 4,
+                                        collapsible: cbCollapsible,
+                                        totalLines: totalCodeLines,
+                                    });
+                                }
+                            }
+                        }
+
+                        let totalLines = contentLines.len();
+                        let collapsible = totalLines > MAX_CODE_BLOCK_LINES;
+                        let visibleCount = if collapsible && !*contentExpanded {
+                            MAX_CODE_BLOCK_LINES
+                        } else {
+                            totalLines
+                        };
+
+                        // Push visible content lines with outer indent.
+                        let globalBase = lines.len();
+                        for (i, contentLine) in contentLines[..visibleCount].iter().enumerate() {
+                            let mut spans = vec![Span::raw(indent.clone())];
+                            spans.extend(contentLine.spans.clone());
+                            lines.push(Line::from(spans));
+                            cont.push(contentCont.get(i).copied().unwrap_or(false));
+                        }
+
+                        // Fix CodeBlockRange indices: convert local contentLines offsets
+                        // to global lines offsets, prune ranges outside visible area.
+                        let visibleEnd = lines.len();
+                        let mut i = codeBlockRangeStart;
+                        while i < codeBlockRanges.len() {
+                            codeBlockRanges[i].startLine += globalBase;
+                            codeBlockRanges[i].endLine += globalBase;
+                            if codeBlockRanges[i].startLine >= visibleEnd {
+                                codeBlockRanges.remove(i);
+                            } else {
+                                if codeBlockRanges[i].endLine >= visibleEnd {
+                                    codeBlockRanges[i].endLine = visibleEnd.saturating_sub(1);
+                                }
+                                i += 1;
+                            }
+                        }
+
+                        // Bottom border with collapse/expand.
+                        if collapsible && !*contentExpanded {
+                            let hidden = totalLines - MAX_CODE_BLOCK_LINES;
+                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
+                                &format!(" \u{25BE}{hidden} "), Style::default().fg(Color::Gray), &indent));
+                        } else if collapsible {
+                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
+                                " \u{25B4} ", Style::default().fg(Color::Gray), &indent));
+                        } else {
+                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
+                                "", borderStyle, &indent));
+                        }
+                        cont.push(false);
+                        // Set toggle line AFTER the border is pushed.
+                        self.lastSubagentToggleLine.set(Some((lines.len() - 1, toggleEntryIdx)));
+                    } else {
+                        // No content — simple bottom border.
+                        lines.push(makeBorderLine("\u{2570}", "\u{256F}",
+                            &footerLabel, Style::default().fg(Color::Green), &indent));
+                        cont.push(false);
+                    }
+                } else {
+                    let elapsed = self.activeSubagent
+                        .as_ref()
+                        .map(|s| s.startTime.elapsed().as_secs())
+                        .unwrap_or(0);
+                    let blobLines = self.throbber.renderLines();
+                    let throbberChar = blobLines[0].spans.first()
+                        .map(|s| s.content.to_string())
+                        .unwrap_or_else(|| "\u{25cc}".into());
+                    let footerLabel = format!(" {throbberChar} running ({elapsed}s) ");
+                    lines.push(makeBorderLine("\u{2570}", "\u{256F}",
+                        &footerLabel, Style::default().fg(Color::Yellow), &indent));
+                    cont.push(false);
+                }
+            }
+            PanelEntry::ToolResult { name, output } => {
+                let codeBlock = RenderedBlock::Code {
+                    lang: Some(name.clone()),
+                    lines: output.lines()
+                        .map(|l| vec![Span::styled(l.to_string(), Style::default().fg(Color::Green))])
+                        .collect(),
+                    code: output.clone(),
+                };
+                prefixRenderedBlocks(
+                    lines, cont, vec![codeBlock],
+                    "\u{25C7} ", Style::default().fg(Color::DarkGray), width,
+                    entryIndex, &self.codeScrollX, &self.codeExpanded,
+                    codeBlockRanges, &self.copiedFlash,
+                );
+            }
+            PanelEntry::CommandResult(text) => {
+                // NOTE: Subtract prefix width ("ℹ︎ " = 2 cols) so blocks size correctly.
+                let mdBlocks = markdown::render(text, width.saturating_sub(2));
+                prefixRenderedBlocks(
+                    lines, cont, mdBlocks,
+                    "\u{2139}\u{FE0E} ", Style::default().fg(Color::DarkGray), width,
+                    entryIndex, &self.codeScrollX, &self.codeExpanded,
+                    codeBlockRanges, &self.copiedFlash,
+                );
             }
             PanelEntry::Error(msg) => {
                 let style = Style::default().fg(Color::Red);
                 let content = vec![Line::from(Span::styled(msg.clone(), style))];
                 prefixFirstLine(lines, cont, content, "\u{26A0}\u{FE0E} ", style, width);
+            }
+            PanelEntry::SessionNotice(text) => {
+                let pillColor = Color::Rgb(30, 50, 90);
+                let ghostStyle = Style::default().fg(Color::Rgb(100, 100, 120));
+                let symbolStyle = Style::default()
+                    .fg(Color::Rgb(200, 200, 210))
+                    .bg(pillColor);
+                let edgeStyle = Style::default().fg(pillColor);
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("\u{E0B6}", edgeStyle),
+                    Span::styled("\u{2139}\u{FE0E}", symbolStyle),
+                    Span::styled("\u{E0B4}", edgeStyle),
+                    Span::styled(format!(" {text}"), ghostStyle),
+                ]));
+                cont.push(false);
+            }
+            PanelEntry::CompactionMarker { stage } => {
+                let dimStyle = Style::default().fg(Color::DarkGray);
+                // Render as: ─── ⚙︎ S2 compressed ───
+                let label = format!(" \u{2699}\u{FE0E} {stage} compressed ");
+                let dashCount = (width as usize).saturating_sub(label.len()) / 2;
+                let dashes = "\u{2500}".repeat(dashCount.max(3));
+                lines.push(Line::from(Span::styled(
+                    format!("{dashes}{label}{dashes}"),
+                    dimStyle,
+                )));
+                cont.push(false);
             }
             PanelEntry::Cancelled => {
                 lines.push(Line::from(Span::styled(
@@ -847,6 +2107,23 @@ fn countReasoningLines(text: &str, width: u16) -> u16 {
     count
 }
 
+/// Count added/removed lines in a unified diff string.
+fn diffStats(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// Prepend a styled symbol to the first line; indent continuations to match.
 ///
 /// Pre-wraps each content line at `(width - prefixWidth)` so that wrapped
@@ -881,11 +2158,169 @@ fn prefixFirstLine(
     }
 }
 
+/// Prepend a styled symbol to the first line of rendered blocks.
+///
+/// Text blocks are word-wrapped; code blocks are rendered with borders
+/// and pushed without wrapping. Tracks code block metadata for scrolling and copy.
+fn prefixRenderedBlocks(
+    out: &mut Vec<Line<'static>>,
+    cont: &mut Vec<bool>,
+    blocks: Vec<RenderedBlock>,
+    symbol: &str,
+    symbolStyle: Style,
+    width: u16,
+    entryIndex: usize,
+    codeScrollX: &HashMap<(usize, usize), u16>,
+    codeExpanded: &HashSet<(usize, usize)>,
+    codeBlockRanges: &mut Vec<CodeBlockRange>,
+    copiedFlash: &Option<((usize, usize), Instant)>,
+) {
+    let prefixWidth: usize = symbol.chars().map(unicode_display_width).sum();
+    let indent = " ".repeat(prefixWidth);
+    let textWidth = (width as usize).saturating_sub(prefixWidth);
+    let mut isFirst = true;
+    let mut codeOrdinal: usize = 0;
+    let mut isFirstBlock = true;
+
+    for block in blocks {
+        // Insert a blank line between blocks for paragraph spacing.
+        if !isFirstBlock {
+            cont.push(false);
+            let prefix = Span::raw(indent.clone());
+            out.push(Line::from(vec![prefix]));
+        }
+        isFirstBlock = false;
+
+        match block {
+            RenderedBlock::Text(textLines) => {
+                for line in textLines {
+                    let wrapped = wrapSpannedLine(line, textWidth);
+                    for (idx, wLine) in wrapped.into_iter().enumerate() {
+                        cont.push(idx > 0);
+                        let prefix = if isFirst {
+                            Span::styled(symbol.to_string(), symbolStyle)
+                        } else {
+                            Span::raw(indent.clone())
+                        };
+                        isFirst = false;
+                        let mut spans = vec![prefix];
+                        spans.extend(wLine.spans);
+                        out.push(Line::from(spans));
+                    }
+                }
+            }
+            RenderedBlock::Code { lang, lines: codeLines, code } => {
+                let blockId = (entryIndex, codeOrdinal);
+                codeOrdinal += 1;
+                let codeWidth = width.saturating_sub(prefixWidth as u16);
+                let totalLines = codeLines.len();
+                let collapsible = totalLines > MAX_CODE_BLOCK_LINES;
+                let isExpanded = codeExpanded.contains(&blockId);
+
+                // Decide visible lines, top indicator, and bottom label.
+                let (visibleLines, topExtra, bottomLabel): (
+                    &[Vec<Span<'static>>], Option<String>, Option<&str>,
+                ) = if collapsible && !isExpanded {
+                    let hidden = totalLines - MAX_CODE_BLOCK_LINES;
+                    (
+                        &codeLines[..MAX_CODE_BLOCK_LINES],
+                        Some(format!("\u{25BE}{hidden}")),
+                        None,
+                    )
+                } else if collapsible {
+                    (&codeLines, Some("\u{25B4}".to_string()), Some("\u{25B4}"))
+                } else {
+                    (&codeLines, None, None)
+                };
+
+                let mcw = markdown::highlight::maxContentWidth(&codeLines);
+                let innerW = (codeWidth as usize).saturating_sub(2);
+                let scrollX = codeScrollX.get(&blockId).copied().unwrap_or(0);
+                let showCopied = copiedFlash
+                    .as_ref()
+                    .is_some_and(|(bid, t)| *bid == blockId && t.elapsed().as_secs() < 2);
+                let copyLabel = if showCopied { "copied" } else { "copy" };
+                let copyLabelCol = codeWidth.saturating_sub(copyLabel.len() as u16 + 1);
+
+                let startLine = out.len();
+                let rendered = markdown::renderCodeBlock(
+                    visibleLines, lang.as_deref(), codeWidth, scrollX, mcw, showCopied,
+                    topExtra.as_deref(), bottomLabel,
+                );
+                for codeLine in rendered {
+                    cont.push(false);
+                    let prefix = if isFirst {
+                        Span::styled(symbol.to_string(), symbolStyle)
+                    } else {
+                        Span::raw(indent.clone())
+                    };
+                    isFirst = false;
+                    let mut spans = vec![prefix];
+                    spans.extend(codeLine.spans);
+                    out.push(Line::from(spans));
+                }
+                let endLine = out.len().saturating_sub(1);
+
+                codeBlockRanges.push(CodeBlockRange {
+                    startLine,
+                    endLine,
+                    blockId,
+                    maxContentWidth: mcw,
+                    innerWidth: innerW,
+                    contentLines: codeLines,
+                    rawCode: code,
+                    copyLabelCol: copyLabelCol + prefixWidth as u16,
+                    collapsible,
+                    totalLines,
+                });
+            }
+        }
+    }
+}
+
+/// Flatten rendered blocks into lines for bounds calculation.
+fn flattenRenderedBlocks(blocks: Vec<RenderedBlock>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for block in blocks {
+        match block {
+            RenderedBlock::Text(textLines) => lines.extend(textLines),
+            RenderedBlock::Code { lang, lines: codeLines, .. } => {
+                let mcw = markdown::highlight::maxContentWidth(&codeLines);
+                lines.extend(markdown::renderCodeBlock(
+                    &codeLines, lang.as_deref(), width, 0, mcw, false, None, None,
+                ));
+            }
+        }
+    }
+    lines
+}
+
 /// Wrap a multi-span Line into multiple lines fitting within maxWidth display columns.
 ///
 /// Prefers breaking at space boundaries. Falls back to character-level
 /// splitting when a word exceeds the available width.
+/// Truncate a string to fit within `maxWidth` display columns, appending `…` if truncated.
+fn truncateToWidth(s: &str, maxWidth: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Reserve 1 column for the ellipsis.
+        if width + cw > maxWidth.saturating_sub(1) {
+            end = i;
+            if width == 0 { end = s.len(); } // Don't produce empty string.
+            return format!("{}\u{2026}", &s[..end]);
+        }
+        width += cw;
+    }
+    // Didn't need truncation.
+    s.to_string()
+}
+
 fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
     if maxWidth == 0 {
         return vec![line];
     }
@@ -897,7 +2332,11 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
         .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
         .collect();
 
-    let totalWidth: usize = chars.iter().map(|(ch, _)| unicode_display_width(*ch)).sum();
+    // NOTE: Use UnicodeWidthChar (crate) not unicode_display_width (custom) so
+    // measurements match UnicodeWidthStr used by bordered line padding and ratatui.
+    let totalWidth: usize = chars.iter()
+        .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0))
+        .sum();
     if totalWidth <= maxWidth {
         return vec![line];
     }
@@ -912,22 +2351,28 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
             lastSpace = Some(i);
         }
 
-        let charW = unicode_display_width(chars[i].0);
+        let charW = UnicodeWidthChar::width(chars[i].0).unwrap_or(0);
 
         if currentWidth + charW > maxWidth && i > lineStart {
-            let breakAt = if let Some(sp) = lastSpace {
-                if sp > lineStart { sp + 1 } else { i }
+            // Break at the last space: exclude the trailing space from output
+            // and skip it for the continuation, so lines never exceed maxWidth.
+            let (sliceEnd, nextStart) = if let Some(sp) = lastSpace {
+                if sp > lineStart { (sp, sp + 1) } else { (i, i) }
             } else {
-                i
+                (i, i)
             };
 
-            result.push(styledCharsToLine(&chars[lineStart..breakAt]));
-            lineStart = breakAt;
+            result.push(styledCharsToLine(&chars[lineStart..sliceEnd]));
+            lineStart = nextStart;
             // Recount width from the new start through the current character.
-            currentWidth = chars[lineStart..=i]
-                .iter()
-                .map(|(ch, _)| unicode_display_width(*ch))
-                .sum();
+            if lineStart <= i {
+                currentWidth = chars[lineStart..=i]
+                    .iter()
+                    .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0))
+                    .sum();
+            } else {
+                currentWidth = 0;
+            }
             lastSpace = None;
         } else {
             currentWidth += charW;

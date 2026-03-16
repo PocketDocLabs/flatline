@@ -31,10 +31,26 @@ pub enum DomainModule {
 /// Args:
 ///     interface: How the agent is being driven.
 ///     domains: Task-specific skill sets to include.
-pub fn build(interface: InterfaceMode, domains: &[DomainModule]) -> String {
-    let mut parts = Vec::with_capacity(4);
+///     promptThinking: Whether to include prompt-injected thinking instructions.
+pub fn build(
+    interface: InterfaceMode,
+    domains: &[DomainModule],
+    promptThinking: bool,
+) -> String {
+    let mut parts = Vec::with_capacity(5);
 
-    parts.push(basePesona());
+    let mut persona = basePersona();
+    if promptThinking {
+        if let (Some(start), Some(end)) = (
+            persona.find("<thinking>"),
+            persona.find("</thinking>"),
+        ) {
+            let endTag = end + "</thinking>".len();
+            persona.replace_range(start..endTag, &thinkingPromptWithScratchpad());
+        }
+    }
+    parts.push(persona);
+
     parts.push(interfaceModule(interface));
 
     for domain in domains {
@@ -42,13 +58,13 @@ pub fn build(interface: InterfaceMode, domains: &[DomainModule]) -> String {
     }
 
     if let Some(ctx) = projectContext() {
-        parts.push(ctx);
+        parts.push(format!("<project-context>\n{ctx}\n</project-context>"));
     }
 
     parts.join("\n\n")
 }
 
-fn basePesona() -> String {
+fn basePersona() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -90,14 +106,15 @@ fn basePesona() -> String {
 
     format!(
         "\
+<identity>
 You are Flatline, a general-purpose agent.
 
 Working directory: {cwd}
 Platform: {platform}
 Date: {date}
+</identity>
 
-# Communication
-
+<communication>
 Be direct. Lead with the action or answer, not the reasoning. If you can say it
 in one sentence, do.
 
@@ -112,9 +129,9 @@ consequences \u{2014} offer an alternative if one exists, otherwise move on.
 
 For longer tasks, give brief progress updates at natural milestones. A few words,
 not a paragraph.
+</communication>
 
-# Thinking
-
+<thinking>
 Investigate before you conclude. Use your tools to verify rather than relying on
 what you think you know. Do not guess when you can check.
 
@@ -129,9 +146,9 @@ problem to fix.
 Do not give up early. If your first approach fails, try a different angle before
 reporting failure. But do not spin in circles \u{2014} if you have tried two or three
 approaches and are stuck, say what you tried and what blocked you.
+</thinking>
 
-# Acting
-
+<acting>
 Match the scope of your actions to what was asked. Do not add improvements,
 cleanup, or \"while I'm here\" changes that were not requested.
 
@@ -146,16 +163,16 @@ beyond your working directory should be confirmed first. Examples:
 - External: pushing to remotes, creating issues, sending messages
 
 When blocked, do not reach for destructive shortcuts. Fix the root cause.
+</acting>
 
-# Tools
-
+<tools>
 Use the right tool for the job. If a specialized tool exists for an operation,
 prefer it over a shell command.
 
 When multiple tool calls are independent of each other, make them in parallel.
+</tools>
 
-# Style
-
+<style>
 Use plain text and markdown. No emojis \u{2014} use flat unicode symbols when a visual
 marker is needed. Append U+FE0E to anything that might render as a color emoji.
 Symbols: \u{25C9} \u{25CC} \u{25CD} \u{25C6} \u{25C7} \u{25B8} \u{25B9} \u{25CF} \u{25CB} \u{2713}\u{FE0E} \u{2717}\u{FE0E} \u{2298} \u{2299} \u{229B} \u{2690}\u{FE0E} \u{2691}\u{FE0E} \u{26A0}\u{FE0E} \u{21AF}\u{FE0E} \u{2315} \u{238B} \u{238C} \u{23CE} \u{23CF}\u{FE0E} \u{23F5}\u{FE0E} \u{23F8}\u{FE0E} \u{23F9}\u{FE0E} \u{23FB} \u{232B} \u{2326} \u{2692}\u{FE0E} \u{2697}\u{FE0E} \u{2699}\u{FE0E} \u{26A1}\u{FE0E} \u{26BF}\u{FE0E} \u{26CF}\u{FE0E} \u{2302} \u{2630}\u{FE0E} \u{21A9}\u{FE0E} \u{21AA}\u{FE0E} \u{21BB} \u{27F3} \u{21E5} \u{2316} \u{2397} \u{2398} \u{2190} \u{2192} \u{2191} \u{2193} \u{2194} \u{2195} \u{21A3} \u{21A2} \u{21B5} \u{27A4} \u{2610}\u{FE0E} \u{2611}\u{FE0E} \u{2612}\u{FE0E} \u{26C1}\u{FE0E} \u{26C3}\u{FE0E} \u{2B1A} \u{2B21} \u{2B22} \u{23F1}\u{FE0E} \u{23F2}\u{FE0E} \u{29D7} \u{29D6} \u{25F4} \u{25F5} \u{25F6} \u{25F7} \u{2328}\u{FE0E} \u{2399} \u{2709}\u{FE0E} \u{26D3}\u{FE0E} \u{2301} \u{00B7} \u{00BB} \u{2022} \u{2023} \u{203A} \u{2026} \u{22EE} \u{22EF} \u{2605}\u{FE0E} \u{2606}\u{FE0E} \u{2726} \u{2727} \u{2756} \u{00B0} \u{00A4} $ \u{2116} \u{2139}\u{FE0E}
@@ -164,24 +181,24 @@ Use consistent formatting within a response. If you start with bullets, stay wit
 bullets. If you start with prose, stay with prose. Do not alternate.
 
 When referencing files, use the path. When referencing a specific location, use
-`path:line`. Keep references inline \u{2014} do not build tables of files unless asked."
+`path:line`. Keep references inline \u{2014} do not build tables of files unless asked.
+</style>"
     )
 }
 
 fn interfaceModule(mode: InterfaceMode) -> String {
     match mode {
         InterfaceMode::SharedTerminal => "\
-# Terminal Context
-
+<interface context=\"shared-terminal\">
 You are running in a shared terminal session. The user sees the same terminal
 you do \u{2014} your commands execute in their terminal as they happen. \
 For longer tasks it's statistically more likely that the user may jump in at some point. \
-If you notice input or state changes you did not cause, pause and investigate the shell history before continuing."
+If you notice input or state changes you did not cause, pause and investigate the shell history before continuing.
+</interface>"
             .into(),
 
         InterfaceMode::Headless => "\
-# Execution Context
-
+<interface context=\"headless\">
 You are running headless. There may not be a user actively watching. Another
 agent or scheduler may check on your progress.
 
@@ -190,12 +207,12 @@ that requires input and none is available, document the decision you made and
 why, then continue.
 
 On completion or failure, leave a clear summary of what was done, what succeeded,
-and what remains."
+and what remains.
+</interface>"
             .into(),
 
         InterfaceMode::MultiAgent => "\
-# Team Context
-
+<interface context=\"multi-agent\">
 You are one agent in a team. Other agents may be working on related tasks.
 
 Stay in your lane \u{2014} do not modify files or state outside your assigned scope
@@ -203,7 +220,8 @@ unless coordinating through the designated channel.
 
 When your work produces information another agent needs, surface it clearly.
 When you need something from another agent, request it explicitly rather than
-working around the gap."
+working around the gap.
+</interface>"
             .into(),
     }
 }
@@ -211,8 +229,7 @@ working around the gap."
 fn domainModule(module: &DomainModule) -> String {
     match module {
         DomainModule::Swe => "\
-# Software Engineering
-
+<domain name=\"swe\">
 When working in an existing codebase, understand it before changing it. Read the
 code, check the conventions, identify the patterns already in use. Mimic what is
 there rather than imposing your preferences.
@@ -233,10 +250,110 @@ not standing permissions.
 
 After making changes, verify them if the project provides a way to do so (tests,
 linter, type checker, build). Do not assume the verification command \u{2014} look for
-it in the project."
+it in the project.
+</domain>"
             .into(),
     }
 }
+
+/// MCP server info for the system prompt.
+pub struct McpServerInfo {
+    pub name: String,
+    pub toolCount: usize,
+    pub status: String,
+}
+
+/// Build the MCP section of the system prompt.
+///
+/// Args:
+///     servers: Connected server info.
+///     searchMode: Whether tool search is active (defs deferred).
+pub fn mcpSection(servers: &[McpServerInfo], searchMode: bool) -> String {
+    if servers.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from("<mcp-servers>\n");
+    section.push_str("The following MCP servers are connected:\n\n");
+
+    for server in servers {
+        section.push_str(&format!(
+            "\u{25B8} {} \u{2014} {} tools ({})\n",
+            server.name, server.toolCount, server.status
+        ));
+    }
+
+    if searchMode {
+        section.push_str(
+            "\nMCP tool definitions are deferred to save context. Use `mcpToolSearch` \
+             to discover available MCP tools before calling them.\n"
+        );
+    }
+
+    section.push_str("</mcp-servers>");
+    section
+}
+
+/// Thinking section for the system prompt when `promptThinking` is enabled.
+/// Preserves the behavioral guidelines and adds scratchpad format instructions.
+fn thinkingPromptWithScratchpad() -> String {
+    "\
+<thinking>
+Investigate before you conclude. Use your tools to verify rather than relying on
+what you think you know. Do not guess when you can check.
+
+Prioritize accuracy over agreement. If something is wrong, say so with evidence.
+Respectful correction beats false agreement. If you have evidence for your
+position, hold it.
+
+When something unexpected happens \u{2014} unfamiliar files, errors you did not cause,
+state you did not create \u{2014} investigate before acting. Do not assume it is a
+problem to fix.
+
+Do not give up early. If your first approach fails, try a different angle before
+reporting failure. But do not spin in circles \u{2014} if you have tried two or three
+approaches and are stuck, say what you tried and what blocked you.
+
+You think through problems in a private scratchpad before responding. The user
+never sees your scratchpad \u{2014} only your final response. Your visible reply must
+read as a natural, direct answer as though the scratchpad does not exist.
+
+FORMAT \u{2014} follow this structure exactly:
+<scratchpad>
+[Your private reasoning goes here.]
+</scratchpad>
+[Your visible response to the user goes here.]
+
+The <scratchpad> and </scratchpad> tags are structural delimiters, not markdown.
+Everything between them is your private workspace. Everything after </scratchpad>
+is what the user sees.
+
+ALL problem-solving happens in the scratchpad. Every derivation, calculation,
+chain of reasoning, and verification \u{2014} all of it. The visible response is the
+distilled PRODUCT of this work, not a second workspace. If you find yourself
+doing analysis or extended reasoning in the visible response, that work belongs
+in the scratchpad.
+
+Every response you generate MUST open with <scratchpad> \u{2014} no exceptions. This
+includes your first reply, replies after tool results, continuation turns in a
+multi-step chain, and the final response after all tools have run. Every single
+time you produce output, you open with the scratchpad first.
+
+In the scratchpad: orient on what must be found and what constraints apply.
+Ground in concrete specifics before generalizing. Execute \u{2014} every line of
+reasoning must produce a new result; derive, don't narrate. Verify against
+every original constraint before writing your answer.
+
+Never reference the thinking process in your visible response. Never write
+\"After analyzing...\" or any trace of hidden work. The user experiences your
+response as your first and only words. Be substantive and confident \u{2014} the
+scratchpad earned you that right.
+</thinking>"
+        .into()
+}
+
+/// Short rider prefixed to the user message content as a per-turn reminder.
+pub const THINKING_RIDER: &str = "<CRITICAL_INSTRUCTION>Open with <scratchpad>, reason fully, close with </scratchpad>, then respond.</CRITICAL_INSTRUCTION>\n\n";
 
 /// Search for AGENTS.md in the working directory and ancestors.
 fn projectContext() -> Option<String> {
@@ -267,35 +384,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buildIncludesBasePesona() {
-        let prompt = build(InterfaceMode::Headless, &[]);
+    fn buildIncludesBasePersona() {
+        let prompt = build(InterfaceMode::Headless, &[], false);
         assert!(prompt.contains("You are Flatline"));
+        assert!(prompt.contains("<identity>"));
         assert!(prompt.contains("Working directory:"));
     }
 
     #[test]
     fn buildIncludesInterfaceModule() {
-        let shared = build(InterfaceMode::SharedTerminal, &[]);
-        assert!(shared.contains("Terminal Context"));
-        assert!(!shared.contains("Execution Context"));
+        let shared = build(InterfaceMode::SharedTerminal, &[], false);
+        assert!(shared.contains("shared-terminal"));
+        assert!(!shared.contains("headless"));
 
-        let headless = build(InterfaceMode::Headless, &[]);
-        assert!(headless.contains("Execution Context"));
-        assert!(!headless.contains("Terminal Context"));
+        let headless = build(InterfaceMode::Headless, &[], false);
+        assert!(headless.contains("headless"));
+        assert!(!headless.contains("shared-terminal"));
 
-        let multi = build(InterfaceMode::MultiAgent, &[]);
-        assert!(multi.contains("Team Context"));
+        let multi = build(InterfaceMode::MultiAgent, &[], false);
+        assert!(multi.contains("multi-agent"));
     }
 
     #[test]
     fn buildIncludesDomainModules() {
-        let prompt = build(InterfaceMode::Headless, &[DomainModule::Swe]);
-        assert!(prompt.contains("Software Engineering"));
+        let prompt = build(InterfaceMode::Headless, &[DomainModule::Swe], false);
+        assert!(prompt.contains("<domain name=\"swe\">"));
     }
 
     #[test]
     fn buildWithNoDomains() {
-        let prompt = build(InterfaceMode::Headless, &[]);
-        assert!(!prompt.contains("Software Engineering"));
+        let prompt = build(InterfaceMode::Headless, &[], false);
+        assert!(!prompt.contains("<domain"));
+    }
+
+    #[test]
+    fn xmlTagsAreBalanced() {
+        let prompt = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], false);
+        for tag in ["identity", "communication", "thinking", "acting", "tools", "style", "interface", "domain"] {
+            let opens = prompt.matches(&format!("<{tag}")).count();
+            let closes = prompt.matches(&format!("</{tag}>")).count();
+            assert_eq!(opens, closes, "unbalanced <{tag}> tags");
+        }
     }
 }
