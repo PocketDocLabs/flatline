@@ -49,7 +49,7 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds. Default 120. The command is interrupted if it exceeds this."
+                            "description": "Timeout in seconds. Default 30. The command is interrupted if it exceeds this."
                         }
                     },
                     "required": ["command"]

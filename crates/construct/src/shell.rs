@@ -30,7 +30,7 @@ const MAX_HISTORY: usize = 50;
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
 
 /// Default shell command timeout (seconds). Commands are interrupted after this.
-pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Grace period between each escalation phase (Ctrl+C → Ctrl+\ → force-extract).
 const SHELL_ESCALATION_SECS: u64 = 3;
