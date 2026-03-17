@@ -358,8 +358,13 @@ impl StatefulWidget for Terminal {
                 let cell = &line[Column(col as usize)];
                 let ch = cell.c;
 
-                // Skip wide char spacers.
+                // Mark wide char spacer cells as continuations so ratatui
+                // knows to skip them during buffer diff rendering.
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    if let Some(bufCell) = buf.cell_mut((area.x + col, area.y + row)) {
+                        bufCell.reset();
+                        bufCell.set_symbol("");
+                    }
                     continue;
                 }
 
