@@ -17,6 +17,7 @@ mod command;
 mod fork_picker;
 mod history;
 mod markdown;
+mod lsp_panel;
 mod mcp_panel;
 mod rewind_picker;
 mod selection;

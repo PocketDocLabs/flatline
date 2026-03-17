@@ -78,6 +78,11 @@ pub const COMMANDS: &[CommandDef] = &[
         aliases: &[],
         description: "Show MCP server status and tool counts",
     },
+    CommandDef {
+        name: "lsp",
+        aliases: &[],
+        description: "Show LSP server status and install hints",
+    },
 ];
 
 /// Return commands whose name or aliases start with the given prefix.
@@ -111,6 +116,8 @@ pub enum CommandAction {
     Clear,
     /// Show MCP server status.
     Mcp,
+    /// Show LSP server status.
+    Lsp,
 }
 
 /// How command output should be rendered.
@@ -177,6 +184,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         }
         "clear" => CommandOutput::Action(CommandAction::Clear),
         "mcp" => CommandOutput::Action(CommandAction::Mcp),
+        "lsp" => CommandOutput::Action(CommandAction::Lsp),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }
 }

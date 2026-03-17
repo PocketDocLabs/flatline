@@ -20,6 +20,7 @@ pub mod compaction;
 pub mod compaction_trigger;
 pub mod config;
 pub mod context;
+pub mod lsp;
 pub mod mcp;
 pub mod message;
 pub mod permissions;

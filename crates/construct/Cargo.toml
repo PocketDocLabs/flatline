@@ -24,3 +24,9 @@ similar.workspace = true
 rmcp.workspace = true
 sha1_smol.workspace = true
 tokio-util.workspace = true
+async-lsp.workspace = true
+dashmap.workspace = true
+tower-service.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

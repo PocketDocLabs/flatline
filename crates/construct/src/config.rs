@@ -42,6 +42,10 @@ pub struct Config {
     /// MCP server configurations. Keys are server names.
     #[serde(default)]
     pub mcp: HashMap<String, ServerConfig>,
+
+    /// LSP server configuration overrides. Keys are server IDs.
+    #[serde(default)]
+    pub lsp: crate::lsp::LspConfig,
 }
 
 /// Web tool settings (Exa API).
@@ -192,6 +196,7 @@ pub fn load() -> Result<Config> {
             compactRatio: defaults::compactRatio(),
             web: WebConfig::default(),
             mcp: HashMap::new(),
+            lsp: HashMap::new(),
         };
 
         // Write default config so the user can edit it.

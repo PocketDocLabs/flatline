@@ -686,6 +686,31 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 }),
             },
         },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "diagnostics".into(),
+                description: "Get LSP diagnostics (errors/warnings) for a file or directory. \
+                    Use after making changes to verify correctness, or to check project \
+                    health before declaring work complete. Requires a language server to be \
+                    available for the file type.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path to check for diagnostics."
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["error", "warning"],
+                            "description": "Minimum severity to report. Default: 'error'."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
     ]
 }
 
@@ -745,6 +770,7 @@ pub enum ToolAction {
     HistoryFetch { blockId: String },
     HistorySearch { query: String },
     Task { prompt: String, agent: Option<String> },
+    Diagnostics { path: String, severity: String },
     Mcp { qualifiedName: String, args: String },
     Unknown { name: String, args: String },
 }
@@ -882,6 +908,7 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::WebSimilar { url, .. } => format!("Find similar: {url}"),
         ToolAction::HistoryFetch { blockId } => format!("Fetch block: {blockId}"),
         ToolAction::HistorySearch { query } => format!("Search history: {query}"),
+        ToolAction::Diagnostics { path, .. } => format!("Check diagnostics: {path}"),
         ToolAction::Task { prompt, agent } => {
             let agentName = agent.as_deref().unwrap_or("general");
             let preview = if prompt.len() > 60 {
@@ -926,7 +953,10 @@ pub fn diffPreview(action: &ToolAction) -> Option<String> {
             let old = std::fs::read_to_string(path).unwrap_or_default();
             if old.is_empty() {
                 // New file — show all lines as additions.
-                let header = format!("--- /dev/null\n+++ b/{path}");
+                let lineCount = content.lines().count();
+                let header = format!(
+                    "--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lineCount} @@"
+                );
                 let additions: String = content
                     .lines()
                     .map(|l| format!("+{l}\n"))
@@ -979,12 +1009,53 @@ pub fn diffPreview(action: &ToolAction) -> Option<String> {
     }
 }
 
+/// Compute the proposed file content after a file mutation, without writing.
+///
+/// Returns (path, proposed_content) for editFile/writeFile/multiEdit,
+/// or None for all other actions. Used to send early LSP didChange
+/// while the user is reviewing the approval prompt.
+pub fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
+    match action {
+        ToolAction::WriteFile { path, content } => {
+            Some((path.clone(), content.clone()))
+        }
+        ToolAction::EditFile { path, oldString, newString, replaceAll } => {
+            let original = std::fs::read_to_string(path).ok()?;
+            let result = if *replaceAll {
+                original.replace(oldString, newString)
+            } else {
+                original.replacen(oldString, newString, 1)
+            };
+            Some((path.clone(), result))
+        }
+        ToolAction::MultiEdit { path, edits } => {
+            let mut content = std::fs::read_to_string(path).ok()?;
+            for edit in edits {
+                if edit.oldString.is_empty() || edit.oldString == edit.newString {
+                    continue;
+                }
+                if edit.replaceAll {
+                    content = content.replace(&edit.oldString, &edit.newString);
+                } else {
+                    content = content.replacen(&edit.oldString, &edit.newString, 1);
+                }
+            }
+            Some((path.clone(), content))
+        }
+        _ => None,
+    }
+}
+
 /// Check if a tool action requires transcript access (handled by session, not here).
 pub fn needsTranscript(action: &ToolAction) -> bool {
     matches!(action, ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. })
 }
 
 /// Check if a tool action is an MCP tool (handled by session, not here).
+pub fn needsLsp(action: &ToolAction) -> bool {
+    matches!(action, ToolAction::Diagnostics { .. })
+}
+
 pub fn needsMcp(action: &ToolAction) -> bool {
     matches!(action, ToolAction::Mcp { .. })
 }
@@ -1053,6 +1124,10 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> String {
         // History tools are handled by session.rs (need transcript access).
         ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. } => {
             "Error: history tools must be executed through the session.".into()
+        }
+        // LSP diagnostics are handled by session.rs (need LspManager).
+        ToolAction::Diagnostics { .. } => {
+            "Error: diagnostics tool must be executed through the session.".into()
         }
         // MCP tools are handled by session.rs (need McpManager).
         ToolAction::Mcp { .. } => {
@@ -2741,6 +2816,10 @@ pub fn parse(name: &str, argsJson: &str) -> ToolAction {
         "task" => ToolAction::Task {
             prompt: args["prompt"].as_str().unwrap_or("").into(),
             agent: args["agent"].as_str().map(String::from),
+        },
+        "diagnostics" => ToolAction::Diagnostics {
+            path: args["path"].as_str().unwrap_or("").into(),
+            severity: args["severity"].as_str().unwrap_or("error").into(),
         },
         _ if crate::mcp::schema::isMcpTool(name) => ToolAction::Mcp {
             qualifiedName: name.into(),

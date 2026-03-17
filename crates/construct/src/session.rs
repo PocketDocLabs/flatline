@@ -36,6 +36,7 @@ use crate::shell::Shell;
 use crate::tool;
 use crate::topic::TopicTracker;
 use crate::transcript::{self, Transcript, SessionMeta};
+use crate::lsp;
 use crate::mcp;
 use crate::web;
 
@@ -123,6 +124,14 @@ pub enum SessionEvent {
         configPath: String,
     },
 
+    /// An LSP server is not installed but could enhance the experience.
+    LspHint { serverId: String, installHint: String },
+
+    /// LSP server status for the /lsp panel.
+    LspStatus {
+        servers: Vec<crate::lsp::FullServerStatus>,
+    },
+
     /// The current topic label changed (for title bar updates).
     TopicChanged { label: String },
 
@@ -201,6 +210,8 @@ pub enum CommandAction {
     Clear,
     /// Show MCP server status.
     Mcp,
+    /// Show LSP server status.
+    Lsp,
 }
 
 /// Agent session — owns the conversation and drives the turn loop.
@@ -221,6 +232,8 @@ pub struct Session {
     exaClient: Option<web::ExaClient>,
     urlCache: web::UrlCache,
     mcpManager: Option<mcp::McpManager>,
+    lspManager: lsp::LspManager,
+    lspWarmedUp: bool,
     /// One-shot system message injected on the first API call after resume, then cleared.
     resumeNotice: Option<String>,
     /// Stored for rebuild on rewind/fork switch.
@@ -276,6 +289,10 @@ impl Session {
         tracing::info!(sessionId = %sessionId, "session created");
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
+        let projectLsp = lsp::config::loadProjectLsp(
+            &std::env::current_dir().unwrap_or_default(),
+        ).unwrap_or_default();
+        let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
         Ok(Self {
             client,
@@ -294,6 +311,8 @@ impl Session {
             exaClient,
             urlCache: web::UrlCache::new(),
             mcpManager: None,
+            lspManager,
+            lspWarmedUp: false,
             resumeNotice: None,
             systemPrompt,
             headTurnId: None,
@@ -455,6 +474,10 @@ impl Session {
         );
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
+        let projectLsp = lsp::config::loadProjectLsp(
+            &std::env::current_dir().unwrap_or_default(),
+        ).unwrap_or_default();
+        let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
         Ok(Self {
             client,
@@ -473,6 +496,8 @@ impl Session {
             exaClient,
             urlCache: web::UrlCache::new(),
             mcpManager: None,
+            lspManager,
+            lspWarmedUp: false,
             resumeNotice,
             systemPrompt,
             headTurnId,
@@ -639,6 +664,13 @@ impl Session {
         Box::pin(async move {
         tracing::info!(len = userMessage.len(), "user message received");
 
+        // Warm up LSP servers on first send (scans project, starts matching servers).
+        if !self.lspWarmedUp {
+            self.lspWarmedUp = true;
+            let projectDir = std::env::current_dir().unwrap_or_default();
+            self.lspManager.warmUp(&projectDir).await;
+        }
+
         // Inject ephemeral resume notice before the user message so the model
         // sees it in context. Stripped at end of send(); re-injected next call
         // until cleared by a shell command.
@@ -794,6 +826,18 @@ impl Session {
                         let action =
                             tool::parse(&call.function.name, &call.function.arguments);
                         let summary = tool::summarize(&action);
+
+                        // Pre-emptive LSP notification: send didChange with proposed
+                        // content so RA starts analyzing while the user reviews.
+                        // Stores (path, original_content) for revert on denial.
+                        let lspPreemptive: Option<(String, String)> = if let Some((path, proposed)) = tool::proposedContent(&action) {
+                            let original = std::fs::read_to_string(&path).ok();
+                            self.lspManager.touchFile(&path, &proposed).await;
+                            original.map(|orig| (path, orig))
+                        } else {
+                            None
+                        };
+
                         let verdict = self.permissions.check(&action);
 
                         tracing::debug!(
@@ -882,6 +926,13 @@ impl Session {
                             }
                         };
 
+                        // Revert pre-emptive LSP notification if denied/aborted.
+                        if !approved {
+                            if let Some((ref path, ref original)) = lspPreemptive {
+                                self.lspManager.touchFile(path, original).await;
+                            }
+                        }
+
                         if aborted {
                             self.pushToolResult(&call.id, "Turn aborted: tool call not permitted.".into());
                             for remaining in &calls[callIdx + 1..] {
@@ -897,6 +948,10 @@ impl Session {
                                     tool = %call.function.name,
                                     "rejected: file not read first"
                                 );
+                                // Revert pre-emptive LSP notification.
+                                if let Some((ref path, ref original)) = lspPreemptive {
+                                    self.lspManager.touchFile(path, original).await;
+                                }
                                 let _ = eventTx.send(SessionEvent::ToolResult {
                                     name: call.function.name.clone(),
                                     output: rejection.clone(),
@@ -930,32 +985,13 @@ impl Session {
                                 .await;
 
                             if tool::needsMcp(&action) {
-                                let result = self.executeMcpTool(&action).await;
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolResult {
-                                        name: call.function.name.clone(),
-                                        output: result.clone(),
-                                    })
-                                    .await;
-                                result
+                                self.executeMcpTool(&action).await
                             } else if tool::needsTranscript(&action) {
-                                let result = self.executeTranscriptTool(&action);
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolResult {
-                                        name: call.function.name.clone(),
-                                        output: result.clone(),
-                                    })
-                                    .await;
-                                result
+                                self.executeTranscriptTool(&action)
                             } else if tool::needsWeb(&action) {
-                                let result = self.executeWebTool(&action).await;
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolResult {
-                                        name: call.function.name.clone(),
-                                        output: result.clone(),
-                                    })
-                                    .await;
-                                result
+                                self.executeWebTool(&action).await
+                            } else if tool::needsLsp(&action) {
+                                self.executeLspTool(&action).await
                             }
                             // Race tool execution against cancellation for shell commands.
                             else if matches!(action, tool::ToolAction::Shell { .. }) {
@@ -970,12 +1006,6 @@ impl Session {
                                             outputLen = result.len(),
                                             "tool execution complete"
                                         );
-                                        let _ = eventTx
-                                            .send(SessionEvent::ToolResult {
-                                                name: call.function.name.clone(),
-                                                output: result.clone(),
-                                            })
-                                            .await;
                                         break result;
                                     }
                                     _ = cancelRx.changed() => {
@@ -1002,12 +1032,6 @@ impl Session {
                                     outputLen = result.len(),
                                     "tool execution complete"
                                 );
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolResult {
-                                        name: call.function.name.clone(),
-                                        output: result.clone(),
-                                    })
-                                    .await;
                                 result
                             }
                             } // Close the else block for non-task tools.
@@ -1029,7 +1053,16 @@ impl Session {
                                     let norm = normalizePath(path);
                                     if let Ok(bytes) = std::fs::read(&norm) {
                                         let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                        self.filesRead.insert(norm, digest);
+                                        self.filesRead.insert(norm.clone(), digest);
+                                    }
+                                    // Sync file with LSP server (lazy spawn if needed).
+                                    if let Ok(content) = std::fs::read_to_string(&norm) {
+                                        if let Some(hint) = self.lspManager.touchFile(&norm, &content).await {
+                                            let _ = eventTx.send(SessionEvent::LspHint {
+                                                serverId: hint.serverId,
+                                                installHint: hint.installHint,
+                                            }).await;
+                                        }
                                     }
                                 }
                             }
@@ -1049,6 +1082,42 @@ impl Session {
                                 }
                             }
                         }
+
+                        // Collect LSP diagnostics after file mutations.
+                        let mut output = output;
+                        if matches!(call.function.name.as_str(), "editFile" | "writeFile" | "multiEdit") {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                &call.function.arguments,
+                            ) {
+                                if let Some(path) = args["path"].as_str() {
+                                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                                    let (diags, hint) = self.lspManager.getDiagnostics(
+                                        path,
+                                        &content,
+                                        std::time::Duration::from_secs(10),
+                                    ).await;
+                                    if !diags.is_empty() {
+                                        output.push_str("\n\nLSP errors detected:\n");
+                                        output.push_str(&diags);
+                                    }
+                                    if let Some(hint) = hint {
+                                        let _ = eventTx.send(SessionEvent::LspHint {
+                                            serverId: hint.serverId,
+                                            installHint: hint.installHint,
+                                        }).await;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Emit ToolResult AFTER diagnostics injection so the TUI
+                        // shows the same content the model sees.
+                        let _ = eventTx
+                            .send(SessionEvent::ToolResult {
+                                name: call.function.name.clone(),
+                                output: output.clone(),
+                            })
+                            .await;
 
                         self.pushToolResult(&call.id, output);
                     }
@@ -2037,6 +2106,21 @@ impl Session {
         }
     }
 
+    /// Execute an LSP diagnostics tool call.
+    async fn executeLspTool(&mut self, action: &tool::ToolAction) -> String {
+        let tool::ToolAction::Diagnostics { path, severity } = action else {
+            return "Not an LSP tool.".into();
+        };
+
+        let minSeverity = match severity.as_str() {
+            "warning" => async_lsp::lsp_types::DiagnosticSeverity::WARNING,
+            _ => async_lsp::lsp_types::DiagnosticSeverity::ERROR,
+        };
+
+        self.lspManager.getDiagnosticsForTool(path, minSeverity, std::time::Duration::from_secs(15))
+            .await
+    }
+
     /// Gather structured MCP status data for the TUI panel.
     pub async fn mcpStatusData(
         &self,
@@ -2109,6 +2193,16 @@ impl Session {
         if let Some(ref mut mgr) = self.mcpManager {
             mgr.shutdown().await;
         }
+    }
+
+    /// Gracefully shut down all LSP server connections.
+    pub async fn shutdownLsp(&mut self) {
+        self.lspManager.shutdown().await;
+    }
+
+    /// Get LSP server status data for the /lsp panel.
+    pub fn lspStatusData(&self) -> Vec<lsp::FullServerStatus> {
+        self.lspManager.allServerStatuses()
     }
 
     /// Push a tool result to history and record to transcript.
@@ -2245,6 +2339,7 @@ impl Session {
             CommandAction::Clear => "Session cleared.".to_string(),
             // Handled specially by the session task — shouldn't reach here.
             CommandAction::Mcp => "Use the /mcp command in the TUI.".to_string(),
+            CommandAction::Lsp => "Use the /lsp command in the TUI.".to_string(),
             // Dispatched as special cases — need eventTx, so not handled here.
             CommandAction::Rewind { .. }
             | CommandAction::ForkAndRewind { .. }

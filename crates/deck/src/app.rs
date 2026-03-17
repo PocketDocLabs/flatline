@@ -32,6 +32,7 @@ use construct::session::{CommandAction, Session, SessionEvent};
 use construct::shell::{ShellIo, spawnShell};
 
 use crate::agent_panel::AgentPanel;
+use crate::lsp_panel::{LspPanel, PanelAction as LspPanelAction};
 use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
 use crate::fork_picker::{ForkPicker, ForkAction};
 use crate::rewind_picker::{RewindPicker, RewindAction};
@@ -230,6 +231,7 @@ pub async fn run() -> Result<()> {
                                     if !config.mcp.is_empty() {
                                         session.initMcp(config.mcp.clone()).await;
                                     }
+
                                     // Load display branch — includes the full un-branched chain
                                     // past the rewind point until the user sends a new message.
                                     let turns = session.loadDisplayTurns().unwrap_or_default();
@@ -291,6 +293,7 @@ pub async fn run() -> Result<()> {
                                     if !config.mcp.is_empty() {
                                         session.initMcp(config.mcp.clone()).await;
                                     }
+
                                     let _ = eventTx.send(SessionEvent::Cleared).await;
                                 }
                                 Err(e) => {
@@ -302,6 +305,12 @@ pub async fn run() -> Result<()> {
                                     return;
                                 }
                             }
+                        }
+                        Some(CommandAction::Lsp) => {
+                            let servers = session.lspStatusData();
+                            let _ = eventTx
+                                .send(SessionEvent::LspStatus { servers })
+                                .await;
                         }
                         Some(CommandAction::Mcp) => {
                             let (servers, totalTools, searchMode, configPath) =
@@ -412,6 +421,7 @@ async fn runLoop(
     let mut forkPicker: Option<ForkPicker> = None;
     let mut pendingRewindMessage: Option<String> = None;
     let mut mcpPanel: Option<McpPanel> = None;
+    let mut lspPanel: Option<LspPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
     let mut subagentPermitTx: Option<mpsc::Sender<construct::permissions::PermitResponse>> = None;
     let projectDir = std::env::current_dir()
@@ -622,6 +632,11 @@ async fn runLoop(
                 panel.render(area, frame.buffer_mut());
             }
 
+            // LSP panel overlay.
+            if let Some(ref mut panel) = lspPanel {
+                panel.render(area, frame.buffer_mut());
+            }
+
             // Subagent panel overlay.
             if let Some(ref mut panel) = subagentPanel {
                 panel.render(area, frame.buffer_mut());
@@ -672,6 +687,13 @@ async fn runLoop(
                 }
                 SessionEvent::TopicChanged { label } => {
                     setTerminalTitle(Some(&label));
+                }
+                SessionEvent::LspHint { serverId, installHint } => {
+                    let msg = format!(
+                        "\u{2699}\u{FE0E} {} not found \u{2014} `{}`",
+                        serverId, installHint,
+                    );
+                    agentPanel.pushCommandResult(&msg);
                 }
                 SessionEvent::TokenUpdate {
                     contextTokens,
@@ -726,6 +748,9 @@ async fn runLoop(
                 }
                 SessionEvent::McpStatus { servers, totalTools, searchMode, configPath } => {
                     mcpPanel = Some(McpPanel::new(servers, totalTools, searchMode, configPath));
+                }
+                SessionEvent::LspStatus { servers } => {
+                    lspPanel = Some(LspPanel::new(servers));
                 }
                 SessionEvent::RewindPickerData { turns } => {
                     rewindPicker = Some(RewindPicker::new(&turns));
@@ -832,6 +857,7 @@ async fn runLoop(
             &mut forkPicker,
             &mut pendingRewindMessage,
             &mut mcpPanel,
+            &mut lspPanel,
             &mut subagentPanel,
             &mut subagentPermitTx,
             &projectDir,
@@ -869,6 +895,7 @@ async fn handleInput(
     forkPicker: &mut Option<ForkPicker>,
     pendingRewindMessage: &mut Option<String>,
     mcpPanel: &mut Option<McpPanel>,
+    lspPanel: &mut Option<LspPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
@@ -932,7 +959,7 @@ async fn handleInput(
 
                 if key.code == KeyCode::Tab {
                     // Don't switch focus when an overlay is active or completion menu is open.
-                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() {
+                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() {
                         // Let the overlay handle Tab (falls through to overlay dispatch below).
                     } else if !(*focus == Focus::Agent && agentPanel.completionActive()) {
                         *focus = match focus {
@@ -1086,6 +1113,26 @@ async fn handleInput(
                     break;
                 }
 
+                // LSP panel intercepts all keys when active.
+                if let Some(panel) = lspPanel {
+                    match panel.handleKey(key) {
+                        LspPanelAction::Close => {
+                            *lspPanel = None;
+                        }
+                        LspPanelAction::Install { serverId, command } => {
+                            *lspPanel = None;
+                            // Run install in the shared terminal.
+                            agentPanel.pushCommandResult(&format!(
+                                "\u{2699}\u{FE0E} Installing {serverId}: {command}",
+                            ));
+                            let cmdBytes = format!("{command}\n").into_bytes();
+                            let _ = shellIo.inputTx.try_send(cmdBytes);
+                        }
+                        LspPanelAction::None => {}
+                    }
+                    break;
+                }
+
                 match focus {
                     Focus::Terminal => {
                         if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -1235,7 +1282,7 @@ async fn handleInput(
                     break;
                 }
                 // Other overlay panels consume all mouse events to prevent click-through.
-                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() {
+                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() {
                     break;
                 }
                 if handleMouse(mouse, focus, agentPanel, termState, selState, shellIo, scrollLock, subagentPanel) {
@@ -1850,5 +1897,6 @@ fn convertAction(action: crate::command::CommandAction) -> CommandAction {
         }
         crate::command::CommandAction::Clear => CommandAction::Clear,
         crate::command::CommandAction::Mcp => CommandAction::Mcp,
+        crate::command::CommandAction::Lsp => CommandAction::Lsp,
     }
 }

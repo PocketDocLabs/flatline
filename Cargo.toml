@@ -73,4 +73,9 @@ rmcp = { version = "1", default-features = false, features = [
     "elicitation",
 ] }
 sha1_smol = "1"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
+tower-service = "0.3"
+
+# LSP
+async-lsp = { version = "0.2", features = ["tokio"] }
+dashmap = "6"

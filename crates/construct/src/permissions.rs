@@ -233,7 +233,7 @@ impl Permissions {
             "readFile", "glob", "grep", "listDir", "structSearch", "diff",
             "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
             "shellHistory", "readOutput", "searchOutput", "readTerminal",
-            "webSearch", "webFetch", "webSimilar",
+            "webSearch", "webFetch", "webSimilar", "diagnostics",
         ];
         Self {
             defaultMode: PermitMode::Ask,
@@ -302,6 +302,7 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::HistoryFetch { blockId } => ("historyFetch", blockId),
         ToolAction::HistorySearch { query } => ("historySearch", query),
         ToolAction::Task { prompt, .. } => ("task", prompt),
+        ToolAction::Diagnostics { path, .. } => ("diagnostics", path),
         ToolAction::Mcp { qualifiedName, args } => (qualifiedName, args),
         ToolAction::Unknown { name, args } => (name, args),
     }
