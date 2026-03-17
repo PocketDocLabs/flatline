@@ -844,7 +844,7 @@ async fn runLoop(
         }
 
         // Handle input.
-        let (quit, hadInput) = handleInput(
+        let (quit, hadInput, wasResized) = handleInput(
             focus,
             shellIo,
             termState,
@@ -872,6 +872,12 @@ async fn runLoop(
         }
         if hadInput {
             needsRedraw = true;
+        }
+        // Force full redraw on resize to clear any cursor-drift artifacts
+        // from characters whose display width differs between unicode-width
+        // and the host terminal.
+        if wasResized {
+            terminal.clear()?;
         }
 
         tokio::task::yield_now().await;
@@ -903,14 +909,15 @@ async fn handleInput(
     subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
-) -> Result<(bool, bool)> {
+) -> Result<(bool, bool, bool)> {
     // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
-        return Ok((false, false));
+        return Ok((false, false, false));
     }
 
     // Drain all queued events to avoid input lag (especially trackpad momentum).
     let mut hadInput = false;
+    let mut resized = false;
     loop {
         match event::read()? {
             Event::Key(key) => {
@@ -938,10 +945,18 @@ async fn handleInput(
                     const DOUBLE_TAP_WINDOW: Duration = Duration::from_secs(1);
                     if let Some(prev) = *lastQuitPress {
                         if prev.elapsed() < DOUBLE_TAP_WINDOW {
-                            return Ok((true, true));
+                            return Ok((true, true, false));
                         }
                     }
                     *lastQuitPress = Some(Instant::now());
+                    break;
+                }
+
+                // Ctrl+L: force full terminal redraw to fix rendering artifacts.
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('l')
+                {
+                    resized = true;
                     break;
                 }
 
@@ -1301,6 +1316,7 @@ async fn handleInput(
             }
             Event::Resize(cols, rows) => {
                 hadInput = true;
+                resized = true;
                 let termCols = (cols * 3 / 5).saturating_sub(2);
                 let termRows = rows.saturating_sub(3);
                 let _ = shellIo.resizeTx.try_send((termCols, termRows));
@@ -1315,7 +1331,7 @@ async fn handleInput(
         }
     }
 
-    Ok((false, hadInput))
+    Ok((false, hadInput, resized))
 }
 
 /// Handle mouse events — selection, scroll wheel.
