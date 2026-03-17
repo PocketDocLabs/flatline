@@ -263,6 +263,32 @@ impl LspManager {
         (formatted, hint)
     }
 
+    /// Get raw diagnostics for a file after a mutation (clears cache, waits for fresh results).
+    ///
+    /// Returns the raw Diagnostic objects for caller-side filtering (e.g. baseline diff).
+    pub async fn getRawDiagnostics(
+        &mut self,
+        path: &str,
+        content: &str,
+        timeout: Duration,
+    ) -> (Vec<async_lsp::lsp_types::Diagnostic>, Option<LspHint>) {
+        let path = &absolutePath(path);
+        let hint = self.touchFile(path, content).await;
+        self.clearDiagnostics(path);
+        self.notifySave(path);
+        let diags = self.collectDiagnostics(path, timeout).await;
+        (diags, hint)
+    }
+
+    /// Get raw cached diagnostics without re-analysis.
+    ///
+    /// Returns whatever diagnostics are already in the store for this file.
+    /// Used to snapshot the baseline before an edit.
+    pub fn getRawCachedDiagnostics(&self, path: &str) -> Vec<async_lsp::lsp_types::Diagnostic> {
+        let path = &absolutePath(path);
+        self.collectExistingDiagnostics(path)
+    }
+
     /// Clear cached diagnostics for a file across all matching connections.
     fn clearDiagnostics(&self, path: &str) {
         let ext = match fileExtension(path) {

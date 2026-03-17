@@ -105,6 +105,47 @@ pub fn formatMultiFileDiagnostics(
     out
 }
 
+/// Key for multiset diffing — message text + severity tag, ignoring line numbers.
+fn diagKey(d: &Diagnostic) -> (String, &'static str) {
+    let msg = d.message.lines().next().unwrap_or("").to_string();
+    let sev = severityLabel(d.severity);
+    (msg, sev)
+}
+
+/// Filter post-edit diagnostics to only those introduced by the edit.
+///
+/// Uses multiset subtraction on (message, severity) to remove pre-existing
+/// errors. Line numbers are preserved on the surviving diagnostics so the
+/// model sees exactly where the new errors are.
+pub fn diffDiagnostics(
+    baseline: &[Diagnostic],
+    current: &[Diagnostic],
+) -> Vec<Diagnostic> {
+    use std::collections::HashMap;
+
+    // Count occurrences of each (message, severity) in baseline.
+    let mut baselineCounts: HashMap<(String, &str), usize> = HashMap::new();
+    for d in baseline {
+        *baselineCounts.entry(diagKey(d)).or_insert(0) += 1;
+    }
+
+    // Walk current diagnostics, subtracting baseline counts.
+    let mut result = Vec::new();
+    for d in current {
+        let key = diagKey(d);
+        match baselineCounts.get_mut(&key) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+            }
+            _ => {
+                result.push(d.clone());
+            }
+        }
+    }
+
+    result
+}
+
 /// Human-readable severity label.
 fn severityLabel(severity: Option<DiagnosticSeverity>) -> &'static str {
     match severity {

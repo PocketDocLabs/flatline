@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use tokio::sync::{mpsc, watch};
@@ -186,6 +187,9 @@ pub enum SessionEvent {
         content: String,
         turns: usize,
     },
+
+    /// A transient API error is being retried silently.
+    Retrying { attempt: u32, maxAttempts: u32 },
 
     /// An error occurred.
     Error(String),
@@ -753,6 +757,9 @@ impl Session {
             }
         }
 
+        const MAX_RETRIES: u32 = 5;
+        let mut retryCount: u32 = 0;
+
         loop {
             // Check for cancellation between turns.
             if *cancelRx.borrow() {
@@ -762,10 +769,43 @@ impl Session {
             }
 
             tracing::debug!(historyLen = self.history.len(), "starting turn");
-            let turnResult = self.streamOneTurn(eventTx, cancelRx).await?;
+            let turnResult = match self.streamOneTurn(eventTx, cancelRx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Catch connection-level errors that look transient.
+                    let msg = e.to_string();
+                    if isTransientError(&msg) {
+                        TurnResult::TransientError(msg)
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
             match turnResult {
+                TurnResult::TransientError(msg) => {
+                    retryCount += 1;
+                    if retryCount > MAX_RETRIES {
+                        let _ = eventTx.send(SessionEvent::Error(msg)).await;
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        attempt = retryCount,
+                        max = MAX_RETRIES,
+                        error = %msg,
+                        "transient API error, retrying"
+                    );
+                    let _ = eventTx.send(SessionEvent::Retrying {
+                        attempt: retryCount,
+                        maxAttempts: MAX_RETRIES,
+                    }).await;
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s.
+                    let delay = Duration::from_secs(1 << (retryCount - 1));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
                 TurnResult::Done { promptTokens } => {
+                    retryCount = 0;
                     if let Some(tokens) = promptTokens {
                         self.compactionTracker.updateTokens(tokens);
                         self.checkCompactionTrigger(eventTx).await;
@@ -780,6 +820,7 @@ impl Session {
                     return Ok(());
                 }
                 TurnResult::ToolCalls { calls, content, reasoning, promptTokens } => {
+                    retryCount = 0;
                     if let Some(tokens) = promptTokens {
                         self.compactionTracker.updateTokens(tokens);
                         self.checkCompactionTrigger(eventTx).await;
@@ -1084,21 +1125,36 @@ impl Session {
                         }
 
                         // Collect LSP diagnostics after file mutations.
+                        // Diff against baseline to only show errors introduced by the edit.
                         let mut output = output;
                         if matches!(call.function.name.as_str(), "editFile" | "writeFile" | "multiEdit") {
                             if let Ok(args) = serde_json::from_str::<serde_json::Value>(
                                 &call.function.arguments,
                             ) {
                                 if let Some(path) = args["path"].as_str() {
+                                    // Baseline: cached diagnostics from before the edit
+                                    // (populated by the pre-emptive touchFile or prior reads).
+                                    let baseline = self.lspManager.getRawCachedDiagnostics(path);
+
                                     let content = std::fs::read_to_string(path).unwrap_or_default();
-                                    let (diags, hint) = self.lspManager.getDiagnostics(
+                                    let (postEdit, hint) = self.lspManager.getRawDiagnostics(
                                         path,
                                         &content,
                                         std::time::Duration::from_secs(10),
                                     ).await;
-                                    if !diags.is_empty() {
-                                        output.push_str("\n\nLSP errors detected:\n");
-                                        output.push_str(&diags);
+
+                                    // Multiset diff: only new errors survive.
+                                    let newErrors = lsp::diagnostics::diffDiagnostics(&baseline, &postEdit);
+                                    if !newErrors.is_empty() {
+                                        let formatted = lsp::diagnostics::formatDiagnostics(
+                                            path,
+                                            &newErrors,
+                                            async_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                                        );
+                                        if !formatted.is_empty() {
+                                            output.push_str("\n\nNew LSP errors after edit:\n");
+                                            output.push_str(&formatted);
+                                        }
                                     }
                                     if let Some(hint) = hint {
                                         let _ = eventTx.send(SessionEvent::LspHint {
@@ -1207,6 +1263,14 @@ impl Session {
                             break;
                         }
                         Some(StreamEvent::Error(msg)) => {
+                            // If nothing was streamed yet and the error looks
+                            // transient, signal the caller to retry silently.
+                            let hadContent = !contentBuf.is_empty()
+                                || !reasoningBuf.is_empty()
+                                || toolAccum.hasContent();
+                            if !hadContent && isTransientError(&msg) {
+                                return Ok(TurnResult::TransientError(msg));
+                            }
                             let _ = tx.send(SessionEvent::Error(msg.clone())).await;
                             bail!("Stream error: {msg}");
                         }
@@ -2686,6 +2750,29 @@ enum TurnResult {
         promptTokens: Option<usize>,
     },
     Cancelled,
+    /// A transient API error that can be retried (e.g. 500, 502, timeout).
+    TransientError(String),
+}
+
+/// Check whether an API error message looks transient (worth retrying).
+fn isTransientError(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("internal server error")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("stream stalled")
+        || lower.contains("overloaded")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("server error")
+        || lower.contains("timeout")
+        || lower.contains("connection reset")
+        || lower.contains("stream read error")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
 }
 
 /// Accumulates streaming tool call deltas into complete tool calls.
@@ -2704,6 +2791,11 @@ impl ToolCallAccumulator {
         Self {
             pending: Vec::new(),
         }
+    }
+
+    /// Whether any tool call deltas have been accumulated.
+    fn hasContent(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     fn accumulate(

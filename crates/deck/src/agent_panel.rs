@@ -86,7 +86,7 @@ struct CompletionState {
 }
 
 /// Maximum visible content lines before a code block is collapsed.
-const MAX_CODE_BLOCK_LINES: usize = 20;
+const MAX_CODE_BLOCK_LINES: usize = 6;
 
 /// Metadata for a rendered code block in the visual line buffer.
 struct CodeBlockRange {
@@ -181,6 +181,8 @@ pub struct AgentPanel {
     lastSubagentHeaderLine: std::cell::Cell<Option<usize>>,
     /// Visual line index + entry index of the subagent content toggle border.
     lastSubagentToggleLine: std::cell::Cell<Option<(usize, usize)>>,
+    /// Transient retry status shown in throbber instead of "thinking".
+    retryStatus: Option<String>,
 }
 
 impl AgentPanel {
@@ -223,6 +225,7 @@ impl AgentPanel {
             codeExpanded: HashSet::new(),
             lastSubagentHeaderLine: std::cell::Cell::new(None),
             lastSubagentToggleLine: std::cell::Cell::new(None),
+            retryStatus: None,
         }
     }
 
@@ -269,6 +272,7 @@ impl AgentPanel {
     pub fn appendContent(&mut self, text: &str) {
         if !self.turnActive { return; }
         self.isStreaming = true;
+        self.retryStatus = None;
         // Content streaming means reasoning phase is over.
         self.reasoningActive = false;
         self.streamingContent.push_str(text);
@@ -277,6 +281,7 @@ impl AgentPanel {
     pub fn appendReasoning(&mut self, text: &str) {
         if !self.turnActive { return; }
         self.isStreaming = true;
+        self.retryStatus = None;
         self.reasoningActive = true;
         if self.thinkingStartTime.is_none() {
             self.thinkingStartTime = Some(Instant::now());
@@ -328,6 +333,7 @@ impl AgentPanel {
         self.turnActive = false;
         self.toolActive = false;
         self.toolStartTime = None;
+        self.retryStatus = None;
     }
 
     /// Finalize streaming state after a cancellation.
@@ -337,6 +343,7 @@ impl AgentPanel {
         self.turnActive = false;
         self.toolActive = false;
         self.toolStartTime = None;
+        self.retryStatus = None;
         self.activeSubagent = None;
         self.pendingPermit = false;
         self.pendingToolName.clear();
@@ -618,6 +625,13 @@ impl AgentPanel {
         self.scrollOffset = 0;
         // Restart thinking indicator — model will be called again after tool results.
         self.isStreaming = true;
+        self.thinkingStartTime = Some(Instant::now());
+    }
+
+    /// Show a transient retry indicator in the throbber area.
+    pub fn showRetrying(&mut self, attempt: u32, maxAttempts: u32) {
+        self.retryStatus = Some(format!("retrying ({attempt}/{maxAttempts})"));
+        // Reset thinking timer so elapsed restarts from the retry.
         self.thinkingStartTime = Some(Instant::now());
     }
 
@@ -1512,7 +1526,9 @@ impl AgentPanel {
                 let elapsed = self.thinkingStartTime
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
-                let suffix = if hasReasoning {
+                let suffix = if let Some(ref status) = self.retryStatus {
+                    format!(" {status}")
+                } else if hasReasoning {
                     let icon = if self.thinkingExpanded { "\u{25BE}" } else { "\u{25B8}" };
                     format!(" thinking ({elapsed}s)  {icon}")
                 } else {

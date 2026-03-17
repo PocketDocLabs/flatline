@@ -701,6 +701,9 @@ async fn runLoop(
                 } => {
                     tokenCount = contextTokens;
                 }
+                SessionEvent::Retrying { attempt, maxAttempts } => {
+                    agentPanel.showRetrying(attempt, maxAttempts);
+                }
                 SessionEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
                 }
