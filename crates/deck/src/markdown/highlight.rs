@@ -78,6 +78,28 @@ pub fn highlightLines(code: &str, lang: Option<&str>) -> Vec<Vec<Span<'static>>>
 ///
 /// Returns:
 ///     Vec<Line<'static>>: Bordered lines with scrolled content.
+/// Truncate a label string to fit within `maxWidth` display columns.
+/// Appends an ellipsis if truncation occurs.
+fn truncateLabelToWidth(s: &str, maxWidth: usize) -> String {
+    let fullWidth = UnicodeWidthStr::width(s);
+    if fullWidth <= maxWidth {
+        return s.to_string();
+    }
+    let mut width = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Reserve 1 column for the ellipsis.
+        if width + cw > maxWidth.saturating_sub(1) {
+            if width == 0 {
+                return s.to_string();
+            }
+            return format!("{}\u{2026}", &s[..i]);
+        }
+        width += cw;
+    }
+    s.to_string()
+}
+
 pub fn renderCodeBlock(
     contentLines: &[Vec<Span<'static>>],
     lang: Option<&str>,
@@ -99,16 +121,21 @@ pub fn renderCodeBlock(
     let mut lines = Vec::with_capacity(contentLines.len() + 3);
 
     // Top border with language label, optional extra, and copy button.
-    let label = lang.unwrap_or("");
+    let rawLabel = lang.unwrap_or("");
     let copyLabel = if showCopied { "copied" } else { "copy" };
     let copyStyle = if showCopied {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    // Use display width, not byte length — multi-byte chars like ▴/▾ are 1 column.
-    let labelLen = UnicodeWidthStr::width(label);
     let copyLen = UnicodeWidthStr::width(copyLabel);
+
+    // Truncate label so copy button and toggle always fit.
+    // Reserve: 1 space after label + copy + 1 space before copy + 3 min rule chars.
+    let maxLabelWidth = innerWidth.saturating_sub(copyLen + 5);
+    let label = truncateLabelToWidth(rawLabel, maxLabelWidth);
+    // Use display width, not byte length — multi-byte chars like ▴/▾ are 1 column.
+    let labelLen = UnicodeWidthStr::width(label.as_str());
     let extraStyle = Style::default().fg(Color::Gray);
 
     let topSpans = if let Some(extra) = topExtra {
