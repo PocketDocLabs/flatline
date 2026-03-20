@@ -15,8 +15,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::mcp::config::ServerConfig;
-
 const CONFIG_DIR: &str = "flatline";
 const CONFIG_FILE: &str = "config.toml";
 
@@ -38,10 +36,6 @@ pub struct Config {
     /// Web tool settings (Exa API).
     #[serde(default)]
     pub web: WebConfig,
-
-    /// MCP server configurations. Keys are server names.
-    #[serde(default)]
-    pub mcp: HashMap<String, ServerConfig>,
 
     /// LSP server configuration overrides. Keys are server IDs.
     #[serde(default)]
@@ -195,7 +189,6 @@ pub fn load() -> Result<Config> {
             utility: defaults::utilityModel(),
             compactRatio: defaults::compactRatio(),
             web: WebConfig::default(),
-            mcp: HashMap::new(),
             lsp: HashMap::new(),
         };
 
@@ -225,30 +218,6 @@ pub fn load() -> Result<Config> {
         if !exaKey.is_empty() {
             config.web.searchKey = exaKey;
         }
-    }
-
-    // Merge project-scoped MCP config if present.
-    if let Ok(cwd) = std::env::current_dir() {
-        match crate::mcp::config::loadProjectMcp(&cwd) {
-            Ok(projectServers) if !projectServers.is_empty() => {
-                config.mcp =
-                    crate::mcp::config::mergeConfigs(config.mcp, projectServers);
-                tracing::debug!("merged project MCP config from .flatline/mcp.toml");
-            }
-            Err(e) => {
-                tracing::warn!("failed to load project MCP config: {e}");
-            }
-            _ => {}
-        }
-    }
-
-    // Validate server names.
-    if let Err(e) = crate::mcp::config::validateServerNames(&config.mcp) {
-        tracing::error!("invalid MCP server name: {e}");
-        // Remove invalid entries rather than failing hard.
-        config.mcp.retain(|name, _| {
-            crate::mcp::schema::validateServerName(name).is_ok()
-        });
     }
 
     Ok(config)

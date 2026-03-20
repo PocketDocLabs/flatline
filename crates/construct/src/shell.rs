@@ -187,6 +187,8 @@ pub struct ShellIo {
     pub inputTx: mpsc::Sender<Vec<u8>>,
     /// Resize events (cols, rows).
     pub resizeTx: mpsc::Sender<(u16, u16)>,
+    /// Trigger the killchain for any active captured command.
+    pub killTx: mpsc::Sender<()>,
 }
 
 /// Create a shell session.
@@ -258,6 +260,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     let (inputTx, mut inputRx) = mpsc::channel::<Vec<u8>>(64);
     let (resizeTx, mut resizeRx) = mpsc::channel::<(u16, u16)>(4);
     let (cmdTx, mut cmdRx) = mpsc::channel::<ShellRequest>(4);
+    let (killTx, mut killRx) = mpsc::channel::<()>(4);
 
     let history: Arc<Mutex<Vec<CommandRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let historyRef = Arc::clone(&history);
@@ -267,6 +270,9 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     // Background task — central hub for all PTY I/O.
     tokio::spawn(async move {
         let mut captureState: Option<CaptureState> = None;
+        // Pending bytes to write to the PTY, drained in chunks so
+        // large commands (heredocs) don't deadlock with output echo.
+        let mut pendingWrite: VecDeque<u8> = VecDeque::new();
 
         // Append bytes to the scrollback ring buffer.
         let appendScrollback = |bytes: &[u8]| {
@@ -335,11 +341,11 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         let filtered = cap.filter.process(&bytes);
                         if !filtered.is_empty() {
                             appendScrollback(&filtered);
-                            let _ = outputTx.send(filtered).await;
+                            let _ = outputTx.try_send(filtered);
                         }
                     } else {
                         appendScrollback(&bytes);
-                        let _ = outputTx.send(bytes).await;
+                        let _ = outputTx.try_send(bytes);
                     }
 
                     // Check for end marker. The echo can't contain the exact
@@ -356,7 +362,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         let (_, remaining) = finalizeCapture(cap, &historyRef, false);
                         if !remaining.is_empty() {
                             appendScrollback(&remaining);
-                            let _ = outputTx.send(remaining).await;
+                            let _ = outputTx.try_send(remaining);
                         }
                     }
                 }
@@ -396,7 +402,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                 let (_, remaining) = finalizeCapture(cap, &historyRef, true);
                                 if !remaining.is_empty() {
                                     appendScrollback(&remaining);
-                                    let _ = outputTx.send(remaining).await;
+                                    let _ = outputTx.try_send(remaining);
                                 }
                                 // Poke the shell with a newline to try to recover the prompt.
                                 let _ = writer.write_all(b"\n");
@@ -412,6 +418,17 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     let _ = writer.flush();
                 }
 
+                // Chunked command write — drain pendingWrite in small
+                // pieces so output processing can interleave, preventing
+                // PTY buffer deadlocks on large commands.
+                _ = std::future::ready(()), if !pendingWrite.is_empty() => {
+                    const CHUNK: usize = 256;
+                    let n = CHUNK.min(pendingWrite.len());
+                    let chunk: Vec<u8> = pendingWrite.drain(..n).collect();
+                    let _ = writer.write_all(&chunk);
+                    let _ = writer.flush();
+                }
+
                 // Command execution request from session.
                 Some(req) = cmdRx.recv() => {
                     let uuid = generateUuid();
@@ -422,7 +439,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     let cmdEcho = format!("\x1b[2;36m{}\x1b[0m\r\n", req.command);
                     let echoBytes = cmdEcho.into_bytes();
                     appendScrollback(&echoBytes);
-                    let _ = outputTx.send(echoBytes).await;
+                    let _ = outputTx.try_send(echoBytes);
 
                     // NOTE: Markers use printf with %s so the shell's command
                     // echo never contains the exact uuid pattern. This prevents
@@ -437,8 +454,9 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     let wrapped = format!(
                         "printf '__FLATLINE_START_%s__\\n' '{uuid}'; printf '\\e]133;C\\a'; {cmd}\n__flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; printf '\\n__FLATLINE_END_%s_%s__\\n' '{uuid}' \"$__flatline_ec\"\n",
                     );
-                    let _ = writer.write_all(wrapped.as_bytes());
-                    let _ = writer.flush();
+                    // Queue for chunked write — large commands (heredocs)
+                    // would deadlock if written in one blocking call.
+                    pendingWrite.extend(wrapped.as_bytes());
 
                     let deadline = req.timeout.map(|d| tokio::time::Instant::now() + d);
                     captureState = Some(CaptureState {
@@ -462,6 +480,17 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     });
                 }
 
+                // User-triggered kill — start/advance the killchain immediately.
+                Some(()) = killRx.recv() => {
+                    if let Some(ref mut cap) = captureState {
+                        cap.deadline = Some(tokio::time::Instant::now());
+                    } else {
+                        // No active capture — just forward Ctrl+C.
+                        let _ = writer.write_all(&[0x03]);
+                        let _ = writer.flush();
+                    }
+                }
+
                 // All channels closed — shut down.
                 else => break,
             }
@@ -478,6 +507,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         outputRx,
         inputTx,
         resizeTx,
+        killTx,
     };
 
     Ok((shell, io))

@@ -138,6 +138,16 @@ impl TerminalState {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// Current grid column count.
+    pub fn columns(&self) -> usize {
+        self.term.grid().columns()
+    }
+
+    /// Current grid screen line count.
+    pub fn screenLines(&self) -> usize {
+        self.term.grid().screen_lines()
+    }
+
     /// Current display offset (0 = at bottom, positive = scrolled up).
     pub fn displayOffset(&self) -> usize {
         self.term.grid().display_offset()

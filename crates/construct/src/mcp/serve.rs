@@ -153,7 +153,7 @@ impl FlatlineServer {
         for (i, line) in lines[start..end].iter().enumerate() {
             let lineNum = start + i + 1;
             let displayLine = if line.len() > 2000 {
-                &line[..2000]
+                &line[..line.floor_char_boundary(2000)]
             } else {
                 line
             };

@@ -838,7 +838,7 @@ pub fn summarize(action: &ToolAction) -> String {
         }
         ToolAction::EditFile { path, oldString, replaceAll, .. } => {
             let preview = if oldString.len() > 40 {
-                format!("{}\u{2026}", &oldString[..40])
+                format!("{}\u{2026}", &oldString[..oldString.floor_char_boundary(40)])
             } else {
                 oldString.clone()
             };
@@ -912,7 +912,7 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::Task { prompt, agent } => {
             let agentName = agent.as_deref().unwrap_or("general");
             let preview = if prompt.len() > 60 {
-                format!("{}\u{2026}", &prompt[..60])
+                format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(60)])
             } else {
                 prompt.clone()
             };
@@ -1414,7 +1414,7 @@ fn executeShellHistory(shell: &Shell) -> String {
         };
         // Truncate long commands for the listing.
         let cmdPreview = if cmd.len() > 80 {
-            format!("{}\u{2026}", &cmd[..80])
+            format!("{}\u{2026}", &cmd[..cmd.floor_char_boundary(80)])
         } else {
             cmd.clone()
         };
@@ -1595,7 +1595,7 @@ fn getFileSymbols(path: &str) -> Vec<(usize, String)> {
                     let text = obj["text"].as_str().unwrap_or("");
                     let firstLine = text.lines().next().unwrap_or("").trim().to_string();
                     let display = if firstLine.len() > 80 {
-                        format!("{}...", &firstLine[..80])
+                        format!("{}...", &firstLine[..firstLine.floor_char_boundary(80)])
                     } else {
                         firstLine
                     };

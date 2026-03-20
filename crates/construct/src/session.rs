@@ -236,6 +236,7 @@ pub struct Session {
     exaClient: Option<web::ExaClient>,
     urlCache: web::UrlCache,
     mcpManager: Option<mcp::McpManager>,
+    mcpConfigs: HashMap<String, mcp::config::ServerConfig>,
     lspManager: lsp::LspManager,
     lspWarmedUp: bool,
     /// One-shot system message injected on the first API call after resume, then cleared.
@@ -315,6 +316,7 @@ impl Session {
             exaClient,
             urlCache: web::UrlCache::new(),
             mcpManager: None,
+            mcpConfigs: HashMap::new(),
             lspManager,
             lspWarmedUp: false,
             resumeNotice: None,
@@ -500,6 +502,7 @@ impl Session {
             exaClient,
             urlCache: web::UrlCache::new(),
             mcpManager: None,
+            mcpConfigs: HashMap::new(),
             lspManager,
             lspWarmedUp: false,
             resumeNotice,
@@ -769,18 +772,11 @@ impl Session {
             }
 
             tracing::debug!(historyLen = self.history.len(), "starting turn");
-            let turnResult = match self.streamOneTurn(eventTx, cancelRx).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Catch connection-level errors that look transient.
-                    let msg = e.to_string();
-                    if isTransientError(&msg) {
-                        TurnResult::TransientError(msg)
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+            // NOTE: Err from streamOneTurn means either a permanent API error
+            // or a transient one that already exhausted the API client's own
+            // 8-attempt retry loop. Don't retry again here — only retry
+            // mid-stream SSE errors (returned as TurnResult::TransientError).
+            let turnResult = self.streamOneTurn(eventTx, cancelRx).await?;
 
             match turnResult {
                 TurnResult::TransientError(msg) => {
@@ -1909,6 +1905,7 @@ impl Session {
 
         let (elicitationTx, _elicitationRx) = mpsc::channel(8);
         let mut mgr = mcp::McpManager::new(elicitationTx);
+        self.mcpConfigs = servers.clone();
         let statuses = mgr.startAll(servers).await;
 
         for status in &statuses {
@@ -2194,10 +2191,7 @@ impl Session {
         bool,
         String,
     ) {
-        let configPath = crate::config::configDir()
-            .join("config.toml")
-            .display()
-            .to_string();
+        let configPath = ".mcp.json".to_string();
 
         let mgr = match &self.mcpManager {
             Some(m) => m,
@@ -2226,8 +2220,7 @@ impl Session {
 
                 // Build transport description from config.
                 let transport = self
-                    .config
-                    .mcp
+                    .mcpConfigs
                     .get(&s.name)
                     .map(|cfg| {
                         if let Some(ref cmd) = cfg.command {
@@ -2574,7 +2567,7 @@ impl Session {
                 let first = t.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
                 let trimmed = first.trim();
                 if trimmed.len() > 60 {
-                    format!("{}\u{2026}", &trimmed[..59])
+                    format!("{}\u{2026}", &trimmed[..trimmed.floor_char_boundary(59)])
                 } else {
                     trimmed.to_string()
                 }

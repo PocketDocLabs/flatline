@@ -440,7 +440,7 @@ async fn compactTopic(
                     let argStr = turn.toolArgs.as_ref()
                         .map(|v| {
                             let s = v.to_string();
-                            if s.len() > 500 { format!("{}...", &s[..500]) } else { s }
+                            if s.len() > 500 { format!("{}...", &s[..s.floor_char_boundary(500)]) } else { s }
                         })
                         .unwrap_or_else(|| "{}".to_string());
                     exchangeParts.push(format!(

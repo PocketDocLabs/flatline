@@ -189,9 +189,13 @@ pub async fn run() -> Result<()> {
             }
         };
 
-        // Initialize MCP servers if configured.
-        if !config.mcp.is_empty() {
-            session.initMcp(config.mcp.clone()).await;
+        // Initialize MCP servers from .mcp.json files.
+        match construct::mcp::config::loadMcpServers() {
+            Ok(servers) if !servers.is_empty() => {
+                session.initMcp(servers).await;
+            }
+            Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+            _ => {}
         }
 
         let mut permitRx = permitRx;
@@ -228,8 +232,12 @@ pub async fn run() -> Result<()> {
                                 Ok(s) => {
                                     session = s;
                                     // Re-init MCP for the resumed session.
-                                    if !config.mcp.is_empty() {
-                                        session.initMcp(config.mcp.clone()).await;
+                                    match construct::mcp::config::loadMcpServers() {
+                                        Ok(servers) if !servers.is_empty() => {
+                                            session.initMcp(servers).await;
+                                        }
+                                        Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+                                        _ => {}
                                     }
 
                                     // Load display branch — includes the full un-branched chain
@@ -262,8 +270,12 @@ pub async fn run() -> Result<()> {
                                         &[DomainModule::Swe],
                                     ) {
                                         Ok(mut s) => {
-                                            if !config.mcp.is_empty() {
-                                                s.initMcp(config.mcp.clone()).await;
+                                            match construct::mcp::config::loadMcpServers() {
+                                                Ok(servers) if !servers.is_empty() => {
+                                                    s.initMcp(servers).await;
+                                                }
+                                                Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+                                                _ => {}
                                             }
                                             session = s;
                                         }
@@ -290,8 +302,12 @@ pub async fn run() -> Result<()> {
                             ) {
                                 Ok(s) => {
                                     session = s;
-                                    if !config.mcp.is_empty() {
-                                        session.initMcp(config.mcp.clone()).await;
+                                    match construct::mcp::config::loadMcpServers() {
+                                        Ok(servers) if !servers.is_empty() => {
+                                            session.initMcp(servers).await;
+                                        }
+                                        Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+                                        _ => {}
                                     }
 
                                     let _ = eventTx.send(SessionEvent::Cleared).await;
@@ -464,6 +480,15 @@ async fn runLoop(
                 .border_style(termBorder)
                 .title(termTitle);
             let termInner = termBlock.inner(hChunks[0]);
+
+            // Sync terminal grid size with render area — a mismatch causes
+            // content to overflow or underflow the panel borders.
+            let gridCols = termState.columns();
+            if gridCols != termInner.width as usize || termState.screenLines() != termInner.height as usize {
+                termState.resize(termInner.width, termInner.height);
+                let _ = shellIo.resizeTx.try_send((termInner.width, termInner.height));
+            }
+
             frame.render_widget(termBlock, hChunks[0]);
             frame.render_stateful_widget(EmbeddedTerminal, termInner, termState);
 
@@ -788,7 +813,7 @@ async fn runLoop(
                         SessionEvent::ToolResult { ref name, ref output } => {
                             // Brief one-liner for the inline block.
                             let brief = if output.len() > 60 {
-                                format!("{}\u{2026}", &output[..60])
+                                format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
                             } else {
                                 output.clone()
                             };
@@ -1157,7 +1182,12 @@ async fn handleInput(
                             if !event::poll(Duration::ZERO)? { break; }
                             continue;
                         }
-                        if let Some(bytes) = keyToBytes(&key) {
+                        // Ctrl+C triggers the killchain for captured commands.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            let _ = shellIo.killTx.try_send(());
+                        } else if let Some(bytes) = keyToBytes(&key) {
                             if termState.displayOffset() > 0 {
                                 termState.scrollToBottom();
                             }
@@ -1786,7 +1816,7 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                         .map(|a| {
                             let s = a.to_string();
                             if s.len() > 80 {
-                                format!("{}\u{2026}", &s[..79])
+                                format!("{}\u{2026}", &s[..s.floor_char_boundary(79)])
                             } else {
                                 s
                             }
@@ -1892,7 +1922,7 @@ fn loadChildToolLines(sessionId: &str) -> (Vec<(String, String)>, usize) {
                 let name = turn.tool.as_deref().unwrap_or("tool");
                 let output = &turn.content;
                 let brief = if output.len() > 60 {
-                    format!("{}\u{2026}", &output[..60])
+                    format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
                 } else {
                     output.clone()
                 };

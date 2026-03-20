@@ -304,12 +304,17 @@ async fn readStream(
 
                 match serde_json::from_str::<StreamChunk>(data) {
                     Ok(chunk) => {
-                        tracing::trace!(
-                            hasUsage = chunk.usage.is_some(),
-                            hasChoices = chunk.choices.is_some(),
-                            choiceCount = chunk.choices.as_ref().map(|c| c.len()).unwrap_or(0),
-                            "parsed SSE chunk"
-                        );
+                        // Log full raw data for error chunks to preserve metadata.
+                        if chunk.error.is_some() {
+                            tracing::error!(raw = %data, "raw SSE error chunk");
+                        } else {
+                            tracing::trace!(
+                                hasUsage = chunk.usage.is_some(),
+                                hasChoices = chunk.choices.is_some(),
+                                choiceCount = chunk.choices.as_ref().map(|c| c.len()).unwrap_or(0),
+                                "parsed SSE chunk"
+                            );
+                        }
                         for event in parseChunk(chunk) {
                             if tx.send(event).await.is_err() {
                                 return Ok(());
@@ -463,8 +468,15 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     if let Some(error) = chunk.error {
-        let msg = error.message.unwrap_or_else(|| "Unknown error".into());
-        tracing::error!(error = %msg, "stream error from API");
+        let msg = error.message.clone().unwrap_or_else(|| "Unknown error".into());
+        tracing::error!(
+            error = %msg,
+            code = ?error.code,
+            errorType = ?error.errorType,
+            status = ?error.status,
+            extra = ?error.extra,
+            "stream error from API"
+        );
         events.push(StreamEvent::Error(msg));
         return events;
     }

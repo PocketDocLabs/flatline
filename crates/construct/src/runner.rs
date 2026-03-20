@@ -154,9 +154,15 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
         session.setTools(filtered);
     }
 
-    // Initialize MCP servers from config (--mcp-config override is TODO).
-    if !runConfig.strictMcp && !config.mcp.is_empty() {
-        session.initMcp(config.mcp.clone()).await;
+    // Initialize MCP servers from .mcp.json files.
+    if !runConfig.strictMcp {
+        match crate::mcp::config::loadMcpServers() {
+            Ok(servers) if !servers.is_empty() => {
+                session.initMcp(servers).await;
+            }
+            Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+            _ => {}
+        }
     }
 
     runSession(&mut session, prompt, runConfig.maxTurns).await
@@ -193,8 +199,12 @@ pub async fn runStreaming(
         &[DomainModule::Swe],
     )?;
 
-    if !config.mcp.is_empty() {
-        session.initMcp(config.mcp.clone()).await;
+    match crate::mcp::config::loadMcpServers() {
+        Ok(servers) if !servers.is_empty() => {
+            session.initMcp(servers).await;
+        }
+        Err(e) => tracing::warn!("failed to load MCP config: {e}"),
+        _ => {}
     }
 
     let sessionId = session.sessionId().to_string();

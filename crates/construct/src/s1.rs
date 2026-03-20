@@ -259,7 +259,7 @@ fn truncateLongResults(
                 threshold,
                 beforeLen = before,
                 afterLen = content.len(),
-                headSample = &content[..content.len().min(80)],
+                headSample = %&content[..content.floor_char_boundary(80)],
                 "S1 middle-out applied"
             );
             middleOutCallIds.push(tool_call_id.clone());

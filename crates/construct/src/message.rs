@@ -181,4 +181,11 @@ pub(crate) struct ChunkFunction {
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamError {
     pub message: Option<String>,
+    pub code: Option<serde_json::Value>,
+    #[serde(rename = "type")]
+    pub errorType: Option<String>,
+    pub status: Option<serde_json::Value>,
+    /// Catch-all for any other fields the provider sends.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
