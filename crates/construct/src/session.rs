@@ -295,7 +295,8 @@ impl Session {
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
         let projectLsp = lsp::config::loadProjectLsp(
-            &std::env::current_dir().unwrap_or_default(),
+            config.projectRoot.as_deref()
+                .unwrap_or(&std::env::current_dir().unwrap_or_default()),
         ).unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
@@ -481,7 +482,8 @@ impl Session {
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
         let projectLsp = lsp::config::loadProjectLsp(
-            &std::env::current_dir().unwrap_or_default(),
+            config.projectRoot.as_deref()
+                .unwrap_or(&std::env::current_dir().unwrap_or_default()),
         ).unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
@@ -924,9 +926,20 @@ impl Session {
                                                         let (toolName, _) = crate::permissions::actionKey(&action);
                                                         self.permissions.addRule(crate::permissions::Rule {
                                                             tool: toolName.into(),
-                                                            pattern: Some(pattern),
+                                                            pattern: Some(pattern.clone()),
                                                             allow: true,
                                                         });
+                                                        // Persist to .flatline/config.toml if we have a project root.
+                                                        if let Some(ref root) = self.config.projectRoot {
+                                                            if let Err(e) = crate::config::persistPermissionRule(
+                                                                root,
+                                                                &self.permissions,
+                                                                toolName,
+                                                                &pattern,
+                                                            ) {
+                                                                tracing::warn!("failed to persist permission rule: {e}");
+                                                            }
+                                                        }
                                                         true
                                                     }
                                                     Some(PermitResponse::Deny) | None => false,

@@ -119,7 +119,7 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
         config.main.providerOrder = Vec::new();
     }
 
-    // Build permissions based on --allowed-tools or defaults.
+    // Build permissions based on --allowed-tools, config, or defaults.
     let permissions = if let Some(ref allowed) = runConfig.allowedTools {
         let mut perms = Permissions::askForEverything();
         for toolName in allowed {
@@ -130,6 +130,8 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
             });
         }
         perms
+    } else if let Some(ref perms) = config.permissions {
+        perms.clone()
     } else {
         // Headless default: ask for everything. With no TUI to answer,
         // unapproved tools are denied. User must use --allowed-tools.
@@ -156,7 +158,7 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
 
     // Initialize MCP servers from .mcp.json files.
     if !runConfig.strictMcp {
-        match crate::mcp::config::loadMcpServers() {
+        match crate::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
             Ok(servers) if !servers.is_empty() => {
                 session.initMcp(servers).await;
             }
@@ -199,7 +201,7 @@ pub async fn runStreaming(
         &[DomainModule::Swe],
     )?;
 
-    match crate::mcp::config::loadMcpServers() {
+    match crate::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
         Ok(servers) if !servers.is_empty() => {
             session.initMcp(servers).await;
         }

@@ -16,9 +16,10 @@
 //! - [`suggestPatterns`] — generate scoped "always allow" patterns
 //!
 //! # Dependencies
-//! None.
+//! `serde`
 
 use crate::tool::ToolAction;
+use serde::{Deserialize, Serialize};
 
 /// Response from the supervisor (TUI or parent agent) to a permission prompt.
 #[derive(Debug, Clone)]
@@ -151,7 +152,8 @@ fn urlPatterns(url: &str) -> Vec<String> {
 }
 
 /// What to do when a tool call isn't pre-approved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PermitMode {
     /// Ask the supervisor (TUI user, parent agent, etc.) and wait for response.
     Ask,
@@ -173,7 +175,7 @@ pub enum Verdict {
 }
 
 /// Permission rule matching a tool action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     /// Tool name to match ("shell", "readFile", "writeFile", or "*" for all).
     pub tool: String,
@@ -187,7 +189,7 @@ pub struct Rule {
 }
 
 /// Permission configuration for a session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Permissions {
     /// What to do when no rule matches and approval is needed.
     pub defaultMode: PermitMode,

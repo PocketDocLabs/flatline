@@ -43,8 +43,9 @@ use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
-fn mainAgentPermissions() -> Permissions {
-    Permissions::allowReadOnly()
+/// Resolve main agent permissions from config, falling back to allowReadOnly.
+fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
+    config.permissions.clone().unwrap_or_else(Permissions::allowReadOnly)
 }
 
 /// Which panel has input focus.
@@ -170,7 +171,7 @@ pub async fn run() -> Result<()> {
         };
 
         // Main agent auto-approves read-only tools but still prompts on writes/mutations.
-        let permissions = mainAgentPermissions();
+        let permissions = mainAgentPermissions(&config);
 
         // Deck is the shared terminal harness — SWE domain by default.
         let mut session = match Session::new(
@@ -190,7 +191,7 @@ pub async fn run() -> Result<()> {
         };
 
         // Initialize MCP servers from .mcp.json files.
-        match construct::mcp::config::loadMcpServers() {
+        match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
             Ok(servers) if !servers.is_empty() => {
                 session.initMcp(servers).await;
             }
@@ -223,7 +224,7 @@ pub async fn run() -> Result<()> {
                             let shell = session.intoShell();
                             match Session::resume(
                                 &config,
-                                mainAgentPermissions(),
+                                mainAgentPermissions(&config),
                                 shell,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
@@ -232,7 +233,7 @@ pub async fn run() -> Result<()> {
                                 Ok(s) => {
                                     session = s;
                                     // Re-init MCP for the resumed session.
-                                    match construct::mcp::config::loadMcpServers() {
+                                    match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
                                             session.initMcp(servers).await;
                                         }
@@ -264,13 +265,13 @@ pub async fn run() -> Result<()> {
                                     // Shell returned — recreate a fresh session.
                                     match Session::new(
                                         &config,
-                                        mainAgentPermissions(),
+                                        mainAgentPermissions(&config),
                                         shell,
                                         InterfaceMode::SharedTerminal,
                                         &[DomainModule::Swe],
                                     ) {
                                         Ok(mut s) => {
-                                            match construct::mcp::config::loadMcpServers() {
+                                            match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                                 Ok(servers) if !servers.is_empty() => {
                                                     s.initMcp(servers).await;
                                                 }
@@ -295,14 +296,14 @@ pub async fn run() -> Result<()> {
                             let shell = session.intoShell();
                             match Session::new(
                                 &config,
-                                mainAgentPermissions(),
+                                mainAgentPermissions(&config),
                                 shell,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
                             ) {
                                 Ok(s) => {
                                     session = s;
-                                    match construct::mcp::config::loadMcpServers() {
+                                    match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
                                             session.initMcp(servers).await;
                                         }

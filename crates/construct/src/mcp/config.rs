@@ -306,15 +306,19 @@ fn convertEnvSyntax(input: &str) -> String {
 ///
 /// Discovery order (lowest → highest priority):
 /// 1. `~/.config/flatline/mcp.json`
-/// 2. `.mcp.json` in current working directory
-pub fn loadMcpServers() -> Result<HashMap<String, ServerConfig>, anyhow::Error> {
+/// 2. `.mcp.json` at project root (or CWD if no project root given)
+pub fn loadMcpServers(
+    projectRoot: Option<&std::path::Path>,
+) -> Result<HashMap<String, ServerConfig>, anyhow::Error> {
     // User-level.
     let userDir = crate::config::configDir();
     let userServers = loadMcpJson(&userDir.join("mcp.json"))?;
 
     // Project-level.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let projectServers = loadMcpJson(&cwd.join(".mcp.json"))?;
+    let projectDir = projectRoot
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let projectServers = loadMcpJson(&projectDir.join(".mcp.json"))?;
 
     let mut merged = mergeConfigs(userServers, projectServers);
 
