@@ -419,10 +419,10 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                 }
 
                 // Chunked command write — drain pendingWrite in small
-                // pieces so output processing can interleave, preventing
-                // PTY buffer deadlocks on large commands.
-                _ = std::future::ready(()), if !pendingWrite.is_empty() => {
-                    const CHUNK: usize = 256;
+                // pieces with a delay so the output arm can interleave
+                // and drain PTY echo, preventing buffer deadlocks.
+                _ = tokio::time::sleep(Duration::from_millis(5)), if !pendingWrite.is_empty() => {
+                    const CHUNK: usize = 128;
                     let n = CHUNK.min(pendingWrite.len());
                     let chunk: Vec<u8> = pendingWrite.drain(..n).collect();
                     let _ = writer.write_all(&chunk);
@@ -482,6 +482,8 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                 // User-triggered kill — start/advance the killchain immediately.
                 Some(()) = killRx.recv() => {
+                    // Abort any in-progress command write.
+                    pendingWrite.clear();
                     if let Some(ref mut cap) = captureState {
                         cap.deadline = Some(tokio::time::Instant::now());
                     } else {
