@@ -83,6 +83,11 @@ pub const COMMANDS: &[CommandDef] = &[
         aliases: &[],
         description: "Show LSP server status and install hints",
     },
+    CommandDef {
+        name: "permissions",
+        aliases: &["perms"],
+        description: "View and manage permission rules",
+    },
 ];
 
 /// Return commands whose name or aliases start with the given prefix.
@@ -118,6 +123,13 @@ pub enum CommandAction {
     Mcp,
     /// Show LSP server status.
     Lsp,
+    /// Show permissions panel.
+    Permissions,
+    /// Save permissions from the panel.
+    SavePermissions {
+        defaultMode: construct::permissions::PermitMode,
+        rules: Vec<construct::permissions::Rule>,
+    },
 }
 
 /// How command output should be rendered.
@@ -185,6 +197,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "clear" => CommandOutput::Action(CommandAction::Clear),
         "mcp" => CommandOutput::Action(CommandAction::Mcp),
         "lsp" => CommandOutput::Action(CommandAction::Lsp),
+        "permissions" => CommandOutput::Action(CommandAction::Permissions),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }
 }

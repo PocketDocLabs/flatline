@@ -33,9 +33,11 @@ pub enum PanelEntry {
     User(String),
     Assistant(String),
     Reasoning { text: String, expanded: bool },
-    ToolRequest { summary: String, diff: Option<String> },
+    ToolRequest { summary: String, diff: Option<String>, command: Option<String> },
     ToolApproved { name: String },
     ToolDenied { name: String },
+    /// A tool was auto-denied by a permission rule (shown with red background).
+    ToolAutoDenied { name: String, summary: String },
     ToolResult { name: String, output: String },
     /// A tool is currently executing (shown with throbber + elapsed time).
     ToolActive { name: String, summary: String },
@@ -126,6 +128,12 @@ pub struct AgentPanel {
     pub history: History,
     pub pendingPermit: bool,
     pendingToolName: String,
+    /// Human-readable summary of the tool call (key arg + description).
+    pendingToolSummary: String,
+    /// Model-provided explanation (shell commands only).
+    pendingToolExplanation: Option<String>,
+    /// Impact tier for visual treatment (color/symbol).
+    pendingToolImpact: construct::tool::ShellImpact,
     /// Suggested "always allow" patterns for the pending permission prompt.
     permitPatterns: Vec<String>,
     /// Currently selected pattern index (last = custom).
@@ -134,6 +142,8 @@ pub struct AgentPanel {
     permitCustomPattern: String,
     /// Whether the custom pattern field is being edited.
     permitEditingCustom: bool,
+    /// Horizontal scroll offset for the permission code block.
+    permitCodeScrollX: u16,
     /// Throbber animation for inline thinking indicator.
     throbber: Throbber,
     /// When reasoning started (for elapsed time display).
@@ -198,10 +208,14 @@ impl AgentPanel {
             history: History::new(),
             pendingPermit: false,
             pendingToolName: String::new(),
+            pendingToolSummary: String::new(),
+            pendingToolExplanation: None,
+            pendingToolImpact: construct::tool::ShellImpact::default(),
             permitPatterns: Vec::new(),
             permitSelectedPattern: 0,
             permitCustomPattern: String::new(),
             permitEditingCustom: false,
+            permitCodeScrollX: 0,
             throbber: Throbber::new(),
             thinkingStartTime: None,
             thinkingExpanded: false,
@@ -359,25 +373,40 @@ impl AgentPanel {
         self.entries.push(PanelEntry::Cancelled);
     }
 
-    pub fn showToolRequest(&mut self, name: &str, summary: &str, args: &str, diff: Option<String>) {
+    pub fn showToolRequest(
+        &mut self,
+        name: &str,
+        summary: &str,
+        args: &str,
+        diff: Option<String>,
+        explanation: Option<String>,
+        impact: construct::tool::ShellImpact,
+    ) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
+        // Extract raw command for shell tools (used for code block preview).
+        let action = construct::tool::parse(name, args);
+        let command = match &action {
+            construct::tool::ToolAction::Shell { command, .. } => Some(command.clone()),
+            _ => None,
+        };
+
         self.entries
-            .push(PanelEntry::ToolRequest { summary: summary.into(), diff });
+            .push(PanelEntry::ToolRequest { summary: summary.into(), diff, command });
         self.pendingPermit = true;
         self.pendingToolName = name.into();
-
-        // Generate "always allow" pattern suggestions from the tool args.
-        let action = construct::tool::parse(name, args);
+        self.pendingToolSummary = summary.into();
+        self.pendingToolExplanation = explanation;
+        self.pendingToolImpact = impact;
         self.permitPatterns = construct::permissions::suggestPatterns(&action);
         self.permitSelectedPattern = 0;
-        // Pre-fill custom with the second pattern (or first if only one).
+        // Pre-fill custom with the most specific pattern.
         self.permitCustomPattern = self.permitPatterns
-            .get(1)
-            .or(self.permitPatterns.first())
+            .first()
             .cloned()
             .unwrap_or_default();
         self.permitEditingCustom = false;
+        self.permitCodeScrollX = 0;
 
         self.scrollOffset = 0;
     }
@@ -433,10 +462,29 @@ impl AgentPanel {
     }
 
     /// Toggle custom pattern editing.
-    pub fn toggleCustomEdit(&mut self) {
-        self.permitEditingCustom = !self.permitEditingCustom;
-        if self.permitEditingCustom {
-            self.permitSelectedPattern = self.permitPatterns.len();
+    /// Get the pending shell command (if the active ToolRequest has one).
+    pub fn pendingCommand(&self) -> Option<&String> {
+        if !self.pendingPermit {
+            return None;
+        }
+        self.entries.last().and_then(|e| match e {
+            PanelEntry::ToolRequest { command, .. } => command.as_ref(),
+            _ => None,
+        })
+    }
+
+    /// Flash "copied" on the permission code block's top border.
+    pub fn flashCopied(&mut self) {
+        self.copiedFlash = Some(((usize::MAX, 0), std::time::Instant::now()));
+    }
+
+    /// Scroll the permission code block horizontally.
+    pub fn scrollPermitCode(&mut self, delta: i16) {
+        if delta < 0 {
+            self.permitCodeScrollX = self.permitCodeScrollX.saturating_sub((-delta) as u16);
+        } else {
+            // Clamp to prevent scrolling past content.
+            self.permitCodeScrollX = self.permitCodeScrollX.saturating_add(delta as u16);
         }
     }
 
@@ -604,6 +652,14 @@ impl AgentPanel {
         self.toolStartTime = None;
         self.entries
             .push(PanelEntry::ToolDenied { name: name.into() });
+    }
+
+    pub fn toolAutoDenied(&mut self, name: &str, summary: &str) {
+        if !self.turnActive { return; }
+        self.toolActive = false;
+        self.toolStartTime = None;
+        self.entries
+            .push(PanelEntry::ToolAutoDenied { name: name.into(), summary: summary.into() });
     }
 
     pub fn pushToolResult(&mut self, name: &str, output: &str) {
@@ -1068,9 +1124,17 @@ impl AgentPanel {
         // Dynamic input height based on content.
         // Width accounts for: 2 right padding + 2 prompt prefix.
         let inputHeight = if self.pendingPermit {
-            // 1 summary + patterns + 1 custom + 1 key hints = patterns.len() + 3, capped.
-            let patternLines = self.permitPatterns.len() + 1; // +1 for custom field.
-            (patternLines as u16 + 3).min(inner.height / 2).max(3)
+            // code block (top border + content, no bottom) + header + explanation + blank + 2 keys + blank + patterns + custom.
+            let codeBlockLines: u16 = if self.pendingCommand().is_some() { 2 } else { 0 };
+            let headerLine: u16 = 1;
+            let availW = inner.width.saturating_sub(6) as usize;
+            let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
+                if availW == 0 { 1 } else { (e.len() / availW + 1) as u16 }
+            });
+            let patternLines = self.permitPatterns.len() as u16 + 1; // +1 for custom field.
+            // code block + header + explanation + blank + 2 keys + blank + patterns.
+            (codeBlockLines + headerLine + explanationLines + 1 + 2 + 1 + patternLines)
+                .min(inner.height * 2 / 3).max(5)
         } else {
             self.textArea.desiredHeight(inner.width.saturating_sub(4)).min(8).max(1)
         };
@@ -1087,17 +1151,19 @@ impl AgentPanel {
         let separatorArea = chunks[1];
         let inputArea = chunks[2];
 
-        // Separator line.
-        let sep = "\u{2500}".repeat(separatorArea.width as usize);
-        Paragraph::new(sep)
-            .style(Style::default().fg(Color::DarkGray))
-            .render(separatorArea, buf);
+        // Separator line (hidden during permission prompt — header is in input area).
+        if !self.pendingPermit {
+            let sep = "\u{2500}".repeat(separatorArea.width as usize);
+            Paragraph::new(sep)
+                .style(Style::default().fg(Color::DarkGray))
+                .render(separatorArea, buf);
+        }
 
-        // Input / permit prompt (with right padding).
+        let inputRightPad: u16 = if self.pendingPermit { 1 } else { 2 };
         let paddedInput = Rect {
             x: inputArea.x,
             y: inputArea.y,
-            width: inputArea.width.saturating_sub(2),
+            width: inputArea.width.saturating_sub(inputRightPad),
             height: inputArea.height,
         };
         self.lastInputRect = paddedInput;
@@ -1192,26 +1258,145 @@ impl AgentPanel {
             .render(padded, buf);
     }
 
+
+
+    /// Build the permission header line into a Vec<Line> (for renderInput).
+    fn renderPermitHeaderInline(&self, w: u16, lines: &mut Vec<Line<'static>>) {
+        use unicode_width::UnicodeWidthStr;
+        let w = w as usize;
+        let (impactColor, impactSymbol) = match self.pendingToolImpact {
+            construct::tool::ShellImpact::Delete => (Color::Red, "\u{2620}\u{FE0E}"),
+            construct::tool::ShellImpact::MajorMod => (Color::Rgb(200, 140, 40), "\u{26A0}\u{FE0E}"),
+            construct::tool::ShellImpact::MinorMod => (Color::Rgb(180, 160, 80), "\u{2691}\u{FE0E}"),
+            construct::tool::ShellImpact::Read => (Color::Rgb(80, 160, 200), "\u{2315}"),
+        };
+        let toolLabel = format!(" {} {} ", self.pendingToolName, impactSymbol);
+
+        // Timeout from summary.
+        let timeoutLabel = if let Some(start) = self.pendingToolSummary.find('(') {
+            if let Some(end) = self.pendingToolSummary.find("s):") {
+                let secs = &self.pendingToolSummary[start + 1..end];
+                if secs.parse::<u64>().is_ok() {
+                    format!(" \u{23F2}\u{FE0E} {secs}s ")
+                } else { String::new() }
+            } else { String::new() }
+        } else { String::new() };
+
+        let spanWidth = |spans: &[Span]| -> usize {
+            spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
+        };
+
+        let mut spans: Vec<Span> = Vec::new();
+        let hasBlock = self.pendingCommand().is_some();
+
+        // Left ┴ at column 1 (aligns with code block left │, shifted right by margin).
+        if hasBlock {
+            spans.push(Span::styled("\u{2500}\u{2534}", Style::default().fg(Color::DarkGray)));
+        }
+
+        // Tool name + symbol.
+        spans.push(Span::styled(
+            format!("\u{2500}{toolLabel}"),
+            Style::default().fg(impactColor).add_modifier(Modifier::BOLD),
+        ));
+
+        // Fill between tool label and timeout.
+        let used = spanWidth(&spans);
+        let timeoutW = UnicodeWidthStr::width(timeoutLabel.as_str());
+        let rightW: usize = if hasBlock { 1 } else { 0 }; // ┴
+        let fill = w.saturating_sub(used + timeoutW + rightW);
+        spans.push(Span::styled("\u{2500}".repeat(fill), Style::default().fg(Color::DarkGray)));
+
+        // Timeout.
+        if !timeoutLabel.is_empty() {
+            spans.push(Span::styled(timeoutLabel, Style::default().fg(Color::DarkGray)));
+        }
+
+        // Right ┴ at last column (aligns with code block right │).
+        if hasBlock {
+            spans.push(Span::styled("\u{2534}", Style::default().fg(Color::DarkGray)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
     fn renderInput(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
         if self.pendingPermit {
             let mut lines: Vec<Line> = Vec::new();
 
-            // Header with tool summary.
+            // Code block: render command preview — just the content lines with │ borders,
+            // no top/bottom border (header line below serves as the bottom).
+            if let Some(cmd) = self.pendingCommand() {
+                let codeLines = vec![vec![Span::raw(cmd.clone())]];
+                // Width minus 1 for the left margin shift.
+                let codeWidth = area.width.saturating_sub(1);
+                let mcw = crate::markdown::highlight::maxContentWidth(&codeLines);
+                let innerWidth = codeWidth.saturating_sub(2) as usize;
+                // Clamp scroll to prevent overflow.
+                let maxScroll = mcw.saturating_sub(innerWidth) as u16;
+                if self.permitCodeScrollX > maxScroll {
+                    self.permitCodeScrollX = maxScroll;
+                }
+                let mut codeBlock = crate::markdown::highlight::renderCodeBlock(
+                    &codeLines,
+                    Some("sh"),
+                    codeWidth,
+                    self.permitCodeScrollX,
+                    mcw,
+                    self.copiedFlash.as_ref().is_some_and(|(bid, t)| bid.0 == usize::MAX && t.elapsed().as_secs() < 2),
+                    None,
+                    None,
+                );
+                // Remove bottom border — the header line replaces it.
+                if codeBlock.len() > 1 {
+                    codeBlock.pop();
+                }
+                // Shift right by 1 char (left margin).
+                for codeLine in codeBlock {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(codeLine.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
+
+            // Header line: ─┴─ tool ⚠︎ ──────── ⏲︎ Ns ─┴─
+            self.renderPermitHeaderInline(area.width, &mut lines);
+
+            // Explanation (shell commands only), wrapped to fit.
+            if let Some(ref explanation) = self.pendingToolExplanation {
+                let style = Style::default().fg(Color::DarkGray);
+                let maxW = area.width.saturating_sub(4) as usize;
+                let spanLine = Line::from(Span::styled(explanation.clone(), style));
+                let wrapped = wrapSpannedLine(spanLine, maxW);
+                for wLine in wrapped {
+                    let mut spans = vec![Span::styled("  ", style)];
+                    spans.extend(wLine.spans);
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+            }
+
+            // 2x2 key grid: allow/deny on rows, once/always on columns.
             lines.push(Line::from(vec![
-                Span::styled(
-                    "\u{2500} Permission ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "\u{2500}".repeat(area.width.saturating_sub(13) as usize),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("  [y]", Style::default().fg(Color::Green)),
+                Span::styled(" allow  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[A]", Style::default().fg(Color::Rgb(80, 80, 120))),
+                Span::styled(" always allow", Style::default().fg(Color::Rgb(80, 80, 80))),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  [n]", Style::default().fg(Color::Red)),
+                Span::styled(" deny   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[D]", Style::default().fg(Color::Rgb(120, 80, 80))),
+                Span::styled(" always deny", Style::default().fg(Color::Rgb(80, 80, 80))),
             ]));
 
-            // Pattern choices.
+            // Blank line between keys and scope patterns.
+            lines.push(Line::from(""));
+
+            // Pattern choices (scope for [A]/[D]).
             for (i, pattern) in self.permitPatterns.iter().enumerate() {
                 let selected = i == self.permitSelectedPattern && !self.permitEditingCustom;
-                let marker = if selected { " \u{25b8} " } else { "   " };
+                let marker = if selected { " \u{25b8}" } else { "  " };
                 let style = if selected {
                     Style::default().fg(Color::Yellow)
                 } else {
@@ -1223,36 +1408,39 @@ impl AgentPanel {
                 ]));
             }
 
-            // Custom field.
+            // Custom field — auto-editable when selected.
             let customSelected = self.permitSelectedPattern >= self.permitPatterns.len();
-            let customMarker = if customSelected { " \u{25b8} " } else { "   " };
-            let customStyle = if self.permitEditingCustom {
+            let customMarker = if customSelected { " \u{25b8}" } else { "  " };
+            let customStyle = if customSelected {
                 Style::default().fg(Color::White)
-            } else if customSelected {
-                Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let cursor = if self.permitEditingCustom { "\u{2502}" } else { "" };
+            let cursor = if customSelected { "\u{2502}" } else { "" };
             lines.push(Line::from(vec![
                 Span::styled(customMarker, customStyle),
                 Span::styled("custom: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{}{cursor}", self.permitCustomPattern), customStyle),
             ]));
 
-            // Key hints.
-            lines.push(Line::from(vec![
-                Span::styled(" [y]", Style::default().fg(Color::Green)),
-                Span::styled(" Once ", Style::default().fg(Color::DarkGray)),
-                Span::styled(" [a]", Style::default().fg(Color::Cyan)),
-                Span::styled(" Always ", Style::default().fg(Color::DarkGray)),
-                Span::styled(" [n]", Style::default().fg(Color::Red)),
-                Span::styled(" Deny ", Style::default().fg(Color::DarkGray)),
-                Span::styled(" [e]", Style::default().fg(Color::DarkGray)),
-                Span::styled(" Edit", Style::default().fg(Color::DarkGray)),
-            ]));
+            // Track the header line row for gap fill.
+            let headerRow = if self.pendingCommand().is_some() {
+                // Code block top border + content lines (1 each) = 2, header is line index 2.
+                Some(area.y + 2)
+            } else {
+                None
+            };
 
             Paragraph::new(lines).render(area, buf);
+
+            // Fill the 1-col gap between the header line and the panel border.
+            if let Some(row) = headerRow {
+                let gapCol = area.x + area.width;
+                if let Some(cell) = buf.cell_mut((gapCol, row)) {
+                    cell.set_char('\u{2500}');
+                    cell.set_style(Style::default().fg(Color::DarkGray));
+                }
+            }
         } else {
             self.textArea.render(area, buf, focused);
             // Ghost text overlay for completion.
@@ -1587,6 +1775,7 @@ impl AgentPanel {
             }
         }
 
+
         (lines, cont, reasoningHeaders, codeBlockRanges, nonCopyable)
     }
 
@@ -1653,9 +1842,9 @@ impl AgentPanel {
                     }
                 }
             }
-            PanelEntry::ToolRequest { summary, diff } => {
+            PanelEntry::ToolRequest { summary, diff, command } => {
                 if let Some(diffText) = diff {
-                    // Summary line with (+N -M) stats.
+                    // File edit: summary line with (+N -M) stats + diff code block.
                     let (added, removed) = diffStats(diffText);
                     let summaryBlock = RenderedBlock::Text(vec![Line::from(vec![
                         Span::styled(
@@ -1684,6 +1873,17 @@ impl AgentPanel {
                         entryIndex, &self.codeScrollX, &self.codeExpanded,
                         codeBlockRanges, &self.copiedFlash,
                     );
+                } else if command.is_some() {
+                    // Shell command: skip rendering in chat when prompt is active
+                    // (code block + info is in the input area). Show compact summary
+                    // only for historical/approved entries.
+                    let isPending = self.pendingPermit
+                        && entryIndex == self.entries.len() - 1;
+                    if !isPending {
+                        let style = Style::default().fg(Color::Yellow);
+                        let content = vec![Line::from(Span::styled(summary.clone(), style))];
+                        prefixFirstLine(lines, cont, content, "\u{2699}\u{FE0E} ", style, width);
+                    }
                 } else {
                     let style = Style::default().fg(Color::Yellow);
                     let content = vec![Line::from(Span::styled(summary.clone(), style))];
@@ -1699,6 +1899,17 @@ impl AgentPanel {
                 let style = Style::default().fg(Color::Red);
                 let content = vec![Line::from(Span::styled(
                     format!("{name} (denied)"),
+                    style,
+                ))];
+                prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
+            }
+            PanelEntry::ToolAutoDenied { name, summary } => {
+                // Red-tinted background for rule-blocked tool calls.
+                let style = Style::default()
+                    .fg(Color::Red)
+                    .bg(Color::Rgb(60, 20, 20));
+                let content = vec![Line::from(Span::styled(
+                    format!("{name}: {summary} (blocked by rule)"),
                     style,
                 ))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);

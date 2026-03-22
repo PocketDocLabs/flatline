@@ -47,12 +47,25 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                             "type": "string",
                             "description": "The shell command to execute."
                         },
+                        "explanation": {
+                            "type": "string",
+                            "description": "One-line description of what this command does and why you are running it."
+                        },
+                        "impact": {
+                            "type": "string",
+                            "enum": ["read", "minorMod", "majorMod", "delete"],
+                            "description": "Scope of the command's effect on the environment. \
+                                read: only reads or inspects, no state change. \
+                                minorMod: creates or modifies a small number of files within the project. \
+                                majorMod: installs packages, modifies configuration, or changes many files. \
+                                delete: removes files, drops state, or performs operations difficult to reverse."
+                        },
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds. Default 30. The command is interrupted if it exceeds this."
                         }
                     },
-                    "required": ["command"]
+                    "required": ["command", "explanation", "impact"]
                 }),
             },
         },
@@ -722,10 +735,25 @@ pub struct EditOp {
     pub replaceAll: bool,
 }
 
+/// Scope of a shell command's effect on the environment (model-classified).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShellImpact {
+    /// Command only reads or inspects. No state change.
+    Read,
+    /// Creates or modifies a small number of files within the project.
+    #[default]
+    MinorMod,
+    /// Installs packages, modifies configuration, or changes many files.
+    MajorMod,
+    /// Removes files, drops state, or performs operations difficult to reverse.
+    Delete,
+}
+
 /// A parsed tool invocation from the LLM.
 #[derive(Debug)]
 pub enum ToolAction {
-    Shell { command: String, timeout: Option<u64> },
+    Shell { command: String, explanation: String, impact: ShellImpact, timeout: Option<u64> },
     ReadFile { path: String, offset: Option<usize>, limit: Option<usize>, anchor: Option<usize> },
     WriteFile { path: String, content: String },
     EditFile { path: String, oldString: String, newString: String, replaceAll: bool },
@@ -815,10 +843,15 @@ pub fn needsTask(action: &ToolAction) -> bool {
 /// Human-readable summary of what a tool action will do.
 pub fn summarize(action: &ToolAction) -> String {
     match action {
-        ToolAction::Shell { command, timeout } => {
-            match timeout {
-                Some(t) => format!("Run ({t}s): {command}"),
-                None => format!("Run: {command}"),
+        ToolAction::Shell { command, explanation, timeout, .. } => {
+            let prefix = match timeout {
+                Some(t) => format!("Run ({t}s)"),
+                None => "Run".into(),
+            };
+            if explanation.is_empty() {
+                format!("{prefix}: {command}")
+            } else {
+                format!("{prefix}: {command} \u{2014} {explanation}")
             }
         }
         ToolAction::ReadFile { path, offset, limit, anchor } => {
@@ -1071,7 +1104,7 @@ pub fn needsWeb(action: &ToolAction) -> bool {
 /// Execute a tool action and return the output string.
 pub async fn execute(action: &ToolAction, shell: &Shell) -> String {
     match action {
-        ToolAction::Shell { command, timeout } => {
+        ToolAction::Shell { command, timeout, .. } => {
             let dur = timeout.map(|s| std::time::Duration::from_secs(s));
             let raw = shell.execute(command, dur).await;
             // Apply same size guard as readFile. Full output is in shell history.
@@ -2690,6 +2723,11 @@ pub fn parse(name: &str, argsJson: &str) -> ToolAction {
     match name {
         "shell" => ToolAction::Shell {
             command: args["command"].as_str().unwrap_or("").into(),
+            explanation: args["explanation"].as_str().unwrap_or("").into(),
+            impact: args["impact"]
+                .as_str()
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok())
+                .unwrap_or_default(),
             timeout: args["timeout"].as_u64(),
         },
         "readFile" => ToolAction::ReadFile {

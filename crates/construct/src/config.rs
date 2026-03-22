@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::permissions::{PermitMode, Permissions, Rule};
+use crate::permissions::{PermissionsSource, PermitMode, Permissions, Rule};
 
 const CONFIG_DIR: &str = "flatline";
 const CONFIG_FILE: &str = "config.toml";
@@ -227,17 +227,30 @@ pub fn load() -> Result<Config> {
     let projectRoot = discoverProjectRoot();
     let mut merged = userLayer;
 
+    // Track which layer last set [permissions] for source tagging.
+    let mut permsSource = if merged.permissions.is_some() {
+        PermissionsSource::User
+    } else {
+        PermissionsSource::BuiltIn
+    };
+
     if let Some(ref root) = projectRoot {
         let projectDir = root.join(PROJECT_DIR);
 
         // Layer 3: project config.
         let projectPath = projectDir.join(PROJECT_CONFIG);
         let projectLayer = loadPartial(&projectPath)?;
+        if projectLayer.permissions.is_some() {
+            permsSource = PermissionsSource::Project;
+        }
         merged = merged.merge(projectLayer);
 
         // Layer 4: local config (personal, gitignored).
         let localPath = projectDir.join(LOCAL_CONFIG);
         let localLayer = loadPartial(&localPath)?;
+        if localLayer.permissions.is_some() {
+            permsSource = PermissionsSource::Local;
+        }
         merged = merged.merge(localLayer);
 
         // Ensure config.local.toml is gitignored.
@@ -249,6 +262,11 @@ pub fn load() -> Result<Config> {
     // Resolve partial into full config.
     let mut config = merged.resolve();
     config.projectRoot = projectRoot;
+
+    // Tag permissions with their source layer.
+    if let Some(ref mut perms) = config.permissions {
+        perms.source = permsSource;
+    }
 
     // Layer 5: env vars always win.
     if let Ok(envKey) = std::env::var("OPENROUTER_API_KEY") {
@@ -479,6 +497,7 @@ pub fn persistPermissionRule(
     currentPermissions: &Permissions,
     toolName: &str,
     pattern: &str,
+    allow: bool,
 ) -> Result<()> {
     let projectDir = projectRoot.join(PROJECT_DIR);
     let configPath = projectDir.join(PROJECT_CONFIG);
@@ -500,7 +519,7 @@ pub fn persistPermissionRule(
     let newRule = Rule {
         tool: toolName.to_string(),
         pattern: if pattern.is_empty() { None } else { Some(pattern.to_string()) },
-        allow: true,
+        allow,
     };
 
     if doc.contains_key("permissions") {
@@ -549,6 +568,45 @@ fn ruleToToml(rule: &Rule) -> toml::Value {
     }
     table.insert("allow".to_string(), toml::Value::Boolean(rule.allow));
     toml::Value::Table(table)
+}
+
+/// Save a full permissions set to `.flatline/config.toml`, replacing the existing section.
+pub fn savePermissions(
+    projectRoot: &Path,
+    defaultMode: &PermitMode,
+    rules: &[Rule],
+) -> Result<()> {
+    let projectDir = projectRoot.join(PROJECT_DIR);
+    let configPath = projectDir.join(PROJECT_CONFIG);
+
+    fs::create_dir_all(&projectDir)
+        .with_context(|| format!("failed to create {}", projectDir.display()))?;
+
+    let existing = if configPath.exists() {
+        fs::read_to_string(&configPath)
+            .with_context(|| format!("failed to read {}", configPath.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+
+    // Build the full permissions section.
+    let ruleValues: Vec<toml::Value> = rules.iter().map(ruleToToml).collect();
+    let mut permTable = toml::Table::new();
+    permTable.insert(
+        "defaultMode".to_string(),
+        toml::Value::String(permitModeToStr(defaultMode).to_string()),
+    );
+    permTable.insert("rules".to_string(), toml::Value::Array(ruleValues));
+    doc.insert("permissions".to_string(), toml::Value::Table(permTable));
+
+    let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
+    fs::write(&configPath, &output)
+        .with_context(|| format!("failed to write {}", configPath.display()))?;
+
+    ensureLocalGitignored(&projectDir);
+    Ok(())
 }
 
 fn permitModeToStr(mode: &PermitMode) -> &'static str {

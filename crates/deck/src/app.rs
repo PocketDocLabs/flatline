@@ -341,6 +341,47 @@ pub async fn run() -> Result<()> {
                                 })
                                 .await;
                         }
+                        Some(CommandAction::Permissions) => {
+                            let (defaultMode, rules, source, configPath) =
+                                session.permissionsStatusData();
+                            let _ = eventTx
+                                .send(SessionEvent::PermissionsStatus {
+                                    defaultMode,
+                                    rules,
+                                    source,
+                                    configPath,
+                                })
+                                .await;
+                        }
+                        Some(CommandAction::SavePermissions { defaultMode, rules }) => {
+                            if let Some(ref root) = config.projectRoot {
+                                match construct::config::savePermissions(
+                                    root,
+                                    &defaultMode,
+                                    &rules,
+                                ) {
+                                    Ok(()) => {
+                                        session.setPermissions(construct::permissions::Permissions {
+                                            defaultMode,
+                                            rules,
+                                            source: construct::permissions::PermissionsSource::Project,
+                                        });
+                                        let _ = eventTx
+                                            .send(SessionEvent::CommandResult(
+                                                "Permissions saved.".into(),
+                                            ))
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = eventTx
+                                            .send(SessionEvent::CommandResult(
+                                                format!("Failed to save permissions: {e}"),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
                         Some(CommandAction::Rewind { target }) if target.is_empty() => {
                             let turns = session.loadDisplayTurns().unwrap_or_default();
                             let _ = eventTx
@@ -439,6 +480,7 @@ async fn runLoop(
     let mut pendingRewindMessage: Option<String> = None;
     let mut mcpPanel: Option<McpPanel> = None;
     let mut lspPanel: Option<LspPanel> = None;
+    let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
     let mut subagentPermitTx: Option<mpsc::Sender<construct::permissions::PermitResponse>> = None;
     let projectDir = std::env::current_dir()
@@ -663,6 +705,11 @@ async fn runLoop(
                 panel.render(area, frame.buffer_mut());
             }
 
+            // Permissions panel overlay.
+            if let Some(ref mut panel) = permissionsPanel {
+                panel.render(area, frame.buffer_mut());
+            }
+
             // Subagent panel overlay.
             if let Some(ref mut panel) = subagentPanel {
                 panel.render(area, frame.buffer_mut());
@@ -682,8 +729,8 @@ async fn runLoop(
             match event {
                 SessionEvent::ContentDelta(text) => agentPanel.appendContent(&text),
                 SessionEvent::ReasoningDelta(text) => agentPanel.appendReasoning(&text),
-                SessionEvent::ToolRequest { name, summary, args, diff } => {
-                    agentPanel.showToolRequest(&name, &summary, &args, diff);
+                SessionEvent::ToolRequest { name, summary, args, diff, explanation, impact } => {
+                    agentPanel.showToolRequest(&name, &summary, &args, diff, explanation, impact);
                 }
                 SessionEvent::ToolResult { name, output } => {
                     // Task tool results are handled by SubagentComplete — don't double-render.
@@ -701,6 +748,9 @@ async fn runLoop(
                 }
                 SessionEvent::ToolDenied { name } => {
                     agentPanel.toolDenied(&name);
+                }
+                SessionEvent::ToolAutoDenied { name, summary } => {
+                    agentPanel.toolAutoDenied(&name, &summary);
                 }
                 SessionEvent::TurnAborted { name } => {
                     agentPanel.pushError(&format!("Turn aborted: {name} not permitted"));
@@ -781,6 +831,11 @@ async fn runLoop(
                 SessionEvent::LspStatus { servers } => {
                     lspPanel = Some(LspPanel::new(servers));
                 }
+                SessionEvent::PermissionsStatus { defaultMode, rules, source, configPath } => {
+                    permissionsPanel = Some(crate::permissions_panel::PermissionsPanel::new(
+                        defaultMode, rules, source, configPath,
+                    ));
+                }
                 SessionEvent::RewindPickerData { turns } => {
                     rewindPicker = Some(RewindPicker::new(&turns));
                 }
@@ -835,7 +890,10 @@ async fn runLoop(
                     sessionId: _, name, summary, args, diff, responseTx,
                 } => {
                     // Show permission prompt for the subagent (reuse same UI).
-                    agentPanel.showToolRequest(&name, &summary, &args, diff);
+                    agentPanel.showToolRequest(
+                        &name, &summary, &args, diff,
+                        None, construct::tool::ShellImpact::MinorMod,
+                    );
                     subagentPermitTx = Some(responseTx);
                 }
                 SessionEvent::SubagentShellOutput { data, .. } => {
@@ -888,6 +946,7 @@ async fn runLoop(
             &mut mcpPanel,
             &mut lspPanel,
             &mut subagentPanel,
+            &mut permissionsPanel,
             &mut subagentPermitTx,
             &projectDir,
             &mut lastQuitPress,
@@ -932,6 +991,7 @@ async fn handleInput(
     mcpPanel: &mut Option<McpPanel>,
     lspPanel: &mut Option<LspPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
+    permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
     subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
@@ -1003,7 +1063,7 @@ async fn handleInput(
 
                 if key.code == KeyCode::Tab {
                     // Don't switch focus when an overlay is active or completion menu is open.
-                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() {
+                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() || permissionsPanel.is_some() {
                         // Let the overlay handle Tab (falls through to overlay dispatch below).
                     } else if !(*focus == Focus::Agent && agentPanel.completionActive()) {
                         *focus = match focus {
@@ -1045,36 +1105,39 @@ async fn handleInput(
                     }
 
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        KeyCode::Char('y') => {
                             agentPanel.approvePending();
                             sendPermit!(PermitResponse::Allow);
                         }
-                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                        // Shift+A: always allow (persist to project config).
+                        KeyCode::Char('A') => {
                             let pattern = agentPanel.selectedPattern();
                             agentPanel.approvePending();
                             sendPermit!(PermitResponse::AlwaysAllow { pattern });
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                        KeyCode::Char('n') => {
                             agentPanel.denyPending();
                             sendPermit!(PermitResponse::Deny);
                         }
-                        KeyCode::Up => agentPanel.prevPattern(),
-                        KeyCode::Down => agentPanel.nextPattern(),
-                        KeyCode::Char('e') | KeyCode::Char('E') => agentPanel.toggleCustomEdit(),
-                        // When editing custom pattern, handle text input.
+                        // Shift+D: always deny (persist to project config).
+                        KeyCode::Char('D') => {
+                            let pattern = agentPanel.selectedPattern();
+                            agentPanel.denyPending();
+                            sendPermit!(PermitResponse::AlwaysDeny { pattern });
+                        }
+                        // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            agentPanel.prevPattern();
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            agentPanel.nextPattern();
+                        }
+                        // Custom pattern text input (when custom field is selected).
                         KeyCode::Char(c) if agentPanel.isEditingCustom() => {
                             agentPanel.customPatternInsert(c);
                         }
                         KeyCode::Backspace if agentPanel.isEditingCustom() => {
                             agentPanel.customPatternBackspace();
-                        }
-                        KeyCode::Enter if agentPanel.isEditingCustom() => {
-                            let pattern = agentPanel.selectedPattern();
-                            agentPanel.approvePending();
-                            sendPermit!(PermitResponse::AlwaysAllow { pattern });
-                        }
-                        KeyCode::Esc if agentPanel.isEditingCustom() => {
-                            agentPanel.toggleCustomEdit();
                         }
                         KeyCode::Char('v') | KeyCode::Char('V') => {
                             // Open subagent panel if a subagent is active.
@@ -1173,6 +1236,24 @@ async fn handleInput(
                             let _ = shellIo.inputTx.try_send(cmdBytes);
                         }
                         LspPanelAction::None => {}
+                    }
+                    break;
+                }
+
+                // Permissions panel intercepts all keys when active.
+                if let Some(panel) = permissionsPanel {
+                    use crate::permissions_panel::PermPanelAction;
+                    match panel.handleKey(key) {
+                        PermPanelAction::Close => {
+                            *permissionsPanel = None;
+                        }
+                        PermPanelAction::Save { defaultMode, rules } => {
+                            *permissionsPanel = None;
+                            let _ = commandTx
+                                .send(CommandAction::SavePermissions { defaultMode, rules })
+                                .await;
+                        }
+                        PermPanelAction::None => {}
                     }
                     break;
                 }
@@ -1331,7 +1412,7 @@ async fn handleInput(
                     break;
                 }
                 // Other overlay panels consume all mouse events to prevent click-through.
-                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() {
+                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() || permissionsPanel.is_some() {
                     break;
                 }
                 if handleMouse(mouse, focus, agentPanel, termState, selState, shellIo, scrollLock, subagentPanel) {
@@ -1390,6 +1471,19 @@ fn handleMouse(
         MouseEventKind::Down(MouseButton::Left) => {
             // Check input area first (not part of panel hit-testing).
             if selState.inputContentRect.contains((mouse.column, mouse.row).into()) {
+                // Permission prompt: check for copy button click on code block top border.
+                if agentPanel.pendingPermit {
+                    let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
+                    let localCol = mouse.column.saturating_sub(selState.inputContentRect.x);
+                    // Top border row — check if click is on "copy" label.
+                    if localRow == 0 && localCol + 6 >= selState.inputContentRect.width {
+                        if let Some(cmd) = agentPanel.pendingCommand() {
+                            crate::selection::copyToClipboard(cmd);
+                            agentPanel.flashCopied();
+                        }
+                    }
+                    return true;
+                }
                 *focus = Focus::Agent;
                 let localCol = mouse.column.saturating_sub(selState.inputContentRect.x);
                 let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
@@ -1613,7 +1707,12 @@ fn handleMouse(
         }
         MouseEventKind::ScrollLeft => {
             if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
-            if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
+            // Permission code block scroll (in input area).
+            if agentPanel.pendingPermit
+                && selState.inputContentRect.contains((mouse.column, mouse.row).into())
+            {
+                agentPanel.scrollPermitCode(-3);
+            } else if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
                 let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
                 let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                 if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
@@ -1623,7 +1722,11 @@ fn handleMouse(
         }
         MouseEventKind::ScrollRight => {
             if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
-            if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
+            if agentPanel.pendingPermit
+                && selState.inputContentRect.contains((mouse.column, mouse.row).into())
+            {
+                agentPanel.scrollPermitCode(3);
+            } else if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
                 let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
                 let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                 if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
@@ -1948,5 +2051,9 @@ fn convertAction(action: crate::command::CommandAction) -> CommandAction {
         crate::command::CommandAction::Clear => CommandAction::Clear,
         crate::command::CommandAction::Mcp => CommandAction::Mcp,
         crate::command::CommandAction::Lsp => CommandAction::Lsp,
+        crate::command::CommandAction::Permissions => CommandAction::Permissions,
+        crate::command::CommandAction::SavePermissions { defaultMode, rules } => {
+            CommandAction::SavePermissions { defaultMode, rules }
+        }
     }
 }

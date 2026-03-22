@@ -57,6 +57,10 @@ pub enum SessionEvent {
         summary: String,
         args: String,
         diff: Option<String>,
+        /// Model-provided explanation (shell commands only).
+        explanation: Option<String>,
+        /// Impact tier for visual treatment.
+        impact: crate::tool::ShellImpact,
     },
 
     /// A tool was auto-approved by the permission config.
@@ -68,8 +72,11 @@ pub enum SessionEvent {
     /// A tool was executed (after approval).
     ToolResult { name: String, output: String },
 
-    /// A tool call was denied.
+    /// A tool call was denied by a user action (pressing [n]).
     ToolDenied { name: String },
+
+    /// A tool call was auto-denied by a permission rule.
+    ToolAutoDenied { name: String, summary: String },
 
     /// Turn aborted because a tool call was denied under Abort mode.
     TurnAborted { name: String },
@@ -90,6 +97,14 @@ pub enum SessionEvent {
 
     /// Result of a slash command execution.
     CommandResult(String),
+
+    /// Permissions status data for the /permissions panel.
+    PermissionsStatus {
+        defaultMode: crate::permissions::PermitMode,
+        rules: Vec<crate::permissions::Rule>,
+        source: crate::permissions::PermissionsSource,
+        configPath: String,
+    },
 
     /// A compaction stage started running.
     CompactionStarted { stage: String },
@@ -216,6 +231,13 @@ pub enum CommandAction {
     Mcp,
     /// Show LSP server status.
     Lsp,
+    /// Show permissions panel.
+    Permissions,
+    /// Save permissions from the panel.
+    SavePermissions {
+        defaultMode: crate::permissions::PermitMode,
+        rules: Vec<crate::permissions::Rule>,
+    },
 }
 
 /// Agent session — owns the conversation and drives the turn loop.
@@ -897,8 +919,9 @@ impl Session {
                             }
                             Verdict::Deny => {
                                 let _ = eventTx
-                                    .send(SessionEvent::ToolDenied {
+                                    .send(SessionEvent::ToolAutoDenied {
                                         name: call.function.name.clone(),
+                                        summary: summary.clone(),
                                     })
                                     .await;
                                 false
@@ -907,12 +930,17 @@ impl Session {
                                 match self.permissions.defaultMode {
                                     PermitMode::Ask => {
                                         let diff = tool::diffPreview(&action);
+                                        let explanation = crate::permissions::toolExplanation(&action)
+                                            .map(|s| s.to_string());
+                                        let impact = crate::permissions::toolImpact(&action);
                                         let _ = eventTx
                                             .send(SessionEvent::ToolRequest {
                                                 name: call.function.name.clone(),
                                                 summary,
                                                 args: call.function.arguments.clone(),
                                                 diff,
+                                                explanation,
+                                                impact,
                                             })
                                             .await;
 
@@ -936,11 +964,32 @@ impl Session {
                                                                 &self.permissions,
                                                                 toolName,
                                                                 &pattern,
+                                                                true,
                                                             ) {
                                                                 tracing::warn!("failed to persist permission rule: {e}");
                                                             }
                                                         }
                                                         true
+                                                    }
+                                                    Some(PermitResponse::AlwaysDeny { pattern }) => {
+                                                        let (toolName, _) = crate::permissions::actionKey(&action);
+                                                        self.permissions.addRule(crate::permissions::Rule {
+                                                            tool: toolName.into(),
+                                                            pattern: Some(pattern.clone()),
+                                                            allow: false,
+                                                        });
+                                                        if let Some(ref root) = self.config.projectRoot {
+                                                            if let Err(e) = crate::config::persistPermissionRule(
+                                                                root,
+                                                                &self.permissions,
+                                                                toolName,
+                                                                &pattern,
+                                                                false,
+                                                            ) {
+                                                                tracing::warn!("failed to persist deny rule: {e}");
+                                                            }
+                                                        }
+                                                        false
                                                     }
                                                     Some(PermitResponse::Deny) | None => false,
                                                 }
@@ -2067,7 +2116,7 @@ impl Session {
                     SessionEvent::TurnComplete => turns += 1,
 
                     // Permission escalation: forward to parent TUI and relay response.
-                    SessionEvent::ToolRequest { name, summary, args, diff } => {
+                    SessionEvent::ToolRequest { name, summary, args, diff, .. } => {
                         let (responseTx, mut responseRx) =
                             mpsc::channel::<crate::permissions::PermitResponse>(1);
                         let _ = forwardParentTx
@@ -2196,6 +2245,32 @@ impl Session {
     }
 
     /// Gather structured MCP status data for the TUI panel.
+    /// Replace the current permission set.
+    pub fn setPermissions(&mut self, permissions: crate::permissions::Permissions) {
+        self.permissions = permissions;
+    }
+
+    /// Get permissions data for the /permissions panel.
+    pub fn permissionsStatusData(&self) -> (
+        crate::permissions::PermitMode,
+        Vec<crate::permissions::Rule>,
+        crate::permissions::PermissionsSource,
+        String,
+    ) {
+        let configPath = self
+            .config
+            .projectRoot
+            .as_ref()
+            .map(|r| r.join(".flatline/config.toml").display().to_string())
+            .unwrap_or_else(|| "~/.config/flatline/config.toml".into());
+        (
+            self.permissions.defaultMode.clone(),
+            self.permissions.rules.clone(),
+            self.permissions.source,
+            configPath,
+        )
+    }
+
     pub async fn mcpStatusData(
         &self,
     ) -> (
@@ -2410,6 +2485,8 @@ impl Session {
             // Handled specially by the session task — shouldn't reach here.
             CommandAction::Mcp => "Use the /mcp command in the TUI.".to_string(),
             CommandAction::Lsp => "Use the /lsp command in the TUI.".to_string(),
+            CommandAction::Permissions => "Use /permissions in the TUI.".to_string(),
+            CommandAction::SavePermissions { .. } => "Handled by TUI.".to_string(),
             // Dispatched as special cases — need eventTx, so not handled here.
             CommandAction::Rewind { .. }
             | CommandAction::ForkAndRewind { .. }

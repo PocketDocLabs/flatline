@@ -26,10 +26,12 @@ use serde::{Deserialize, Serialize};
 pub enum PermitResponse {
     /// Allow this one invocation.
     Allow,
-    /// Allow and add a session rule for the given pattern.
+    /// Allow and persist an allow rule for the given pattern.
     AlwaysAllow { pattern: String },
     /// Deny this invocation.
     Deny,
+    /// Deny and persist a deny rule for the given pattern.
+    AlwaysDeny { pattern: String },
 }
 
 /// Generate suggested "always allow" patterns for a tool action.
@@ -87,6 +89,32 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
     }
 }
 
+/// Get the display impact tier for any tool action.
+///
+/// For shell: uses the model-provided impact classification.
+/// For file writes/edits/MCP: hardcoded to MinorMod.
+/// For read-only tools (shouldn't reach a prompt): Read.
+pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
+    use crate::tool::ShellImpact;
+    match action {
+        ToolAction::Shell { impact, .. } => impact.clone(),
+        ToolAction::WriteFile { .. }
+        | ToolAction::EditFile { .. }
+        | ToolAction::MultiEdit { .. } => ShellImpact::MinorMod,
+        ToolAction::Mcp { .. } => ShellImpact::MinorMod,
+        ToolAction::Task { .. } => ShellImpact::MinorMod,
+        _ => ShellImpact::Read,
+    }
+}
+
+/// Get the shell explanation from a tool action (only present for shell commands).
+pub fn toolExplanation(action: &ToolAction) -> Option<&str> {
+    match action {
+        ToolAction::Shell { explanation, .. } if !explanation.is_empty() => Some(explanation),
+        _ => None,
+    }
+}
+
 /// Generate directory-based patterns from a file path.
 fn pathPatterns(path: &str) -> Vec<String> {
     let mut patterns = Vec::new();
@@ -111,16 +139,57 @@ fn pathPatterns(path: &str) -> Vec<String> {
     patterns
 }
 
-/// Generate token-prefix patterns from a shell command.
+/// Generate shell command patterns for "always allow/deny" rules.
+///
+/// Parses the command to extract the binary and optional subcommand,
+/// ignoring flags, quoted strings, pipes, and shell metacharacters.
+/// Patterns use trailing `*` for prefix matching.
 fn shellPatterns(command: &str) -> Vec<String> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut patterns = Vec::new();
 
-    // First 3, 2, 1 tokens as prefixes.
-    for n in (1..=3.min(tokens.len())).rev() {
-        let prefix = tokens[..n].join(" ");
-        patterns.push(prefix);
+    // Take only the first command (before pipes, &&, ||, ;).
+    let firstCmd = command
+        .split(&['|', ';'][..])
+        .next()
+        .unwrap_or(command)
+        .split("&&")
+        .next()
+        .unwrap_or(command)
+        .split("||")
+        .next()
+        .unwrap_or(command)
+        .trim();
+
+    // Tokenize, skipping env assignments (FOO=bar).
+    let tokens: Vec<&str> = firstCmd
+        .split_whitespace()
+        .filter(|t| !(t.contains('=') && !t.starts_with('-')))
+        .collect();
+
+    if tokens.is_empty() {
+        return patterns;
     }
+
+    let binary = tokens[0];
+
+    // A subcommand is an alphabetic word (not a flag, path, quoted string, or redirect).
+    let subcommand = tokens.get(1).and_then(|t| {
+        let first = t.chars().next()?;
+        if first.is_alphabetic()
+            && t.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            Some(*t)
+        } else {
+            None
+        }
+    });
+
+    // Most specific: binary + subcommand.
+    if let Some(sub) = subcommand {
+        patterns.push(format!("{binary} {sub}*"));
+    }
+    // Broadest: just the binary.
+    patterns.push(format!("{binary}*"));
 
     patterns.dedup();
     patterns
@@ -188,6 +257,20 @@ pub struct Rule {
     pub allow: bool,
 }
 
+/// Where a permission set was loaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PermissionsSource {
+    /// Built-in preset (allowReadOnly, askForEverything, etc.).
+    #[default]
+    BuiltIn,
+    /// User config (`~/.config/flatline/config.toml`).
+    User,
+    /// Project config (`.flatline/config.toml`).
+    Project,
+    /// Local config (`.flatline/config.local.toml`).
+    Local,
+}
+
 /// Permission configuration for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Permissions {
@@ -195,6 +278,9 @@ pub struct Permissions {
     pub defaultMode: PermitMode,
     /// Ordered list of rules. First match wins.
     pub rules: Vec<Rule>,
+    /// Which config layer these permissions came from (runtime-only, not serialized).
+    #[serde(skip)]
+    pub source: PermissionsSource,
 }
 
 impl Default for Permissions {
@@ -203,6 +289,7 @@ impl Default for Permissions {
         Self {
             defaultMode: PermitMode::Ask,
             rules: Vec::new(),
+            source: PermissionsSource::BuiltIn,
         }
     }
 }
@@ -218,6 +305,7 @@ impl Permissions {
         Self {
             defaultMode: PermitMode::Abort,
             rules: Vec::new(),
+            source: PermissionsSource::BuiltIn,
         }
     }
 
@@ -226,6 +314,7 @@ impl Permissions {
         Self {
             defaultMode: PermitMode::Deny,
             rules: vec![Rule { tool: "*".into(), pattern: None, allow: true }],
+            source: PermissionsSource::BuiltIn,
         }
     }
 
@@ -243,6 +332,7 @@ impl Permissions {
                 .iter()
                 .map(|&tool| Rule { tool: tool.into(), pattern: None, allow: true })
                 .collect(),
+            source: PermissionsSource::BuiltIn,
         }
     }
 
@@ -260,7 +350,13 @@ impl Permissions {
                 continue;
             }
             if let Some(pattern) = &rule.pattern {
-                if !keyArg.contains(pattern.as_str()) {
+                // Trailing * = prefix match. Otherwise substring match.
+                let matches = if let Some(prefix) = pattern.strip_suffix('*') {
+                    keyArg.starts_with(prefix)
+                } else {
+                    keyArg.contains(pattern.as_str())
+                };
+                if !matches {
                     continue;
                 }
             }

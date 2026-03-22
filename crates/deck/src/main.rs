@@ -19,6 +19,7 @@ mod history;
 mod markdown;
 mod lsp_panel;
 mod mcp_panel;
+mod permissions_panel;
 mod rewind_picker;
 mod selection;
 mod session_picker;
@@ -28,14 +29,142 @@ mod text_area;
 mod throbber;
 
 use anyhow::Result;
+use clap::{Args, CommandFactory, Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "flatline", version, about = "General-purpose agentic terminal tool")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a prompt headlessly.
+    Exec(ExecArgs),
+
+    /// Start MCP server.
+    McpServe,
+
+    /// Generate shell completions.
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate for (bash, zsh, fish, powershell, elvish).
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// The prompt to execute (reads stdin if omitted).
+    prompt: Option<String>,
+
+    /// Output format.
+    #[arg(long, default_value = "text", value_parser = ["text", "json", "events"])]
+    output: String,
+
+    /// Maximum agent turns.
+    #[arg(long, default_value_t = 50)]
+    maxTurns: usize,
+
+    /// Model override.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Replace the system prompt.
+    #[arg(long, group = "sysprompt")]
+    systemPrompt: Option<String>,
+
+    /// Read system prompt from file.
+    #[arg(long, group = "sysprompt")]
+    systemPromptFile: Option<std::path::PathBuf>,
+
+    /// Append to the default system prompt.
+    #[arg(long)]
+    appendSystemPrompt: Option<String>,
+
+    /// Comma-separated list of allowed tools.
+    #[arg(long, value_delimiter = ',')]
+    allowedTools: Option<Vec<String>>,
+
+    /// Comma-separated list of tools (empty string = none).
+    #[arg(long, value_delimiter = ',')]
+    tools: Option<Vec<String>>,
+
+    /// Agent name.
+    #[arg(long)]
+    agent: Option<String>,
+
+    /// Strict MCP mode.
+    #[arg(long)]
+    strictMcp: bool,
+
+    /// Ephemeral session.
+    #[arg(long)]
+    ephemeral: bool,
+}
+
+/// Resolve ExecArgs into a prompt string and RunConfig.
+fn resolveExecArgs(args: ExecArgs) -> Result<(String, construct::runner::RunConfig)> {
+    // Resolve prompt: positional arg or stdin fallback.
+    let prompt = match args.prompt {
+        Some(p) => p,
+        None => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                Cli::command()
+                    .find_subcommand_mut("exec")
+                    .expect("exec subcommand exists")
+                    .print_help()?;
+                std::process::exit(2);
+            }
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            if buf.trim().is_empty() {
+                anyhow::bail!("no prompt provided");
+            }
+            buf
+        }
+    };
+
+    // Resolve system prompt override.
+    let systemPrompt = if let Some(text) = args.systemPrompt {
+        Some(construct::runner::SystemPromptOverride::Replace(text))
+    } else if let Some(path) = args.systemPromptFile {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read system prompt file: {e}"))?;
+        Some(construct::runner::SystemPromptOverride::Replace(content))
+    } else {
+        args.appendSystemPrompt.map(construct::runner::SystemPromptOverride::Append)
+    };
+
+    // Filter empty strings from tools (handles `--tools ""`).
+    let tools = args.tools.map(|v| {
+        let filtered: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+        filtered
+    });
+
+    let config = construct::runner::RunConfig {
+        maxTurns: args.maxTurns,
+        model: args.model,
+        systemPrompt,
+        allowedTools: args.allowedTools,
+        tools,
+        agent: args.agent,
+        mcpConfigPath: None,
+        strictMcp: args.strictMcp,
+        ephemeral: args.ephemeral,
+    };
+
+    Ok((prompt, config))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let subcommand = args.first().map(|s| s.as_str());
+    let cli = Cli::parse();
 
-    match subcommand {
-        Some("mcp-serve") => {
+    match cli.command {
+        Some(Commands::McpServe) => {
             let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
             tracing_subscriber::fmt()
@@ -47,7 +176,7 @@ async fn main() -> Result<()> {
             construct::mcp::serve::run().await
         }
 
-        Some("exec") => {
+        Some(Commands::Exec(args)) => {
             let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
             tracing_subscriber::fmt()
@@ -56,25 +185,14 @@ async fn main() -> Result<()> {
                 .with_env_filter(envFilter)
                 .init();
 
-            let execArgs = parseExecArgs(&args[1..])?;
+            let outputMode = args.output.clone();
+            let (prompt, runConfig) = resolveExecArgs(args)?;
             let config = construct::config::load()?;
-            let runConfig = construct::runner::RunConfig {
-                maxTurns: execArgs.maxTurns,
-                model: execArgs.model,
-                systemPrompt: execArgs.systemPrompt,
-                allowedTools: execArgs.allowedTools,
-                tools: execArgs.tools,
-                agent: execArgs.agent,
-                mcpConfigPath: None, // TODO: --mcp-config flag
-                strictMcp: execArgs.strictMcp,
-                ephemeral: execArgs.ephemeral,
-            };
 
-            match execArgs.output.as_str() {
+            match outputMode.as_str() {
                 "json" => {
-                    // Buffer everything, print structured JSON at the end.
                     let result = construct::runner::run(
-                        &config, &execArgs.prompt, &runConfig,
+                        &config, &prompt, &runConfig,
                     ).await?;
                     let out = serde_json::json!({
                         "sessionId": result.sessionId,
@@ -88,9 +206,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 "events" => {
-                    // Stream each event as NDJSON.
                     let (handle, mut eventRx) = construct::runner::runStreaming(
-                        &config, &execArgs.prompt, &runConfig,
+                        &config, &prompt, &runConfig,
                     ).await?;
                     while let Some(event) = eventRx.recv().await {
                         let line = formatEventJson(&event);
@@ -99,10 +216,9 @@ async fn main() -> Result<()> {
                     handle.await??;
                 }
                 _ => {
-                    // Text mode: stream content to stdout, tool activity to stderr.
                     use std::io::Write;
                     let (handle, mut eventRx) = construct::runner::runStreaming(
-                        &config, &execArgs.prompt, &runConfig,
+                        &config, &prompt, &runConfig,
                     ).await?;
                     while let Some(event) = eventRx.recv().await {
                         use construct::session::SessionEvent;
@@ -118,7 +234,6 @@ async fn main() -> Result<()> {
                                 eprintln!("\x1b[2m\u{25b8} {name}: {summary}\x1b[0m");
                             }
                             SessionEvent::ToolResult { name, .. } => {
-                                // Clear the "started" line and show completion.
                                 eprint!("\r\x1b[K");
                                 tracing::debug!(tool = %name, "tool result");
                             }
@@ -128,7 +243,6 @@ async fn main() -> Result<()> {
                             _ => {}
                         }
                     }
-                    // Ensure final newline.
                     println!();
                     handle.await??;
                 }
@@ -136,20 +250,17 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        // Legacy support for --serve.
-        Some("--serve") => {
-            let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_ansi(false)
-                .with_env_filter(envFilter)
-                .init();
-
-            construct::mcp::serve::run().await
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "flatline",
+                &mut std::io::stdout(),
+            );
+            Ok(())
         }
 
-        _ => {
+        None => {
             // TUI mode: file-based logging so it doesn't collide with the TUI.
             let logDir = construct::config::configDir();
             std::fs::create_dir_all(&logDir)?;
@@ -167,153 +278,6 @@ async fn main() -> Result<()> {
     }
 }
 
-struct ExecArgs {
-    prompt: String,
-    output: String,
-    maxTurns: usize,
-    model: Option<String>,
-    systemPrompt: Option<construct::runner::SystemPromptOverride>,
-    allowedTools: Option<Vec<String>>,
-    tools: Option<Vec<String>>,
-    agent: Option<String>,
-    strictMcp: bool,
-    ephemeral: bool,
-}
-
-fn parseExecArgs(args: &[String]) -> Result<ExecArgs> {
-    let mut prompt: Option<String> = None;
-    let mut output = "text".to_string();
-    let mut maxTurns: usize = 50;
-    let mut model: Option<String> = None;
-    let mut systemPrompt: Option<construct::runner::SystemPromptOverride> = None;
-    let mut allowedTools: Option<Vec<String>> = None;
-    let mut tools: Option<Vec<String>> = None;
-    let mut agent: Option<String> = None;
-    let mut strictMcp = false;
-    let mut ephemeral = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--output" => {
-                i += 1;
-                if i < args.len() {
-                    output = args[i].clone();
-                } else {
-                    anyhow::bail!("--output requires a value (text, json, events)");
-                }
-            }
-            "--max-turns" => {
-                i += 1;
-                if i < args.len() {
-                    maxTurns = args[i].parse().map_err(|_| {
-                        anyhow::anyhow!("--max-turns requires a number")
-                    })?;
-                } else {
-                    anyhow::bail!("--max-turns requires a value");
-                }
-            }
-            "--model" => {
-                i += 1;
-                if i < args.len() {
-                    model = Some(args[i].clone());
-                } else {
-                    anyhow::bail!("--model requires a value");
-                }
-            }
-            "--system-prompt" => {
-                i += 1;
-                if i < args.len() {
-                    systemPrompt = Some(construct::runner::SystemPromptOverride::Replace(args[i].clone()));
-                } else {
-                    anyhow::bail!("--system-prompt requires a value");
-                }
-            }
-            "--system-prompt-file" => {
-                i += 1;
-                if i < args.len() {
-                    let content = std::fs::read_to_string(&args[i])
-                        .map_err(|e| anyhow::anyhow!("failed to read system prompt file: {e}"))?;
-                    systemPrompt = Some(construct::runner::SystemPromptOverride::Replace(content));
-                } else {
-                    anyhow::bail!("--system-prompt-file requires a path");
-                }
-            }
-            "--append-system-prompt" => {
-                i += 1;
-                if i < args.len() {
-                    systemPrompt = Some(construct::runner::SystemPromptOverride::Append(args[i].clone()));
-                } else {
-                    anyhow::bail!("--append-system-prompt requires a value");
-                }
-            }
-            "--allowed-tools" => {
-                i += 1;
-                if i < args.len() {
-                    allowedTools = Some(
-                        args[i].split(',').map(|s| s.trim().to_string()).collect()
-                    );
-                } else {
-                    anyhow::bail!("--allowed-tools requires comma-separated tool names");
-                }
-            }
-            "--tools" => {
-                i += 1;
-                if i < args.len() {
-                    if args[i].is_empty() {
-                        tools = Some(Vec::new());
-                    } else {
-                        tools = Some(
-                            args[i].split(',').map(|s| s.trim().to_string()).collect()
-                        );
-                    }
-                } else {
-                    anyhow::bail!("--tools requires comma-separated tool names (or empty string)");
-                }
-            }
-            "--agent" => {
-                i += 1;
-                if i < args.len() {
-                    agent = Some(args[i].clone());
-                } else {
-                    anyhow::bail!("--agent requires a name");
-                }
-            }
-            "--strict-mcp" => { strictMcp = true; }
-            "--ephemeral" => { ephemeral = true; }
-            arg if !arg.starts_with('-') && prompt.is_none() => {
-                prompt = Some(arg.to_string());
-            }
-            other => {
-                anyhow::bail!("unknown flag: {other}");
-            }
-        }
-        i += 1;
-    }
-
-    // If no prompt arg, try reading stdin.
-    let prompt = match prompt {
-        Some(p) => p,
-        None => {
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() {
-                anyhow::bail!("usage: flatline exec \"prompt\" [flags]\n\nFlags:\n  --output text|json|events\n  --max-turns N\n  --model MODEL\n  --system-prompt TEXT\n  --system-prompt-file PATH\n  --append-system-prompt TEXT\n  --allowed-tools TOOLS\n  --tools TOOLS\n  --agent NAME\n  --strict-mcp\n  --ephemeral");
-            }
-            let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-            if buf.trim().is_empty() {
-                anyhow::bail!("no prompt provided");
-            }
-            buf
-        }
-    };
-
-    Ok(ExecArgs {
-        prompt, output, maxTurns, model, systemPrompt,
-        allowedTools, tools, agent, strictMcp, ephemeral,
-    })
-}
-
 /// Serialize a SessionEvent to a JSON line for NDJSON output.
 fn formatEventJson(event: &construct::session::SessionEvent) -> String {
     use construct::session::SessionEvent;
@@ -324,7 +288,7 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
         SessionEvent::ReasoningDelta(text) => serde_json::json!({
             "type": "reasoningDelta", "text": text,
         }),
-        SessionEvent::ToolRequest { name, summary, args, diff } => serde_json::json!({
+        SessionEvent::ToolRequest { name, summary, args, diff, .. } => serde_json::json!({
             "type": "toolRequest", "name": name, "summary": summary,
             "args": args, "diff": diff,
         }),
@@ -339,6 +303,9 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
         }),
         SessionEvent::ToolDenied { name } => serde_json::json!({
             "type": "toolDenied", "name": name,
+        }),
+        SessionEvent::ToolAutoDenied { name, summary } => serde_json::json!({
+            "type": "toolAutoDenied", "name": name, "summary": summary,
         }),
         SessionEvent::TurnAborted { name } => serde_json::json!({
             "type": "turnAborted", "name": name,
