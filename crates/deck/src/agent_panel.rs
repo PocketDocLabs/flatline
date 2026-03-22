@@ -210,7 +210,7 @@ impl AgentPanel {
             pendingToolName: String::new(),
             pendingToolSummary: String::new(),
             pendingToolExplanation: None,
-            pendingToolImpact: construct::tool::ShellImpact::default(),
+            pendingToolImpact: construct::tool::ShellImpact::Read,
             permitPatterns: Vec::new(),
             permitSelectedPattern: 0,
             permitCustomPattern: String::new(),
@@ -385,11 +385,12 @@ impl AgentPanel {
         if !self.turnActive { return; }
         self.finalizeStreaming();
         // Extract raw command for shell tools (used for code block preview).
-        let action = construct::tool::parse(name, args);
-        let command = match &action {
-            construct::tool::ToolAction::Shell { command, .. } => Some(command.clone()),
-            _ => None,
-        };
+        let command = construct::tool::parse(name, args).ok().and_then(|action| {
+            match action {
+                construct::tool::ToolAction::Shell { command, .. } => Some(command),
+                _ => None,
+            }
+        });
 
         self.entries
             .push(PanelEntry::ToolRequest { summary: summary.into(), diff, command });
@@ -398,7 +399,10 @@ impl AgentPanel {
         self.pendingToolSummary = summary.into();
         self.pendingToolExplanation = explanation;
         self.pendingToolImpact = impact;
-        self.permitPatterns = construct::permissions::suggestPatterns(&action);
+        // Generate pattern suggestions (re-parse — the action was consumed above).
+        self.permitPatterns = construct::tool::parse(name, args)
+            .map(|a| construct::permissions::suggestPatterns(&a))
+            .unwrap_or_default();
         self.permitSelectedPattern = 0;
         // Pre-fill custom with the most specific pattern.
         self.permitCustomPattern = self.permitPatterns

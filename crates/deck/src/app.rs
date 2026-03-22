@@ -2018,8 +2018,10 @@ fn loadChildToolLines(sessionId: &str) -> (Vec<(String, String)>, usize) {
                 let argsJson = turn.args.as_ref()
                     .map(|a| a.to_string())
                     .unwrap_or_default();
-                let action = construct::tool::parse(name, &argsJson);
-                let summary = construct::tool::summarize(&action);
+                let summary = match construct::tool::parse(name, &argsJson) {
+                    Ok(action) => construct::tool::summarize(&action),
+                    Err(_) => format!("{name} (parse error)"),
+                };
                 toolLines.push((name.to_string(), summary));
             }
             TurnRole::ToolResult => {

@@ -884,8 +884,16 @@ impl Session {
                             return Ok(());
                         }
 
-                        let action =
-                            tool::parse(&call.function.name, &call.function.arguments);
+                        let action = match tool::parse(
+                            &call.function.name,
+                            &call.function.arguments,
+                        ) {
+                            Ok(a) => a,
+                            Err(msg) => {
+                                self.pushToolResult(&call.id, msg);
+                                continue;
+                            }
+                        };
                         let summary = tool::summarize(&action);
 
                         // Pre-emptive LSP notification: send didChange with proposed

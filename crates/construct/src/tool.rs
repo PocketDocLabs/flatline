@@ -736,13 +736,12 @@ pub struct EditOp {
 }
 
 /// Scope of a shell command's effect on the environment (model-classified).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ShellImpact {
     /// Command only reads or inspects. No state change.
     Read,
     /// Creates or modifies a small number of files within the project.
-    #[default]
     MinorMod,
     /// Installs packages, modifies configuration, or changes many files.
     MajorMod,
@@ -2717,146 +2716,198 @@ fn symbolPatterns(lang: &str, symbol: &str) -> Vec<String> {
 }
 
 /// Parse a tool call name + JSON arguments into a ToolAction.
-pub fn parse(name: &str, argsJson: &str) -> ToolAction {
-    let args: serde_json::Value = serde_json::from_str(argsJson).unwrap_or_default();
+///
+/// Returns Err with a message listing missing/malformed required fields.
+/// The error message is sent back to the model as the tool result so it can retry.
+pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
+    let args: serde_json::Value = serde_json::from_str(argsJson)
+        .map_err(|e| format!("Malformed JSON arguments: {e}"))?;
 
-    match name {
-        "shell" => ToolAction::Shell {
-            command: args["command"].as_str().unwrap_or("").into(),
-            explanation: args["explanation"].as_str().unwrap_or("").into(),
-            impact: args["impact"]
+    /// Extract a required string field, or collect its name into `missing`.
+    macro_rules! reqStr {
+        ($field:expr) => {
+            match args[$field].as_str() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                Some(_) => return Err(format!("Missing required field '{}'.", $field)),
+                None => return Err(format!("Missing required field '{}'.", $field)),
+            }
+        };
+    }
+
+    /// Extract an optional string field. Returns Err if present but wrong type.
+    macro_rules! optStr {
+        ($field:expr) => {
+            match &args[$field] {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Null => None,
+                _ => return Err(format!("Field '{}': expected string.", $field)),
+            }
+        };
+    }
+
+    /// Extract an optional u64 field. Returns Err if present but wrong type.
+    macro_rules! optU64 {
+        ($field:expr) => {
+            match &args[$field] {
+                serde_json::Value::Number(n) => n.as_u64(),
+                serde_json::Value::Null => None,
+                _ => return Err(format!("Field '{}': expected integer.", $field)),
+            }
+        };
+    }
+
+    /// Extract an optional bool field. Returns Err if present but wrong type.
+    macro_rules! optBool {
+        ($field:expr) => {
+            match &args[$field] {
+                serde_json::Value::Bool(b) => Some(*b),
+                serde_json::Value::Null => None,
+                _ => return Err(format!("Field '{}': expected boolean.", $field)),
+            }
+        };
+    }
+
+    let action = match name {
+        "shell" => {
+            let impact: ShellImpact = args["impact"]
                 .as_str()
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok())
-                .unwrap_or_default(),
-            timeout: args["timeout"].as_u64(),
-        },
+                .ok_or_else(|| "Missing required field 'impact' (one of: read, minorMod, majorMod, delete).".to_string())?;
+            ToolAction::Shell {
+                command: reqStr!("command"),
+                explanation: reqStr!("explanation"),
+                impact,
+                timeout: optU64!("timeout"),
+            }
+        }
         "readFile" => ToolAction::ReadFile {
-            path: args["path"].as_str().unwrap_or("").into(),
-            offset: args["offset"].as_u64().map(|v| v as usize),
-            limit: args["limit"].as_u64().map(|v| v as usize),
-            anchor: args["anchor"].as_u64().map(|v| v as usize),
+            path: reqStr!("path"),
+            offset: optU64!("offset").map(|v| v as usize),
+            limit: optU64!("limit").map(|v| v as usize),
+            anchor: optU64!("anchor").map(|v| v as usize),
         },
         "writeFile" => ToolAction::WriteFile {
-            path: args["path"].as_str().unwrap_or("").into(),
-            content: args["content"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
+            content: reqStr!("content"),
         },
         "editFile" => ToolAction::EditFile {
-            path: args["path"].as_str().unwrap_or("").into(),
-            oldString: args["old_string"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
+            oldString: reqStr!("old_string"),
             newString: args["new_string"].as_str().unwrap_or("").into(),
-            replaceAll: args["replace_all"].as_bool().unwrap_or(false),
+            replaceAll: optBool!("replace_all").unwrap_or(false),
         },
         "multiEdit" => ToolAction::MultiEdit {
-            path: args["path"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
             edits: args["edits"]
                 .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|e| EditOp {
-                            oldString: e["old_string"].as_str().unwrap_or("").into(),
-                            newString: e["new_string"].as_str().unwrap_or("").into(),
-                            replaceAll: e["replace_all"].as_bool().unwrap_or(false),
-                        })
-                        .collect()
+                .ok_or_else(|| "Missing required field 'edits'.".to_string())?
+                .iter()
+                .map(|e| {
+                    Ok(EditOp {
+                        oldString: e["old_string"].as_str()
+                            .ok_or_else(|| "Edit missing 'old_string'.".to_string())?.into(),
+                        newString: e["new_string"].as_str().unwrap_or("").into(),
+                        replaceAll: e["replace_all"].as_bool().unwrap_or(false),
+                    })
                 })
-                .unwrap_or_default(),
+                .collect::<Result<Vec<_>, String>>()?,
         },
         "shellHistory" => ToolAction::ShellHistory,
         "readOutput" => ToolAction::ReadOutput {
-            index: args["index"].as_u64().unwrap_or(0) as usize,
-            offset: args["offset"].as_u64().map(|v| v as usize),
-            limit: args["limit"].as_u64().map(|v| v as usize),
+            index: optU64!("index").unwrap_or(0) as usize,
+            offset: optU64!("offset").map(|v| v as usize),
+            limit: optU64!("limit").map(|v| v as usize),
         },
         "searchOutput" => ToolAction::SearchOutput {
-            index: args["index"].as_u64().unwrap_or(0) as usize,
-            pattern: args["pattern"].as_str().unwrap_or("").into(),
-            context: args["context"].as_u64().unwrap_or(3) as usize,
+            index: optU64!("index").unwrap_or(0) as usize,
+            pattern: reqStr!("pattern"),
+            context: optU64!("context").unwrap_or(3) as usize,
         },
         "readTerminal" => ToolAction::ReadTerminal {
-            lines: args["lines"].as_u64().unwrap_or(50) as usize,
+            lines: optU64!("lines").unwrap_or(50) as usize,
         },
         "glob" => ToolAction::Glob {
-            pattern: args["pattern"].as_str().unwrap_or("").into(),
-            path: args["path"].as_str().map(String::from),
+            pattern: reqStr!("pattern"),
+            path: optStr!("path"),
         },
         "grep" => ToolAction::Grep {
-            pattern: args["pattern"].as_str().unwrap_or("").into(),
-            path: args["path"].as_str().map(String::from),
-            include: args["include"].as_str().map(String::from),
-            fileType: args["type"].as_str().map(String::from),
+            pattern: reqStr!("pattern"),
+            path: optStr!("path"),
+            include: optStr!("include"),
+            fileType: optStr!("type"),
             outputMode: args["output_mode"].as_str().unwrap_or("files").into(),
-            caseSensitive: args["case_sensitive"].as_bool(),
-            contextLines: args["context_lines"].as_u64().map(|v| v as usize),
-            multiline: args["multiline"].as_bool().unwrap_or(false),
+            caseSensitive: optBool!("case_sensitive"),
+            contextLines: optU64!("context_lines").map(|v| v as usize),
+            multiline: optBool!("multiline").unwrap_or(false),
         },
         "listDir" => ToolAction::ListDir {
             path: args["path"].as_str().unwrap_or(".").into(),
-            depth: args["depth"].as_u64().unwrap_or(2).min(5).max(1) as usize,
-            offset: args["offset"].as_u64().unwrap_or(0) as usize,
-            limit: args["limit"].as_u64().unwrap_or(500) as usize,
+            depth: optU64!("depth").unwrap_or(2).min(5).max(1) as usize,
+            offset: optU64!("offset").unwrap_or(0) as usize,
+            limit: optU64!("limit").unwrap_or(500) as usize,
         },
         "structSearch" => ToolAction::StructSearch {
-            pattern: args["pattern"].as_str().unwrap_or("").into(),
+            pattern: reqStr!("pattern"),
             language: args["language"].as_str().unwrap_or("").into(),
-            path: args["path"].as_str().map(String::from),
+            path: optStr!("path"),
         },
         "diff" => ToolAction::Diff {
-            path: args["path"].as_str().map(String::from),
-            gitRef: args["ref"].as_str().map(String::from),
-            pathA: args["path_a"].as_str().map(String::from),
-            pathB: args["path_b"].as_str().map(String::from),
+            path: optStr!("path"),
+            gitRef: optStr!("ref"),
+            pathA: optStr!("path_a"),
+            pathB: optStr!("path_b"),
         },
         "fuzzyFind" => ToolAction::FuzzyFind {
-            query: args["query"].as_str().unwrap_or("").into(),
-            path: args["path"].as_str().map(String::from),
+            query: reqStr!("query"),
+            path: optStr!("path"),
         },
         "fileOutline" => ToolAction::FileOutline {
-            path: args["path"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
         },
         "viewSymbol" => ToolAction::ViewSymbol {
-            file: args["file"].as_str().unwrap_or("").into(),
-            symbol: args["symbol"].as_str().unwrap_or("").into(),
+            file: reqStr!("file"),
+            symbol: reqStr!("symbol"),
         },
         "relatedFiles" => ToolAction::RelatedFiles {
-            path: args["path"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
         },
         "webSearch" => ToolAction::WebSearch {
-            query: args["query"].as_str().unwrap_or("").into(),
+            query: reqStr!("query"),
             allowedDomains: args["allowed_domains"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
             blockedDomains: args["blocked_domains"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
-            maxResults: args["max_results"].as_u64().map(|v| v as usize),
+            maxResults: optU64!("max_results").map(|v| v as usize),
         },
         "webFetch" => ToolAction::WebFetch {
-            url: args["url"].as_str().unwrap_or("").into(),
-            prompt: args["prompt"].as_str().map(String::from),
-            subpages: args["subpages"].as_u64().map(|v| v as usize),
+            url: reqStr!("url"),
+            prompt: optStr!("prompt"),
+            subpages: optU64!("subpages").map(|v| v as usize),
         },
         "webSimilar" => ToolAction::WebSimilar {
-            url: args["url"].as_str().unwrap_or("").into(),
+            url: reqStr!("url"),
             allowedDomains: args["allowed_domains"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
             blockedDomains: args["blocked_domains"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
-            maxResults: args["max_results"].as_u64().map(|v| v as usize),
+            maxResults: optU64!("max_results").map(|v| v as usize),
         },
         "historyFetch" => ToolAction::HistoryFetch {
-            blockId: args["blockId"].as_str().unwrap_or("").into(),
+            blockId: reqStr!("blockId"),
         },
         "historySearch" => ToolAction::HistorySearch {
-            query: args["query"].as_str().unwrap_or("").into(),
+            query: reqStr!("query"),
         },
         "task" => ToolAction::Task {
-            prompt: args["prompt"].as_str().unwrap_or("").into(),
-            agent: args["agent"].as_str().map(String::from),
+            prompt: reqStr!("prompt"),
+            agent: optStr!("agent"),
         },
         "diagnostics" => ToolAction::Diagnostics {
-            path: args["path"].as_str().unwrap_or("").into(),
+            path: reqStr!("path"),
             severity: args["severity"].as_str().unwrap_or("error").into(),
         },
         _ if crate::mcp::schema::isMcpTool(name) => ToolAction::Mcp {
@@ -2867,5 +2918,7 @@ pub fn parse(name: &str, argsJson: &str) -> ToolAction {
             name: name.into(),
             args: argsJson.into(),
         },
-    }
+    };
+
+    Ok(action)
 }
