@@ -328,7 +328,7 @@ async fn compactBlock(
             content: BLOCK_COMPACT_SYSTEM.to_string(),
         },
         crate::message::Message::User {
-            content: userPrompt,
+            content: userPrompt.into(),
         },
     ];
 

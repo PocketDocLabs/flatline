@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 
+#[derive(Clone)]
 pub struct CheckpointManager {
     // TODO(pocketdoc, 2026-03-11): Shadow git repo handle.
 }

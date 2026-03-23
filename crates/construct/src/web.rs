@@ -379,7 +379,7 @@ async fn maybeSummarize(
         Message::User {
             content: format!(
                 "Page content:\n\n{content}\n\n---\n\nExtract: {prompt}"
-            ),
+            ).into(),
         },
     ];
 

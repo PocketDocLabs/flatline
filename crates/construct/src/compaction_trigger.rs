@@ -123,6 +123,11 @@ impl Tracker {
         self.exhausted.clear();
     }
 
+    /// Check if a specific stage is exhausted.
+    pub fn isExhausted(&self, stage: StagePick) -> bool {
+        self.exhausted.contains(&stage)
+    }
+
     /// Check if all stages are exhausted (nothing more we can do).
     pub fn allExhausted(&self) -> bool {
         self.exhausted.contains(&StagePick::S1)

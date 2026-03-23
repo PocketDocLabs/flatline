@@ -35,11 +35,38 @@ use crate::permissions::{PermitMode, Permissions, Verdict};
 use crate::prompt::{self, DomainModule, InterfaceMode};
 use crate::shell::Shell;
 use crate::tool;
-use crate::topic::TopicTracker;
+use crate::topic::{TopicDecision, TopicTracker};
 use crate::transcript::{self, Transcript, SessionMeta};
 use crate::lsp;
 use crate::mcp;
 use crate::web;
+
+/// A user input message with optional image attachments.
+#[derive(Debug, Clone)]
+pub struct UserInput {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+/// A binary attachment to a user message.
+///
+/// For clipboard-pasted images, `data` contains raw RGBA pixels and
+/// `rgbaDimensions` holds (width, height). PNG encoding is deferred to
+/// submit time to avoid blocking the TUI event loop.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub mimeType: String,
+    pub data: Vec<u8>,
+    pub label: String,
+    /// Raw RGBA dimensions — set when data is raw pixels, None when already encoded.
+    pub rgbaDimensions: Option<(u32, u32)>,
+}
+
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        UserInput { text, attachments: Vec::new() }
+    }
+}
 
 /// Events emitted by the session during a turn.
 #[derive(Debug, Clone)]
@@ -267,6 +294,12 @@ pub struct Session {
     systemPrompt: String,
     /// Active branch head turn ID. None for fresh sessions with no messages yet.
     headTurnId: Option<String>,
+    /// Pending topic classification task from the previous turn.
+    pendingTopicEval: Option<tokio::task::JoinHandle<TopicDecision>>,
+    /// Block ID associated with the pending topic eval (needed to apply the result).
+    pendingTopicBlockId: Option<String>,
+    /// Pending checkpoint snapshot (must resolve before tool dispatch).
+    pendingCheckpoint: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl Session {
@@ -345,6 +378,9 @@ impl Session {
             resumeNotice: None,
             systemPrompt,
             headTurnId: None,
+            pendingTopicEval: None,
+            pendingTopicBlockId: None,
+            pendingCheckpoint: None,
         })
     }
 
@@ -453,18 +489,24 @@ impl Session {
         // Restore topic tracker state from meta.json.
         let mut topicTracker = TopicTracker::new();
         if let Some(ref m) = meta {
-            let topicInfos: Vec<crate::topic::TopicInfo> = m
-                .topicLabels
-                .iter()
-                .enumerate()
-                .map(|(i, label)| crate::topic::TopicInfo {
-                    topicId: format!("topic-{:02}", i + 1),
-                    label: label.clone(),
-                    startBlock: String::new(),
-                    blockCount: 0,
-                })
-                .collect();
-            topicTracker.restoreState(topicInfos);
+            if !m.topics.is_empty() {
+                // New format: full TopicInfo persisted.
+                topicTracker.restoreState(m.topics.clone());
+            } else if !m.topicLabels.is_empty() {
+                // Backward compat: old sessions with only labels.
+                let topicInfos: Vec<crate::topic::TopicInfo> = m
+                    .topicLabels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| crate::topic::TopicInfo {
+                        topicId: format!("topic-{:02}", i + 1),
+                        label: label.clone(),
+                        startBlock: String::new(),
+                        blockCount: 0,
+                    })
+                    .collect();
+                topicTracker.restoreState(topicInfos);
+            }
         }
 
         // Rebuild filesRead from history — hash current disk content for staleness detection.
@@ -532,7 +574,15 @@ impl Session {
             resumeNotice,
             systemPrompt,
             headTurnId,
+            pendingTopicEval: None,
+            pendingTopicBlockId: None,
+            pendingCheckpoint: None,
         })
+    }
+
+    /// Current topic label (for title bar display on resume).
+    pub fn currentTopicLabel(&self) -> &str {
+        self.topicTracker.currentLabel()
     }
 
     /// Initialize the checkpoint system for a project directory.
@@ -577,6 +627,23 @@ impl Session {
         }
         chain.reverse();
         Ok(chain)
+    }
+
+    /// Rebuild the topic tracker from the active branch turns.
+    ///
+    /// Must be called after rewind or fork-switch so topic state reflects
+    /// only the active branch.
+    fn rebuildTopicTracker(&mut self) {
+        let branchTurns = self.loadBranchTurns().unwrap_or_default();
+        let rebuilt = crate::topic::rebuildTopicInfos(
+            &branchTurns,
+            self.topicTracker.topics(),
+        );
+        self.topicTracker.restoreState(rebuilt);
+        let currentId = self.topicTracker.currentTopicId().to_string();
+        if !currentId.is_empty() {
+            self.transcript.setTopicId(&currentId);
+        }
     }
 
     /// Load turns for display — extends past the current head through any
@@ -682,18 +749,19 @@ impl Session {
     /// permit channel is not consulted.
     ///
     /// Args:
-    ///     userMessage: The user's input text.
+    ///     input: The user's input (text + optional image attachments).
     ///     eventTx: Channel for session events.
     ///     permitRx: Channel for permission responses.
     pub fn send<'a>(
         &'a mut self,
-        userMessage: &'a str,
+        input: &'a UserInput,
         eventTx: &'a mpsc::Sender<SessionEvent>,
         permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
         cancelRx: &'a mut watch::Receiver<bool>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-        tracing::info!(len = userMessage.len(), "user message received");
+        let userMessage = &input.text;
+        tracing::info!(len = userMessage.len(), attachments = input.attachments.len(), "user message received");
 
         // Warm up LSP servers on first send (scans project, starts matching servers).
         if !self.lspWarmedUp {
@@ -713,16 +781,49 @@ impl Session {
 
         // When prompt thinking is active, prefix the user message with a
         // short rider reminding the model to use its scratchpad.
-        let historyContent = if self.config.main.promptThinking {
+        let historyText = if self.config.main.promptThinking {
             format!("{}{}", prompt::THINKING_RIDER, userMessage)
         } else {
             userMessage.to_string()
         };
 
-        self.history.push(Message::User {
-            content: historyContent,
-        });
-        match self.transcript.recordUser(userMessage, self.headTurnId.as_deref()) {
+        // Build content — multimodal if attachments present.
+        // Encode any raw RGBA attachments to PNG (deferred from paste time).
+        let encodedAttachments: Vec<(String, Vec<u8>)> = input.attachments.iter().map(|att| {
+            if let Some((w, h)) = att.rgbaDimensions {
+                let png = encodeRgbaToPng(&att.data, w, h);
+                ("image/png".to_string(), png)
+            } else {
+                (att.mimeType.clone(), att.data.clone())
+            }
+        }).collect();
+
+        let content = if encodedAttachments.is_empty() {
+            crate::message::Content::text(&historyText)
+        } else {
+            use base64::Engine;
+            let imageUris: Vec<String> = encodedAttachments.iter().map(|(mime, data)| {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+                format!("data:{mime};base64,{b64}")
+            }).collect();
+            crate::message::Content::withImages(&historyText, imageUris)
+        };
+
+        self.history.push(Message::User { content });
+
+        // Persist image attachments to transcript for resume.
+        let turnAttachments = if encodedAttachments.is_empty() {
+            None
+        } else {
+            use base64::Engine;
+            Some(encodedAttachments.iter().map(|(mime, data)| {
+                crate::transcript::TurnAttachment {
+                    mimeType: mime.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                }
+            }).collect())
+        };
+        match self.transcript.recordUser(userMessage, self.headTurnId.as_deref(), turnAttachments) {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
@@ -744,44 +845,56 @@ impl Session {
         permitRx: &mut mpsc::Receiver<crate::permissions::PermitResponse>,
         cancelRx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        // Evaluate topic tracker — sends full history to utility model for
-        // prefix cache hits, then classifies the latest user message.
         let blockId = self.transcript.currentBlock().to_string();
-        match self.topicTracker.evaluate(
-            &self.history,
-            &blockId,
-            &self.client,
-            &self.config.utility.model,
-        ).await {
-            Ok(result) => {
-                self.transcript.setTopicId(&result.topicId);
-                if result.isNewTopic {
-                    tracing::info!(
-                        topicId = %result.topicId,
-                        label = %result.label,
-                        "new topic segment"
-                    );
+
+        // Collect pending topic eval from the previous turn (serialization:
+        // topic N must finish before topic N+1 starts).
+        if let Some(handle) = self.pendingTopicEval.take() {
+            let prevBlockId = self.pendingTopicBlockId.take().unwrap_or_default();
+            match handle.await {
+                Ok(decision) => {
+                    let result = self.topicTracker.applyDecision(decision, &prevBlockId);
+                    self.transcript.setTopicId(&result.topicId);
+                    if result.isNewTopic {
+                        tracing::info!(
+                            topicId = %result.topicId,
+                            label = %result.label,
+                            "new topic segment (collected)"
+                        );
+                    }
+                    let _ = eventTx
+                        .send(SessionEvent::TopicChanged {
+                            label: result.label.clone(),
+                        })
+                        .await;
                 }
-                let _ = eventTx
-                    .send(SessionEvent::TopicChanged {
-                        label: result.label.clone(),
-                    })
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!("topic evaluation failed: {e}");
+                Err(e) => {
+                    tracing::warn!("pending topic eval panicked: {e}");
+                }
             }
         }
+
+        // Spawn topic classification as a background task — runs concurrently
+        // with the main model stream. Result collected next sendInner call.
+        let topicMessages = self.topicTracker.prepareClassification(&self.history);
+        let topicClient = self.client.clone();
+        let topicModel = self.config.utility.model.clone();
+        self.pendingTopicBlockId = Some(blockId.clone());
+        self.pendingTopicEval = Some(tokio::spawn(async move {
+            crate::topic::classifyPrepared(topicMessages, topicClient, topicModel).await
+        }));
 
         // Persist session metadata so /resume can find this session.
         self.updateMeta();
 
-        // Take a checkpoint snapshot before the model turn.
-        if let Some(ref checkpoint) = self.checkpoint {
+        // Spawn checkpoint snapshot — must resolve before tool dispatch but
+        // can overlap with the main model's text streaming.
+        let checkpointClone = self.checkpoint.clone();
+        if let Some(cp) = checkpointClone {
             let turnId = self.transcript.currentBlock().to_string();
-            if let Err(e) = checkpoint.snapshot(&turnId).await {
-                tracing::warn!("checkpoint snapshot failed: {e}");
-            }
+            self.pendingCheckpoint = Some(tokio::spawn(async move {
+                cp.snapshot(&turnId).await
+            }));
         }
 
         const MAX_RETRIES: u32 = 5;
@@ -871,6 +984,15 @@ impl Session {
                         self.config.main.promptThinking,
                     ));
 
+                    // Checkpoint must complete before tools modify files.
+                    if let Some(handle) = self.pendingCheckpoint.take() {
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!("checkpoint snapshot failed: {e}"),
+                            Err(e) => tracing::warn!("checkpoint task panicked: {e}"),
+                        }
+                    }
+
                     let mut aborted = false;
 
                     for (callIdx, call) in calls.iter().enumerate() {
@@ -878,7 +1000,7 @@ impl Session {
                         if *cancelRx.borrow() {
                             tracing::info!("cancelled between tool calls");
                             for remaining in &calls[callIdx..] {
-                                self.pushToolResult(&remaining.id, "Cancelled by user.".into());
+                                self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                             }
                             let _ = eventTx.send(SessionEvent::TurnCancelled).await;
                             return Ok(());
@@ -890,7 +1012,7 @@ impl Session {
                         ) {
                             Ok(a) => a,
                             Err(msg) => {
-                                self.pushToolResult(&call.id, msg);
+                                self.pushToolResult(&call.id, msg.into());
                                 continue;
                             }
                         };
@@ -1005,7 +1127,7 @@ impl Session {
                                             _ = cancelRx.changed() => {
                                                 tracing::info!("cancelled during permission wait");
                                                 for remaining in &calls[callIdx..] {
-                                                    self.pushToolResult(&remaining.id, "Cancelled by user.".into());
+                                                    self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                                 }
                                                 let _ = eventTx.send(SessionEvent::TurnCancelled).await;
                                                 return Ok(());
@@ -1063,7 +1185,7 @@ impl Session {
                                     name: call.function.name.clone(),
                                     output: rejection.clone(),
                                 }).await;
-                                self.pushToolResult(&call.id, rejection.clone());
+                                self.pushToolResult(&call.id, rejection.clone().into());
                                 continue;
                             }
                         }
@@ -1081,7 +1203,7 @@ impl Session {
                                 };
                                 let result = self.executeTask(&taskPrompt, &taskAgent, eventTx, cancelRx).await;
                                 // NOTE: No ToolResult event — SubagentComplete already notified the TUI.
-                                result
+                                crate::message::Content::text(result)
                             } else {
                             // Emit ToolStarted for non-task tools.
                             let _ = eventTx
@@ -1092,13 +1214,13 @@ impl Session {
                                 .await;
 
                             if tool::needsMcp(&action) {
-                                self.executeMcpTool(&action).await
+                                crate::message::Content::text(self.executeMcpTool(&action).await)
                             } else if tool::needsTranscript(&action) {
-                                self.executeTranscriptTool(&action)
+                                crate::message::Content::text(self.executeTranscriptTool(&action))
                             } else if tool::needsWeb(&action) {
-                                self.executeWebTool(&action).await
+                                crate::message::Content::text(self.executeWebTool(&action).await)
                             } else if tool::needsLsp(&action) {
-                                self.executeLspTool(&action).await
+                                crate::message::Content::text(self.executeLspTool(&action).await)
                             }
                             // Race tool execution against cancellation for shell commands.
                             else if matches!(action, tool::ToolAction::Shell { .. }) {
@@ -1110,7 +1232,7 @@ impl Session {
                                     result = tool::execute(&action, &self.shell) => {
                                         tracing::debug!(
                                             tool = %call.function.name,
-                                            outputLen = result.len(),
+                                            outputLen = result.charCount(),
                                             "tool execution complete"
                                         );
                                         break result;
@@ -1122,9 +1244,9 @@ impl Session {
                                         }
                                         tracing::info!(tool = %call.function.name, "cancelled during shell execution");
                                         self.shell.interrupt();
-                                        self.pushToolResult(&call.id, "Cancelled by user.".into());
+                                        self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
                                         for remaining in &calls[callIdx + 1..] {
-                                            self.pushToolResult(&remaining.id, "Cancelled by user.".into());
+                                            self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                         }
                                         let _ = eventTx.send(SessionEvent::TurnCancelled).await;
                                         return Ok(());
@@ -1136,7 +1258,7 @@ impl Session {
                                 let result = tool::execute(&action, &self.shell).await;
                                 tracing::debug!(
                                     tool = %call.function.name,
-                                    outputLen = result.len(),
+                                    outputLen = result.charCount(),
                                     "tool execution complete"
                                 );
                                 result
@@ -1148,7 +1270,7 @@ impl Session {
                                     name: call.function.name.clone(),
                                 })
                                 .await;
-                            "User denied this action.".into()
+                            crate::message::Content::text("User denied this action.")
                         };
 
                         // Track file reads for the edit gate (hash for staleness detection).
@@ -1218,8 +1340,11 @@ impl Session {
                                             async_lsp::lsp_types::DiagnosticSeverity::ERROR,
                                         );
                                         if !formatted.is_empty() {
-                                            output.push_str("\n\nNew LSP errors after edit:\n");
-                                            output.push_str(&formatted);
+                                            // Append diagnostics to text content.
+                                            let mut text = output.textContent().to_string();
+                                            text.push_str("\n\nNew LSP errors after edit:\n");
+                                            text.push_str(&formatted);
+                                            output = crate::message::Content::text(text);
                                         }
                                     }
                                     if let Some(hint) = hint {
@@ -1237,7 +1362,7 @@ impl Session {
                         let _ = eventTx
                             .send(SessionEvent::ToolResult {
                                 name: call.function.name.clone(),
-                                output: output.clone(),
+                                output: output.textContent().to_string(),
                             })
                             .await;
 
@@ -1839,6 +1964,13 @@ impl Session {
                                 output.push_str(&turn.content);
                                 output.push('\n');
                             }
+
+                            // Indicate attachments.
+                            if let Some(ref atts) = turn.attachments {
+                                if !atts.is_empty() {
+                                    output.push_str(&format!("[+{} image(s) attached]\n", atts.len()));
+                                }
+                            }
                             output.push('\n');
                         }
                         output
@@ -1846,15 +1978,24 @@ impl Session {
                     Err(e) => format!("Failed to load transcript: {e}"),
                 }
             }
-            tool::ToolAction::HistorySearch { query } => {
+            tool::ToolAction::HistorySearch { query, mediaType } => {
                 match self.transcript.loadAll() {
                     Ok(turns) => {
                         let queryLower = query.to_lowercase();
                         let mut matches: Vec<(String, String, String)> = Vec::new();
 
                         for turn in &turns {
+                            // Filter by mediaType if specified.
+                            if let Some(mt) = mediaType {
+                                let hasMatchingMedia = turn.attachments.as_ref().map_or(false, |atts| {
+                                    atts.iter().any(|a| a.mimeType.starts_with(mt.as_str()))
+                                });
+                                if !hasMatchingMedia {
+                                    continue;
+                                }
+                            }
+
                             if turn.content.to_lowercase().contains(&queryLower) {
-                                // Extract a snippet around the match.
                                 let snippet = extractSnippet(&turn.content, &queryLower);
                                 let roleLabel = match turn.role {
                                     crate::transcript::TurnRole::User => "user",
@@ -1863,9 +2004,14 @@ impl Session {
                                     crate::transcript::TurnRole::ToolResult => "tool_result",
                                     crate::transcript::TurnRole::System => "system",
                                 };
+                                // Annotate if turn has attachments.
+                                let imageNote = turn.attachments.as_ref()
+                                    .filter(|a| !a.is_empty())
+                                    .map(|a| format!(" [+{} image(s)]", a.len()))
+                                    .unwrap_or_default();
                                 matches.push((
                                     turn.blockId.clone(),
-                                    format!("{} ({})", turn.id, roleLabel),
+                                    format!("{} ({}){imageNote}", turn.id, roleLabel),
                                     snippet,
                                 ));
                             }
@@ -2168,8 +2314,9 @@ impl Session {
         });
 
         // Run the child session.
+        let childInput = UserInput::from(prompt.to_string());
         let sendResult = child
-            .send(prompt, &childEventTx, &mut childPermitRx, &mut childCancelRx)
+            .send(&childInput, &childEventTx, &mut childPermitRx, &mut childCancelRx)
             .await;
 
         // Drop sender so forwarding task exits.
@@ -2373,8 +2520,28 @@ impl Session {
         });
     }
 
-    fn pushToolResult(&mut self, callId: &str, content: String) {
-        match self.transcript.recordToolResult(callId, &content) {
+    fn pushToolResult(&mut self, callId: &str, content: crate::message::Content) {
+        // Extract image attachments for transcript persistence.
+        let turnAttachments = if content.hasImages() {
+            let atts: Vec<crate::transcript::TurnAttachment> = content.imageUris().iter().map(|uri| {
+                // Parse data URI: "data:image/png;base64,..."
+                let (mime, data) = if let Some(rest) = uri.strip_prefix("data:") {
+                    if let Some((header, b64)) = rest.split_once(",") {
+                        let mime = header.strip_suffix(";base64").unwrap_or(header);
+                        (mime.to_string(), b64.to_string())
+                    } else {
+                        ("image/png".into(), String::new())
+                    }
+                } else {
+                    ("image/png".into(), String::new())
+                };
+                crate::transcript::TurnAttachment { mimeType: mime, data }
+            }).collect();
+            if atts.is_empty() { None } else { Some(atts) }
+        } else {
+            None
+        };
+        match self.transcript.recordToolResult(callId, content.textContent(), turnAttachments) {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
@@ -2405,6 +2572,7 @@ impl Session {
             updatedAt: now,
             name: existingMeta.as_ref().and_then(|m| m.name.clone()),
             topicLabels: self.topicTracker.topicLabels(),
+            topics: self.topicTracker.topics().to_vec(),
             headTurn: self.headTurnId.clone(),
             forks: existingMeta.map(|m| m.forks).unwrap_or_default(),
         };
@@ -2423,12 +2591,30 @@ impl Session {
     pub async fn executeCommand(&mut self, action: &CommandAction) -> String {
         match action {
             CommandAction::ShowContext => {
-                let state = context::buildState(
-                    &self.history,
-                    self.config.main.contextWindow,
-                    self.config.compactRatio,
-                    &self.compactionLog,
-                );
+                let input = context::BuildStateInput {
+                    history: &self.history,
+                    contextWindow: self.config.main.contextWindow,
+                    compactRatio: self.config.compactRatio,
+                    compactionLog: &self.compactionLog,
+                    reportedTokens: self.compactionTracker.lastTokens(),
+                    s1Exhausted: self.compactionTracker.isExhausted(
+                        compaction_trigger::StagePick::S1,
+                    ),
+                    s2Exhausted: self.compactionTracker.isExhausted(
+                        compaction_trigger::StagePick::S2,
+                    ),
+                    s3Exhausted: self.compactionTracker.isExhausted(
+                        compaction_trigger::StagePick::S3,
+                    ),
+                    s4Exhausted: self.compactionTracker.isExhausted(
+                        compaction_trigger::StagePick::S4,
+                    ),
+                    topics: self.topicTracker.topics(),
+                    currentTopicId: self.topicTracker.currentTopicId(),
+                    transcript: &self.transcript,
+                    headTurnId: self.headTurnId.as_deref().unwrap_or(""),
+                };
+                let state = context::buildState(&input);
                 context::formatState(&state)
             }
             CommandAction::Undo => {
@@ -2553,6 +2739,13 @@ impl Session {
         self.filesRead.clear();
         self.compactionTracker.clearExhaustion();
 
+        // Cancel stale topic classification and rebuild from active branch.
+        if let Some(handle) = self.pendingTopicEval.take() {
+            handle.abort();
+        }
+        self.pendingTopicBlockId = None;
+        self.rebuildTopicTracker();
+
         // Emit events for panel replay.
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
         let markers = self.compactionMarkers();
@@ -2567,6 +2760,15 @@ impl Session {
                 markers,
             })
             .await;
+        // Update window title to the topic at the rewind point.
+        let label = self.topicTracker.currentLabel();
+        if !label.is_empty() {
+            let _ = eventTx
+                .send(SessionEvent::TopicChanged {
+                    label: label.to_string(),
+                })
+                .await;
+        }
 
         format!("Rewound to {targetTurnId}")
     }
@@ -2620,6 +2822,13 @@ impl Session {
         self.filesRead.clear();
         self.compactionTracker.clearExhaustion();
 
+        // Cancel stale topic classification and rebuild from active branch.
+        if let Some(handle) = self.pendingTopicEval.take() {
+            handle.abort();
+        }
+        self.pendingTopicBlockId = None;
+        self.rebuildTopicTracker();
+
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
         let markers = self.compactionMarkers();
         let _ = eventTx
@@ -2633,6 +2842,15 @@ impl Session {
                 markers,
             })
             .await;
+        // Update window title to the topic on this fork.
+        let label = self.topicTracker.currentLabel();
+        if !label.is_empty() {
+            let _ = eventTx
+                .send(SessionEvent::TopicChanged {
+                    label: label.to_string(),
+                })
+                .await;
+        }
 
         format!("Switched to fork: {}", fork.label)
     }
@@ -2864,6 +3082,30 @@ fn isTransientError(msg: &str) -> bool {
         || lower.contains("502")
         || lower.contains("503")
         || lower.contains("504")
+}
+
+/// Encode raw RGBA pixel data to PNG bytes.
+/// Resizes images larger than 2048px on either side.
+fn encodeRgbaToPng(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .expect("RGBA buffer size mismatch");
+    let dynamic = image::DynamicImage::ImageRgba8(img);
+
+    // Resize oversized images with a fast filter.
+    let final_img = if width > 2048 || height > 2048 {
+        dynamic.resize(2048, 2048, image::imageops::FilterType::Triangle)
+    } else {
+        dynamic
+    };
+
+    let mut buf = Vec::new();
+    final_img
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Png,
+        )
+        .expect("PNG encoding failed");
+    buf
 }
 
 /// Accumulates streaming tool call deltas into complete tool calls.

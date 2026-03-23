@@ -119,7 +119,7 @@ pub async fn run(
             content: FULL_COMPACT_SYSTEM.to_string(),
         },
         Message::User {
-            content: userPrompt,
+            content: userPrompt.into(),
         },
     ];
 

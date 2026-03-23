@@ -36,6 +36,7 @@ impl std::fmt::Display for PermanentApiError {
 impl std::error::Error for PermanentApiError {}
 
 /// OpenRouter API client.
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     main: ModelConfig,

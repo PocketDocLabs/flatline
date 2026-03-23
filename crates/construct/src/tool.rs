@@ -636,7 +636,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Retrieve the full original content of a specific exchange block \
                     from the transcript. Use this to access details that may have been \
                     compacted or truncated from the current context. Returns all turns \
-                    (user message, assistant responses, tool calls, tool results) in the block.".into(),
+                    (user message, assistant responses, tool calls, tool results) in the block, \
+                    including any images that were attached.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -656,13 +657,18 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Search across the full original transcript by text match. \
                     Returns matching blocks with snippets, block IDs, and topic labels. \
                     Use this to find specific information that may have been compacted \
-                    away from the current context.".into(),
+                    away from the current context. Use mediaType to filter for turns \
+                    with specific attachment types (e.g. 'image').".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description": "Text to search for across all transcript content."
+                        },
+                        "mediaType": {
+                            "type": "string",
+                            "description": "Filter by attachment type (e.g. 'image'). When set, only returns turns that have attachments of this type."
                         }
                     },
                     "required": ["query"]
@@ -795,7 +801,7 @@ pub enum ToolAction {
         maxResults: Option<usize>,
     },
     HistoryFetch { blockId: String },
-    HistorySearch { query: String },
+    HistorySearch { query: String, mediaType: Option<String> },
     Task { prompt: String, agent: Option<String> },
     Diagnostics { path: String, severity: String },
     Mcp { qualifiedName: String, args: String },
@@ -939,7 +945,7 @@ pub fn summarize(action: &ToolAction) -> String {
         }
         ToolAction::WebSimilar { url, .. } => format!("Find similar: {url}"),
         ToolAction::HistoryFetch { blockId } => format!("Fetch block: {blockId}"),
-        ToolAction::HistorySearch { query } => format!("Search history: {query}"),
+        ToolAction::HistorySearch { query, .. } => format!("Search history: {query}"),
         ToolAction::Diagnostics { path, .. } => format!("Check diagnostics: {path}"),
         ToolAction::Task { prompt, agent } => {
             let agentName = agent.as_deref().unwrap_or("general");
@@ -1100,33 +1106,33 @@ pub fn needsWeb(action: &ToolAction) -> bool {
     )
 }
 
-/// Execute a tool action and return the output string.
-pub async fn execute(action: &ToolAction, shell: &Shell) -> String {
+/// Execute a tool action and return the content (text or multimodal).
+pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Content {
     match action {
         ToolAction::Shell { command, timeout, .. } => {
             let dur = timeout.map(|s| std::time::Duration::from_secs(s));
             let raw = shell.execute(command, dur).await;
             // Apply same size guard as readFile. Full output is in shell history.
             let index = shell.historyLen().saturating_sub(1);
-            truncateOutput(&raw, index)
+            crate::message::Content::text(truncateOutput(&raw, index))
         }
         ToolAction::ReadFile { path, offset, limit, anchor } => {
             executeReadFile(path, *offset, *limit, *anchor)
         }
-        ToolAction::WriteFile { path, content } => executeWriteFile(path, content),
+        ToolAction::WriteFile { path, content } => executeWriteFile(path, content).into(),
         ToolAction::EditFile { path, oldString, newString, replaceAll } => {
-            executeEditFile(path, oldString, newString, *replaceAll)
+            executeEditFile(path, oldString, newString, *replaceAll).into()
         }
-        ToolAction::MultiEdit { path, edits } => executeMultiEdit(path, edits),
-        ToolAction::ShellHistory => executeShellHistory(shell),
+        ToolAction::MultiEdit { path, edits } => executeMultiEdit(path, edits).into(),
+        ToolAction::ShellHistory => executeShellHistory(shell).into(),
         ToolAction::ReadOutput { index, offset, limit } => {
-            executeReadOutput(shell, *index, *offset, *limit)
+            executeReadOutput(shell, *index, *offset, *limit).into()
         }
         ToolAction::SearchOutput { index, pattern, context } => {
-            executeSearchOutput(shell, *index, pattern, *context)
+            executeSearchOutput(shell, *index, pattern, *context).into()
         }
-        ToolAction::ReadTerminal { lines } => shell.readTerminal(*lines),
-        ToolAction::Glob { pattern, path } => executeGlob(pattern, path.as_deref()).await,
+        ToolAction::ReadTerminal { lines } => shell.readTerminal(*lines).into(),
+        ToolAction::Glob { pattern, path } => executeGlob(pattern, path.as_deref()).await.into(),
         ToolAction::Grep {
             pattern, path, include, fileType, outputMode,
             caseSensitive, contextLines, multiline,
@@ -1134,42 +1140,42 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> String {
             executeGrep(
                 pattern, path.as_deref(), include.as_deref(), fileType.as_deref(),
                 outputMode, *caseSensitive, *contextLines, *multiline,
-            ).await
+            ).await.into()
         }
         ToolAction::ListDir { path, depth, offset, limit } => {
-            executeListDir(path, *depth, *offset, *limit)
+            executeListDir(path, *depth, *offset, *limit).into()
         }
         ToolAction::StructSearch { pattern, language, path } => {
-            executeStructSearch(pattern, language, path.as_deref()).await
+            executeStructSearch(pattern, language, path.as_deref()).await.into()
         }
         ToolAction::Diff { path, gitRef, pathA, pathB } => {
-            executeDiff(path.as_deref(), gitRef.as_deref(), pathA.as_deref(), pathB.as_deref()).await
+            executeDiff(path.as_deref(), gitRef.as_deref(), pathA.as_deref(), pathB.as_deref()).await.into()
         }
-        ToolAction::FuzzyFind { query, path } => executeFuzzyFind(query, path.as_deref()).await,
-        ToolAction::FileOutline { path } => executeFileOutline(path).await,
-        ToolAction::ViewSymbol { file, symbol } => executeViewSymbol(file, symbol).await,
-        ToolAction::RelatedFiles { path } => executeRelatedFiles(path),
+        ToolAction::FuzzyFind { query, path } => executeFuzzyFind(query, path.as_deref()).await.into(),
+        ToolAction::FileOutline { path } => executeFileOutline(path).await.into(),
+        ToolAction::ViewSymbol { file, symbol } => executeViewSymbol(file, symbol).await.into(),
+        ToolAction::RelatedFiles { path } => executeRelatedFiles(path).into(),
         // Web tools are handled by session.rs (need ExaClient + cache).
         ToolAction::WebSearch { .. } | ToolAction::WebFetch { .. } | ToolAction::WebSimilar { .. } => {
-            "Error: web tools must be executed through the session.".into()
+            crate::message::Content::text("Error: web tools must be executed through the session.")
         }
         // History tools are handled by session.rs (need transcript access).
         ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. } => {
-            "Error: history tools must be executed through the session.".into()
+            crate::message::Content::text("Error: history tools must be executed through the session.")
         }
         // LSP diagnostics are handled by session.rs (need LspManager).
         ToolAction::Diagnostics { .. } => {
-            "Error: diagnostics tool must be executed through the session.".into()
+            crate::message::Content::text("Error: diagnostics tool must be executed through the session.")
         }
         // MCP tools are handled by session.rs (need McpManager).
         ToolAction::Mcp { .. } => {
-            "Error: MCP tools must be executed through the session.".into()
+            crate::message::Content::text("Error: MCP tools must be executed through the session.")
         }
         // Task tools are handled by session.rs (need to spawn child session).
         ToolAction::Task { .. } => {
-            "Error: task tools must be executed through the session.".into()
+            crate::message::Content::text("Error: task tools must be executed through the session.")
         }
-        ToolAction::Unknown { name, .. } => format!("Unknown tool: {name}"),
+        ToolAction::Unknown { name, .. } => crate::message::Content::text(format!("Unknown tool: {name}")),
     }
 }
 
@@ -1220,35 +1226,61 @@ fn executeReadFile(
     offset: Option<usize>,
     limit: Option<usize>,
     anchor: Option<usize>,
-) -> String {
-    // Binary detection via first 512 bytes.
+) -> crate::message::Content {
+    use base64::Engine;
+
+    // File type detection via first 512 bytes.
     match std::fs::File::open(path) {
         Ok(mut file) => {
             use std::io::Read;
             let mut probe = [0u8; 512];
             let probeLen = match file.read(&mut probe) {
                 Ok(n) => n,
-                Err(e) => return format!("Failed to read file: {e}"),
+                Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
             };
-            if isBinary(&probe[..probeLen]) {
-                return format!("Binary file ({} bytes). Use shell tools to inspect.",
-                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+            match classifyFile(&probe[..probeLen]) {
+                FileKind::Image(fmt) => {
+                    let fileSize = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    if fileSize > MAX_IMAGE_BYTES {
+                        return crate::message::Content::text(format!(
+                            "Image file ({fileSize} bytes). Too large to send inline \u{2014} maximum is 4 MB."
+                        ));
+                    }
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let dataUri = format!("data:{};base64,{b64}", fmt.mimeType());
+                            return crate::message::Content::withImages(
+                                &format!("[{path}]"),
+                                vec![dataUri],
+                            );
+                        }
+                        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
+                    }
+                }
+                FileKind::Binary => {
+                    return crate::message::Content::text(format!(
+                        "Binary file ({} bytes). Use shell tools to inspect.",
+                        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                    ));
+                }
+                FileKind::Text => {}
             }
         }
-        Err(e) => return format!("Failed to read file: {e}"),
+        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
     }
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) => return format!("Failed to read file: {e}"),
+        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
     };
 
     // Anchor mode: expand from a line based on indentation.
     if let Some(anchorLine) = anchor {
-        return expandFromAnchor(&content, anchorLine);
+        return crate::message::Content::text(expandFromAnchor(&content, anchorLine));
     }
 
-    formatNumberedLines(&content, offset, limit)
+    crate::message::Content::text(formatNumberedLines(&content, offset, limit))
 }
 
 /// Format text as numbered lines with offset/limit and truncation.
@@ -1487,18 +1519,63 @@ fn executeSearchOutput(shell: &Shell, index: usize, pattern: &str, context: usiz
     }
 }
 
-/// Detect binary content by checking for NUL bytes and known magic numbers.
-fn isBinary(bytes: &[u8]) -> bool {
+/// Classification of a file's content type based on magic bytes.
+pub enum FileKind {
+    Text,
+    Image(ImageFormat),
+    Binary,
+}
+
+/// Recognized image formats (by magic bytes).
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Bmp,
+    Webp,
+}
+
+impl ImageFormat {
+    pub fn mimeType(&self) -> &'static str {
+        match self {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::Bmp => "image/bmp",
+            ImageFormat::Webp => "image/webp",
+        }
+    }
+}
+
+/// Maximum image file size for inline base64 encoding (4 MB).
+const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Classify file content by probing magic bytes.
+fn classifyFile(bytes: &[u8]) -> FileKind {
     if bytes.is_empty() {
-        return false;
+        return FileKind::Text;
     }
 
-    // Magic number signatures for common binary formats.
-    const MAGIC: &[&[u8]] = &[
-        b"\x89PNG",            // PNG
-        b"\xff\xd8\xff",      // JPEG
-        b"GIF8",              // GIF
-        b"BM",                // BMP
+    // Image signatures — check before generic binary.
+    if bytes.starts_with(b"\x89PNG") {
+        return FileKind::Image(ImageFormat::Png);
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return FileKind::Image(ImageFormat::Jpeg);
+    }
+    if bytes.starts_with(b"GIF8") {
+        return FileKind::Image(ImageFormat::Gif);
+    }
+    if bytes.starts_with(b"BM") {
+        return FileKind::Image(ImageFormat::Bmp);
+    }
+    // WebP: starts with RIFF....WEBP.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return FileKind::Image(ImageFormat::Webp);
+    }
+
+    // Non-image binary signatures.
+    const BINARY_MAGIC: &[&[u8]] = &[
         b"PK\x03\x04",       // ZIP/DOCX/JAR
         b"\x7fELF",          // ELF
         b"\xfe\xed\xfa",     // Mach-O
@@ -1506,14 +1583,18 @@ fn isBinary(bytes: &[u8]) -> bool {
         b"%PDF",              // PDF
         b"\x1f\x8b",         // gzip
     ];
-    for sig in MAGIC {
+    for sig in BINARY_MAGIC {
         if bytes.starts_with(sig) {
-            return true;
+            return FileKind::Binary;
         }
     }
 
     // NUL byte check (strong binary indicator in first 512 bytes).
-    bytes.contains(&0x00)
+    if bytes.contains(&0x00) {
+        return FileKind::Binary;
+    }
+
+    FileKind::Text
 }
 
 // --- Subprocess helper ---
@@ -2901,6 +2982,7 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         },
         "historySearch" => ToolAction::HistorySearch {
             query: reqStr!("query"),
+            mediaType: args["mediaType"].as_str().map(String::from),
         },
         "task" => ToolAction::Task {
             prompt: reqStr!("prompt"),
@@ -2921,4 +3003,124 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
     };
 
     Ok(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifyPng() {
+        let header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        match classifyFile(header) {
+            FileKind::Image(ImageFormat::Png) => {}
+            other => panic!("expected PNG, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyJpeg() {
+        let header = b"\xff\xd8\xff\xe0\x00\x10JFIF";
+        match classifyFile(header) {
+            FileKind::Image(ImageFormat::Jpeg) => {}
+            other => panic!("expected JPEG, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyGif() {
+        let header = b"GIF89a\x01\x00\x01\x00";
+        match classifyFile(header) {
+            FileKind::Image(ImageFormat::Gif) => {}
+            other => panic!("expected GIF, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyWebp() {
+        let header = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+        match classifyFile(header) {
+            FileKind::Image(ImageFormat::Webp) => {}
+            other => panic!("expected WebP, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyElf() {
+        let header = b"\x7fELF\x02\x01\x01\x00";
+        match classifyFile(header) {
+            FileKind::Binary => {}
+            other => panic!("expected Binary, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyPlainText() {
+        let header = b"fn main() {\n    println!(\"hello\");\n}";
+        match classifyFile(header) {
+            FileKind::Text => {}
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyNulAsBinary() {
+        let header = b"some text\x00more text";
+        match classifyFile(header) {
+            FileKind::Binary => {}
+            other => panic!("expected Binary, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classifyEmptyAsText() {
+        match classifyFile(b"") {
+            FileKind::Text => {}
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn readFileTextReturnsContent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "line 1\nline 2\n").unwrap();
+        let result = executeReadFile(tmp.path().to_str().unwrap(), None, None, None);
+        let text = result.textContent();
+        assert!(text.contains("line 1"));
+        assert!(text.contains("line 2"));
+        assert!(!result.hasImages());
+    }
+
+    #[test]
+    fn readFilePngReturnsImageContent() {
+        // Write a minimal 1x1 PNG.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
+            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+            0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(tmp.path(), png).unwrap();
+        let result = executeReadFile(tmp.path().to_str().unwrap(), None, None, None);
+        assert!(result.hasImages());
+        let uris = result.imageUris();
+        assert_eq!(uris.len(), 1);
+        assert!(uris[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn readFileBinaryReturnsError() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let elf = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        std::fs::write(tmp.path(), elf).unwrap();
+        let result = executeReadFile(tmp.path().to_str().unwrap(), None, None, None);
+        assert!(!result.hasImages());
+        assert!(result.textContent().contains("Binary file"));
+    }
 }

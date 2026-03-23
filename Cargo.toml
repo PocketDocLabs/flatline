@@ -32,6 +32,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
+# Encoding
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # Error handling
 anyhow = "1"
 
@@ -58,6 +62,10 @@ regex = "1"
 
 # Fuzzy matching
 nucleo-matcher = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Config
 dirs = "6"

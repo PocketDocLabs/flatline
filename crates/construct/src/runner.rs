@@ -211,7 +211,7 @@ pub async fn runStreaming(
 
     let sessionId = session.sessionId().to_string();
     let _maxTurns = runConfig.maxTurns;
-    let prompt = prompt.to_string();
+    let input = crate::session::UserInput::from(prompt.to_string());
 
     let (eventTx, eventRx) = mpsc::channel::<SessionEvent>(256);
     let (_, mut permitRx) = mpsc::channel::<crate::permissions::PermitResponse>(1);
@@ -223,7 +223,7 @@ pub async fn runStreaming(
         let _cancel = cancelTx;
 
         let sendResult = session
-            .send(&prompt, &eventTx, &mut permitRx, &mut cancelRx)
+            .send(&input, &eventTx, &mut permitRx, &mut cancelRx)
             .await;
 
         // Drop eventTx so the receiver knows we're done.
@@ -292,8 +292,9 @@ pub fn runSession<'a>(
     });
 
     // Run the agentic turn loop.
+    let input = crate::session::UserInput::from(prompt.to_string());
     let sendResult = session
-        .send(prompt, &eventTx, &mut permitRx, &mut cancelRx)
+        .send(&input, &eventTx, &mut permitRx, &mut cancelRx)
         .await;
 
     // Drop the sender so the drain task exits.

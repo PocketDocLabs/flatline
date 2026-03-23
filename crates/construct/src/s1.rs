@@ -236,6 +236,7 @@ fn truncateLongResults(
     }
 
     // Truncate long Tool results in place — only within the S1 zone.
+    // Also strip image blocks from multimodal content (same pass).
     for (i, msg) in history.iter_mut().enumerate() {
         if !zoneIndices.contains(&i) {
             continue;
@@ -245,21 +246,28 @@ fn truncateLongResults(
             content,
         } = msg
         {
-            if content.len() <= threshold {
+            // Strip images from multimodal content in the S1 zone.
+            if content.hasImages() {
+                *content = content.stripImages();
+            }
+
+            let textLen = content.charCount();
+            if textLen <= threshold {
                 continue;
             }
             if alreadyProcessed.contains(tool_call_id.as_str()) {
                 continue;
             }
             let blockId = blockHints.get(tool_call_id).map(|s| s.as_str());
-            let before = content.len();
-            *content = middleOut(content, threshold, blockId);
+            let before = textLen;
+            let text = content.textContent();
+            let truncated = middleOut(text, threshold, blockId);
+            *content = crate::message::Content::text(truncated);
             tracing::debug!(
                 tool_call_id = %tool_call_id,
                 threshold,
                 beforeLen = before,
-                afterLen = content.len(),
-                headSample = %&content[..content.floor_char_boundary(80)],
+                afterLen = content.charCount(),
                 "S1 middle-out applied"
             );
             middleOutCallIds.push(tool_call_id.clone());
@@ -269,6 +277,13 @@ fn truncateLongResults(
                 if !invalidatedFiles.contains(path) {
                     invalidatedFiles.push(path.clone());
                 }
+            }
+        }
+
+        // Strip images from User messages in the S1 zone too.
+        if let Message::User { content } = msg {
+            if content.hasImages() {
+                *content = content.stripImages();
             }
         }
     }
@@ -335,7 +350,8 @@ fn calculateZone(history: &[Message]) -> HashSet<usize> {
 /// Rough character count for a message.
 fn messageLen(msg: &Message) -> usize {
     match msg {
-        Message::System { content } | Message::User { content } => content.len(),
+        Message::System { content } => content.len(),
+        Message::User { content } => content.charCount(),
         Message::Assistant { content, tool_calls, .. } => {
             let textLen = content.as_ref().map_or(0, |c| c.len());
             let callsLen = tool_calls.as_ref().map_or(0, |calls| {
@@ -343,7 +359,7 @@ fn messageLen(msg: &Message) -> usize {
             });
             textLen + callsLen
         }
-        Message::Tool { content, .. } => content.len(),
+        Message::Tool { content, .. } => content.charCount(),
     }
 }
 

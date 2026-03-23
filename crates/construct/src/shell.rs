@@ -635,9 +635,21 @@ fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
             }
         }
         None => {
+            // START marker never appeared — command likely failed before
+            // the printf ran (e.g., zsh parse error on history expansion).
+            // Strip sentinel lines so internal tokens don't leak to the agent.
+            let exitCode = text.rfind(&endPrefix).and_then(|endPos| {
+                let afterPrefix = &text[endPos + endPrefix.len()..];
+                afterPrefix.split("__").next()?.parse::<i32>().ok()
+            });
+            let cleaned: String = stripAnsi(&text)
+                .lines()
+                .filter(|l| !l.contains("__FLATLINE_") && !l.contains("__flatline_ec"))
+                .collect::<Vec<_>>()
+                .join("\n");
             return ExtractedResult {
-                output: stripAnsi(&text),
-                exitCode: None,
+                output: cleaned.trim().to_string(),
+                exitCode,
             };
         }
     };
@@ -745,6 +757,9 @@ fn injectShellIntegration(shell: &str, cmd: &mut CommandBuilder) -> Result<()> {
         let zshrc = format!(
             r#"[[ -f "{originalZdotdir}/.zshrc" ]] && source "{originalZdotdir}/.zshrc"
 ZDOTDIR="{originalZdotdir}"
+# Agent shell has no interactive history — disable ! expansion
+# so globs like [!.]* don't trigger "event not found".
+set +H
 flatline_precmd() {{ printf '\e]133;D;%s\a\e]133;A\a' "$?" }}
 flatline_preexec() {{ printf '\e]133;C\a' }}
 precmd_functions+=(flatline_precmd)
@@ -755,6 +770,9 @@ preexec_functions+=(flatline_preexec)
         cmd.env("ZDOTDIR", integrationDir.to_str().unwrap_or_default());
     } else if shell.ends_with("bash") {
         let bashrc = r#"[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
+# Agent shell has no interactive history — disable ! expansion
+# so globs like [!.]* don't trigger "event not found".
+set +H
 flatline_prompt_command() { printf '\033]133;D;%s\a\033]133;A\a' "$?"; }
 PROMPT_COMMAND="flatline_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 trap 'printf "\033]133;C\a"' DEBUG

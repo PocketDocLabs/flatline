@@ -193,6 +193,8 @@ pub struct AgentPanel {
     lastSubagentToggleLine: std::cell::Cell<Option<(usize, usize)>>,
     /// Transient retry status shown in throbber instead of "thinking".
     retryStatus: Option<String>,
+    /// Image attachments queued for the next message submission.
+    attachments: Vec<construct::session::Attachment>,
 }
 
 impl AgentPanel {
@@ -240,6 +242,7 @@ impl AgentPanel {
             lastSubagentHeaderLine: std::cell::Cell::new(None),
             lastSubagentToggleLine: std::cell::Cell::new(None),
             retryStatus: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -266,10 +269,38 @@ impl AgentPanel {
         self.lastCodeBlockRanges.clear();
         self.copiedFlash = None;
         self.codeExpanded.clear();
+        self.attachments.clear();
+    }
+
+    /// Add an image attachment for the next submission.
+    pub fn addAttachment(&mut self, att: construct::session::Attachment) {
+        self.attachments.push(att);
+    }
+
+    /// Drain and return all queued attachments.
+    pub fn takeAttachments(&mut self) -> Vec<construct::session::Attachment> {
+        std::mem::take(&mut self.attachments)
+    }
+
+    /// Number of queued attachments.
+    pub fn attachmentCount(&self) -> usize {
+        self.attachments.len()
+    }
+
+    /// Remove the most recently added attachment.
+    pub fn removeLastAttachment(&mut self) {
+        self.attachments.pop();
     }
 
     pub fn pushUser(&mut self, text: &str) {
-        self.entries.push(PanelEntry::User(text.into()));
+        let display = if self.attachments.is_empty() {
+            text.to_string()
+        } else {
+            let n = self.attachments.len();
+            let suffix = if n == 1 { "1 image" } else { &format!("{n} images") };
+            format!("{text}\n[+{suffix} attached]")
+        };
+        self.entries.push(PanelEntry::User(display));
         self.scrollOffset = 0;
         self.turnActive = true;
         // Start thinking indicator immediately for responsiveness.
@@ -1129,8 +1160,11 @@ impl AgentPanel {
         // Width accounts for: 2 right padding + 2 prompt prefix.
         let inputHeight = if self.pendingPermit {
             // code block (top border + content, no bottom) + header + explanation + blank + 2 keys + blank + patterns + custom.
-            let codeBlockLines: u16 = if self.pendingCommand().is_some() { 2 } else { 0 };
-            let headerLine: u16 = 1;
+            let hasCmd = self.pendingCommand().is_some();
+            let codeBlockLines: u16 = if hasCmd { 2 } else { 0 };
+            // Header is in the input area only for shell (code block present).
+            // Non-shell header is in the separator slot.
+            let headerLine: u16 = if hasCmd { 1 } else { 0 };
             let availW = inner.width.saturating_sub(6) as usize;
             let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
                 if availW == 0 { 1 } else { (e.len() / availW + 1) as u16 }
@@ -1140,7 +1174,10 @@ impl AgentPanel {
             (codeBlockLines + headerLine + explanationLines + 1 + 2 + 1 + patternLines)
                 .min(inner.height * 2 / 3).max(5)
         } else {
-            self.textArea.desiredHeight(inner.width.saturating_sub(4)).min(8).max(1)
+            let baseHeight = self.textArea.desiredHeight(inner.width.saturating_sub(4)).min(8).max(1);
+            // Add space for attachment bar: entries + separator.
+            let attLines = if self.attachments.is_empty() { 0 } else { self.attachments.len() as u16 + 1 };
+            baseHeight + attLines
         };
 
         // Split: chat area + separator + input.
@@ -1155,8 +1192,15 @@ impl AgentPanel {
         let separatorArea = chunks[1];
         let inputArea = chunks[2];
 
-        // Separator line (hidden during permission prompt — header is in input area).
-        if !self.pendingPermit {
+        // Separator. Non-shell permit: header in separator slot. Shell permit: hidden
+        // (header is in input area after the code block). Normal: plain separator.
+        if self.pendingPermit && self.pendingCommand().is_none() {
+            let mut headerLines: Vec<Line> = Vec::new();
+            self.renderPermitHeaderInline(separatorArea.width, &mut headerLines);
+            if let Some(line) = headerLines.into_iter().next() {
+                Paragraph::new(line).render(separatorArea, buf);
+            }
+        } else if !self.pendingPermit {
             let sep = "\u{2500}".repeat(separatorArea.width as usize);
             Paragraph::new(sep)
                 .style(Style::default().fg(Color::DarkGray))
@@ -1363,8 +1407,11 @@ impl AgentPanel {
                 }
             }
 
-            // Header line: ─┴─ tool ⚠︎ ──────── ⏲︎ Ns ─┴─
-            self.renderPermitHeaderInline(area.width, &mut lines);
+            // Header line: only in input area for shell (with code block).
+            // Non-shell header is rendered in the separator slot.
+            if self.pendingCommand().is_some() {
+                self.renderPermitHeaderInline(area.width, &mut lines);
+            }
 
             // Explanation (shell commands only), wrapped to fit.
             if let Some(ref explanation) = self.pendingToolExplanation {
@@ -1446,7 +1493,75 @@ impl AgentPanel {
                 }
             }
         } else {
-            self.textArea.render(area, buf, focused);
+            // Attachment bar — shown above text area when images are queued.
+            let attCount = self.attachments.len() as u16;
+            let inputArea = if attCount > 0 {
+                // Entries + separator line. Ensure at least 1 line for text area.
+                let barHeight = (attCount + 1).min(area.height.saturating_sub(1));
+                let attRect = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: barHeight,
+                };
+                let inputRect = Rect {
+                    x: area.x,
+                    y: area.y + barHeight,
+                    width: area.width,
+                    height: area.height.saturating_sub(barHeight),
+                };
+
+                let labelStyle = Style::default().fg(Color::White);
+                let dimStyle = Style::default().fg(Color::DarkGray);
+
+                let mut lines: Vec<Line> = Vec::new();
+
+                // One line per attachment with size info.
+                for (i, att) in self.attachments.iter().enumerate() {
+                    let sizeStr = formatBytes(att.data.len());
+                    let mut spans = vec![
+                        Span::styled(" \u{2398}\u{FE0E} ", labelStyle),
+                        Span::styled(&att.label, labelStyle),
+                        Span::styled(format!("  {sizeStr}"), dimStyle),
+                    ];
+                    // Show Ctrl+D hint on the last attachment line.
+                    if i == self.attachments.len() - 1 {
+                        let usedLen = att.label.len() + sizeStr.len() + 6; // " ⎘︎ " + "  "
+                        let pad = (area.width as usize).saturating_sub(usedLen + 8);
+                        spans.push(Span::raw(" ".repeat(pad)));
+                        spans.push(Span::styled("[Ctrl+D]", dimStyle));
+                    }
+                    lines.push(Line::from(spans));
+                }
+
+                // Render attachment entries.
+                let entriesRect = Rect {
+                    x: attRect.x,
+                    y: attRect.y,
+                    width: attRect.width,
+                    height: attCount,
+                };
+                Paragraph::new(lines).render(entriesRect, buf);
+
+                // Separator — rendered at full inner width (undo the 2-char right padding
+                // so it matches the panel's own chat/input separator).
+                let sepRect = Rect {
+                    x: attRect.x,
+                    y: attRect.y + attCount,
+                    width: attRect.width + 2,
+                    height: 1,
+                };
+                let sep = "\u{2500}".repeat(sepRect.width as usize);
+                Paragraph::new(sep)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .render(sepRect, buf);
+
+                inputRect
+            } else {
+                area
+            };
+
+            self.textArea.render(inputArea, buf, focused);
             // Ghost text overlay for completion.
             if let Some(state) = &self.completion {
                 if let Some(cmd) = state.matches.get(state.selected) {
@@ -1787,12 +1902,16 @@ impl AgentPanel {
         match entry {
             PanelEntry::User(text) => {
                 let style = Style::default().fg(Color::Cyan);
+                let dimStyle = Style::default().fg(Color::DarkGray);
                 let prefixWidth: usize = 2; // "› " = 2 display columns.
                 let textWidth = (width as usize).saturating_sub(prefixWidth);
                 let mut isFirst = true;
 
                 for logicalLine in text.lines() {
-                    let spanLine = Line::from(Span::styled(logicalLine.to_string(), style));
+                    // Attachment indicator gets dimmed styling.
+                    let isDim = logicalLine.starts_with("[+") && logicalLine.ends_with("attached]");
+                    let lineStyle = if isDim { dimStyle } else { style };
+                    let spanLine = Line::from(Span::styled(logicalLine.to_string(), lineStyle));
                     let wrapped = wrapSpannedLine(spanLine, textWidth);
                     for (idx, wLine) in wrapped.into_iter().enumerate() {
                         cont.push(idx > 0);
@@ -1802,7 +1921,7 @@ impl AgentPanel {
                             "  "
                         };
                         isFirst = false;
-                        let mut spans = vec![Span::styled(prefix.to_string(), style)];
+                        let mut spans = vec![Span::styled(prefix.to_string(), lineStyle)];
                         spans.extend(wLine.spans);
                         lines.push(Line::from(spans));
                     }
@@ -2306,6 +2425,19 @@ impl AgentPanel {
 
 /// Extract a substring from a plain text string by display column range.
 ///
+/// Format a byte count as a human-readable string (e.g. "1.2 MB").
+fn formatBytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Accounts for multi-width characters. Returns the trimmed slice between
 /// `colStart` and `colEnd` (exclusive) in display columns.
 fn sliceByDisplayColumn(text: &str, colStart: u16, colEnd: u16) -> String {

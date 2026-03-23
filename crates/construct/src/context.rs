@@ -316,7 +316,7 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
                     SummaryKind::Topic => formatTopicSummary(content, sourceBlockIds),
                     SummaryKind::Full => formatFullBriefing(content, sourceBlockIds),
                 };
-                history.push(Message::User { content: wrapped });
+                history.push(Message::User { content: wrapped.into() });
             }
             TransformedTurn::Original(turn) | TransformedTurn::Replaced { turn, .. } => {
                 let content = match tt {
@@ -367,13 +367,15 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
                     }
                     TurnRole::User => {
                         flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
-                        history.push(Message::User { content });
+                        let msgContent = rebuildContent(&content, &turn.attachments);
+                        history.push(Message::User { content: msgContent });
                     }
                     TurnRole::ToolResult => {
                         flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
+                        let msgContent = rebuildContent(&content, &turn.attachments);
                         history.push(Message::Tool {
                             tool_call_id: turn.toolCallId.clone().unwrap_or_default(),
-                            content,
+                            content: msgContent,
                         });
                     }
                     TurnRole::System => {}
@@ -384,6 +386,25 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
 
     flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
     history
+}
+
+/// Rebuild `Content` from turn text + optional persisted attachments.
+///
+/// When a turn has TurnAttachments, reconstruct multimodal content with
+/// data URIs. Otherwise, return plain text content.
+fn rebuildContent(
+    text: &str,
+    attachments: &Option<Vec<crate::transcript::TurnAttachment>>,
+) -> crate::message::Content {
+    match attachments {
+        Some(atts) if !atts.is_empty() => {
+            let imageUris: Vec<String> = atts.iter().map(|a| {
+                format!("data:{};base64,{}", a.mimeType, a.data)
+            }).collect();
+            crate::message::Content::withImages(text, imageUris)
+        }
+        _ => crate::message::Content::text(text),
+    }
 }
 
 /// Flush pending assistant content and/or tool calls into history.
@@ -489,7 +510,8 @@ pub fn calculateZones(
 /// Rough character count for a message (used for zone calculation).
 fn messageCharCount(msg: &Message) -> usize {
     match msg {
-        Message::System { content } | Message::User { content } => content.len(),
+        Message::System { content } => content.len(),
+        Message::User { content } => content.charCount(),
         Message::Assistant { content, tool_calls, .. } => {
             let textLen = content.as_ref().map_or(0, |c| c.len());
             let callsLen = tool_calls.as_ref().map_or(0, |calls| {
@@ -497,7 +519,7 @@ fn messageCharCount(msg: &Message) -> usize {
             });
             textLen + callsLen
         }
-        Message::Tool { content, .. } => content.len(),
+        Message::Tool { content, .. } => content.charCount(),
     }
 }
 
@@ -505,57 +527,440 @@ fn messageCharCount(msg: &Message) -> usize {
 // /context display
 // ---------------------------------------------------------------------------
 
-/// Context state for /context display.
+/// Topic info for display.
+pub struct TopicDisplay {
+    pub label: String,
+    pub blockCount: usize,
+    pub isCurrent: bool,
+}
+
+/// Per-zone stats for display.
+pub struct ZoneInfo {
+    pub originalTurns: usize,
+    pub resultTurns: usize,
+    pub estimatedTokens: usize,
+}
+
+/// Input parameters for building context state.
+pub struct BuildStateInput<'a> {
+    pub history: &'a [Message],
+    pub contextWindow: usize,
+    pub compactRatio: f64,
+    pub compactionLog: &'a CompactionLog,
+    pub reportedTokens: usize,
+    pub s1Exhausted: bool,
+    pub s2Exhausted: bool,
+    pub s3Exhausted: bool,
+    pub s4Exhausted: bool,
+    pub topics: &'a [crate::topic::TopicInfo],
+    pub currentTopicId: &'a str,
+    pub transcript: &'a Transcript,
+    pub headTurnId: &'a str,
+}
+
+/// Full context state for /context display.
 pub struct ContextState {
-    pub totalTokens: usize,
+    pub estimatedTokens: usize,
+    pub reportedTokens: usize,
     pub contextWindow: usize,
     pub compactLimit: usize,
+    pub s1s2Threshold: usize,
+    pub s3Threshold: usize,
+    pub s4Threshold: usize,
     pub messageCount: usize,
-    pub compactionOps: usize,
+    // S1 ops.
+    pub dedupOps: usize,
+    pub middleOutOps: usize,
+    // S2/S3/S4 compression ratios.
+    pub s2TurnsIn: usize,
+    pub s2SummariesOut: usize,
+    pub s3BlocksIn: usize,
+    pub s3SummariesOut: usize,
+    pub s4SourcesIn: usize,
+    pub s4BriefingsOut: usize,
+    // Stage exhaustion.
+    pub s1Exhausted: bool,
+    pub s2Exhausted: bool,
+    pub s3Exhausted: bool,
+    pub s4Exhausted: bool,
+    // Zones.
+    pub s3Zone: ZoneInfo,
+    pub s2Zone: ZoneInfo,
+    pub rawZone: ZoneInfo,
+    // Topics.
+    pub topics: Vec<TopicDisplay>,
+}
+
+/// Character count for a transformed turn.
+fn transformedTurnCharCount(tt: &TransformedTurn) -> usize {
+    match tt {
+        TransformedTurn::Original(turn) => turn.content.len(),
+        TransformedTurn::Replaced { newContent, .. } => newContent.len(),
+        TransformedTurn::Summary { content, .. } => content.len(),
+    }
+}
+
+/// Compute zone stats from transcript + compaction log.
+///
+/// Walks the active turn chain, applies compaction ops, then divides
+/// the result into S3/S2/Raw zones (30/30/40 by char count). For each
+/// zone, counts original turns (from transcript) and result turns
+/// (from the transformed stream).
+fn computeZoneStats(
+    transcript: &Transcript,
+    compactionLog: &CompactionLog,
+    headTurnId: &str,
+) -> (ZoneInfo, ZoneInfo, ZoneInfo) {
+    let empty = || ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 };
+
+    let allTurns = match transcript.loadAll() {
+        Ok(t) => t,
+        Err(_) => return (empty(), empty(), empty()),
+    };
+    let chain = walkChain(&allTurns, headTurnId);
+    if chain.is_empty() {
+        return (empty(), empty(), empty());
+    }
+
+    let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
+    let allOps = compactionLog.loadAll().unwrap_or_default();
+    let ops = filterOpsForChain(allOps, &activeBlockIds);
+    let transformed = applyOps(&chain, &ops);
+
+    // Count original turns per block.
+    let mut turnsPerBlock: HashMap<&str, usize> = HashMap::new();
+    for turn in &chain {
+        *turnsPerBlock.entry(turn.blockId.as_str()).or_default() += 1;
+    }
+
+    let charCounts: Vec<usize> = transformed.iter().map(transformedTurnCharCount).collect();
+    let totalChars: usize = charCounts.iter().sum();
+    if totalChars == 0 {
+        return (empty(), empty(), empty());
+    }
+
+    let s3Boundary = totalChars * 30 / 100;
+    let s2Boundary = totalChars * 60 / 100;
+
+    let mut s3 = empty();
+    let mut s2 = empty();
+    let mut raw = empty();
+    let mut countedBlocks: HashSet<String> = HashSet::new();
+    let mut cumulative: usize = 0;
+
+    for (i, tt) in transformed.iter().enumerate() {
+        cumulative += charCounts[i];
+
+        // Collect block IDs covered by this turn.
+        let blockIds: Vec<&str> = match tt {
+            TransformedTurn::Summary { sourceBlockIds, .. } => {
+                sourceBlockIds.iter().map(|s| s.as_str()).collect()
+            }
+            _ => vec![tt.blockId()],
+        };
+
+        // Count original turns for blocks we haven't seen yet.
+        let origCount: usize = blockIds
+            .into_iter()
+            .filter(|bid| countedBlocks.insert(bid.to_string()))
+            .map(|bid| turnsPerBlock.get(bid).copied().unwrap_or(0))
+            .sum();
+
+        let zone = if cumulative <= s3Boundary {
+            &mut s3
+        } else if cumulative <= s2Boundary {
+            &mut s2
+        } else {
+            &mut raw
+        };
+
+        zone.originalTurns += origCount;
+        zone.resultTurns += 1;
+        zone.estimatedTokens += charCounts[i] / 4;
+    }
+
+    (s3, s2, raw)
 }
 
 /// Build context state for display.
-pub fn buildState(
-    history: &[Message],
-    contextWindow: usize,
-    compactRatio: f64,
-    compactionLog: &CompactionLog,
-) -> ContextState {
-    let opCount = compactionLog.loadAll().map(|ops| ops.len()).unwrap_or(0);
+pub fn buildState(input: &BuildStateInput) -> ContextState {
+    let ops = input.compactionLog.loadAll().unwrap_or_default();
 
-    // Rough token estimate: ~4 chars per token.
-    let totalChars: usize = history.iter().map(|m| messageCharCount(m)).sum();
+    // Count per-stage ops.
+    let mut dedupOps = 0usize;
+    let mut middleOutOps = 0usize;
+    let mut s2TurnsIn = 0usize;
+    let mut s2SummariesOut = 0usize;
+    let mut s3BlocksIn = 0usize;
+    let mut s3SummariesOut = 0usize;
+    let mut s4SourcesIn = 0usize;
+    let mut s4BriefingsOut = 0usize;
+
+    for op in &ops {
+        match op {
+            CompactionOp::FileDedup { targetIds, .. } => {
+                dedupOps += targetIds.len();
+            }
+            CompactionOp::MiddleOut { targetIds, .. } => {
+                middleOutOps += targetIds.len();
+            }
+            CompactionOp::BlockCompact { sourceIds, .. } => {
+                s2TurnsIn += sourceIds.len();
+                s2SummariesOut += 1;
+            }
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
+                s3BlocksIn += sourceBlockIds.len();
+                s3SummariesOut += 1;
+            }
+            CompactionOp::FullCompact { sourceIds, .. } => {
+                s4SourcesIn += sourceIds.len();
+                s4BriefingsOut += 1;
+            }
+        }
+    }
+
+    // Rough token estimate from history char count.
+    let totalChars: usize = input.history.iter().map(|m| messageCharCount(m)).sum();
     let estimatedTokens = totalChars / 4;
 
+    let compactLimit = (input.contextWindow as f64 * input.compactRatio) as usize;
+    let s1s2Threshold = compactLimit * 80 / 100;
+    let s3Threshold = compactLimit * 90 / 100;
+
+    // Zones.
+    let (s3Zone, s2Zone, rawZone) = if !input.headTurnId.is_empty() {
+        computeZoneStats(input.transcript, input.compactionLog, input.headTurnId)
+    } else {
+        let empty = ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 };
+        (empty, ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 },
+         ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 })
+    };
+
+    // Topics.
+    let topics: Vec<TopicDisplay> = input.topics.iter().map(|t| TopicDisplay {
+        label: t.label.clone(),
+        blockCount: t.blockCount,
+        isCurrent: t.topicId == input.currentTopicId,
+    }).collect();
+
     ContextState {
-        totalTokens: estimatedTokens,
-        contextWindow,
-        compactLimit: (contextWindow as f64 * compactRatio) as usize,
-        messageCount: history.len(),
-        compactionOps: opCount,
+        estimatedTokens,
+        reportedTokens: input.reportedTokens,
+        contextWindow: input.contextWindow,
+        compactLimit,
+        s1s2Threshold,
+        s3Threshold,
+        s4Threshold: compactLimit,
+        messageCount: input.history.len(),
+        dedupOps,
+        middleOutOps,
+        s2TurnsIn,
+        s2SummariesOut,
+        s3BlocksIn,
+        s3SummariesOut,
+        s4SourcesIn,
+        s4BriefingsOut,
+        s1Exhausted: input.s1Exhausted,
+        s2Exhausted: input.s2Exhausted,
+        s3Exhausted: input.s3Exhausted,
+        s4Exhausted: input.s4Exhausted,
+        s3Zone,
+        s2Zone,
+        rawZone,
+        topics,
     }
 }
 
 /// Format context state for display.
+///
+/// All lines target max ~38 chars to avoid word-wrap
+/// in narrow agent panels.
 pub fn formatState(state: &ContextState) -> String {
+    // Use reported tokens if available, otherwise estimated.
+    let tokens = if state.reportedTokens > 0 {
+        state.reportedTokens
+    } else {
+        state.estimatedTokens
+    };
+    let prefix = if state.reportedTokens > 0 { "" } else { "~" };
+
     let usagePercent = if state.contextWindow > 0 {
-        (state.totalTokens as f64 / state.contextWindow as f64) * 100.0
+        (tokens as f64 / state.contextWindow as f64) * 100.0
     } else {
         0.0
     };
 
-    format!(
-        "Context: {} messages, ~{} tokens ({:.0}%)\n\
-         Window: {} tokens\n\
-         Compact limit: {} tokens\n\
-         Compaction ops applied: {}",
-        state.messageCount,
-        state.totalTokens,
+    let mut out = String::new();
+
+    // Header.
+    out.push_str(&format!(
+        "{}{} / {} tokens ({:.1}%)\n",
+        prefix,
+        formatTokenCount(tokens),
+        formatTokenCount(state.contextWindow),
         usagePercent,
-        state.contextWindow,
-        state.compactLimit,
-        state.compactionOps,
-    )
+    ));
+    out.push_str(&format!(
+        "S1/S2: {}  S3: {}  S4: {}\n",
+        formatTokenCount(state.s1s2Threshold),
+        formatTokenCount(state.s3Threshold),
+        formatTokenCount(state.s4Threshold),
+    ));
+
+    // Layers — status on first line, detail on second.
+    out.push('\n');
+    formatLayerInto(&mut out, "S1 Mechanical", state.s1Exhausted,
+        state.s1s2Threshold, tokens,
+        &formatS1Detail(state.dedupOps, state.middleOutOps));
+    formatLayerInto(&mut out, "S2 Block LLM", state.s2Exhausted,
+        state.s1s2Threshold, tokens,
+        &formatCompressDetail(state.s2TurnsIn, state.s2SummariesOut, "sum"));
+    formatLayerInto(&mut out, "S3 Topic LLM", state.s3Exhausted,
+        state.s3Threshold, tokens,
+        &formatCompressDetail(state.s3BlocksIn, state.s3SummariesOut, "sum"));
+    formatLayerInto(&mut out, "S4 Full merge", state.s4Exhausted,
+        state.s4Threshold, tokens,
+        &formatCompressDetail(state.s4SourcesIn, state.s4BriefingsOut, "sum"));
+
+    // Zones.
+    out.push('\n');
+    let s3 = &state.s3Zone;
+    let s2 = &state.s2Zone;
+    let raw = &state.rawZone;
+
+    if s3.resultTurns > 0 {
+        if s3.originalTurns != s3.resultTurns {
+            out.push_str(&format!(
+                "S3  {} \u{2192} {}  ~{} tok\n",
+                s3.originalTurns, s3.resultTurns,
+                formatTokenCount(s3.estimatedTokens),
+            ));
+        } else {
+            out.push_str(&format!(
+                "S3  {} msgs  ~{} tok\n",
+                s3.resultTurns,
+                formatTokenCount(s3.estimatedTokens),
+            ));
+        }
+    }
+
+    if s2.resultTurns > 0 {
+        if s2.originalTurns != s2.resultTurns {
+            out.push_str(&format!(
+                "S2  {} \u{2192} {}  ~{} tok\n",
+                s2.originalTurns, s2.resultTurns,
+                formatTokenCount(s2.estimatedTokens),
+            ));
+        } else {
+            out.push_str(&format!(
+                "S2  {} msgs  ~{} tok\n",
+                s2.resultTurns,
+                formatTokenCount(s2.estimatedTokens),
+            ));
+        }
+    }
+
+    if raw.resultTurns > 0 {
+        out.push_str(&format!(
+            "Raw {} msgs  ~{} tok\n",
+            raw.resultTurns,
+            formatTokenCount(raw.estimatedTokens),
+        ));
+    }
+
+    // Topics.
+    if !state.topics.is_empty() {
+        out.push_str(&format!(
+            "\nTopics ({})\n", state.topics.len(),
+        ));
+        for topic in &state.topics {
+            let marker = if topic.isCurrent {
+                " \u{2190}"
+            } else {
+                ""
+            };
+            // Truncate long labels to fit panel.
+            let label = truncateLabel(&topic.label, 24);
+            out.push_str(&format!(
+                "  {label}{marker}  {} blk\n",
+                topic.blockCount,
+            ));
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Append a layer block (status line + optional detail line).
+fn formatLayerInto(
+    out: &mut String,
+    name: &str,
+    exhausted: bool,
+    threshold: usize,
+    currentTokens: usize,
+    detail: &str,
+) {
+    let (symbol, status) = if exhausted {
+        ("\u{2713}\u{FE0E}", "exhausted")
+    } else if currentTokens >= threshold {
+        ("\u{25C6}", "armed")
+    } else {
+        ("\u{25CB}", "idle")
+    };
+    out.push_str(&format!("{name}  {symbol} {status}\n"));
+    if detail != "\u{2014}" {
+        out.push_str(&format!("  {detail}\n"));
+    }
+}
+
+/// Format S1 detail string.
+fn formatS1Detail(dedups: usize, truncations: usize) -> String {
+    if dedups == 0 && truncations == 0 {
+        return "\u{2014}".to_string();
+    }
+    let mut parts = Vec::new();
+    if dedups > 0 {
+        parts.push(format!("{dedups} dedup"));
+    }
+    if truncations > 0 {
+        parts.push(format!("{truncations} trunc"));
+    }
+    parts.join(" \u{00B7} ")
+}
+
+/// Format S2/S3/S4 compression detail.
+fn formatCompressDetail(
+    inputCount: usize,
+    outputCount: usize,
+    outputLabel: &str,
+) -> String {
+    if outputCount == 0 {
+        return "\u{2014}".to_string();
+    }
+    format!("{inputCount} \u{2192} {outputCount} {outputLabel}")
+}
+
+/// Format a token count with K/M suffixes.
+fn formatTokenCount(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 10_000 {
+        format!("{:.0}k", count as f64 / 1_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{count}")
+    }
+}
+
+/// Truncate a label to fit within `maxLen` chars.
+fn truncateLabel(label: &str, maxLen: usize) -> String {
+    if label.len() <= maxLen {
+        label.to_string()
+    } else {
+        let truncated = &label[..label.floor_char_boundary(maxLen - 1)];
+        format!("{truncated}\u{2026}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +1081,7 @@ mod tests {
         /// Mirrors session.rs:658 — `recordUser(msg, headTurnId)`.
         fn user(&mut self, content: &str) {
             let id = self.transcript
-                .recordUser(content, self.headTurnId.as_deref())
+                .recordUser(content, self.headTurnId.as_deref(), None)
                 .unwrap();
             self.headTurnId = Some(id);
         }
@@ -703,7 +1108,7 @@ mod tests {
         /// Mirrors session.rs:2084-2093 (pushToolResult).
         fn toolResult(&mut self, callId: &str, content: &str) {
             let id = self.transcript
-                .recordToolResult(callId, content)
+                .recordToolResult(callId, content, None)
                 .unwrap();
             self.headTurnId = Some(id);
         }
@@ -731,7 +1136,7 @@ mod tests {
                     println!("  [{i}] System ({} chars)", content.len());
                 }
                 Message::User { content } => {
-                    println!("  [{i}] User: {}", truncate(content, 60));
+                    println!("  [{i}] User: {}", truncate(content.textContent(), 60));
                 }
                 Message::Assistant { content, tool_calls, reasoning } => {
                     println!(
@@ -742,7 +1147,7 @@ mod tests {
                     );
                 }
                 Message::Tool { tool_call_id, content } => {
-                    println!("  [{i}] Tool({tool_call_id}): {}", truncate(content, 50));
+                    println!("  [{i}] Tool({tool_call_id}): {}", truncate(content.textContent(), 50));
                 }
             }
         }
@@ -764,18 +1169,18 @@ mod tests {
         }
     }
 
-    /// Assert a message is `Tool` and return (callId, content).
+    /// Assert a message is `Tool` and return (callId, content text).
     fn assertTool(msg: &Message) -> (&str, &str) {
         match msg {
-            Message::Tool { tool_call_id, content } => (tool_call_id, content),
+            Message::Tool { tool_call_id, content } => (tool_call_id, content.textContent()),
             other => panic!("expected Tool, got {other:?}"),
         }
     }
 
-    /// Assert a message is `User` and return content.
+    /// Assert a message is `User` and return content text.
     fn assertUser(msg: &Message) -> &str {
         match msg {
-            Message::User { content } => content,
+            Message::User { content } => content.textContent(),
             other => panic!("expected User, got {other:?}"),
         }
     }
@@ -1027,7 +1432,7 @@ mod tests {
         dump("three_block_chain", &msgs);
 
         let userMsgs: Vec<&str> = msgs.iter().filter_map(|m| {
-            if let Message::User { content } = m { Some(content.as_str()) } else { None }
+            if let Message::User { content } = m { Some(content.textContent()) } else { None }
         }).collect();
         assert_eq!(userMsgs, vec!["Step 1", "Step 2", "Step 3"]);
     }
@@ -1234,7 +1639,7 @@ mod tests {
 
         let hasCompressed = msgs.iter().any(|m| {
             if let Message::User { content } = m {
-                content.contains("<compressed_content>")
+                content.textContent().contains("<compressed_content>")
             } else {
                 false
             }

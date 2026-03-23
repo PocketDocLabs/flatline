@@ -16,6 +16,7 @@ mod app;
 mod command;
 mod fork_picker;
 mod history;
+mod image_util;
 mod markdown;
 mod lsp_panel;
 mod mcp_panel;

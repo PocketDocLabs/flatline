@@ -27,6 +27,8 @@ tokio-util.workspace = true
 async-lsp.workspace = true
 dashmap.workspace = true
 tower-service.workspace = true
+base64.workspace = true
+image.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -11,16 +11,24 @@
 //! - [`TopicTracker`] — stateful topic classifier
 //! - [`TopicInfo`] — metadata for a topic segment
 //! - [`EvalResult`] — result of a single evaluation
+//! - [`TopicDecision`] — raw classification output (for async spawning)
+//! - [`classifyPrepared`] — free function for spawned classification tasks
 //!
 //! # Dependencies
 //! `crate::api`, `crate::message`
 
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
 use crate::api;
 use crate::message::Message;
+use crate::transcript::Turn;
 
 use anyhow::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TopicInfo {
     pub topicId: String,
     pub label: String,
@@ -32,6 +40,15 @@ pub struct EvalResult {
     pub topicId: String,
     pub label: String,
     pub isNewTopic: bool,
+}
+
+/// Raw classification output — either the topic is the same or a new label.
+///
+/// Exposed publicly so spawned tasks can return it and the caller
+/// can apply the decision to TopicTracker state on the main thread.
+pub enum TopicDecision {
+    Same,
+    New(String),
 }
 
 pub struct TopicTracker {
@@ -51,11 +68,10 @@ impl TopicTracker {
         }
     }
 
-    /// Evaluate whether a user message starts a new topic.
+    /// Evaluate whether a user message starts a new topic (synchronous convenience).
     ///
-    /// Sends the full conversation history to the utility model with a
-    /// topic classification instruction appended. The shared prefix with
-    /// the main model call gets cache hits.
+    /// Calls prepareClassification + classifyPrepared + applyDecision sequentially.
+    /// For async overlap, use the three methods separately.
     ///
     /// Args:
     ///     history: The live conversation history (same as the main model sees).
@@ -69,25 +85,62 @@ impl TopicTracker {
         client: &api::Client,
         utilityModel: &str,
     ) -> Result<EvalResult> {
-        let response = self.classify(history, client, utilityModel).await;
+        let messages = self.prepareClassification(history);
+        let decision = classifyPrepared(
+            messages,
+            client.clone(),
+            utilityModel.to_string(),
+        ).await;
+        Ok(self.applyDecision(decision, blockId))
+    }
 
-        match response {
-            TopicDecision::New(label) => Ok(self.startTopic(&label, blockId)),
+    /// Build the message list for a topic classification call.
+    ///
+    /// Clones history, strips the last user message, and appends the
+    /// topic context XML block. Returns owned data suitable for passing
+    /// to a spawned task via [`classifyPrepared`].
+    pub fn prepareClassification(&self, history: &[Message]) -> Vec<Message> {
+        // Extract the next user message text for the XML block.
+        let nextMessage = history.iter().rev().find_map(|m| match m {
+            Message::User { content } => Some(content.textContent()),
+            _ => None,
+        }).unwrap_or("");
+
+        // Clone history without the last user message — it's presented
+        // inside the <topic_tracker> block instead to avoid duplication.
+        let mut messages: Vec<Message> = history.to_vec();
+        if let Some(pos) = messages.iter().rposition(|m| matches!(m, Message::User { .. })) {
+            messages.remove(pos);
+        }
+        messages.push(Message::User {
+            content: self.buildTopicContext(nextMessage).into(),
+        });
+
+        messages
+    }
+
+    /// Apply a classification decision to internal state.
+    ///
+    /// Call this on the main thread after collecting the result from
+    /// a spawned [`classifyPrepared`] task.
+    pub fn applyDecision(&mut self, decision: TopicDecision, blockId: &str) -> EvalResult {
+        match decision {
+            TopicDecision::New(label) => self.startTopic(&label, blockId),
             TopicDecision::Same => {
                 if self.currentTopicId.is_empty() {
                     // First message but model said "same" — shouldn't happen,
                     // but fall back to a generic label.
-                    return Ok(self.startTopic("General", blockId));
+                    return self.startTopic("General", blockId);
                 }
                 // Increment block count on current topic.
                 if let Some(last) = self.topics.last_mut() {
                     last.blockCount += 1;
                 }
-                Ok(EvalResult {
+                EvalResult {
                     topicId: self.currentTopicId.clone(),
                     label: self.currentLabel.clone(),
                     isNewTopic: false,
-                })
+                }
             }
         }
     }
@@ -186,49 +239,25 @@ impl TopicTracker {
         ctx.push_str("\n</topic_tracker>");
         ctx
     }
-
-    /// Classify the next user message by sending the conversation history
-    /// with a topic classification block appended.
-    ///
-    /// The history passes through untouched (same system prompt, same
-    /// messages) so the provider's prefix cache covers the shared prefix.
-    /// The next user message is stripped from history and presented inside
-    /// the `<topic_tracker>` block instead to avoid duplication.
-    async fn classify(
-        &self,
-        history: &[Message],
-        client: &api::Client,
-        utilityModel: &str,
-    ) -> TopicDecision {
-        // Extract the next user message text for the XML block.
-        let nextMessage = history.iter().rev().find_map(|m| match m {
-            Message::User { content } => Some(content.as_str()),
-            _ => None,
-        }).unwrap_or("");
-
-        // Clone history without the next user message — it's presented
-        // inside the <topic_tracker> block instead to avoid duplication.
-        let mut messages: Vec<Message> = history.to_vec();
-        if let Some(pos) = messages.iter().rposition(|m| matches!(m, Message::User { .. })) {
-            messages.remove(pos);
-        }
-        messages.push(Message::User {
-            content: self.buildTopicContext(nextMessage),
-        });
-
-        match client.complete(&messages, Some(utilityModel)).await {
-            Ok(response) => parseTopicResponse(&response),
-            Err(e) => {
-                tracing::warn!("topic classification failed, assuming same: {e}");
-                TopicDecision::Same
-            }
-        }
-    }
 }
 
-enum TopicDecision {
-    Same,
-    New(String),
+/// Run a topic classification using pre-built messages.
+///
+/// Free function — takes only owned data, safe to `tokio::spawn`.
+/// Returns the raw [`TopicDecision`]; caller applies it to tracker
+/// state via [`TopicTracker::applyDecision`].
+pub async fn classifyPrepared(
+    messages: Vec<Message>,
+    client: api::Client,
+    utilityModel: String,
+) -> TopicDecision {
+    match client.complete(&messages, Some(&utilityModel)).await {
+        Ok(response) => parseTopicResponse(&response),
+        Err(e) => {
+            tracing::warn!("topic classification failed, assuming same: {e}");
+            TopicDecision::Same
+        }
+    }
 }
 
 const TOPIC_SYSTEM_PROMPT: &str = "\
@@ -316,4 +345,65 @@ fn sanitizeLabel(raw: &str) -> String {
         .trim_end_matches('.')
         .trim()
         .to_string()
+}
+
+/// Rebuild TopicInfo entries from a chain of transcript turns.
+///
+/// Groups turns by topicId, derives startBlock (first blockId per topic)
+/// and blockCount (distinct blockId count per topic). Labels are looked up
+/// from `existingTopics`; unknown topicIds get fallback "Unknown".
+///
+/// Args:
+///     turns: Turns on the active branch, in chronological order.
+///     existingTopics: Previous TopicInfo list (for label lookup).
+pub fn rebuildTopicInfos(turns: &[Turn], existingTopics: &[TopicInfo]) -> Vec<TopicInfo> {
+    let labelMap: HashMap<&str, &str> = existingTopics
+        .iter()
+        .map(|t| (t.topicId.as_str(), t.label.as_str()))
+        .collect();
+
+    // Track first-seen order, first blockId, and distinct blockIds per topic.
+    let mut order: Vec<String> = Vec::new();
+    let mut firstBlock: HashMap<String, String> = HashMap::new();
+    let mut blockSets: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for turn in turns {
+        if turn.topicId.is_empty() {
+            continue;
+        }
+        let tid = &turn.topicId;
+
+        if !firstBlock.contains_key(tid) {
+            order.push(tid.clone());
+            firstBlock.insert(tid.clone(), turn.blockId.clone());
+        }
+
+        blockSets
+            .entry(tid.clone())
+            .or_default()
+            .insert(turn.blockId.clone());
+    }
+
+    order
+        .into_iter()
+        .map(|tid| {
+            let label = labelMap
+                .get(tid.as_str())
+                .copied()
+                .unwrap_or("Unknown");
+            let startBlock = firstBlock
+                .get(&tid)
+                .cloned()
+                .unwrap_or_default();
+            let blockCount = blockSets
+                .get(&tid)
+                .map_or(0, |s| s.len());
+            TopicInfo {
+                topicId: tid,
+                label: label.to_string(),
+                startBlock,
+                blockCount,
+            }
+        })
+        .collect()
 }

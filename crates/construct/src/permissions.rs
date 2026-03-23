@@ -398,7 +398,7 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::WebFetch { url, .. } => ("webFetch", url),
         ToolAction::WebSimilar { url, .. } => ("webSimilar", url),
         ToolAction::HistoryFetch { blockId } => ("historyFetch", blockId),
-        ToolAction::HistorySearch { query } => ("historySearch", query),
+        ToolAction::HistorySearch { query, .. } => ("historySearch", query),
         ToolAction::Task { prompt, .. } => ("task", prompt),
         ToolAction::Diagnostics { path, .. } => ("diagnostics", path),
         ToolAction::Mcp { qualifiedName, args } => (qualifiedName, args),

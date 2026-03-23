@@ -103,7 +103,7 @@ impl ScrollAxisLock {
 /// Set the host terminal's window title via OSC 2.
 fn setTerminalTitle(topic: Option<&str>) {
     let title = match topic {
-        Some(t) if !t.is_empty() => format!("\u{25c6}\u{fe0e} {t}"),
+        Some(t) if !t.is_empty() => format!("\u{1f0a1} {t}"),
         _ => "flatline".to_string(),
     };
     let _ = write!(io::stdout(), "\x1b]2;{title}\x07");
@@ -153,7 +153,7 @@ pub async fn run() -> Result<()> {
     // Session channels.
     let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
     let (permitTx, permitRx) = mpsc::channel::<construct::permissions::PermitResponse>(1);
-    let (userInputTx, mut userInputRx) = mpsc::channel::<String>(16);
+    let (userInputTx, mut userInputRx) = mpsc::channel::<construct::session::UserInput>(16);
     let (commandTx, mut commandRx) = mpsc::channel::<CommandAction>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
 
@@ -248,6 +248,15 @@ pub async fn run() -> Result<()> {
                                     let _ = eventTx
                                         .send(SessionEvent::SessionRestored { turns, markers })
                                         .await;
+                                    // Set window title to the current topic on resume.
+                                    let label = session.currentTopicLabel();
+                                    if !label.is_empty() {
+                                        let _ = eventTx
+                                            .send(SessionEvent::TopicChanged {
+                                                label: label.to_string(),
+                                            })
+                                            .await;
+                                    }
                                     let _ = eventTx
                                         .send(SessionEvent::ResumeComplete {
                                             success: true,
@@ -468,7 +477,7 @@ async fn runLoop(
     scrollLock: &mut ScrollAxisLock,
     eventRx: &mut mpsc::Receiver<SessionEvent>,
     permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
-    userInputTx: &mpsc::Sender<String>,
+    userInputTx: &mpsc::Sender<construct::session::UserInput>,
     commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
     contextWindow: usize,
@@ -981,7 +990,7 @@ async fn handleInput(
     selState: &mut SelectionState,
     scrollLock: &mut ScrollAxisLock,
     permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
-    userInputTx: &mpsc::Sender<String>,
+    userInputTx: &mpsc::Sender<construct::session::UserInput>,
     commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
     sessionPicker: &mut Option<SessionPicker>,
@@ -1308,6 +1317,32 @@ async fn handleInput(
                         }
 
                         if !completionHandled {
+                            // Handle attachment-related keys before borrowing textArea.
+                            if ctrl && key.code == KeyCode::Char('d') && agentPanel.attachmentCount() > 0 {
+                                agentPanel.removeLastAttachment();
+                                break;
+                            }
+                            if ctrl && key.code == KeyCode::Char('v') {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    if let Ok(imgData) = cb.get_image() {
+                                        // Store raw RGBA — PNG encoding deferred to submit.
+                                        agentPanel.addAttachment(construct::session::Attachment {
+                                            mimeType: "image/rgba".into(),
+                                            data: imgData.bytes.to_vec(),
+                                            label: format!(
+                                                "pasted image ({}x{})",
+                                                imgData.width, imgData.height,
+                                            ),
+                                            rgbaDimensions: Some((imgData.width as u32, imgData.height as u32)),
+                                        });
+                                    } else if let Ok(text) = cb.get_text() {
+                                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                                        agentPanel.textArea.insertStr(&normalized);
+                                    }
+                                }
+                                break;
+                            }
+
                             let ta = &mut agentPanel.textArea;
                             match key.code {
                                 KeyCode::Enter if shift => ta.insert('\n'),
@@ -1335,7 +1370,11 @@ async fn handleInput(
                                             let _ = cancelTx.send(false);
                                             agentPanel.history.push(&msg);
                                             agentPanel.pushUser(&msg);
-                                            let _ = userInputTx.send(msg).await;
+                                            let input = construct::session::UserInput {
+                                                text: msg,
+                                                attachments: agentPanel.takeAttachments(),
+                                            };
+                                            let _ = userInputTx.send(input).await;
                                         }
                                     }
                                 }
@@ -1869,7 +1908,15 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
     for turn in turns {
         match turn.role {
             TurnRole::User => {
-                panel.entries.push(crate::agent_panel::PanelEntry::User(turn.content.clone()));
+                let display = match &turn.attachments {
+                    Some(atts) if !atts.is_empty() => {
+                        let n = atts.len();
+                        let suffix = if n == 1 { "1 image".to_string() } else { format!("{n} images") };
+                        format!("{}\n[+{suffix} attached]", turn.content)
+                    }
+                    _ => turn.content.clone(),
+                };
+                panel.entries.push(crate::agent_panel::PanelEntry::User(display));
             }
             TurnRole::Assistant => {
                 if let Some(ref reasoning) = turn.reasoning {

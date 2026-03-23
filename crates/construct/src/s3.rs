@@ -247,8 +247,8 @@ fn calculateZoneChars(history: &[crate::message::Message]) -> usize {
 
 fn messageLen(msg: &crate::message::Message) -> usize {
     match msg {
-        crate::message::Message::System { content }
-        | crate::message::Message::User { content } => content.len(),
+        crate::message::Message::System { content } => content.len(),
+        crate::message::Message::User { content } => content.charCount(),
         crate::message::Message::Assistant { content, tool_calls, .. } => {
             let textLen = content.as_ref().map_or(0, |c| c.len());
             let callsLen = tool_calls.as_ref().map_or(0, |calls| {
@@ -256,7 +256,7 @@ fn messageLen(msg: &crate::message::Message) -> usize {
             });
             textLen + callsLen
         }
-        crate::message::Message::Tool { content, .. } => content.len(),
+        crate::message::Message::Tool { content, .. } => content.charCount(),
     }
 }
 
@@ -471,7 +471,7 @@ async fn compactTopic(
             content: TOPIC_COMPACT_SYSTEM.to_string(),
         },
         crate::message::Message::User {
-            content: userPrompt,
+            content: userPrompt.into(),
         },
     ];
 

@@ -58,6 +58,18 @@ pub struct Turn {
     pub toolCallId: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reasoning: Option<String>,
+    /// Image attachments persisted for session resume.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub attachments: Option<Vec<TurnAttachment>>,
+}
+
+/// An image attachment stored in the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnAttachment {
+    pub mimeType: String,
+    /// Base64-encoded image data.
+    pub data: String,
 }
 
 /// A saved conversation fork — a branch you can switch back to.
@@ -84,6 +96,10 @@ pub struct SessionMeta {
     pub updatedAt: u64,
     pub name: Option<String>,
     pub topicLabels: Vec<String>,
+    /// Full topic metadata (startBlock, blockCount). Backward-compatible:
+    /// old sessions without this field deserialize as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<crate::topic::TopicInfo>,
     #[serde(default)]
     pub headTurn: Option<String>,
     #[serde(default)]
@@ -205,7 +221,12 @@ impl Transcript {
     ///
     /// `parentId` is the turn to branch from. `None` for the first message
     /// in a session; `Some(headTurnId)` for continuing or branching.
-    pub fn recordUser(&mut self, content: &str, parentId: Option<&str>) -> Result<String> {
+    pub fn recordUser(
+        &mut self,
+        content: &str,
+        parentId: Option<&str>,
+        attachments: Option<Vec<TurnAttachment>>,
+    ) -> Result<String> {
         let blockId = randomHexId("b");
         self.currentBlockId = blockId.clone();
         let turn = Turn {
@@ -220,6 +241,7 @@ impl Transcript {
             args: None,
             toolCallId: None,
             reasoning: None,
+            attachments,
         };
         self.writeTurn(&turn)
     }
@@ -238,6 +260,7 @@ impl Transcript {
             args: None,
             toolCallId: None,
             reasoning: reasoning.map(|s| s.to_string()),
+            attachments: None,
         };
         self.writeTurn(&turn)
     }
@@ -261,12 +284,18 @@ impl Transcript {
             args: Some(args.clone()),
             toolCallId: Some(callId.to_string()),
             reasoning: None,
+            attachments: None,
         };
         self.writeTurn(&turn)
     }
 
     /// Record a tool result.
-    pub fn recordToolResult(&mut self, callId: &str, content: &str) -> Result<String> {
+    pub fn recordToolResult(
+        &mut self,
+        callId: &str,
+        content: &str,
+        attachments: Option<Vec<TurnAttachment>>,
+    ) -> Result<String> {
         let turn = Turn {
             id: randomHexId("t"),
             blockId: self.currentBlockId.clone(),
@@ -279,6 +308,7 @@ impl Transcript {
             args: None,
             toolCallId: Some(callId.to_string()),
             reasoning: None,
+            attachments,
         };
         self.writeTurn(&turn)
     }
@@ -388,4 +418,110 @@ pub fn listSessions(projectDir: Option<&str>) -> Result<Vec<SessionMeta>> {
     // Sort by updatedAt descending (most recent first).
     sessions.sort_by(|a, b| b.updatedAt.cmp(&a.updatedAt));
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turnAttachmentRoundTrip() {
+        let turn = Turn {
+            id: "t_test".into(),
+            blockId: "b_test".into(),
+            topicId: String::new(),
+            role: TurnRole::User,
+            content: "look at this image".into(),
+            ts: 1000,
+            parentId: None,
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: Some(vec![
+                TurnAttachment {
+                    mimeType: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                },
+            ]),
+        };
+
+        let json = serde_json::to_string(&turn).unwrap();
+        let restored: Turn = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.content, "look at this image");
+        let atts = restored.attachments.unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].mimeType, "image/png");
+        assert_eq!(atts[0].data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn turnWithoutAttachmentsBackwardCompatible() {
+        // Simulate old transcript line with no attachments field.
+        let json = r#"{"id":"t_1","blockId":"b_1","topicId":"","role":"user","content":"hello","ts":1000}"#;
+        let turn: Turn = serde_json::from_str(json).unwrap();
+        assert!(turn.attachments.is_none());
+        assert_eq!(turn.content, "hello");
+    }
+
+    /// Create a transcript in a temp directory for testing.
+    fn tempTranscript(dir: &std::path::Path) -> Transcript {
+        let path = dir.join("transcript.jsonl");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        Transcript {
+            sessionId: "test".into(),
+            sessionDir: dir.to_path_buf(),
+            writer: std::io::BufWriter::new(file),
+            lastTurnId: None,
+            currentBlockId: String::new(),
+            currentTopicId: String::new(),
+        }
+    }
+
+    #[test]
+    fn recordUserPersistsAttachments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut transcript = tempTranscript(dir.path());
+
+        let atts = vec![TurnAttachment {
+            mimeType: "image/jpeg".into(),
+            data: "/9j/4AAQ".into(),
+        }];
+        transcript.recordUser("check this", None, Some(atts)).unwrap();
+
+        let turns = transcript.loadAll().unwrap();
+        assert_eq!(turns.len(), 1);
+        let atts = turns[0].attachments.as_ref().unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].mimeType, "image/jpeg");
+        assert_eq!(atts[0].data, "/9j/4AAQ");
+    }
+
+    #[test]
+    fn recordToolResultPersistsAttachments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut transcript = tempTranscript(dir.path());
+
+        // Need a user message first to start a block.
+        transcript.recordUser("start", None, None).unwrap();
+
+        let atts = vec![TurnAttachment {
+            mimeType: "image/png".into(),
+            data: "iVBOR=".into(),
+        }];
+        transcript.recordToolResult("call_1", "[screenshot.png]", Some(atts)).unwrap();
+
+        let turns = transcript.loadAll().unwrap();
+        assert_eq!(turns.len(), 2);
+        let toolTurn = &turns[1];
+        assert_eq!(toolTurn.content, "[screenshot.png]");
+        let atts = toolTurn.attachments.as_ref().unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].mimeType, "image/png");
+    }
 }
