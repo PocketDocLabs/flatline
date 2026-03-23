@@ -928,6 +928,11 @@ async fn runLoop(
             needsRedraw = true;
         }
 
+        // Advance character reveal buffer.
+        if agentPanel.tickReveal() {
+            needsRedraw = true;
+        }
+
         // Clear the quit hint after the double-tap window expires.
         if let Some(t) = lastQuitPress {
             if t.elapsed() >= Duration::from_secs(1) {

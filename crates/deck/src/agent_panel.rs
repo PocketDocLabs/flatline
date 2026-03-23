@@ -120,6 +120,20 @@ pub struct AgentPanel {
     /// Active slash command completion, if any.
     completion: Option<CompletionState>,
     streamingContent: String,
+    /// Buffered incoming content waiting to be revealed character-by-character.
+    pendingContent: String,
+    /// Fade progress of the next character to reveal (0.0 = invisible, 1.0 = fully bright).
+    fadeProgress: f32,
+    /// Last time the reveal ticker advanced.
+    lastRevealTick: Instant,
+    /// When buffered content started arriving (for spool-up delay).
+    revealStart: Option<Instant>,
+    /// When the last content chunk was received (for stream rate calculation).
+    lastReceiveTime: Instant,
+    /// Total chars received this turn (for stream rate calculation).
+    totalCharsReceived: usize,
+    /// Finalization deferred until pending reveal buffer drains.
+    deferredFinalize: bool,
     streamingReasoning: String,
     isStreaming: bool,
     /// True from pushUser() until TurnComplete/TurnCancelled.
@@ -203,6 +217,13 @@ impl AgentPanel {
             entries: Vec::new(),
             completion: None,
             streamingContent: String::new(),
+            pendingContent: String::new(),
+            fadeProgress: 1.0,
+            lastRevealTick: Instant::now(),
+            revealStart: None,
+            lastReceiveTime: Instant::now(),
+            totalCharsReceived: 0,
+            deferredFinalize: false,
             streamingReasoning: String::new(),
             isStreaming: false,
             turnActive: false,
@@ -250,6 +271,12 @@ impl AgentPanel {
     pub fn clearDisplay(&mut self) {
         self.entries.clear();
         self.streamingContent.clear();
+        self.pendingContent.clear();
+        self.fadeProgress = 1.0;
+        self.revealStart = None;
+        self.lastReceiveTime = Instant::now();
+        self.totalCharsReceived = 0;
+        self.deferredFinalize = false;
         self.streamingReasoning.clear();
         self.isStreaming = false;
         self.turnActive = false;
@@ -320,7 +347,17 @@ impl AgentPanel {
         self.retryStatus = None;
         // Content streaming means reasoning phase is over.
         self.reasoningActive = false;
-        self.streamingContent.push_str(text);
+        let now = Instant::now();
+        // On first content arrival, start the spool-up timer and reset the
+        // reveal clock so the first tick doesn't see a stale elapsed time.
+        if self.revealStart.is_none() {
+            self.revealStart = Some(now);
+            self.lastRevealTick = now;
+            self.fadeProgress = 0.0;
+        }
+        self.lastReceiveTime = now;
+        self.totalCharsReceived += text.chars().count();
+        self.pendingContent.push_str(text);
     }
 
     pub fn appendReasoning(&mut self, text: &str) {
@@ -343,6 +380,22 @@ impl AgentPanel {
                 expanded: false,
             });
         }
+        // If there's still pending content being revealed, defer finalization
+        // so the reveal can finish at its natural pace instead of snapping.
+        if !self.pendingContent.is_empty() {
+            self.deferredFinalize = true;
+            return;
+        }
+        self.doFinalize();
+    }
+
+    /// Actually commit streaming content to entries and reset state.
+    /// Called directly when pending is empty, or by tickReveal after deferred drain.
+    fn doFinalize(&mut self) {
+        self.deferredFinalize = false;
+        self.fadeProgress = 1.0;
+        self.revealStart = None;
+        self.totalCharsReceived = 0;
         if !self.streamingContent.is_empty() {
             let clean = construct::text::sanitizeVariationSelectors(&self.streamingContent);
             self.streamingContent.clear();
@@ -944,6 +997,7 @@ impl AgentPanel {
     pub fn tickThrobber(&mut self) -> bool {
         let waiting = self.isStreaming
             && self.streamingContent.is_empty()
+            && self.pendingContent.is_empty()
             && self.streamingReasoning.is_empty();
         let subagentRunning = self.activeSubagent.is_some()
             && !self.entries.iter().rev().any(|e| matches!(e, PanelEntry::SubagentBlock { done: true, .. }));
@@ -958,6 +1012,80 @@ impl AgentPanel {
         } else {
             false
         }
+    }
+
+    /// Advance the character reveal animation. Each character fades in fully
+    /// before the next one begins. Speed is calculated directly from the
+    /// stream's throughput so the reveal matches the actual rate of arrival.
+    /// Returns true if visual state changed (caller needs redraw).
+    pub fn tickReveal(&mut self) -> bool {
+        if self.pendingContent.is_empty() && self.fadeProgress >= 1.0 {
+            // If reveal just finished and finalization was deferred, do it now.
+            if self.deferredFinalize {
+                self.doFinalize();
+                return true;
+            }
+            return false;
+        }
+
+        // Spool-up delay: let the buffer fill for 150ms before starting reveal.
+        const SPOOL_DELAY: Duration = Duration::from_millis(150);
+        if let Some(start) = self.revealStart {
+            if start.elapsed() < SPOOL_DELAY {
+                return false;
+            }
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.lastRevealTick).as_secs_f32();
+        self.lastRevealTick = now;
+        // Guard against stale timestamps producing a huge first tick.
+        let elapsed = elapsed.min(0.05);
+
+        // Pure calculated speed: total chars received / time elapsed.
+        // During streaming, use wall clock so the rate naturally dips during
+        // token gaps (prevents draining the buffer then stuttering).
+        // After the stream ends, freeze to the stream's own duration so the
+        // remaining buffer drains at the established pace.
+        let start = self.revealStart.unwrap_or(now);
+        let denom = if self.deferredFinalize {
+            self.lastReceiveTime.duration_since(start).as_secs_f32()
+        } else {
+            now.duration_since(start).as_secs_f32()
+        };
+        let fadesPerSec = (self.totalCharsReceived as f32 / denom.max(0.1)).max(15.0);
+
+        self.fadeProgress += elapsed * fadesPerSec;
+
+        // Each time fadeProgress crosses 1.0, that char is fully revealed.
+        while self.fadeProgress >= 1.0 && !self.pendingContent.is_empty() {
+            let firstLen = self.pendingContent
+                .chars().next().unwrap().len_utf8();
+            let ch: String = self.pendingContent.drain(..firstLen).collect();
+            self.streamingContent.push_str(&ch);
+            self.fadeProgress -= 1.0;
+        }
+
+        // Nothing left — clamp.
+        if self.pendingContent.is_empty() {
+            self.fadeProgress = self.fadeProgress.max(1.0);
+        }
+
+        true
+    }
+
+    /// Build the display string for streaming content: fully revealed text
+    /// plus the currently-fading character (if any).
+    fn displayContent(&self) -> String {
+        if self.pendingContent.is_empty() || self.fadeProgress <= 0.0 {
+            return self.streamingContent.clone();
+        }
+        // Include the next pending char that's mid-fade.
+        let mut s = self.streamingContent.clone();
+        if let Some(ch) = self.pendingContent.chars().next() {
+            s.push(ch);
+        }
+        s
     }
 
     /// Toggle the most recent reasoning block (streaming or finalized).
@@ -1714,6 +1842,7 @@ impl AgentPanel {
         if matchIdx.is_none() && self.isStreaming {
             let streamStart = cursor;
             let waiting = self.streamingContent.is_empty()
+                && self.pendingContent.is_empty()
                 && self.streamingReasoning.is_empty();
 
             // Throbber: shown while waiting or during reasoning.
@@ -1733,9 +1862,10 @@ impl AgentPanel {
                 cursor += 1; // separator
             }
 
-            if !self.streamingContent.is_empty() {
+            let displayContent = self.displayContent();
+            if !displayContent.is_empty() {
                 // NOTE: Subtract prefix width ("◆ " = 2 cols) so blocks size correctly.
-                let blocks = markdown::render(&self.streamingContent, (w as u16).saturating_sub(2));
+                let blocks = markdown::render(&displayContent, (w as u16).saturating_sub(2));
                 let md = flattenRenderedBlocks(blocks, (w as u16).saturating_sub(2));
                 for line in &md {
                     let lineWidth = line.width();
@@ -1819,6 +1949,7 @@ impl AgentPanel {
         // Streaming content.
         if self.isStreaming {
             let waiting = self.streamingContent.is_empty()
+                && self.pendingContent.is_empty()
                 && self.streamingReasoning.is_empty();
             let showThrobber = waiting || self.reasoningActive;
             let hasReasoning = !self.streamingReasoning.is_empty();
@@ -1883,14 +2014,21 @@ impl AgentPanel {
                 cont.push(false);
             }
 
-            if !self.streamingContent.is_empty() {
-                let mdBlocks = markdown::render(&self.streamingContent, width.saturating_sub(2));
+            let displayContent = self.displayContent();
+            let hasFadingChar = !self.pendingContent.is_empty() && self.fadeProgress < 1.0;
+            if !displayContent.is_empty() {
+                let linesBeforeMd = lines.len();
+                let mdBlocks = markdown::render(&displayContent, width.saturating_sub(2));
                 prefixRenderedBlocks(
                     &mut lines, &mut cont, mdBlocks,
                     "\u{25C6} ", Style::default().fg(Color::White), width,
                     usize::MAX, &self.codeScrollX, &self.codeExpanded,
                     &mut codeBlockRanges, &self.copiedFlash,
                 );
+                // Apply fade to the last character if one is mid-reveal.
+                if hasFadingChar {
+                    applyFadeToLastChar(&mut lines[linesBeforeMd..], self.fadeProgress);
+                }
             }
         }
 
@@ -2656,6 +2794,67 @@ fn flattenRenderedBlocks(blocks: Vec<RenderedBlock>, width: u16) -> Vec<Line<'st
         }
     }
     lines
+}
+
+/// Interpolate a color toward dark based on fade progress (0.0 = dark, 1.0 = original).
+fn fadeColor(color: Color, progress: f32) -> Color {
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::White => (255, 255, 255),
+        Color::Reset => (200, 200, 200),
+        Color::Gray => (128, 128, 128),
+        Color::DarkGray => (80, 80, 80),
+        Color::Red => (255, 0, 0),
+        Color::Green => (0, 255, 0),
+        Color::Yellow => (255, 255, 0),
+        Color::Blue => (0, 0, 255),
+        Color::Magenta => (255, 0, 255),
+        Color::Cyan => (0, 255, 255),
+        _ => return color,
+    };
+    let dark = 25_f32;
+    let blend = |c: u8| -> u8 {
+        (dark + (c as f32 - dark) * progress).clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(blend(r), blend(g), blend(b))
+}
+
+/// Dim the last visible character in a slice of lines based on fade progress.
+fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
+    // Walk backward to find the last line with visible content.
+    for line in lines.iter_mut().rev() {
+        // Find the last non-empty span with non-whitespace content.
+        let lastIdx = match line.spans.iter().rposition(|s| {
+            !s.content.is_empty() && s.content.chars().any(|c| !c.is_whitespace())
+        }) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        let span = &line.spans[lastIdx];
+        let content = span.content.to_string();
+        let style = span.style;
+
+        // Find the byte offset of the last char.
+        if let Some((byteIdx, _)) = content.char_indices().last() {
+            let prefix = content[..byteIdx].to_string();
+            let lastCharStr = content[byteIdx..].to_string();
+
+            let originalFg = style.fg.unwrap_or(Color::White);
+            let fadedFg = fadeColor(originalFg, progress);
+            let fadedStyle = Style { fg: Some(fadedFg), ..style };
+
+            if prefix.is_empty() {
+                // Entire span is one char — replace in place.
+                line.spans[lastIdx] = Span::styled(lastCharStr, fadedStyle);
+            } else {
+                // Split: prefix keeps original style, last char gets faded style.
+                line.spans[lastIdx] = Span::styled(prefix, style);
+                line.spans.insert(lastIdx + 1, Span::styled(lastCharStr, fadedStyle));
+            }
+        }
+        return;
+    }
 }
 
 /// Wrap a multi-span Line into multiple lines fitting within maxWidth display columns.
