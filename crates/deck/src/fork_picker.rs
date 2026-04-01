@@ -293,11 +293,13 @@ fn formatRelativeTime(ts: u64, now: u64) -> String {
 
 /// Truncate a string to fit within maxChars, adding ellipsis if needed.
 fn truncate(s: &str, maxChars: usize) -> String {
-    if s.len() <= maxChars {
+    if s.chars().count() <= maxChars {
         s.to_string()
     } else if maxChars > 3 {
-        format!("{}\u{2026}", &s[..maxChars - 1])
+        let end = s.char_indices().nth(maxChars - 1).map_or(s.len(), |(i, _)| i);
+        format!("{}\u{2026}", &s[..end])
     } else {
-        s[..maxChars].to_string()
+        let end = s.char_indices().nth(maxChars).map_or(s.len(), |(i, _)| i);
+        s[..end].to_string()
     }
 }

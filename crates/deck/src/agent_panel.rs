@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::command::{self, CommandDef};
@@ -209,6 +209,8 @@ pub struct AgentPanel {
     retryStatus: Option<String>,
     /// Image attachments queued for the next message submission.
     attachments: Vec<construct::session::Attachment>,
+    /// Messages queued while the agent is mid-turn (full payload for multimodal).
+    queuedMessages: VecDeque<construct::session::UserInput>,
 }
 
 impl AgentPanel {
@@ -264,6 +266,7 @@ impl AgentPanel {
             lastSubagentToggleLine: std::cell::Cell::new(None),
             retryStatus: None,
             attachments: Vec::new(),
+            queuedMessages: VecDeque::new(),
         }
     }
 
@@ -297,6 +300,7 @@ impl AgentPanel {
         self.copiedFlash = None;
         self.codeExpanded.clear();
         self.attachments.clear();
+        self.queuedMessages.clear();
     }
 
     /// Add an image attachment for the next submission.
@@ -319,6 +323,36 @@ impl AgentPanel {
         self.attachments.pop();
     }
 
+    /// Restore attachments (e.g. when popping a queued message back to the editor).
+    pub fn restoreAttachments(&mut self, atts: Vec<construct::session::Attachment>) {
+        self.attachments.extend(atts);
+    }
+
+    /// Queue a message for mid-turn injection.
+    pub fn queueMessage(&mut self, input: construct::session::UserInput) {
+        self.queuedMessages.push_back(input);
+    }
+
+    /// Pop the last queued message for editing. Returns the full UserInput.
+    pub fn popQueuedMessage(&mut self) -> Option<construct::session::UserInput> {
+        self.queuedMessages.pop_back()
+    }
+
+    /// Number of queued messages.
+    pub fn queuedCount(&self) -> usize {
+        self.queuedMessages.len()
+    }
+
+    /// Move queued messages into conversation entries (called on SteerInjected).
+    pub fn promoteQueue(&mut self, texts: &[String]) {
+        for text in texts {
+            self.entries.push(PanelEntry::User(text.clone()));
+        }
+        // Discard the deck-side queue — construct has consumed them.
+        self.queuedMessages.clear();
+        self.scrollOffset = 0;
+    }
+
     pub fn pushUser(&mut self, text: &str) {
         let display = if self.attachments.is_empty() {
             text.to_string()
@@ -330,6 +364,7 @@ impl AgentPanel {
         self.entries.push(PanelEntry::User(display));
         self.scrollOffset = 0;
         self.turnActive = true;
+        self.textArea.placeholder = "Queue a message...";
         // Start thinking indicator immediately for responsiveness.
         self.isStreaming = true;
         self.thinkingStartTime = Some(Instant::now());
@@ -432,6 +467,7 @@ impl AgentPanel {
         self.toolActive = false;
         self.toolStartTime = None;
         self.retryStatus = None;
+        self.textArea.placeholder = "Type a message...";
     }
 
     /// Finalize streaming state after a cancellation.
@@ -445,6 +481,8 @@ impl AgentPanel {
         self.activeSubagent = None;
         self.pendingPermit = false;
         self.pendingToolName.clear();
+        self.queuedMessages.clear();
+        self.textArea.placeholder = "Type a message...";
         // Mark any active subagent block as done.
         for entry in self.entries.iter_mut().rev() {
             if let PanelEntry::SubagentBlock { done, .. } = entry {
@@ -1308,17 +1346,34 @@ impl AgentPanel {
             baseHeight + attLines
         };
 
-        // Split: chat area + separator + input.
-        let chunks = Layout::default()
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(inputHeight),
-            ])
-            .split(inner);
-        let chatArea = chunks[0];
-        let separatorArea = chunks[1];
-        let inputArea = chunks[2];
+        // Queue zone height: 1 row per queued message, max 4 visible.
+        let queueHeight = if self.queuedMessages.is_empty() {
+            0u16
+        } else {
+            (self.queuedMessages.len() as u16).min(4)
+        };
+
+        // Split: chat area + separator + [queue zone] + input.
+        let (chatArea, separatorArea, queueArea, inputArea) = if queueHeight > 0 {
+            let chunks = Layout::default()
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(queueHeight),
+                    Constraint::Length(inputHeight),
+                ])
+                .split(inner);
+            (chunks[0], chunks[1], Some(chunks[2]), chunks[3])
+        } else {
+            let chunks = Layout::default()
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(inputHeight),
+                ])
+                .split(inner);
+            (chunks[0], chunks[1], None, chunks[2])
+        };
 
         // Separator. Non-shell permit: header in separator slot. Shell permit: hidden
         // (header is in input area after the code block). Normal: plain separator.
@@ -1333,6 +1388,11 @@ impl AgentPanel {
             Paragraph::new(sep)
                 .style(Style::default().fg(Color::DarkGray))
                 .render(separatorArea, buf);
+        }
+
+        // Queue zone — queued messages above the input area.
+        if let Some(queueRect) = queueArea {
+            self.renderQueueZone(queueRect, buf);
         }
 
         let inputRightPad: u16 = if self.pendingPermit { 1 } else { 2 };
@@ -1494,6 +1554,48 @@ impl AgentPanel {
         }
 
         lines.push(Line::from(spans));
+    }
+
+    /// Render the queue zone — one line per queued message, most recent at bottom.
+    fn renderQueueZone(&self, area: Rect, buf: &mut Buffer) {
+        let dimStyle = Style::default().fg(Color::DarkGray);
+        let textStyle = Style::default().fg(Color::White);
+        let imgStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+        let maxVisible = area.height as usize;
+        let total = self.queuedMessages.len();
+        let skip = total.saturating_sub(maxVisible);
+
+        for (i, input) in self.queuedMessages.iter().skip(skip).enumerate() {
+            let row = area.y + i as u16;
+            if row >= area.y + area.height { break; }
+
+            let prefix = " \u{25B9} "; // ▹
+            let imgSuffix = if input.attachments.is_empty() {
+                String::new()
+            } else {
+                let n = input.attachments.len();
+                if n == 1 { "  [+1 image]".to_string() }
+                else { format!("  [+{n} images]") }
+            };
+
+            let availW = (area.width as usize).saturating_sub(3 + imgSuffix.len());
+            let truncated = if input.text.len() > availW {
+                format!("{}...", &input.text[..availW.saturating_sub(3)])
+            } else {
+                input.text.clone()
+            };
+
+            let mut spans = vec![
+                Span::styled(prefix, dimStyle),
+                Span::styled(truncated, textStyle),
+            ];
+            if !imgSuffix.is_empty() {
+                spans.push(Span::styled(imgSuffix, imgStyle));
+            }
+
+            let lineRect = Rect { x: area.x, y: row, width: area.width, height: 1 };
+            Paragraph::new(Line::from(spans)).render(lineRect, buf);
+        }
     }
 
     fn renderInput(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
@@ -2329,16 +2431,21 @@ impl AgentPanel {
                             match block {
                                 crate::markdown::RenderedBlock::Text(textLines) => {
                                     for textLine in textLines {
-                                        let wrapped = wrapSpannedLine(textLine, contentInnerW);
+                                        let (barSpans, contentLine, barW) =
+                                            stripBlockquoteBars(textLine);
+                                        let effW = contentInnerW.saturating_sub(barW);
+                                        let wrapped = wrapSpannedLine(contentLine, effW);
                                         for wLine in wrapped {
                                             // Measure and pad.
-                                            let lineText: String = wLine.spans.iter()
+                                            let lineText: String = barSpans.iter()
+                                                .chain(wLine.spans.iter())
                                                 .map(|s| s.content.as_ref()).collect();
                                             let lineW = UnicodeWidthStr::width(lineText.as_str());
                                             let pad = contentInnerW.saturating_sub(lineW);
                                             let mut spans = vec![
                                                 Span::styled("\u{2502} ", borderStyle),
                                             ];
+                                            spans.extend(barSpans.iter().cloned());
                                             spans.extend(wLine.spans);
                                             spans.push(Span::styled(
                                                 format!("{} \u{2502}", " ".repeat(pad)),
@@ -2695,7 +2802,12 @@ fn prefixRenderedBlocks(
         match block {
             RenderedBlock::Text(textLines) => {
                 for line in textLines {
-                    let wrapped = wrapSpannedLine(line, textWidth);
+                    // Strip leading blockquote bar spans so wrapping operates
+                    // on content only, then re-add bars to every wrapped line.
+                    let (barSpans, contentLine, barWidth) =
+                        stripBlockquoteBars(line);
+                    let effectiveWidth = textWidth.saturating_sub(barWidth);
+                    let wrapped = wrapSpannedLine(contentLine, effectiveWidth);
                     for (idx, wLine) in wrapped.into_iter().enumerate() {
                         cont.push(idx > 0);
                         let prefix = if isFirst {
@@ -2705,6 +2817,7 @@ fn prefixRenderedBlocks(
                         };
                         isFirst = false;
                         let mut spans = vec![prefix];
+                        spans.extend(barSpans.iter().cloned());
                         spans.extend(wLine.spans);
                         out.push(Line::from(spans));
                     }
@@ -2878,6 +2991,31 @@ fn truncateToWidth(s: &str, maxWidth: usize) -> String {
     }
     // Didn't need truncation.
     s.to_string()
+}
+
+/// Strip leading blockquote bar spans (`│ `) from a line.
+///
+/// Returns the bar spans, the remaining content line, and the
+/// total display width consumed by the bars so the caller can
+/// wrap at a reduced width and re-add bars to every wrapped line.
+fn stripBlockquoteBars(line: Line<'static>) -> (Vec<Span<'static>>, Line<'static>, usize) {
+    let barStr = "\u{2502} ";
+    let mut barSpans: Vec<Span<'static>> = Vec::new();
+    let mut barWidth: usize = 0;
+    let mut rest: Vec<Span<'static>> = Vec::new();
+    let mut inPrefix = true;
+
+    for span in line.spans {
+        if inPrefix && span.content.as_ref() == barStr {
+            barWidth += 2;
+            barSpans.push(span);
+        } else {
+            inPrefix = false;
+            rest.push(span);
+        }
+    }
+
+    (barSpans, Line::from(rest), barWidth)
 }
 
 fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {

@@ -30,9 +30,17 @@ pub enum RewindAction {
     /// Close the picker.
     Close,
     /// Rewind to a turn ID (destructive — no fork saved).
-    Rewind { target: String, userMessage: String },
+    Rewind {
+        target: String,
+        userMessage: String,
+        attachments: Option<Vec<construct::transcript::TurnAttachment>>,
+    },
     /// Fork current branch, then rewind to a turn ID.
-    ForkAndRewind { target: String, userMessage: String },
+    ForkAndRewind {
+        target: String,
+        userMessage: String,
+        attachments: Option<Vec<construct::transcript::TurnAttachment>>,
+    },
 }
 
 /// A selectable exchange block in the picker.
@@ -45,6 +53,8 @@ struct PickerItem {
     rewindTo: String,
     /// Full user message to put back in the input box.
     userMessage: String,
+    /// Image attachments from the user turn (for restoring on rewind).
+    attachments: Option<Vec<construct::transcript::TurnAttachment>>,
 }
 
 /// Interactive rewind picker.
@@ -70,6 +80,7 @@ impl RewindPicker {
                 turnCount: b.turnCount,
                 rewindTo: b.rewindTo,
                 userMessage: b.userMessage,
+                attachments: b.attachments,
             })
             .collect();
 
@@ -96,6 +107,7 @@ impl RewindPicker {
                     RewindAction::Rewind {
                         target: item.rewindTo.clone(),
                         userMessage: item.userMessage.clone(),
+                        attachments: item.attachments.clone(),
                     }
                 } else {
                     RewindAction::None
@@ -107,6 +119,7 @@ impl RewindPicker {
                     RewindAction::ForkAndRewind {
                         target: item.rewindTo.clone(),
                         userMessage: item.userMessage.clone(),
+                        attachments: item.attachments.clone(),
                     }
                 } else {
                     RewindAction::None
@@ -295,6 +308,8 @@ struct BlockData {
     rewindTo: String,
     /// Full user message content.
     userMessage: String,
+    /// Image attachments from the user turn.
+    attachments: Option<Vec<construct::transcript::TurnAttachment>>,
 }
 
 fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
@@ -306,6 +321,7 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
     let mut currentBlockId = String::new();
     let mut userPreview = String::new();
     let mut userMessage = String::new();
+    let mut userAttachments: Option<Vec<construct::transcript::TurnAttachment>> = None;
     let mut assistantPreview = String::new();
     let mut turnCount: usize = 0;
     let mut lastTurnId = String::new();
@@ -322,12 +338,14 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
                     turnCount,
                     rewindTo,
                     userMessage: userMessage.clone(),
+                    attachments: userAttachments.clone(),
                 });
                 prevBlockLastTurn = lastTurnId.clone();
             }
             currentBlockId = turn.blockId.clone();
             userPreview = String::new();
             userMessage = String::new();
+            userAttachments = None;
             assistantPreview = String::new();
             turnCount = 0;
         }
@@ -340,6 +358,7 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
                 if userPreview.is_empty() {
                     userPreview = firstLine(&turn.content, 120);
                     userMessage = turn.content.clone();
+                    userAttachments = turn.attachments.clone();
                 }
             }
             TurnRole::Assistant if assistantPreview.is_empty() => {
@@ -357,6 +376,7 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
             turnCount,
             rewindTo: prevBlockLastTurn,
             userMessage,
+            attachments: userAttachments,
         });
     }
 
@@ -373,12 +393,14 @@ fn firstLine(content: &str, maxLen: usize) -> String {
 }
 
 fn truncate(s: &str, maxChars: usize) -> String {
-    if s.len() <= maxChars {
+    if s.chars().count() <= maxChars {
         s.to_string()
     } else if maxChars > 3 {
-        format!("{}\u{2026}", &s[..maxChars - 1])
+        let end = s.char_indices().nth(maxChars - 1).map_or(s.len(), |(i, _)| i);
+        format!("{}\u{2026}", &s[..end])
     } else {
-        s[..maxChars].to_string()
+        let end = s.char_indices().nth(maxChars).map_or(s.len(), |(i, _)| i);
+        s[..end].to_string()
     }
 }
 

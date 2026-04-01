@@ -114,6 +114,9 @@ pub enum SessionEvent {
     /// The turn was cancelled by the user.
     TurnCancelled,
 
+    /// Queued user messages were injected into the conversation.
+    SteerInjected { texts: Vec<String> },
+
     /// Token usage update from the API.
     /// contextTokens = prompt + completion (what the next call will see as input).
     TokenUpdate {
@@ -212,6 +215,10 @@ pub enum SessionEvent {
         summary: String,
         args: String,
         diff: Option<String>,
+        /// Model-provided explanation (shell commands only).
+        explanation: Option<String>,
+        /// Impact tier for visual treatment.
+        impact: crate::tool::ShellImpact,
         /// One-shot channel for the TUI to send the response back.
         responseTx: mpsc::Sender<crate::permissions::PermitResponse>,
     },
@@ -585,6 +592,37 @@ impl Session {
         self.topicTracker.currentLabel()
     }
 
+    /// Collect the pending topic classification and emit TopicChanged.
+    ///
+    /// Called at the end of sendInner so the title updates within the
+    /// same turn, not deferred to the next user message.
+    async fn collectTopicEval(&mut self, eventTx: &mpsc::Sender<SessionEvent>) {
+        if let Some(handle) = self.pendingTopicEval.take() {
+            let prevBlockId = self.pendingTopicBlockId.take().unwrap_or_default();
+            match handle.await {
+                Ok(decision) => {
+                    let result = self.topicTracker.applyDecision(decision, &prevBlockId);
+                    self.transcript.setTopicId(&result.topicId);
+                    if result.isNewTopic {
+                        tracing::info!(
+                            topicId = %result.topicId,
+                            label = %result.label,
+                            "new topic segment"
+                        );
+                    }
+                    let _ = eventTx
+                        .send(SessionEvent::TopicChanged {
+                            label: result.label.clone(),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!("pending topic eval panicked: {e}");
+                }
+            }
+        }
+    }
+
     /// Initialize the checkpoint system for a project directory.
     ///
     /// Args:
@@ -758,8 +796,12 @@ impl Session {
         eventTx: &'a mpsc::Sender<SessionEvent>,
         permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
         cancelRx: &'a mut watch::Receiver<bool>,
+        steerRx: &'a mut mpsc::Receiver<UserInput>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+        // Drain stale steer messages from a previous cancelled turn.
+        while steerRx.try_recv().is_ok() {}
+
         let userMessage = &input.text;
         tracing::info!(len = userMessage.len(), attachments = input.attachments.len(), "user message received");
 
@@ -788,47 +830,14 @@ impl Session {
         };
 
         // Build content — multimodal if attachments present.
-        // Encode any raw RGBA attachments to PNG (deferred from paste time).
-        let encodedAttachments: Vec<(String, Vec<u8>)> = input.attachments.iter().map(|att| {
-            if let Some((w, h)) = att.rgbaDimensions {
-                let png = encodeRgbaToPng(&att.data, w, h);
-                ("image/png".to_string(), png)
-            } else {
-                (att.mimeType.clone(), att.data.clone())
-            }
-        }).collect();
-
-        let content = if encodedAttachments.is_empty() {
-            crate::message::Content::text(&historyText)
-        } else {
-            use base64::Engine;
-            let imageUris: Vec<String> = encodedAttachments.iter().map(|(mime, data)| {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-                format!("data:{mime};base64,{b64}")
-            }).collect();
-            crate::message::Content::withImages(&historyText, imageUris)
-        };
-
+        let (content, turnAttachments) = buildUserContent(&historyText, &input.attachments);
         self.history.push(Message::User { content });
-
-        // Persist image attachments to transcript for resume.
-        let turnAttachments = if encodedAttachments.is_empty() {
-            None
-        } else {
-            use base64::Engine;
-            Some(encodedAttachments.iter().map(|(mime, data)| {
-                crate::transcript::TurnAttachment {
-                    mimeType: mime.clone(),
-                    data: base64::engine::general_purpose::STANDARD.encode(data),
-                }
-            }).collect())
-        };
         match self.transcript.recordUser(userMessage, self.headTurnId.as_deref(), turnAttachments) {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
 
-        let result = self.sendInner(eventTx, permitRx, cancelRx).await;
+        let result = self.sendInner(eventTx, permitRx, cancelRx, steerRx).await;
 
         // Always strip injected messages from history so they don't accumulate.
         self.removeResumeInjection();
@@ -844,38 +853,12 @@ impl Session {
         eventTx: &mpsc::Sender<SessionEvent>,
         permitRx: &mut mpsc::Receiver<crate::permissions::PermitResponse>,
         cancelRx: &mut watch::Receiver<bool>,
+        steerRx: &mut mpsc::Receiver<UserInput>,
     ) -> Result<()> {
         let blockId = self.transcript.currentBlock().to_string();
 
-        // Collect pending topic eval from the previous turn (serialization:
-        // topic N must finish before topic N+1 starts).
-        if let Some(handle) = self.pendingTopicEval.take() {
-            let prevBlockId = self.pendingTopicBlockId.take().unwrap_or_default();
-            match handle.await {
-                Ok(decision) => {
-                    let result = self.topicTracker.applyDecision(decision, &prevBlockId);
-                    self.transcript.setTopicId(&result.topicId);
-                    if result.isNewTopic {
-                        tracing::info!(
-                            topicId = %result.topicId,
-                            label = %result.label,
-                            "new topic segment (collected)"
-                        );
-                    }
-                    let _ = eventTx
-                        .send(SessionEvent::TopicChanged {
-                            label: result.label.clone(),
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!("pending topic eval panicked: {e}");
-                }
-            }
-        }
-
-        // Spawn topic classification as a background task — runs concurrently
-        // with the main model stream. Result collected next sendInner call.
+        // Spawn topic classification — runs concurrently with the main model
+        // stream. Collected at the end of this sendInner call (not deferred).
         let topicMessages = self.topicTracker.prepareClassification(&self.history);
         let topicClient = self.client.clone();
         let topicModel = self.config.utility.model.clone();
@@ -900,12 +883,15 @@ impl Session {
         const MAX_RETRIES: u32 = 5;
         let mut retryCount: u32 = 0;
 
-        loop {
+        // NOTE: All exit paths use `break` (not `return`) so the topic eval
+        // collection at the bottom of this block always runs.
+        let result: Result<()> = 'turns: {
+            loop {
             // Check for cancellation between turns.
             if *cancelRx.borrow() {
                 tracing::info!("turn cancelled before streaming");
                 let _ = eventTx.send(SessionEvent::TurnCancelled).await;
-                return Ok(());
+                break 'turns Ok(());
             }
 
             tracing::debug!(historyLen = self.history.len(), "starting turn");
@@ -920,7 +906,7 @@ impl Session {
                     retryCount += 1;
                     if retryCount > MAX_RETRIES {
                         let _ = eventTx.send(SessionEvent::Error(msg)).await;
-                        return Ok(());
+                        break 'turns Ok(());
                     }
                     tracing::warn!(
                         attempt = retryCount,
@@ -943,20 +929,27 @@ impl Session {
                         self.compactionTracker.updateTokens(tokens);
                         self.checkCompactionTrigger(eventTx).await;
                     }
+                    // Extend turn if user queued messages during streaming.
+                    if self.drainSteer(steerRx, eventTx).await {
+                        tracing::info!("extending turn with queued user messages");
+                        continue;
+                    }
                     tracing::info!("turn complete (no tool calls)");
                     let _ = eventTx.send(SessionEvent::TurnComplete).await;
-                    return Ok(());
+                    break 'turns Ok(());
                 }
                 TurnResult::Cancelled => {
                     tracing::info!("turn cancelled during streaming");
                     let _ = eventTx.send(SessionEvent::TurnCancelled).await;
-                    return Ok(());
+                    break 'turns Ok(());
                 }
                 TurnResult::ToolCalls { calls, content, reasoning, promptTokens } => {
                     retryCount = 0;
+                    // Update token count but don't trigger compaction mid-loop.
+                    // Compaction fires at TurnResult::Done to avoid duplicate
+                    // history content and latency stalls between tool calls.
                     if let Some(tokens) = promptTokens {
                         self.compactionTracker.updateTokens(tokens);
-                        self.checkCompactionTrigger(eventTx).await;
                     }
                     tracing::info!(
                         callCount = calls.len(),
@@ -1003,7 +996,7 @@ impl Session {
                                 self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                             }
                             let _ = eventTx.send(SessionEvent::TurnCancelled).await;
-                            return Ok(());
+                            break 'turns Ok(());
                         }
 
                         let action = match tool::parse(
@@ -1130,7 +1123,7 @@ impl Session {
                                                     self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                                 }
                                                 let _ = eventTx.send(SessionEvent::TurnCancelled).await;
-                                                return Ok(());
+                                                break 'turns Ok(());
                                             }
                                         }
                                     }
@@ -1249,7 +1242,7 @@ impl Session {
                                             self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                         }
                                         let _ = eventTx.send(SessionEvent::TurnCancelled).await;
-                                        return Ok(());
+                                        break 'turns Ok(());
                                     }
                                 }
                                 }
@@ -1371,11 +1364,64 @@ impl Session {
 
                     if aborted {
                         let _ = eventTx.send(SessionEvent::TurnComplete).await;
-                        return Ok(());
+                        break 'turns Ok(());
                     }
+                    // Inject queued user messages before the next API call.
+                    self.drainSteer(steerRx, eventTx).await;
                 }
             }
         }
+        };
+
+        // Collect topic classification before returning — the eval ran
+        // concurrently with the turn loop and should be done by now.
+        self.collectTopicEval(eventTx).await;
+
+        // Always persist meta after the turn completes so headTurn reflects
+        // the latest assistant/tool turn, not the stale user turn written
+        // at the start of sendInner.
+        self.updateMeta();
+
+        result
+    }
+
+    /// Drain pending steer messages and inject as a User message.
+    ///
+    /// Collects all buffered `UserInput` payloads from the steer channel,
+    /// combines their text and attachments, pushes a single User message to
+    /// history, records to transcript, and emits `SteerInjected`.
+    ///
+    /// Returns true if anything was injected (caller should continue the turn).
+    async fn drainSteer(
+        &mut self,
+        steerRx: &mut mpsc::Receiver<UserInput>,
+        eventTx: &mpsc::Sender<SessionEvent>,
+    ) -> bool {
+        let mut allTexts: Vec<String> = Vec::new();
+        let mut allAttachments: Vec<Attachment> = Vec::new();
+
+        while let Ok(input) = steerRx.try_recv() {
+            allTexts.push(input.text);
+            allAttachments.extend(input.attachments);
+        }
+
+        if allTexts.is_empty() {
+            return false;
+        }
+
+        let combined = allTexts.join("\n\n");
+        tracing::info!(count = allTexts.len(), "injecting queued user messages");
+
+        let (content, turnAttachments) = buildUserContent(&combined, &allAttachments);
+        self.history.push(Message::User { content });
+
+        match self.transcript.recordUser(&combined, self.headTurnId.as_deref(), turnAttachments) {
+            Ok(turnId) => self.headTurnId = Some(turnId),
+            Err(e) => tracing::warn!("steer transcript write failed: {e}"),
+        }
+
+        let _ = eventTx.send(SessionEvent::SteerInjected { texts: allTexts }).await;
+        true
     }
 
     /// Stream one API call and return what happened.
@@ -1743,9 +1789,11 @@ impl Session {
         stageStr: &str,
         eventTx: &mpsc::Sender<SessionEvent>,
     ) -> bool {
+        let headTurn = self.headTurnId.clone().unwrap_or_default();
         let s2Result = match crate::s2::run(
             &self.transcript,
             &self.compactionLog,
+            &headTurn,
             &self.client,
             &self.config.utility.model,
             self.config.main.contextWindow,
@@ -2270,7 +2318,7 @@ impl Session {
                     SessionEvent::TurnComplete => turns += 1,
 
                     // Permission escalation: forward to parent TUI and relay response.
-                    SessionEvent::ToolRequest { name, summary, args, diff, .. } => {
+                    SessionEvent::ToolRequest { name, summary, args, diff, explanation, impact, .. } => {
                         let (responseTx, mut responseRx) =
                             mpsc::channel::<crate::permissions::PermitResponse>(1);
                         let _ = forwardParentTx
@@ -2280,6 +2328,8 @@ impl Session {
                                 summary: summary.clone(),
                                 args: args.clone(),
                                 diff: diff.clone(),
+                                explanation: explanation.clone(),
+                                impact: impact.clone(),
                                 responseTx,
                             })
                             .await;
@@ -2313,10 +2363,11 @@ impl Session {
             (content, turns)
         });
 
-        // Run the child session.
+        // Run the child session. Subagents don't support mid-turn steering.
         let childInput = UserInput::from(prompt.to_string());
+        let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
         let sendResult = child
-            .send(&childInput, &childEventTx, &mut childPermitRx, &mut childCancelRx)
+            .send(&childInput, &childEventTx, &mut childPermitRx, &mut childCancelRx, &mut childSteerRx)
             .await;
 
         // Drop sender so forwarding task exits.
@@ -3082,6 +3133,48 @@ fn isTransientError(msg: &str) -> bool {
         || lower.contains("502")
         || lower.contains("503")
         || lower.contains("504")
+}
+
+/// Encode attachments and build multimodal user content for the conversation history.
+///
+/// Returns the `Content` for `Message::User` and optional `TurnAttachment` list for transcript.
+fn buildUserContent(
+    text: &str,
+    attachments: &[Attachment],
+) -> (crate::message::Content, Option<Vec<crate::transcript::TurnAttachment>>) {
+    use base64::Engine;
+
+    let encoded: Vec<(String, Vec<u8>)> = attachments.iter().map(|att| {
+        if let Some((w, h)) = att.rgbaDimensions {
+            let png = encodeRgbaToPng(&att.data, w, h);
+            ("image/png".to_string(), png)
+        } else {
+            (att.mimeType.clone(), att.data.clone())
+        }
+    }).collect();
+
+    let content = if encoded.is_empty() {
+        crate::message::Content::text(text)
+    } else {
+        let imageUris: Vec<String> = encoded.iter().map(|(mime, data)| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            format!("data:{mime};base64,{b64}")
+        }).collect();
+        crate::message::Content::withImages(text, imageUris)
+    };
+
+    let turnAttachments = if encoded.is_empty() {
+        None
+    } else {
+        Some(encoded.iter().map(|(mime, data)| {
+            crate::transcript::TurnAttachment {
+                mimeType: mime.clone(),
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+            }
+        }).collect())
+    };
+
+    (content, turnAttachments)
 }
 
 /// Encode raw RGBA pixel data to PNG bytes.

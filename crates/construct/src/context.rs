@@ -1086,6 +1086,14 @@ mod tests {
             self.headTurnId = Some(id);
         }
 
+        /// Record a user message with image attachments.
+        fn userWithImages(&mut self, content: &str, attachments: Vec<crate::transcript::TurnAttachment>) {
+            let id = self.transcript
+                .recordUser(content, self.headTurnId.as_deref(), Some(attachments))
+                .unwrap();
+            self.headTurnId = Some(id);
+        }
+
         /// Record assistant text (and optional reasoning).
         /// Mirrors session.rs:1182-1187 — content recorded before tool calls.
         fn assistant(&mut self, content: &str, reasoning: Option<&str>) {
@@ -1648,5 +1656,77 @@ mod tests {
 
         let toolCount = msgs.iter().filter(|m| matches!(m, Message::Tool { .. })).count();
         assert_eq!(toolCount, 0, "compacted block's tool results should be gone");
+    }
+
+    // -----------------------------------------------------------------------
+    // Image attachment reconstruction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn imageAttachmentsReconstructedOnRewind() {
+        let mut s = TestSession::new();
+
+        // Turn 1: user sends message with image.
+        s.userWithImages("look at this screenshot", vec![
+            crate::transcript::TurnAttachment {
+                mimeType: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+        ]);
+        s.assistant("I can see the screenshot.", None);
+        let turn1Head = s.headTurnId.clone().unwrap();
+
+        // Turn 2: user sends text-only follow-up.
+        s.user("now fix the bug");
+        s.assistant("Done.", None);
+
+        // Rewind to turn 1 — images should be in the reconstructed history.
+        let msgs = {
+            let log = s.compactionLog();
+            reconstruct(&s.transcript, &log, &turn1Head, false).unwrap()
+        };
+        dump("image_rewind", &msgs);
+
+        assert_eq!(msgs.len(), 2, "User + Assistant");
+        if let Message::User { content } = &msgs[0] {
+            assert!(content.hasImages(), "rewound user message should have images");
+            let uris = content.imageUris();
+            assert_eq!(uris.len(), 1);
+            assert!(uris[0].contains("iVBORw0KGgo="), "should contain original base64 data");
+        } else {
+            panic!("expected User message");
+        }
+    }
+
+    #[test]
+    fn imageAttachmentsReconstructedInFullChain() {
+        let mut s = TestSession::new();
+
+        s.userWithImages("check this", vec![
+            crate::transcript::TurnAttachment {
+                mimeType: "image/jpeg".into(),
+                data: "/9j/4AAQ".into(),
+            },
+        ]);
+        s.assistant("I see the image.", None);
+        s.user("thanks");
+        s.assistant("No problem.", None);
+
+        // Full chain should preserve images on the first user message.
+        let msgs = s.reconstruct(false);
+        dump("image_full_chain", &msgs);
+
+        if let Message::User { content } = &msgs[0] {
+            assert!(content.hasImages(), "first user message should have images");
+        } else {
+            panic!("expected User message");
+        }
+
+        // Second user message should NOT have images.
+        if let Message::User { content } = &msgs[2] {
+            assert!(!content.hasImages(), "second user message should not have images");
+        } else {
+            panic!("expected User message at index 2");
+        }
     }
 }

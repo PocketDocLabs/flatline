@@ -55,27 +55,28 @@ pub struct S2Result {
 pub async fn run(
     transcript: &Transcript,
     compactionLog: &CompactionLog,
+    headTurnId: &str,
     client: &api::Client,
     utilityModel: &str,
-    contextWindow: usize,
-    compactRatio: f64,
+    _contextWindow: usize,
+    _compactRatio: f64,
 ) -> Result<S2Result> {
-    let turns = transcript.loadAll()?;
+    let allTurns = transcript.loadAll()?;
+    if allTurns.is_empty() {
+        return Ok(S2Result { didWork: false, compacted: Vec::new() });
+    }
+
+    // Walk the active branch only — dead branches from rewinds
+    // must not consume the char budget.
+    let turns = crate::transcript::walkBranchTurns(&allTurns, headTurnId);
     if turns.is_empty() {
         return Ok(S2Result { didWork: false, compacted: Vec::new() });
     }
 
-    // Find which blocks are already compacted.
+    // Build compacted sizes map and zone from shared infrastructure.
     let ops = compactionLog.loadAll()?;
-    let alreadyCompacted: HashSet<String> = ops
-        .iter()
-        .filter_map(|op| match op {
-            crate::compaction::CompactionOp::BlockCompact { blockId, .. } => {
-                Some(blockId.clone())
-            }
-            _ => None,
-        })
-        .collect();
+    let compactedSizes = crate::compaction::compactedBlockSizes(&ops);
+    let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.60);
 
     // Group turns by blockId, preserving order.
     let blocks = groupByBlock(&turns);
@@ -83,27 +84,15 @@ pub async fn run(
         return Ok(S2Result { didWork: false, compacted: Vec::new() });
     }
 
-    // Calculate the 60% boundary by character count.
-    let compactLimit = (contextWindow as f64 * compactRatio) as usize;
-    // S2 targets the first 60% of compactLimit by character count.
-    let charBudget = (compactLimit as f64 * 0.60) as usize;
-    // Rough chars-per-token estimate to convert token budget to char budget.
-    let charTarget = charBudget * 4;
-
-    // Walk blocks, accumulate chars, collect eligible blocks.
-    let mut cumChars: usize = 0;
+    // Filter to eligible blocks: in zone, not already compacted, has agent content.
     let mut eligible: Vec<usize> = Vec::new();
-
     for (i, block) in blocks.iter().enumerate() {
-        if cumChars >= charTarget {
-            break;
-        }
-        cumChars += block.charCount;
-
-        if alreadyCompacted.contains(&block.blockId) {
+        if !zone.contains(&block.blockId) {
             continue;
         }
-        // Skip blocks with no agent content (nothing to compress).
+        if compactedSizes.contains_key(&block.blockId) {
+            continue;
+        }
         if block.agentTurns.is_empty() {
             continue;
         }
@@ -527,3 +516,119 @@ initLogging() in src/logging.rs, which sets LevelFilter::Debug when \
 true. Note: user wants -v shorthand, not --verbose.\
 </compacted_monolithic_string>\n\
 </example>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn makeTurn(id: &str, blockId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+        Turn {
+            id: id.to_string(),
+            blockId: blockId.to_string(),
+            topicId: String::new(),
+            role,
+            content: content.to_string(),
+            ts: 0,
+            parentId: parentId.map(|s| s.to_string()),
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn groupByBlock_groups_turns_by_blockId() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", TurnRole::User, "hello", None),
+            makeTurn("t2", "b_aaa", TurnRole::Assistant, "hi there", Some("t1")),
+            makeTurn("t3", "b_bbb", TurnRole::User, "next", Some("t2")),
+            makeTurn("t4", "b_bbb", TurnRole::Assistant, "sure", Some("t3")),
+        ];
+        let blocks = groupByBlock(&turns);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].blockId, "b_aaa");
+        assert_eq!(blocks[1].blockId, "b_bbb");
+        assert_eq!(blocks[0].allTurnIds.len(), 2);
+        assert_eq!(blocks[1].allTurnIds.len(), 2);
+    }
+
+    #[test]
+    fn eligibility_skips_compacted_blocks_at_summary_size() {
+        // 3 blocks: first two already compacted, third not.
+        // Raw charCount of compacted blocks is large (1000 each).
+        // Summary size is small (50 each). charTarget = 500.
+        //
+        // With raw sizes: cumChars hits 2000 before block 3 → no eligible.
+        // With summary sizes: cumChars hits 100 before block 3 → block 3 eligible.
+        let turns = vec![
+            makeTurn("t1", "b_aaa", TurnRole::User, &"x".repeat(500), None),
+            makeTurn("t2", "b_aaa", TurnRole::Assistant, &"y".repeat(500), Some("t1")),
+            makeTurn("t3", "b_bbb", TurnRole::User, &"x".repeat(500), Some("t2")),
+            makeTurn("t4", "b_bbb", TurnRole::Assistant, &"y".repeat(500), Some("t3")),
+            makeTurn("t5", "b_ccc", TurnRole::User, "question", Some("t4")),
+            makeTurn("t6", "b_ccc", TurnRole::Assistant, "answer with enough content", Some("t5")),
+        ];
+
+        let blocks = groupByBlock(&turns);
+        assert_eq!(blocks.len(), 3);
+
+        // Simulate compaction log: blocks aaa and bbb are compacted with short summaries.
+        let mut alreadyCompacted: HashMap<String, usize> = HashMap::new();
+        alreadyCompacted.insert("b_aaa".into(), 50);
+        alreadyCompacted.insert("b_bbb".into(), 50);
+
+        // charTarget set to cover all 3 blocks at summary size but not at raw size.
+        let charTarget = 500;
+
+        let mut cumChars: usize = 0;
+        let mut eligible: Vec<usize> = Vec::new();
+
+        for (i, block) in blocks.iter().enumerate() {
+            if cumChars >= charTarget {
+                break;
+            }
+            if let Some(summaryLen) = alreadyCompacted.get(&block.blockId) {
+                cumChars += summaryLen;
+                continue;
+            }
+            cumChars += block.charCount;
+            if block.agentTurns.is_empty() {
+                continue;
+            }
+            eligible.push(i);
+        }
+
+        assert!(
+            !eligible.is_empty(),
+            "block b_ccc should be eligible — compacted blocks counted at summary size"
+        );
+        assert_eq!(eligible[0], 2, "block index 2 (b_ccc) should be eligible");
+    }
+
+    #[test]
+    fn eligibility_uses_only_active_branch() {
+        // Simulate rewind: turns t1→t2→t3 on original branch, rewind to t2,
+        // then t4→t5 on new branch. Active branch = t1→t2→t4→t5.
+        // t3 (dead branch) should NOT be included.
+        let allTurns = vec![
+            makeTurn("t1", "b_aaa", TurnRole::User, "first", None),
+            makeTurn("t2", "b_aaa", TurnRole::Assistant, "reply", Some("t1")),
+            makeTurn("t3", "b_dead", TurnRole::User, "dead branch", Some("t2")),
+            makeTurn("t4", "b_bbb", TurnRole::User, "after rewind", Some("t2")),
+            makeTurn("t5", "b_bbb", TurnRole::Assistant, "new reply", Some("t4")),
+        ];
+
+        let activeTurns = crate::transcript::walkBranchTurns(&allTurns, "t5");
+        assert_eq!(activeTurns.len(), 4); // t1, t2, t4, t5
+        let blockIds: Vec<&str> = activeTurns.iter().map(|t| t.blockId.as_str()).collect();
+        assert!(!blockIds.contains(&"b_dead"), "dead branch block should not be on active branch");
+
+        let blocks = groupByBlock(&activeTurns);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].blockId, "b_aaa");
+        assert_eq!(blocks[1].blockId, "b_bbb");
+    }
+}

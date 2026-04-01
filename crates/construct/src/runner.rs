@@ -222,8 +222,11 @@ pub async fn runStreaming(
         // Keep the sender alive so cancelRx.changed() doesn't resolve immediately.
         let _cancel = cancelTx;
 
+        // Subagents don't support mid-turn steering.
+        let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+
         let sendResult = session
-            .send(&input, &eventTx, &mut permitRx, &mut cancelRx)
+            .send(&input, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx)
             .await;
 
         // Drop eventTx so the receiver knows we're done.
@@ -293,8 +296,11 @@ pub fn runSession<'a>(
 
     // Run the agentic turn loop.
     let input = crate::session::UserInput::from(prompt.to_string());
+    // Headless runners don't support mid-turn steering.
+    let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+
     let sendResult = session
-        .send(&input, &eventTx, &mut permitRx, &mut cancelRx)
+        .send(&input, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx)
         .await;
 
     // Drop the sender so the drain task exits.

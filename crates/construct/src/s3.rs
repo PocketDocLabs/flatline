@@ -27,7 +27,6 @@ use futures::future::join_all;
 
 use crate::api;
 use crate::compaction::{CompactionLog, CompactionOp};
-use crate::context;
 use crate::topic::TopicInfo;
 use crate::transcript::{Transcript, Turn, TurnRole};
 
@@ -76,47 +75,45 @@ pub async fn run(
         .iter()
         .filter_map(|op| match op {
             CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                // Use the first block ID as the topic's identity key.
                 sourceBlockIds.first().cloned()
             }
             _ => None,
         })
         .collect();
 
-    // Blocks already S2-compacted (prerequisite for S3).
-    let s2CompactedBlocks: HashSet<String> = ops
-        .iter()
-        .filter_map(|op| match op {
-            CompactionOp::BlockCompact { blockId, .. } => Some(blockId.clone()),
-            _ => None,
-        })
-        .collect();
-
-    // Reconstruct live context to measure the 30% zone.
-    // NOTE: promptThinking=false here — S3 only measures zone sizes,
-    // reasoning is already excluded from char counts.
-    let liveHistory = context::reconstruct(transcript, compactionLog, headTurnId, false)?;
-    let charTarget = calculateZoneChars(&liveHistory);
-
-    if charTarget == 0 {
-        return Ok(S3Result { didWork: false, compacted: Vec::new() });
-    }
+    // Compacted block sizes (shared zone infrastructure).
+    let compactedSizes = crate::compaction::compactedBlockSizes(&ops);
 
     // Group transcript turns by blockId for content retrieval.
     let blockContent = groupTurnsByBlock(&turns);
 
-    // Walk topics from oldest, accumulate chars from live context,
-    // collect eligible topics within the 30% zone.
+    // Build topicId → distinct block IDs from the transcript turns.
+    let topicBlockMap = buildTopicBlockMap(&turns);
+
+    // Walk the active branch and compute the 30% zone.
+    let activeTurns = crate::transcript::walkBranchTurns(&turns, headTurnId);
+    if activeTurns.is_empty() {
+        return Ok(S3Result { didWork: false, compacted: Vec::new() });
+    }
+    let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, 0.30);
+
     let eligible = findEligibleTopics(
         topics,
-        &liveHistory,
-        &blockContent,
-        &s2CompactedBlocks,
+        &topicBlockMap,
+        &zone,
+        &compactedSizes,
         &alreadyCompacted,
-        charTarget,
     );
 
     if eligible.is_empty() {
+        tracing::debug!(
+            topicCount = topics.len(),
+            topicBlockMapKeys = ?topicBlockMap.keys().collect::<Vec<_>>(),
+            compactedCount = compactedSizes.len(),
+            zoneBlockCount = zone.len(),
+            activeTurnCount = activeTurns.len(),
+            "S3: no eligible topics found"
+        );
         return Ok(S3Result { didWork: false, compacted: Vec::new() });
     }
 
@@ -234,32 +231,6 @@ fn groupTurnsByBlock(turns: &[Turn]) -> HashMap<String, BlockTurns> {
     map
 }
 
-/// Calculate the S3 zone: oldest 30% of live context by char count.
-/// Returns the char boundary.
-fn calculateZoneChars(history: &[crate::message::Message]) -> usize {
-    if history.len() <= 1 {
-        return 0;
-    }
-
-    let totalChars: usize = history[1..].iter().map(|m| messageLen(m)).sum();
-    totalChars * 30 / 100
-}
-
-fn messageLen(msg: &crate::message::Message) -> usize {
-    match msg {
-        crate::message::Message::System { content } => content.len(),
-        crate::message::Message::User { content } => content.charCount(),
-        crate::message::Message::Assistant { content, tool_calls, .. } => {
-            let textLen = content.as_ref().map_or(0, |c| c.len());
-            let callsLen = tool_calls.as_ref().map_or(0, |calls| {
-                calls.iter().map(|c| c.function.arguments.len() + c.function.name.len()).sum()
-            });
-            textLen + callsLen
-        }
-        crate::message::Message::Tool { content, .. } => content.charCount(),
-    }
-}
-
 /// Find topics eligible for S3 compaction within the 30% zone.
 ///
 /// A topic is eligible if:
@@ -269,114 +240,78 @@ fn messageLen(msg: &crate::message::Message) -> usize {
 /// - It starts within the 30% zone (or straddles the boundary)
 fn findEligibleTopics(
     topics: &[TopicInfo],
-    liveHistory: &[crate::message::Message],
-    blockContent: &HashMap<String, BlockTurns>,
-    s2Compacted: &HashSet<String>,
+    topicBlockMap: &HashMap<String, Vec<String>>,
+    zone: &HashSet<String>,
+    compactedSizes: &HashMap<String, usize>,
     alreadyCompacted: &HashSet<String>,
-    charTarget: usize,
 ) -> Vec<EligibleTopic> {
-    // Walk live history to map char positions to block boundaries.
-    // We need to know which blocks fall in the 30% zone.
-    let zoneBlockIds = blocksInZone(liveHistory, charTarget);
-
     let mut eligible = Vec::new();
 
     for topic in topics {
-        // Expand topic into its block IDs.
-        let blockIds = expandTopicBlocks(topic, blockContent);
+        let blockIds = match topicBlockMap.get(&topic.topicId) {
+            Some(ids) => ids.clone(),
+            None => {
+                tracing::debug!(topicId = %topic.topicId, "S3 skip: not in transcript");
+                continue;
+            }
+        };
         if blockIds.is_empty() {
-            continue;
-        }
-
-        // Skip single-block topics — S2 already handles those.
-        if blockIds.len() <= 1 {
             continue;
         }
 
         // Skip if already S3-compacted (idempotency check on first block).
         if alreadyCompacted.contains(&blockIds[0]) {
+            tracing::debug!(topicId = %topic.topicId, "S3 skip: already compacted");
             continue;
         }
 
-        // At least the first block must be in the zone
-        // (straddling is OK — topic can extend past the boundary).
-        if !zoneBlockIds.contains(&blockIds[0]) {
+        // Narrow to blocks that are both in the zone and S2-compacted.
+        // Partial topic compaction is OK — the rest gets picked up on future passes.
+        let zonedBlocks: Vec<String> = blockIds
+            .iter()
+            .filter(|bid| zone.contains(*bid) && compactedSizes.contains_key(*bid))
+            .cloned()
+            .collect();
+
+        if zonedBlocks.is_empty() {
+            tracing::debug!(topicId = %topic.topicId, "S3 skip: no in-zone S2'd blocks");
             continue;
         }
 
-        // All blocks must be S2-compacted (S3 prerequisite).
-        let allS2 = blockIds.iter().all(|bid| s2Compacted.contains(bid));
-        if !allS2 {
+        // Need at least 2 blocks — single blocks are S2's domain.
+        if zonedBlocks.len() <= 1 {
+            tracing::debug!(topicId = %topic.topicId, "S3 skip: only 1 block in zone");
             continue;
         }
 
         eligible.push(EligibleTopic {
             topicId: topic.topicId.clone(),
             label: topic.label.clone(),
-            blockIds,
+            blockIds: zonedBlocks,
         });
     }
 
     eligible
 }
 
-/// Expand a TopicInfo into its block IDs by parsing startBlock and counting.
-fn expandTopicBlocks(
-    topic: &TopicInfo,
-    blockContent: &HashMap<String, BlockTurns>,
-) -> Vec<String> {
-    // startBlock format: "b000001", blockCount tells us how many.
-    let startNum = topic.startBlock
-        .get(1..)
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+/// Build a map of topicId → ordered distinct block IDs from transcript turns.
+fn buildTopicBlockMap(turns: &[Turn]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
 
-    let mut ids = Vec::new();
-    for i in 0..topic.blockCount as u32 {
-        let bid = format!("b{:06}", startNum + i);
-        // Only include blocks that actually exist in the transcript.
-        if blockContent.contains_key(&bid) {
-            ids.push(bid);
+    for turn in turns {
+        if turn.topicId.is_empty() {
+            continue;
+        }
+        let set = seen.entry(turn.topicId.clone()).or_default();
+        if set.insert(turn.blockId.clone()) {
+            map.entry(turn.topicId.clone())
+                .or_default()
+                .push(turn.blockId.clone());
         }
     }
-    ids
-}
 
-/// Find block IDs that fall within the 30% char zone of live history.
-fn blocksInZone(
-    history: &[crate::message::Message],
-    charTarget: usize,
-) -> HashSet<String> {
-    let mut zoneBlocks = HashSet::new();
-    let mut cumulative: usize = 0;
-
-    // Walk messages from oldest (skip system at index 0).
-    // Track block transitions by looking for User messages
-    // (each User message starts a new block).
-    let mut currentBlock = String::new();
-    let mut blockNum: u32 = 0;
-
-    for i in 1..history.len() {
-        if cumulative >= charTarget {
-            break;
-        }
-
-        let len = messageLen(&history[i]);
-
-        // Detect block boundaries: User messages start new blocks.
-        if matches!(history[i], crate::message::Message::User { .. }) {
-            blockNum += 1;
-            currentBlock = format!("b{:06}", blockNum);
-        }
-
-        if !currentBlock.is_empty() {
-            zoneBlocks.insert(currentBlock.clone());
-        }
-
-        cumulative += len;
-    }
-
-    zoneBlocks
+    map
 }
 
 /// Collect file paths read in the given blocks (for edit gate invalidation).
@@ -554,3 +489,158 @@ Structure:\n\
 - Closing: unresolved issues or noted next steps, if any\n\
 \n\
 Target length: 1-3 short paragraphs depending on topic complexity.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn makeTurn(id: &str, blockId: &str, topicId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+        Turn {
+            id: id.to_string(),
+            blockId: blockId.to_string(),
+            topicId: topicId.to_string(),
+            role,
+            content: content.to_string(),
+            ts: 0,
+            parentId: parentId.map(|s| s.to_string()),
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn buildTopicBlockMap_groups_by_topicId() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, "a", None),
+            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, "b", Some("t1")),
+            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, "c", Some("t2")),
+            makeTurn("t4", "b_ccc", "topic-02", TurnRole::User, "d", Some("t3")),
+            makeTurn("t5", "b_ddd", "topic-02", TurnRole::User, "e", Some("t4")),
+        ];
+        let map = buildTopicBlockMap(&turns);
+        assert_eq!(map["topic-01"], vec!["b_aaa", "b_bbb"]);
+        assert_eq!(map["topic-02"], vec!["b_ccc", "b_ddd"]);
+    }
+
+    #[test]
+    fn zoneBlocks_returns_oldest_30_percent() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", "", TurnRole::User, &"x".repeat(50), None),
+            makeTurn("t2", "b_aaa", "", TurnRole::Assistant, &"y".repeat(50), Some("t1")),
+            makeTurn("t3", "b_bbb", "", TurnRole::User, &"x".repeat(50), Some("t2")),
+            makeTurn("t4", "b_bbb", "", TurnRole::Assistant, &"y".repeat(50), Some("t3")),
+            makeTurn("t5", "b_ccc", "", TurnRole::User, &"x".repeat(50), Some("t4")),
+            makeTurn("t6", "b_ccc", "", TurnRole::Assistant, &"y".repeat(50), Some("t5")),
+            makeTurn("t7", "b_ddd", "", TurnRole::User, &"x".repeat(50), Some("t6")),
+            makeTurn("t8", "b_ddd", "", TurnRole::Assistant, &"y".repeat(50), Some("t7")),
+        ];
+
+        let compactedSizes = HashMap::new();
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+
+        assert!(zone.contains("b_aaa"), "first block should be in zone");
+        assert!(!zone.contains("b_ddd"), "last block should NOT be in zone");
+    }
+
+    #[test]
+    fn zoneBlocks_extends_past_compacted_blocks() {
+        // 4 blocks, first 2 compacted to 10 chars each, last 2 raw at 200 each.
+        // Total effective = 10 + 10 + 200 + 200 = 420. 30% = 126.
+        // Zone should include blocks aaa (10) + bbb (10) + ccc (200 pushes past 126).
+        let turns = vec![
+            makeTurn("t1", "b_aaa", "", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_aaa", "", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
+            makeTurn("t3", "b_bbb", "", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_bbb", "", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
+            makeTurn("t5", "b_ccc", "", TurnRole::User, &"x".repeat(100), Some("t4")),
+            makeTurn("t6", "b_ccc", "", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
+            makeTurn("t7", "b_ddd", "", TurnRole::User, &"x".repeat(100), Some("t6")),
+            makeTurn("t8", "b_ddd", "", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+        ];
+
+        let mut compactedSizes = HashMap::new();
+        compactedSizes.insert("b_aaa".to_string(), 10_usize);
+        compactedSizes.insert("b_bbb".to_string(), 10_usize);
+
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+
+        // Without compacted sizes: 30% of 800 = 240 → only aaa+bbb (400 raw) would fill it.
+        // With compacted sizes: 30% of 420 = 126 → aaa(10)+bbb(10)+ccc(200) fills it.
+        assert!(zone.contains("b_aaa"), "compacted block should be in zone");
+        assert!(zone.contains("b_bbb"), "compacted block should be in zone");
+        assert!(zone.contains("b_ccc"), "uncompacted block should now be reachable");
+        assert!(!zone.contains("b_ddd"), "last block should not be in zone");
+    }
+
+    #[test]
+    fn findEligibleTopics_finds_multi_block_s2d_topic_in_zone() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
+            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
+            makeTurn("t5", "b_ccc", "topic-02", TurnRole::User, &"x".repeat(100), Some("t4")),
+            makeTurn("t6", "b_ccc", "topic-02", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
+            makeTurn("t7", "b_ddd", "topic-02", TurnRole::User, &"x".repeat(100), Some("t6")),
+            makeTurn("t8", "b_ddd", "topic-02", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+        ];
+
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "First".into(), startBlock: "b_aaa".into(), blockCount: 2 },
+            TopicInfo { topicId: "topic-02".into(), label: "Second".into(), startBlock: "b_ccc".into(), blockCount: 2 },
+        ];
+
+        let topicBlockMap = buildTopicBlockMap(&turns);
+        let mut compactedSizes = HashMap::new();
+        for id in &["b_aaa", "b_bbb", "b_ccc", "b_ddd"] {
+            compactedSizes.insert(id.to_string(), 50_usize);
+        }
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let alreadyCompacted: HashSet<String> = HashSet::new();
+
+        let eligible = findEligibleTopics(
+            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+        );
+
+        assert!(!eligible.is_empty(), "should find at least one eligible topic");
+        assert_eq!(eligible[0].topicId, "topic-01");
+    }
+
+    #[test]
+    fn findEligibleTopics_allows_partial_topic_compaction() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
+            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
+            makeTurn("t5", "b_ccc", "topic-01", TurnRole::User, &"x".repeat(100), Some("t4")),
+            makeTurn("t6", "b_ccc", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
+            makeTurn("t7", "b_ddd", "topic-01", TurnRole::User, &"x".repeat(100), Some("t6")),
+            makeTurn("t8", "b_ddd", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+        ];
+
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "Big Topic".into(), startBlock: "b_aaa".into(), blockCount: 4 },
+        ];
+
+        let topicBlockMap = buildTopicBlockMap(&turns);
+        // Only first 2 blocks S2'd.
+        let mut compactedSizes = HashMap::new();
+        compactedSizes.insert("b_aaa".to_string(), 50_usize);
+        compactedSizes.insert("b_bbb".to_string(), 50_usize);
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let alreadyCompacted: HashSet<String> = HashSet::new();
+
+        let eligible = findEligibleTopics(
+            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+        );
+
+        assert_eq!(eligible.len(), 1, "topic-01 should be eligible (partial)");
+        assert_eq!(eligible[0].blockIds.len(), 2, "only the 2 in-zone S2'd blocks");
+        assert_eq!(eligible[0].blockIds, vec!["b_aaa", "b_bbb"]);
+    }
+}

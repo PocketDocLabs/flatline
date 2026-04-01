@@ -37,6 +37,8 @@ pub struct TextArea {
     selAnchor: Option<usize>,
     /// Selection endpoint (byte offset) — updated on drag.
     selEnd: Option<usize>,
+    /// Ghost text shown when the input is empty.
+    pub placeholder: &'static str,
 }
 
 impl TextArea {
@@ -50,6 +52,7 @@ impl TextArea {
             cursorScreenPos: None,
             selAnchor: None,
             selEnd: None,
+            placeholder: "Type a message...",
         }
     }
 
@@ -443,7 +446,7 @@ impl TextArea {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    "Type a message...",
+                    self.placeholder,
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);

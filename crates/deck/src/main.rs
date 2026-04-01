@@ -263,9 +263,10 @@ async fn main() -> Result<()> {
 
         None => {
             // TUI mode: file-based logging so it doesn't collide with the TUI.
-            let logDir = construct::config::configDir();
+            let logDir = construct::config::configDir().join("logs");
             std::fs::create_dir_all(&logDir)?;
-            let logFile = std::fs::File::create(logDir.join("flatline.log"))?;
+            let logPath = logDir.join(format!("flatline-{}.log", std::process::id()));
+            let logFile = std::fs::File::create(&logPath)?;
             let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
             tracing_subscriber::fmt()
@@ -273,6 +274,22 @@ async fn main() -> Result<()> {
                 .with_ansi(false)
                 .with_env_filter(envFilter)
                 .init();
+
+            // Redirect panics to the log file instead of stderr, which would
+            // corrupt the TUI. On the main thread, also restore the terminal
+            // so the panic is readable after exit.
+            std::panic::set_hook(Box::new(|info| {
+                tracing::error!("{info}");
+
+                if std::thread::current().name() == Some("main") {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::LeaveAlternateScreen,
+                    );
+                    eprintln!("{info}");
+                }
+            }));
 
             app::run().await
         }

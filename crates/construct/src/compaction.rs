@@ -11,12 +11,15 @@
 //! # Dependencies
 //! `serde`, `serde_json`
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::transcript::Turn;
 
 /// A compaction operation stored in the log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +79,80 @@ impl CompactionOp {
             | Self::FullCompact { afterTurn, .. } => afterTurn,
         }
     }
+}
+
+/// Build a map of blockId → summary char count from BlockCompact entries.
+///
+/// Used by S2/S3 zone calculations to account for post-compaction sizes.
+pub fn compactedBlockSizes(ops: &[CompactionOp]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for op in ops {
+        if let CompactionOp::BlockCompact { blockId, summary, .. } = op {
+            map.insert(blockId.clone(), summary.len());
+        }
+    }
+    map
+}
+
+/// Determine which block IDs fall in the oldest `fraction` of the
+/// effective context size.
+///
+/// Walks the active branch turns, groups by block, and uses the compacted
+/// summary size for already-S2'd blocks (instead of the raw content size).
+/// This prevents the zone from being consumed by blocks that are already
+/// tiny in the actual context, letting it extend to reach uncompacted content.
+///
+/// Args:
+///     activeTurns: Turns on the active branch (from `walkBranchTurns`).
+///     compactedSizes: blockId → summary char count (from `compactedBlockSizes`).
+///     fraction: Zone fraction (0.60 for S2, 0.30 for S3).
+pub fn zoneBlocks(
+    activeTurns: &[Turn],
+    compactedSizes: &HashMap<String, usize>,
+    fraction: f64,
+) -> HashSet<String> {
+    // Group turns by block and compute raw char size per block.
+    let mut blocks: Vec<(String, usize)> = Vec::new();
+    let mut currentBlockId = String::new();
+    let mut currentRawSize: usize = 0;
+
+    for turn in activeTurns {
+        if turn.blockId != currentBlockId {
+            if !currentBlockId.is_empty() {
+                let effective = compactedSizes
+                    .get(&currentBlockId)
+                    .copied()
+                    .unwrap_or(currentRawSize);
+                blocks.push((currentBlockId.clone(), effective));
+            }
+            currentBlockId = turn.blockId.clone();
+            currentRawSize = 0;
+        }
+        currentRawSize += turn.content.len();
+    }
+    // Flush last block.
+    if !currentBlockId.is_empty() {
+        let effective = compactedSizes
+            .get(&currentBlockId)
+            .copied()
+            .unwrap_or(currentRawSize);
+        blocks.push((currentBlockId, effective));
+    }
+
+    let total: usize = blocks.iter().map(|(_, s)| s).sum();
+    let target = (total as f64 * fraction) as usize;
+
+    let mut zone = HashSet::new();
+    let mut cumulative: usize = 0;
+    for (blockId, size) in &blocks {
+        if cumulative >= target {
+            break;
+        }
+        zone.insert(blockId.clone());
+        cumulative += size;
+    }
+
+    zone
 }
 
 fn now() -> u64 {

@@ -67,6 +67,9 @@ pub struct TerminalState {
     commandRegions: Vec<CommandRegion>,
     /// Absolute line of the most recent output start (OSC 133;C), not yet closed.
     pendingOutputStart: Option<usize>,
+    /// Whether the terminal content changed since the last render.
+    /// Consumed by the app loop to trigger a full screen clear.
+    dirty: bool,
 }
 
 impl TerminalState {
@@ -88,6 +91,7 @@ impl TerminalState {
             processor: Processor::new(),
             commandRegions: Vec::new(),
             pendingOutputStart: None,
+            dirty: true,
         }
     }
 
@@ -96,6 +100,7 @@ impl TerminalState {
     /// Scans for OSC 133 shell integration markers and records
     /// command output boundaries before passing bytes to alacritty.
     pub fn process(&mut self, data: &[u8]) {
+        self.dirty = true;
         let mut offset = 0;
         while offset < data.len() {
             if let Some(m) = findOsc133(&data[offset..]) {
@@ -121,6 +126,7 @@ impl TerminalState {
             screenLines: rows as usize,
         };
         self.term.resize(size);
+        self.dirty = true;
     }
 
     /// Scroll the terminal display up (into scrollback).
@@ -136,6 +142,16 @@ impl TerminalState {
     /// Reset scroll to the bottom (live output).
     pub fn scrollToBottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Returns true and clears the dirty flag if the terminal content
+    /// changed since the last call. Used by the app loop to decide
+    /// when a full screen clear is needed to prevent cursor-drift
+    /// artifacts in ratatui's differential renderer.
+    pub fn takeDirty(&mut self) -> bool {
+        let was = self.dirty;
+        self.dirty = false;
+        was
     }
 
     /// Current grid column count.

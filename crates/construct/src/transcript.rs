@@ -141,6 +141,28 @@ impl Transcript {
         })
     }
 
+    /// Create a transcript at an explicit directory (for tests).
+    pub fn createAt(dir: &Path, sessionId: &str) -> Result<Self> {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("create session dir: {}", dir.display()))?;
+
+        let path = dir.join("transcript.jsonl");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open transcript: {}", path.display()))?;
+
+        Ok(Self {
+            sessionId: sessionId.to_string(),
+            sessionDir: dir.to_path_buf(),
+            writer: BufWriter::new(file),
+            lastTurnId: None,
+            currentBlockId: String::new(),
+            currentTopicId: String::new(),
+        })
+    }
+
     /// Open an existing transcript for append.
     pub fn open(sessionId: &str) -> Result<Self> {
         let dir = sessionsDir().join(sessionId);
@@ -418,6 +440,27 @@ pub fn listSessions(projectDir: Option<&str>) -> Result<Vec<SessionMeta>> {
     // Sort by updatedAt descending (most recent first).
     sessions.sort_by(|a, b| b.updatedAt.cmp(&a.updatedAt));
     Ok(sessions)
+}
+
+/// Walk the parent chain from headTurnId to root, return turns in chronological order.
+///
+/// Used by S2/S3 compaction to operate only on the active branch after rewinds.
+pub fn walkBranchTurns(allTurns: &[Turn], headTurnId: &str) -> Vec<Turn> {
+    let turnMap: std::collections::HashMap<&str, &Turn> =
+        allTurns.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    let mut chain = Vec::new();
+    let mut current: Option<&str> = Some(headTurnId);
+    while let Some(id) = current {
+        if let Some(turn) = turnMap.get(id) {
+            chain.push((*turn).clone());
+            current = turn.parentId.as_deref();
+        } else {
+            break;
+        }
+    }
+    chain.reverse();
+    chain
 }
 
 #[cfg(test)]

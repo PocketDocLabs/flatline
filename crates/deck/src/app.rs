@@ -156,9 +156,11 @@ pub async fn run() -> Result<()> {
     let (userInputTx, mut userInputRx) = mpsc::channel::<construct::session::UserInput>(16);
     let (commandTx, mut commandRx) = mpsc::channel::<CommandAction>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
+    let (steerTx, steerRx) = mpsc::channel::<construct::session::UserInput>(16);
 
     // Spawn the agent session task.
     let mut cancelRx = cancelRx;
+    let mut steerRx = steerRx;
     tokio::spawn(async move {
         let config = match construct::config::load() {
             Ok(c) => c,
@@ -208,7 +210,7 @@ pub async fn run() -> Result<()> {
                         Some(msg) => {
                             // Clear any stale cancel notification from a previous turn.
                             cancelRx.borrow_and_update();
-                            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx).await {
+                            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx).await {
                                 let _ = eventTx
                                     .send(SessionEvent::Error(format!("Agent error: {e}")))
                                     .await;
@@ -447,6 +449,7 @@ pub async fn run() -> Result<()> {
         &userInputTx,
         &commandTx,
         &cancelTx,
+        &steerTx,
         contextWindow,
     )
     .await;
@@ -480,6 +483,7 @@ async fn runLoop(
     userInputTx: &mpsc::Sender<construct::session::UserInput>,
     commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
+    steerTx: &mpsc::Sender<construct::session::UserInput>,
     contextWindow: usize,
 ) -> Result<()> {
     let mut tokenCount: usize = 0;
@@ -487,6 +491,7 @@ async fn runLoop(
     let mut rewindPicker: Option<RewindPicker> = None;
     let mut forkPicker: Option<ForkPicker> = None;
     let mut pendingRewindMessage: Option<String> = None;
+    let mut pendingRewindAttachments: Option<Vec<construct::transcript::TurnAttachment>> = None;
     let mut mcpPanel: Option<McpPanel> = None;
     let mut lspPanel: Option<LspPanel> = None;
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
@@ -499,6 +504,14 @@ async fn runLoop(
     let mut lastQuitPress: Option<Instant> = None;
 
     loop {
+        // Full screen clear when terminal content changed — resets ratatui's
+        // diff state so cursor-drift from the terminal flush can't persist
+        // into the border or agent panel.
+        if termState.takeDirty() {
+            terminal.clear()?;
+            needsRedraw = true;
+        }
+
         // Draw only when state has changed.
         if needsRedraw {
         needsRedraw = false;
@@ -666,7 +679,9 @@ async fn runLoop(
                 .map(|t| t.elapsed() < Duration::from_secs(1))
                 .unwrap_or(false);
             let controls = if quitHintActive {
-                "▸ press Ctrl+Q again to quit"
+                "\u{25B8} press Ctrl+Q again to quit"
+            } else if agentPanel.isActive() && agentPanel.queuedCount() > 0 {
+                "\u{2191}: edit last  Esc: cancel  Ctrl+Q\u{00d7}2: quit"
             } else if agentPanel.isActive() {
                 "Esc: cancel  Ctrl+Q\u{00d7}2: quit"
             } else {
@@ -770,6 +785,9 @@ async fn runLoop(
                 SessionEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
                 }
+                SessionEvent::SteerInjected { texts } => {
+                    agentPanel.promoteQueue(&texts);
+                }
                 SessionEvent::TopicChanged { label } => {
                     setTerminalTitle(Some(&label));
                 }
@@ -823,6 +841,21 @@ async fn runLoop(
                     tokenCount = 0;
                     if let Some(msg) = pendingRewindMessage.take() {
                         agentPanel.textArea.setText(&msg);
+                    }
+                    // Restore image attachments from the rewound turn.
+                    if let Some(atts) = pendingRewindAttachments.take() {
+                        use base64::Engine;
+                        for att in atts {
+                            let data = base64::engine::general_purpose::STANDARD
+                                .decode(&att.data)
+                                .unwrap_or_default();
+                            agentPanel.addAttachment(construct::session::Attachment {
+                                mimeType: att.mimeType.clone(),
+                                data,
+                                label: format!("restored image"),
+                                rgbaDimensions: None,
+                            });
+                        }
                     }
                     tracing::info!(target = %targetTurnId, "conversation rewound");
                 }
@@ -896,12 +929,12 @@ async fn runLoop(
                     }
                 }
                 SessionEvent::SubagentPermitRequest {
-                    sessionId: _, name, summary, args, diff, responseTx,
+                    sessionId: _, name, summary, args, diff, explanation, impact, responseTx,
                 } => {
                     // Show permission prompt for the subagent (reuse same UI).
                     agentPanel.showToolRequest(
                         &name, &summary, &args, diff,
-                        None, construct::tool::ShellImpact::MinorMod,
+                        explanation, impact,
                     );
                     subagentPermitTx = Some(responseTx);
                 }
@@ -953,10 +986,12 @@ async fn runLoop(
             userInputTx,
             commandTx,
             cancelTx,
+            steerTx,
             &mut sessionPicker,
             &mut rewindPicker,
             &mut forkPicker,
             &mut pendingRewindMessage,
+        &mut pendingRewindAttachments,
             &mut mcpPanel,
             &mut lspPanel,
             &mut subagentPanel,
@@ -972,9 +1007,6 @@ async fn runLoop(
         if hadInput {
             needsRedraw = true;
         }
-        // Force full redraw on resize to clear any cursor-drift artifacts
-        // from characters whose display width differs between unicode-width
-        // and the host terminal.
         if wasResized {
             terminal.clear()?;
         }
@@ -998,10 +1030,12 @@ async fn handleInput(
     userInputTx: &mpsc::Sender<construct::session::UserInput>,
     commandTx: &mpsc::Sender<CommandAction>,
     cancelTx: &watch::Sender<bool>,
+    steerTx: &mpsc::Sender<construct::session::UserInput>,
     sessionPicker: &mut Option<SessionPicker>,
     rewindPicker: &mut Option<RewindPicker>,
     forkPicker: &mut Option<ForkPicker>,
     pendingRewindMessage: &mut Option<String>,
+    pendingRewindAttachments: &mut Option<Vec<construct::transcript::TurnAttachment>>,
     mcpPanel: &mut Option<McpPanel>,
     lspPanel: &mut Option<LspPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
@@ -1193,13 +1227,15 @@ async fn handleInput(
                         RewindAction::Close => {
                             *rewindPicker = None;
                         }
-                        RewindAction::Rewind { target, userMessage } => {
+                        RewindAction::Rewind { target, userMessage, attachments } => {
                             *pendingRewindMessage = Some(userMessage);
+                            *pendingRewindAttachments = attachments;
                             let action = CommandAction::Rewind { target };
                             let _ = commandTx.send(action).await;
                         }
-                        RewindAction::ForkAndRewind { target, userMessage } => {
+                        RewindAction::ForkAndRewind { target, userMessage, attachments } => {
                             *pendingRewindMessage = Some(userMessage);
+                            *pendingRewindAttachments = attachments;
                             let action = CommandAction::ForkAndRewind { target };
                             let _ = commandTx.send(action).await;
                         }
@@ -1348,6 +1384,19 @@ async fn handleInput(
                                 break;
                             }
 
+                            // Pop queued message on Up before borrowing textArea.
+                            if key.code == KeyCode::Up
+                                && (agentPanel.textArea.isEmpty() || agentPanel.textArea.lineCount() == 1)
+                                && agentPanel.isActive()
+                                && agentPanel.queuedCount() > 0
+                            {
+                                if let Some(input) = agentPanel.popQueuedMessage() {
+                                    agentPanel.textArea.setText(&input.text);
+                                    agentPanel.restoreAttachments(input.attachments);
+                                }
+                                break;
+                            }
+
                             let ta = &mut agentPanel.textArea;
                             match key.code {
                                 KeyCode::Enter if shift => ta.insert('\n'),
@@ -1371,6 +1420,15 @@ async fn handleInput(
                                                     let _ = commandTx.send(constructAction).await;
                                                 }
                                             }
+                                        } else if agentPanel.isActive() {
+                                            // Queue for mid-turn injection.
+                                            agentPanel.history.push(&msg);
+                                            let input = construct::session::UserInput {
+                                                text: msg,
+                                                attachments: agentPanel.takeAttachments(),
+                                            };
+                                            agentPanel.queueMessage(input.clone());
+                                            let _ = steerTx.try_send(input);
                                         } else {
                                             let _ = cancelTx.send(false);
                                             agentPanel.history.push(&msg);
