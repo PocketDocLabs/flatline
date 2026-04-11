@@ -21,19 +21,128 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alacritty_terminal::{
+    Term,
+    event::VoidListener,
+    grid::Dimensions as VtDimensions,
+    index::{Column, Line},
+    term::Config as VtConfig,
+    vte::ansi::Processor,
+};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
 const MAX_HISTORY: usize = 50;
-const MAX_SCROLLBACK_BYTES: usize = 512_000;
+
+// VT render grid for turning captured PTY byte streams into the final
+// visible text the user would see at the prompt. Also used by the live
+// shell-side VT that backs `readTerminal`.
+const VT_RENDER_COLS: usize = 200;
+const VT_RENDER_ROWS: usize = 50;
+const VT_SCROLLBACK_LINES: usize = 5000;
 
 /// Default shell command timeout (seconds). Commands are interrupted after this.
 pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Grace period between each escalation phase (Ctrl+C → Ctrl+\ → force-extract).
 const SHELL_ESCALATION_SECS: u64 = 3;
+
+/// Headless VT dimensions for rendering captured output.
+struct VtSize {
+    cols: usize,
+    rows: usize,
+}
+
+impl VtDimensions for VtSize {
+    fn total_lines(&self) -> usize { self.rows }
+    fn screen_lines(&self) -> usize { self.rows }
+    fn columns(&self) -> usize { self.cols }
+}
+
+/// Dump a VT grid (scrollback + visible region) as one row per line,
+/// trailing whitespace trimmed per row, trailing blank rows dropped.
+fn dumpVtGrid(term: &Term<VoidListener>) -> Vec<String> {
+    let grid = term.grid();
+    let numCols = grid.columns();
+    let historySize = grid.total_lines().saturating_sub(grid.screen_lines());
+    let firstLine = -(historySize as i32);
+    let lastLine = grid.screen_lines() as i32 - 1;
+
+    let mut rows: Vec<String> = Vec::with_capacity((lastLine - firstLine + 1) as usize);
+    for gridLine in firstLine..=lastLine {
+        let line = &grid[Line(gridLine)];
+        let mut row = String::with_capacity(numCols);
+        for col in 0..numCols {
+            row.push(line[Column(col)].c);
+        }
+        while row.ends_with(' ') {
+            row.pop();
+        }
+        rows.push(row);
+    }
+
+    while rows.last().map(|r| r.is_empty()).unwrap_or(false) {
+        rows.pop();
+    }
+
+    rows
+}
+
+/// Construct a fresh headless VT with the standard render dimensions.
+fn newRenderVt() -> (Term<VoidListener>, Processor) {
+    let size = VtSize { cols: VT_RENDER_COLS, rows: VT_RENDER_ROWS };
+    let mut config = VtConfig::default();
+    config.scrolling_history = VT_SCROLLBACK_LINES;
+    let term = Term::new(config, &size, VoidListener);
+    let processor: Processor = Processor::new();
+    (term, processor)
+}
+
+/// Feed captured command-output bytes through a fresh headless VT
+/// emulator and return the final visible text. This is what turns
+/// rich/textual/progress-bar frame spam into the single final state
+/// the user would actually see at the prompt.
+fn renderCommandOutput(bytes: &[u8]) -> String {
+    let (mut term, mut processor) = newRenderVt();
+    processor.advance(&mut term, bytes);
+    dumpVtGrid(&term).join("\n")
+}
+
+/// Live VT emulator that tracks everything the shell has written to
+/// its PTY. Used by `readTerminal` so the model sees what the user
+/// actually sees on screen — including alt-screen apps, cursor-
+/// positioned dashboards, and anything else that relies on terminal
+/// semantics instead of plain text.
+struct ShellVt {
+    term: Term<VoidListener>,
+    processor: Processor,
+}
+
+impl ShellVt {
+    fn new() -> Self {
+        let (term, processor) = newRenderVt();
+        Self { term, processor }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let size = VtSize { cols: cols as usize, rows: rows as usize };
+        self.term.resize(size);
+    }
+
+    /// Dump the last `lines` rows of the rendered grid. Returns the
+    /// final visible state of the terminal, joined with newlines.
+    fn dumpRecentLines(&self, lines: usize) -> String {
+        let rows = dumpVtGrid(&self.term);
+        let start = rows.len().saturating_sub(lines);
+        rows[start..].join("\n")
+    }
+}
 
 /// A stored command result.
 #[derive(Debug, Clone)]
@@ -53,7 +162,7 @@ pub struct Shell {
     cmdTx: mpsc::Sender<ShellRequest>,
     inputTx: mpsc::Sender<Vec<u8>>,
     history: Arc<Mutex<Vec<CommandRecord>>>,
-    scrollback: Arc<Mutex<VecDeque<u8>>>,
+    vt: Arc<Mutex<ShellVt>>,
 }
 
 impl Shell {
@@ -166,16 +275,13 @@ impl Shell {
     }
 
     /// Read the last N lines from the terminal scrollback.
-    /// This includes everything visible in the terminal — user commands,
-    /// agent commands, and all output.
+    ///
+    /// Dumps the live VT grid — scrollback above the visible region
+    /// plus the current screen — as plain text. For alt-screen apps
+    /// (btm, htop, textual) this returns the current dashboard state
+    /// with its layout intact, not the raw positioning stream.
     pub fn readTerminal(&self, lines: usize) -> String {
-        let scrollback = self.scrollback.lock().unwrap();
-        let raw = Vec::from(scrollback.clone());
-        let text = stripAnsi(&String::from_utf8_lossy(&raw));
-
-        let allLines: Vec<&str> = text.lines().collect();
-        let start = allLines.len().saturating_sub(lines);
-        allLines[start..].join("\n")
+        self.vt.lock().unwrap().dumpRecentLines(lines)
     }
 }
 
@@ -264,8 +370,11 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
     let history: Arc<Mutex<Vec<CommandRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let historyRef = Arc::clone(&history);
-    let scrollback: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let scrollbackRef = Arc::clone(&scrollback);
+    let vt: Arc<Mutex<ShellVt>> = Arc::new(Mutex::new(ShellVt::new()));
+    let vtRef = Arc::clone(&vt);
+    // Size the live VT to the initial PTY dimensions so cursor
+    // positioning from the shell lines up with what we track.
+    vtRef.lock().unwrap().resize(cols, rows);
 
     // Background task — central hub for all PTY I/O.
     tokio::spawn(async move {
@@ -274,17 +383,9 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         // large commands (heredocs) don't deadlock with output echo.
         let mut pendingWrite: VecDeque<u8> = VecDeque::new();
 
-        // Append bytes to the scrollback ring buffer.
-        let appendScrollback = |bytes: &[u8]| {
-            let mut sb = scrollbackRef.lock().unwrap();
-            sb.extend(bytes);
-            // Trim from front if over capacity, on a line boundary.
-            while sb.len() > MAX_SCROLLBACK_BYTES {
-                match sb.iter().position(|&b| b == b'\n') {
-                    Some(pos) => { sb.drain(..=pos); }
-                    None => { sb.drain(..1024); }
-                }
-            }
+        // Feed bytes into the live VT that backs `readTerminal`.
+        let feedVt = |bytes: &[u8]| {
+            vtRef.lock().unwrap().feed(bytes);
         };
 
         /// Finalize a capture: extract output, store in history, resolve oneshot.
@@ -340,11 +441,11 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         // Filtered bytes go to harness (no sentinels in display).
                         let filtered = cap.filter.process(&bytes);
                         if !filtered.is_empty() {
-                            appendScrollback(&filtered);
+                            feedVt(&filtered);
                             let _ = outputTx.try_send(filtered);
                         }
                     } else {
-                        appendScrollback(&bytes);
+                        feedVt(&bytes);
                         let _ = outputTx.try_send(bytes);
                     }
 
@@ -361,7 +462,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         let cap = captureState.take().unwrap();
                         let (_, remaining) = finalizeCapture(cap, &historyRef, false);
                         if !remaining.is_empty() {
-                            appendScrollback(&remaining);
+                            feedVt(&remaining);
                             let _ = outputTx.try_send(remaining);
                         }
                     }
@@ -401,7 +502,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                 let cap = captureState.take().unwrap();
                                 let (_, remaining) = finalizeCapture(cap, &historyRef, true);
                                 if !remaining.is_empty() {
-                                    appendScrollback(&remaining);
+                                    feedVt(&remaining);
                                     let _ = outputTx.try_send(remaining);
                                 }
                                 // Poke the shell with a newline to try to recover the prompt.
@@ -438,7 +539,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     // Dim cyan to distinguish agent commands from user input.
                     let cmdEcho = format!("\x1b[2;36m{}\x1b[0m\r\n", req.command);
                     let echoBytes = cmdEcho.into_bytes();
-                    appendScrollback(&echoBytes);
+                    feedVt(&echoBytes);
                     let _ = outputTx.try_send(echoBytes);
 
                     // NOTE: Markers use printf with %s so the shell's command
@@ -478,6 +579,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         pixel_width: 0,
                         pixel_height: 0,
                     });
+                    vtRef.lock().unwrap().resize(cols, rows);
                 }
 
                 // User-triggered kill — start/advance the killchain immediately.
@@ -503,7 +605,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         cmdTx,
         inputTx: inputTx.clone(),
         history,
-        scrollback,
+        vt,
     };
     let io = ShellIo {
         outputRx,
@@ -621,58 +723,67 @@ impl DisplayFilter {
 /// and sentinel markers. The wrapped command uses printf with %s for the
 /// uuid, so the echo never contains the exact marker strings — only the
 /// actual output does. This makes rfind unambiguous.
+///
+/// The sliced byte range between START and END is fed through a headless
+/// VT emulator so control sequences (`\r` overwrites, cursor moves,
+/// alt-screen switches) are **applied** rather than stripped. This turns
+/// rich/textual/progress-bar frame spam into the single final rendered
+/// state the user would see at the prompt.
 fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
-    let text = String::from_utf8_lossy(buffer);
     let startMarker = format!("__FLATLINE_START_{uuid}__");
     let endPrefix = format!("__FLATLINE_END_{uuid}_");
 
-    let afterStart = match text.rfind(&startMarker) {
-        Some(pos) => {
-            let rest = &text[pos + startMarker.len()..];
-            match rest.find('\n') {
-                Some(nl) => &rest[nl + 1..],
-                None => rest,
-            }
-        }
-        None => {
-            // START marker never appeared — command likely failed before
-            // the printf ran (e.g., zsh parse error on history expansion).
-            // Strip sentinel lines so internal tokens don't leak to the agent.
-            let exitCode = text.rfind(&endPrefix).and_then(|endPos| {
-                let afterPrefix = &text[endPos + endPrefix.len()..];
-                afterPrefix.split("__").next()?.parse::<i32>().ok()
-            });
-            let cleaned: String = stripAnsi(&text)
-                .lines()
-                .filter(|l| !l.contains("__FLATLINE_") && !l.contains("__flatline_ec"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return ExtractedResult {
-                output: cleaned.trim().to_string(),
-                exitCode,
-            };
-        }
+    // Find markers by byte position in the raw buffer. rfind on a slice
+    // gives us the byte offset directly — no UTF-8 boundary worries
+    // because the marker bytes are pure ASCII.
+    let startPos = rfindBytes(buffer, startMarker.as_bytes());
+    let endPos = rfindBytes(buffer, endPrefix.as_bytes());
+
+    // Exit code is parsed from the tail of the END marker
+    // (`__FLATLINE_END_{uuid}_{code}__`), same as before.
+    let exitCode = endPos.and_then(|pos| {
+        let afterPrefix = &buffer[pos + endPrefix.len()..];
+        let text = String::from_utf8_lossy(afterPrefix);
+        text.split("__").next()?.parse::<i32>().ok()
+    });
+
+    let Some(startPos) = startPos else {
+        // START marker never appeared — command likely failed before
+        // the printf ran (e.g., zsh parse error on history expansion).
+        // Fall back to ANSI-strip + line-filter since there's no
+        // well-defined command-output slice to feed the VT.
+        let text = String::from_utf8_lossy(buffer);
+        let cleaned: String = stripAnsi(&text)
+            .lines()
+            .filter(|l| !l.contains("__FLATLINE_") && !l.contains("__flatline_ec"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return ExtractedResult {
+            output: cleaned.trim().to_string(),
+            exitCode,
+        };
     };
 
-    let output = match afterStart.find(&endPrefix) {
-        Some(pos) => afterStart[..pos]
-            .trim_end_matches('\n')
-            .trim_end_matches('\r'),
+    // Command output begins after the START marker's newline.
+    let afterStart = startPos + startMarker.len();
+    let contentStart = match buffer[afterStart..].iter().position(|&b| b == b'\n') {
+        Some(nl) => afterStart + nl + 1,
         None => afterStart,
     };
 
-    // Strip ANSI escapes and filter out echoed sentinel machinery.
-    let cleaned: String = stripAnsi(output)
+    // Command output ends at the END marker, if present.
+    let contentEnd = endPos.filter(|&p| p >= contentStart).unwrap_or(buffer.len());
+
+    // Feed command output bytes through the VT emulator.
+    let rendered = renderCommandOutput(&buffer[contentStart..contentEnd]);
+
+    // Residual sentinel lines can still land in the grid if the END
+    // marker partially wrote before we clipped — filter them out.
+    let cleaned: String = rendered
         .lines()
-        .filter(|l| !l.contains("__flatline_ec"))
+        .filter(|l| !l.contains("__FLATLINE_") && !l.contains("__flatline_ec"))
         .collect::<Vec<_>>()
         .join("\n");
-
-    // Extract exit code from end marker.
-    let exitCode = text.rfind(&endPrefix).and_then(|endPos| {
-        let afterPrefix = &text[endPos + endPrefix.len()..];
-        afterPrefix.split("__").next()?.parse::<i32>().ok()
-    });
 
     ExtractedResult {
         output: cleaned,
@@ -680,51 +791,57 @@ fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
     }
 }
 
+/// Byte-level `rfind` for a needle in a haystack. Returns the byte
+/// offset of the last occurrence.
+fn rfindBytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let limit = haystack.len() - needle.len();
+    (0..=limit).rev().find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
 /// Strip ANSI escape sequences from text.
+///
+/// Iterates by Unicode scalar (not bytes) so multi-byte UTF-8
+/// characters like box-drawing glyphs survive intact. ANSI control
+/// sequences are all ASCII, so char-level scanning handles them
+/// correctly with no byte gymnastics.
 fn stripAnsi(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
+    let mut chars = input.chars();
 
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            match bytes[i + 1] {
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
                 // CSI sequence: ESC [ ... (letter or ~).
-                b'[' => {
-                    i += 2;
-                    while i < bytes.len() && !bytes[i].is_ascii_alphabetic() && bytes[i] != b'~' {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1;
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            break;
+                        }
                     }
                 }
                 // OSC sequence: ESC ] ... (BEL or ST).
-                b']' => {
-                    i += 2;
-                    while i < bytes.len() {
-                        if bytes[i] == 0x07 {
-                            i += 1;
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
                             break;
                         }
-                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                            i += 2;
+                        if c == '\x1b' {
+                            // ST terminator (ESC \) — consume the backslash.
+                            chars.next();
                             break;
                         }
-                        i += 1;
                     }
                 }
-                // Other escape: ESC + single char.
-                _ => {
-                    i += 2;
-                }
+                // Other escape: ESC + single char already consumed.
+                _ => {}
             }
-        } else if bytes[i] == b'\r' {
+        } else if c == '\r' {
             // Skip carriage returns (PTY uses \r\n).
-            i += 1;
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            result.push(c);
         }
     }
 

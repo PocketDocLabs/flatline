@@ -428,6 +428,7 @@ dependencies = [
 name = "construct"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "async-lsp",
  "backon",
@@ -614,12 +615,10 @@ dependencies = [
  "construct",
  "crossterm",
  "dirs",
- "image",
  "pulldown-cmark",
  "ratatui",
  "serde",
  "serde_json",
- "similar",
  "syntect",
  "tokio",
  "tracing",

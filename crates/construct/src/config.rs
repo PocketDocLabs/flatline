@@ -56,9 +56,22 @@ pub struct Config {
     #[serde(default, skip_serializing)]
     pub permissions: Option<Permissions>,
 
+    /// Budget and cost warning settings.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+
     /// Discovered project root (not serialized — derived at load time).
     #[serde(skip)]
     pub projectRoot: Option<PathBuf>,
+}
+
+/// Budget and cost warning settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetConfig {
+    /// Session cost warning threshold (USD). Emits a warning when exceeded.
+    #[serde(default)]
+    pub sessionLimit: Option<f64>,
 }
 
 /// Web tool settings (Exa API).
@@ -72,7 +85,7 @@ pub struct WebConfig {
 /// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// API provider. Currently only "openrouter".
+    /// API provider: "openrouter" or "fireworks".
     #[serde(default = "defaults::provider")]
     pub provider: String,
 
@@ -196,7 +209,7 @@ pub fn configDir() -> PathBuf {
 /// 2. User (`~/.config/flatline/config.toml`)
 /// 3. Project (`.flatline/config.toml`)
 /// 4. Local (`.flatline/config.local.toml`, gitignored)
-/// 5. Env vars (`OPENROUTER_API_KEY`, `EXA_API_KEY`)
+/// 5. Env vars (`OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
     let userDir = configDir();
     let userPath = userDir.join(CONFIG_FILE);
@@ -213,6 +226,7 @@ pub fn load() -> Result<Config> {
             web: WebConfig::default(),
             lsp: HashMap::new(),
             permissions: None,
+            budget: BudgetConfig::default(),
             projectRoot: None,
         };
         fs::create_dir_all(&userDir)
@@ -269,16 +283,9 @@ pub fn load() -> Result<Config> {
     }
 
     // Layer 5: env vars always win.
-    if let Ok(envKey) = std::env::var("OPENROUTER_API_KEY") {
-        if !envKey.is_empty() {
-            if config.main.key.is_empty() {
-                config.main.key = envKey.clone();
-            }
-            if config.utility.key.is_empty() {
-                config.utility.key = envKey;
-            }
-        }
-    }
+    // Apply provider-specific API key env vars.
+    applyEnvKey(&mut config.main);
+    applyEnvKey(&mut config.utility);
 
     if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
         if !exaKey.is_empty() {
@@ -287,6 +294,25 @@ pub fn load() -> Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Apply provider-specific env var to a model config if its key is empty.
+fn applyEnvKey(config: &mut ModelConfig) {
+    if !config.key.is_empty() {
+        return;
+    }
+
+    let envVar = match config.provider.as_str() {
+        "fireworks" => "FIREWORKS_API_KEY",
+        // Default to OpenRouter for backward compatibility.
+        _ => "OPENROUTER_API_KEY",
+    };
+
+    if let Ok(key) = std::env::var(envVar) {
+        if !key.is_empty() {
+            config.key = key;
+        }
+    }
 }
 
 // ── Project root discovery ──────────────────────────────────────────
@@ -344,6 +370,7 @@ struct PartialConfig {
     web: Option<PartialWebConfig>,
     lsp: Option<crate::lsp::LspConfig>,
     permissions: Option<Permissions>,
+    budget: Option<BudgetConfig>,
 }
 
 /// Partial model config — mirrors ModelConfig with all fields optional.
@@ -388,6 +415,7 @@ impl PartialConfig {
             lsp: mergeLsp(self.lsp, overlay.lsp),
             // Permissions use replace semantics — overlay wins entirely.
             permissions: overlay.permissions.or(self.permissions),
+            budget: overlay.budget.or(self.budget),
         }
     }
 
@@ -400,6 +428,7 @@ impl PartialConfig {
             web: resolveWeb(self.web),
             lsp: self.lsp.unwrap_or_default(),
             permissions: self.permissions,
+            budget: self.budget.unwrap_or_default(),
             projectRoot: None,
         }
     }

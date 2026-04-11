@@ -82,6 +82,8 @@ pub struct RunConfig {
     pub mcpConfigPath: Option<std::path::PathBuf>,
     pub strictMcp: bool,
     pub ephemeral: bool,
+    /// Maximum budget in USD (hard stop).
+    pub maxBudgetUsd: Option<f64>,
 }
 
 /// Outcome of a headless run.
@@ -146,6 +148,11 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
         &[DomainModule::Swe],
     )?;
 
+    // Apply hard budget limit.
+    if let Some(limit) = runConfig.maxBudgetUsd {
+        session.setMaxBudget(limit);
+    }
+
     // Apply tool restriction (--tools flag).
     if let Some(ref toolNames) = runConfig.tools {
         let allDefs = crate::tool::builtinDefs();
@@ -200,6 +207,11 @@ pub async fn runStreaming(
         InterfaceMode::Headless,
         &[DomainModule::Swe],
     )?;
+
+    // Apply hard budget limit.
+    if let Some(limit) = runConfig.maxBudgetUsd {
+        session.setMaxBudget(limit);
+    }
 
     match crate::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
         Ok(servers) if !servers.is_empty() => {

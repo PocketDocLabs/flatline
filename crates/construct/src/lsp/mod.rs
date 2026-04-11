@@ -27,8 +27,6 @@ pub use connection::ConnectionState;
 
 use config::{ResolvedServer, resolveServers};
 use connection::LspConnection;
-use servers::{languageIdForExtension, serversForExtension};
-
 /// Manages all active LSP connections and routes file events.
 pub struct LspManager {
     /// Active connections keyed by "serverId:projectRoot".

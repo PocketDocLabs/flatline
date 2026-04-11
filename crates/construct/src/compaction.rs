@@ -94,21 +94,48 @@ pub fn compactedBlockSizes(ops: &[CompactionOp]) -> HashMap<String, usize> {
     map
 }
 
+/// Collect block IDs that are superseded by S3/S4 compaction.
+///
+/// These blocks are replaced by a single summary in the live context
+/// and should not count toward zone budgets.
+pub fn supersededBlocks(ops: &[CompactionOp]) -> HashSet<String> {
+    let mut superseded = HashSet::new();
+    for op in ops {
+        match op {
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
+                for bid in sourceBlockIds {
+                    superseded.insert(bid.clone());
+                }
+            }
+            CompactionOp::FullCompact { sourceIds, .. } => {
+                for bid in sourceIds {
+                    superseded.insert(bid.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    superseded
+}
+
 /// Determine which block IDs fall in the oldest `fraction` of the
 /// effective context size.
 ///
 /// Walks the active branch turns, groups by block, and uses the compacted
 /// summary size for already-S2'd blocks (instead of the raw content size).
-/// This prevents the zone from being consumed by blocks that are already
-/// tiny in the actual context, letting it extend to reach uncompacted content.
+/// Blocks in `superseded` (covered by S3/S4) are skipped entirely — they
+/// don't exist as individual blocks in the live context and should not
+/// consume zone budget.
 ///
 /// Args:
 ///     activeTurns: Turns on the active branch (from `walkBranchTurns`).
 ///     compactedSizes: blockId → summary char count (from `compactedBlockSizes`).
+///     superseded: Block IDs replaced by S3/S4 (from `supersededBlocks`).
 ///     fraction: Zone fraction (0.60 for S2, 0.30 for S3).
 pub fn zoneBlocks(
     activeTurns: &[Turn],
     compactedSizes: &HashMap<String, usize>,
+    superseded: &HashSet<String>,
     fraction: f64,
 ) -> HashSet<String> {
     // Group turns by block and compute raw char size per block.
@@ -118,7 +145,7 @@ pub fn zoneBlocks(
 
     for turn in activeTurns {
         if turn.blockId != currentBlockId {
-            if !currentBlockId.is_empty() {
+            if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
                 let effective = compactedSizes
                     .get(&currentBlockId)
                     .copied()
@@ -131,7 +158,7 @@ pub fn zoneBlocks(
         currentRawSize += turn.content.len();
     }
     // Flush last block.
-    if !currentBlockId.is_empty() {
+    if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
         let effective = compactedSizes
             .get(&currentBlockId)
             .copied()

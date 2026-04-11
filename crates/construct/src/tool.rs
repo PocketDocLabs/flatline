@@ -1179,7 +1179,13 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
     }
 }
 
-/// Truncate shell output with a reference to readOutput for the rest.
+/// Truncate shell output into a head/middle/tail three-piece slice with
+/// a reference to readOutput for the rest.
+///
+/// Tail-weighted (20/10/70) because for shell output the **tail** is
+/// where the signal lives — exit codes, error summaries, final state.
+/// Head gives setup context; a middle sample helps the model tell
+/// whether something interesting sits in the elided range.
 fn truncateOutput(raw: &str, historyIndex: usize) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     let totalLines = lines.len();
@@ -1188,37 +1194,87 @@ fn truncateOutput(raw: &str, historyIndex: usize) -> String {
         return raw.to_string();
     }
 
-    let mut output = String::new();
-    let mut byteCount = 0usize;
-    let mut linesEmitted = 0usize;
+    const HEAD_RATIO: f64 = 0.20;
+    const MIDDLE_RATIO: f64 = 0.10;
+    // Tail takes the remainder (~0.70).
 
-    for line in &lines {
-        if linesEmitted >= MAX_READ_LINES {
-            break;
+    let headLineBudget = (MAX_READ_LINES as f64 * HEAD_RATIO) as usize;
+    let midLineBudget = (MAX_READ_LINES as f64 * MIDDLE_RATIO) as usize;
+    let tailLineBudget = MAX_READ_LINES - headLineBudget - midLineBudget;
+
+    let headByteBudget = (MAX_READ_BYTES as f64 * HEAD_RATIO) as usize;
+    let midByteBudget = (MAX_READ_BYTES as f64 * MIDDLE_RATIO) as usize;
+    let tailByteBudget = MAX_READ_BYTES - headByteBudget - midByteBudget;
+
+    // Emit lines in `start..end` until either budget is hit. Each line
+    // is clipped to MAX_LINE_LENGTH before being counted. Returns the
+    // emitted text and the index of the first line NOT emitted.
+    fn emitSlice(
+        lines: &[&str],
+        start: usize,
+        end: usize,
+        lineBudget: usize,
+        byteBudget: usize,
+    ) -> (String, usize) {
+        let mut out = String::new();
+        let mut emitted = 0usize;
+        let mut bytes = 0usize;
+        let mut idx = start;
+        while idx < end && emitted < lineBudget {
+            let line = lines[idx];
+            let display = if line.len() > MAX_LINE_LENGTH {
+                format!("{}...\n", &line[..MAX_LINE_LENGTH])
+            } else {
+                format!("{line}\n")
+            };
+            if bytes + display.len() > byteBudget {
+                break;
+            }
+            bytes += display.len();
+            out.push_str(&display);
+            emitted += 1;
+            idx += 1;
         }
-
-        let displayLine = if line.len() > MAX_LINE_LENGTH {
-            format!("{}...\n", &line[..MAX_LINE_LENGTH])
-        } else {
-            format!("{line}\n")
-        };
-
-        if byteCount + displayLine.len() > MAX_READ_BYTES {
-            break;
-        }
-
-        byteCount += displayLine.len();
-        output.push_str(&displayLine);
-        linesEmitted += 1;
+        (out, idx)
     }
 
-    let remaining = totalLines - linesEmitted;
-    output.push_str(&format!(
-        "\n... truncated ({remaining} more lines, {totalLines} total). \
-         Use readOutput(index: {historyIndex}) to access full output."
-    ));
+    // Head: first N lines.
+    let (head, headEnd) = emitSlice(&lines, 0, totalLines, headLineBudget, headByteBudget);
 
-    output
+    // Middle: window centered on the midpoint of the full output. Clamp
+    // the start past headEnd so the sections never overlap.
+    let midCenter = totalLines / 2;
+    let midStart = midCenter.saturating_sub(midLineBudget / 2).max(headEnd);
+    let (middle, midEnd) = emitSlice(
+        &lines, midStart, totalLines, midLineBudget, midByteBudget,
+    );
+
+    // Tail: last N lines. Clamp past midEnd so they can't overlap.
+    let tailStart = totalLines.saturating_sub(tailLineBudget).max(midEnd);
+    let (tail, _tailEnd) = emitSlice(
+        &lines, tailStart, totalLines, tailLineBudget, tailByteBudget,
+    );
+
+    let headElided = midStart.saturating_sub(headEnd);
+    let midElided = tailStart.saturating_sub(midEnd);
+
+    let headMarker = if headElided > 0 {
+        format!("\n... [{headElided} lines elided] ...\n\n")
+    } else {
+        String::new()
+    };
+    let midMarker = if midElided > 0 {
+        format!("\n... [{midElided} lines elided] ...\n\n")
+    } else {
+        String::new()
+    };
+
+    let hint = format!(
+        "\n[truncated \u{2014} {totalLines} total lines; \
+         use readOutput(index: {historyIndex}) for full output]"
+    );
+
+    format!("{head}{headMarker}{middle}{midMarker}{tail}{hint}")
 }
 
 fn executeReadFile(

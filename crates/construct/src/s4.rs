@@ -27,6 +27,8 @@ pub struct S4Result {
     pub didWork: bool,
     pub summary: String,
     pub sourceBlockIds: Vec<String>,
+    /// USD cost of the utility model call (None if not reported).
+    pub cost: Option<f64>,
 }
 
 /// Merge S3 topic summaries and existing S4 briefings into a single
@@ -95,6 +97,7 @@ pub async fn run(
             didWork: false,
             summary: String::new(),
             sourceBlockIds: Vec::new(),
+            cost: None,
         });
     }
 
@@ -123,15 +126,17 @@ pub async fn run(
         },
     ];
 
-    let response = client
+    let (response, usage) = client
         .complete(&messages, Some(utilityModel))
         .await
         .context("S4 utility model call failed")?;
 
+    let cost = usage.and_then(|u| u.cost);
     let summary = extractCompactedString(&response);
 
     tracing::info!(
         outputChars = summary.len(),
+        cost = ?cost,
         "S4: briefing produced"
     );
 
@@ -139,6 +144,7 @@ pub async fn run(
         didWork: true,
         summary,
         sourceBlockIds: allSourceBlockIds,
+        cost,
     })
 }
 

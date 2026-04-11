@@ -10,8 +10,8 @@
 //!
 //! # Public API
 //! - [`reconstruct`] — rebuild history from transcript + compaction log
-//! - [`calculateZones`] — determine S2/S3 zone boundaries
-//! - [`buildState`] / [`formatState`] — `/context` display
+//! - [`calculateZones`] — determine S2/S3 zone boundaries for compaction
+//! - [`buildState`] — `/context` geological layer data (rendered by deck)
 //!
 //! # Dependencies
 //! `crate::compaction`, `crate::transcript`, `crate::message`
@@ -527,421 +527,277 @@ fn messageCharCount(msg: &Message) -> usize {
 // /context display
 // ---------------------------------------------------------------------------
 
-/// Topic info for display.
-pub struct TopicDisplay {
-    pub label: String,
-    pub blockCount: usize,
-    pub isCurrent: bool,
-}
-
-/// Per-zone stats for display.
-pub struct ZoneInfo {
-    pub originalTurns: usize,
-    pub resultTurns: usize,
-    pub estimatedTokens: usize,
-}
-
 /// Input parameters for building context state.
 pub struct BuildStateInput<'a> {
-    pub history: &'a [Message],
     pub contextWindow: usize,
-    pub compactRatio: f64,
     pub compactionLog: &'a CompactionLog,
     pub reportedTokens: usize,
-    pub s1Exhausted: bool,
-    pub s2Exhausted: bool,
-    pub s3Exhausted: bool,
-    pub s4Exhausted: bool,
-    pub topics: &'a [crate::topic::TopicInfo],
-    pub currentTopicId: &'a str,
     pub transcript: &'a Transcript,
     pub headTurnId: &'a str,
 }
 
+/// S4 briefing layer — the deepest compression.
+#[derive(Debug, Clone)]
+pub struct S4Layer {
+    /// How many topics were merged into the briefing.
+    pub topicsMerged: usize,
+    /// How many prior S4 briefings were superseded.
+    pub priorBriefings: usize,
+    /// Total turns covered by this briefing.
+    pub turnsCovered: usize,
+    pub estimatedTokens: usize,
+}
+
+/// S3 topic summary layer.
+#[derive(Debug, Clone)]
+pub struct S3Layer {
+    /// Labels of topics currently held as summaries.
+    pub topicLabels: Vec<String>,
+    /// Total turns condensed into these topic summaries.
+    pub turnsCondensed: usize,
+    pub estimatedTokens: usize,
+}
+
+/// S2 per-turn summary layer.
+#[derive(Debug, Clone)]
+pub struct S2Layer {
+    /// Total turns condensed into summaries.
+    pub turnsCondensed: usize,
+    pub estimatedTokens: usize,
+}
+
+/// Raw (uncompressed) layer.
+#[derive(Debug, Clone)]
+pub struct RawLayer {
+    pub turns: usize,
+    pub estimatedTokens: usize,
+}
+
 /// Full context state for /context display.
+#[derive(Debug, Clone)]
 pub struct ContextState {
     pub estimatedTokens: usize,
     pub reportedTokens: usize,
     pub contextWindow: usize,
-    pub compactLimit: usize,
-    pub s1s2Threshold: usize,
-    pub s3Threshold: usize,
-    pub s4Threshold: usize,
-    pub messageCount: usize,
-    // S1 ops.
-    pub dedupOps: usize,
-    pub middleOutOps: usize,
-    // S2/S3/S4 compression ratios.
-    pub s2TurnsIn: usize,
-    pub s2SummariesOut: usize,
-    pub s3BlocksIn: usize,
-    pub s3SummariesOut: usize,
-    pub s4SourcesIn: usize,
-    pub s4BriefingsOut: usize,
-    // Stage exhaustion.
-    pub s1Exhausted: bool,
-    pub s2Exhausted: bool,
-    pub s3Exhausted: bool,
-    pub s4Exhausted: bool,
-    // Zones.
-    pub s3Zone: ZoneInfo,
-    pub s2Zone: ZoneInfo,
-    pub rawZone: ZoneInfo,
-    // Topics.
-    pub topics: Vec<TopicDisplay>,
+    // Layers — only present if that stage has fired.
+    pub s4: Option<S4Layer>,
+    pub s3: Option<S3Layer>,
+    pub s2: Option<S2Layer>,
+    pub raw: RawLayer,
 }
 
-/// Character count for a transformed turn.
-fn transformedTurnCharCount(tt: &TransformedTurn) -> usize {
-    match tt {
-        TransformedTurn::Original(turn) => turn.content.len(),
-        TransformedTurn::Replaced { newContent, .. } => newContent.len(),
-        TransformedTurn::Summary { content, .. } => content.len(),
-    }
-}
-
-/// Compute zone stats from transcript + compaction log.
+/// Build context state for /context display.
 ///
-/// Walks the active turn chain, applies compaction ops, then divides
-/// the result into S3/S2/Raw zones (30/30/40 by char count). For each
-/// zone, counts original turns (from transcript) and result turns
-/// (from the transformed stream).
-fn computeZoneStats(
-    transcript: &Transcript,
-    compactionLog: &CompactionLog,
-    headTurnId: &str,
-) -> (ZoneInfo, ZoneInfo, ZoneInfo) {
-    let empty = || ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 };
-
-    let allTurns = match transcript.loadAll() {
-        Ok(t) => t,
-        Err(_) => return (empty(), empty(), empty()),
-    };
-    let chain = walkChain(&allTurns, headTurnId);
-    if chain.is_empty() {
-        return (empty(), empty(), empty());
-    }
-
-    let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
-    let allOps = compactionLog.loadAll().unwrap_or_default();
-    let ops = filterOpsForChain(allOps, &activeBlockIds);
-    let transformed = applyOps(&chain, &ops);
-
-    // Count original turns per block.
-    let mut turnsPerBlock: HashMap<&str, usize> = HashMap::new();
-    for turn in &chain {
-        *turnsPerBlock.entry(turn.blockId.as_str()).or_default() += 1;
-    }
-
-    let charCounts: Vec<usize> = transformed.iter().map(transformedTurnCharCount).collect();
-    let totalChars: usize = charCounts.iter().sum();
-    if totalChars == 0 {
-        return (empty(), empty(), empty());
-    }
-
-    let s3Boundary = totalChars * 30 / 100;
-    let s2Boundary = totalChars * 60 / 100;
-
-    let mut s3 = empty();
-    let mut s2 = empty();
-    let mut raw = empty();
-    let mut countedBlocks: HashSet<String> = HashSet::new();
-    let mut cumulative: usize = 0;
-
-    for (i, tt) in transformed.iter().enumerate() {
-        cumulative += charCounts[i];
-
-        // Collect block IDs covered by this turn.
-        let blockIds: Vec<&str> = match tt {
-            TransformedTurn::Summary { sourceBlockIds, .. } => {
-                sourceBlockIds.iter().map(|s| s.as_str()).collect()
-            }
-            _ => vec![tt.blockId()],
-        };
-
-        // Count original turns for blocks we haven't seen yet.
-        let origCount: usize = blockIds
-            .into_iter()
-            .filter(|bid| countedBlocks.insert(bid.to_string()))
-            .map(|bid| turnsPerBlock.get(bid).copied().unwrap_or(0))
-            .sum();
-
-        let zone = if cumulative <= s3Boundary {
-            &mut s3
-        } else if cumulative <= s2Boundary {
-            &mut s2
-        } else {
-            &mut raw
-        };
-
-        zone.originalTurns += origCount;
-        zone.resultTurns += 1;
-        zone.estimatedTokens += charCounts[i] / 4;
-    }
-
-    (s3, s2, raw)
-}
-
-/// Build context state for display.
+/// Walks the compaction log to determine what lives in each layer,
+/// then estimates token counts from the transformed turn stream.
 pub fn buildState(input: &BuildStateInput) -> ContextState {
     let ops = input.compactionLog.loadAll().unwrap_or_default();
 
-    // Count per-stage ops.
-    let mut dedupOps = 0usize;
-    let mut middleOutOps = 0usize;
-    let mut s2TurnsIn = 0usize;
-    let mut s2SummariesOut = 0usize;
-    let mut s3BlocksIn = 0usize;
-    let mut s3SummariesOut = 0usize;
-    let mut s4SourcesIn = 0usize;
-    let mut s4BriefingsOut = 0usize;
+    if input.headTurnId.is_empty() {
+        return ContextState {
+            estimatedTokens: 0,
+            reportedTokens: input.reportedTokens,
+            contextWindow: input.contextWindow,
+            s4: None,
+            s3: None,
+            s2: None,
+            raw: RawLayer { turns: 0, estimatedTokens: 0 },
+        };
+    }
 
-    for op in &ops {
+    let allTurns = match input.transcript.loadAll() {
+        Ok(t) => t,
+        Err(_) => {
+            return ContextState {
+                estimatedTokens: 0,
+                reportedTokens: input.reportedTokens,
+                contextWindow: input.contextWindow,
+                s4: None,
+                s3: None,
+                s2: None,
+                raw: RawLayer { turns: 0, estimatedTokens: 0 },
+            };
+        }
+    };
+
+    let chain = walkChain(&allTurns, input.headTurnId);
+    let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
+    let filteredOps = filterOpsForChain(ops, &activeBlockIds);
+    let transformed = applyOps(&chain, &filteredOps);
+
+    // Count unique blocks in the chain (each block = one user-visible turn).
+    let allBlockIds: Vec<&str> = {
+        let mut seen = HashSet::new();
+        chain.iter()
+            .filter(|t| seen.insert(t.blockId.as_str()))
+            .map(|t| t.blockId.as_str())
+            .collect()
+    };
+
+    // Track which blocks are covered by each compaction stage.
+    let mut s4Blocks: HashSet<&str> = HashSet::new();
+    let mut s3Blocks: HashSet<&str> = HashSet::new();
+    let mut s2Blocks: HashSet<&str> = HashSet::new();
+
+    // NOTE: FullCompact supersedes earlier TopicCompact ops for the same blocks.
+    // We count topics that were folded into S4 by tracking TopicCompact labels
+    // whose source blocks are now covered by a FullCompact.
+    let mut s4CoveredTopicLabels: HashSet<String> = HashSet::new();
+
+    // S3: active topic labels (not superseded by S4).
+    let mut s3TopicLabels: Vec<String> = Vec::new();
+
+    // First pass: identify S4 coverage.
+    let mut fullCompactCount = 0usize;
+    for op in &filteredOps {
+        if let CompactionOp::FullCompact { sourceIds, .. } = op {
+            fullCompactCount += 1;
+            for id in sourceIds {
+                s4Blocks.insert(id.as_str());
+            }
+        }
+    }
+    // Prior briefings = total S4 ops minus the current active one.
+    let s4PriorBriefings = fullCompactCount.saturating_sub(1);
+
+    // Second pass: classify S3 and S2, count S4 topics.
+    for op in &filteredOps {
         match op {
-            CompactionOp::FileDedup { targetIds, .. } => {
-                dedupOps += targetIds.len();
+            CompactionOp::TopicCompact { sourceBlockIds, topicLabel, .. } => {
+                let coveredByS4 = sourceBlockIds.iter()
+                    .all(|id| s4Blocks.contains(id.as_str()));
+                if coveredByS4 {
+                    s4CoveredTopicLabels.insert(topicLabel.clone());
+                } else {
+                    s3TopicLabels.push(topicLabel.clone());
+                    for id in sourceBlockIds {
+                        s3Blocks.insert(id.as_str());
+                    }
+                }
             }
-            CompactionOp::MiddleOut { targetIds, .. } => {
-                middleOutOps += targetIds.len();
+            CompactionOp::BlockCompact { blockId, .. } => {
+                // Only count if not already covered by S3 or S4.
+                if !s4Blocks.contains(blockId.as_str())
+                    && !s3Blocks.contains(blockId.as_str())
+                {
+                    s2Blocks.insert(blockId.as_str());
+                }
             }
-            CompactionOp::BlockCompact { sourceIds, .. } => {
-                s2TurnsIn += sourceIds.len();
-                s2SummariesOut += 1;
-            }
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                s3BlocksIn += sourceBlockIds.len();
-                s3SummariesOut += 1;
-            }
-            CompactionOp::FullCompact { sourceIds, .. } => {
-                s4SourcesIn += sourceIds.len();
-                s4BriefingsOut += 1;
+            _ => {}
+        }
+    }
+
+    let s4TopicsMerged = s4CoveredTopicLabels.len();
+
+    // Count turns (blocks) per layer.
+    let s4TurnCount = allBlockIds.iter()
+        .filter(|bid| s4Blocks.contains(**bid))
+        .count();
+    let s3TurnCount = allBlockIds.iter()
+        .filter(|bid| s3Blocks.contains(**bid))
+        .count();
+    let s2TurnCount = allBlockIds.iter()
+        .filter(|bid| s2Blocks.contains(**bid))
+        .count();
+    let rawTurnCount = allBlockIds.iter()
+        .filter(|bid| {
+            !s4Blocks.contains(**bid)
+                && !s3Blocks.contains(**bid)
+                && !s2Blocks.contains(**bid)
+        })
+        .count();
+
+    // Estimate tokens per layer from the transformed stream.
+    let mut s4Tokens = 0usize;
+    let mut s3Tokens = 0usize;
+    let mut s2Tokens = 0usize;
+    let mut rawTokens = 0usize;
+
+    for tt in &transformed {
+        let chars = match tt {
+            TransformedTurn::Original(turn) => turn.content.len(),
+            TransformedTurn::Replaced { newContent, .. } => newContent.len(),
+            TransformedTurn::Summary { content, .. } => content.len(),
+        };
+        let tokens = chars / 4;
+
+        match tt {
+            TransformedTurn::Summary { kind, .. } => match kind {
+                SummaryKind::Full => s4Tokens += tokens,
+                SummaryKind::Topic => s3Tokens += tokens,
+                SummaryKind::Block => s2Tokens += tokens,
+            },
+            TransformedTurn::Original(turn) | TransformedTurn::Replaced { turn, .. } => {
+                let bid = turn.blockId.as_str();
+                if s4Blocks.contains(bid) {
+                    s4Tokens += tokens;
+                } else if s3Blocks.contains(bid) {
+                    s3Tokens += tokens;
+                } else if s2Blocks.contains(bid) {
+                    s2Tokens += tokens;
+                } else {
+                    rawTokens += tokens;
+                }
             }
         }
     }
 
-    // Rough token estimate from history char count.
-    let totalChars: usize = input.history.iter().map(|m| messageCharCount(m)).sum();
-    let estimatedTokens = totalChars / 4;
-
-    let compactLimit = (input.contextWindow as f64 * input.compactRatio) as usize;
-    let s1s2Threshold = compactLimit * 80 / 100;
-    let s3Threshold = compactLimit * 90 / 100;
-
-    // Zones.
-    let (s3Zone, s2Zone, rawZone) = if !input.headTurnId.is_empty() {
-        computeZoneStats(input.transcript, input.compactionLog, input.headTurnId)
+    // Build layers — only present if that stage has produced output.
+    let s4 = if fullCompactCount > 0 {
+        Some(S4Layer {
+            topicsMerged: s4TopicsMerged,
+            priorBriefings: s4PriorBriefings,
+            turnsCovered: s4TurnCount,
+            estimatedTokens: s4Tokens,
+        })
     } else {
-        let empty = ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 };
-        (empty, ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 },
-         ZoneInfo { originalTurns: 0, resultTurns: 0, estimatedTokens: 0 })
+        None
     };
 
-    // Topics.
-    let topics: Vec<TopicDisplay> = input.topics.iter().map(|t| TopicDisplay {
-        label: t.label.clone(),
-        blockCount: t.blockCount,
-        isCurrent: t.topicId == input.currentTopicId,
-    }).collect();
+    let s3 = if !s3TopicLabels.is_empty() {
+        Some(S3Layer {
+            topicLabels: s3TopicLabels,
+            turnsCondensed: s3TurnCount,
+            estimatedTokens: s3Tokens,
+        })
+    } else {
+        None
+    };
+
+    let s2 = if !s2Blocks.is_empty() {
+        Some(S2Layer {
+            turnsCondensed: s2TurnCount,
+            estimatedTokens: s2Tokens,
+        })
+    } else {
+        None
+    };
+
+    let raw = RawLayer {
+        turns: rawTurnCount,
+        estimatedTokens: rawTokens,
+    };
+
+    // Use sum of layer estimates as the total — more accurate than
+    // history char count because it reflects the actual compacted content.
+    let layerTotal = s4.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
+        + s3.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
+        + s2.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
+        + raw.estimatedTokens;
 
     ContextState {
-        estimatedTokens,
+        estimatedTokens: layerTotal,
         reportedTokens: input.reportedTokens,
         contextWindow: input.contextWindow,
-        compactLimit,
-        s1s2Threshold,
-        s3Threshold,
-        s4Threshold: compactLimit,
-        messageCount: input.history.len(),
-        dedupOps,
-        middleOutOps,
-        s2TurnsIn,
-        s2SummariesOut,
-        s3BlocksIn,
-        s3SummariesOut,
-        s4SourcesIn,
-        s4BriefingsOut,
-        s1Exhausted: input.s1Exhausted,
-        s2Exhausted: input.s2Exhausted,
-        s3Exhausted: input.s3Exhausted,
-        s4Exhausted: input.s4Exhausted,
-        s3Zone,
-        s2Zone,
-        rawZone,
-        topics,
+        s4,
+        s3,
+        s2,
+        raw,
     }
-}
-
-/// Format context state for display.
-///
-/// All lines target max ~38 chars to avoid word-wrap
-/// in narrow agent panels.
-pub fn formatState(state: &ContextState) -> String {
-    // Use reported tokens if available, otherwise estimated.
-    let tokens = if state.reportedTokens > 0 {
-        state.reportedTokens
-    } else {
-        state.estimatedTokens
-    };
-    let prefix = if state.reportedTokens > 0 { "" } else { "~" };
-
-    let usagePercent = if state.contextWindow > 0 {
-        (tokens as f64 / state.contextWindow as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let mut out = String::new();
-
-    // Header.
-    out.push_str(&format!(
-        "{}{} / {} tokens ({:.1}%)\n",
-        prefix,
-        formatTokenCount(tokens),
-        formatTokenCount(state.contextWindow),
-        usagePercent,
-    ));
-    out.push_str(&format!(
-        "S1/S2: {}  S3: {}  S4: {}\n",
-        formatTokenCount(state.s1s2Threshold),
-        formatTokenCount(state.s3Threshold),
-        formatTokenCount(state.s4Threshold),
-    ));
-
-    // Layers — status on first line, detail on second.
-    out.push('\n');
-    formatLayerInto(&mut out, "S1 Mechanical", state.s1Exhausted,
-        state.s1s2Threshold, tokens,
-        &formatS1Detail(state.dedupOps, state.middleOutOps));
-    formatLayerInto(&mut out, "S2 Block LLM", state.s2Exhausted,
-        state.s1s2Threshold, tokens,
-        &formatCompressDetail(state.s2TurnsIn, state.s2SummariesOut, "sum"));
-    formatLayerInto(&mut out, "S3 Topic LLM", state.s3Exhausted,
-        state.s3Threshold, tokens,
-        &formatCompressDetail(state.s3BlocksIn, state.s3SummariesOut, "sum"));
-    formatLayerInto(&mut out, "S4 Full merge", state.s4Exhausted,
-        state.s4Threshold, tokens,
-        &formatCompressDetail(state.s4SourcesIn, state.s4BriefingsOut, "sum"));
-
-    // Zones.
-    out.push('\n');
-    let s3 = &state.s3Zone;
-    let s2 = &state.s2Zone;
-    let raw = &state.rawZone;
-
-    if s3.resultTurns > 0 {
-        if s3.originalTurns != s3.resultTurns {
-            out.push_str(&format!(
-                "S3  {} \u{2192} {}  ~{} tok\n",
-                s3.originalTurns, s3.resultTurns,
-                formatTokenCount(s3.estimatedTokens),
-            ));
-        } else {
-            out.push_str(&format!(
-                "S3  {} msgs  ~{} tok\n",
-                s3.resultTurns,
-                formatTokenCount(s3.estimatedTokens),
-            ));
-        }
-    }
-
-    if s2.resultTurns > 0 {
-        if s2.originalTurns != s2.resultTurns {
-            out.push_str(&format!(
-                "S2  {} \u{2192} {}  ~{} tok\n",
-                s2.originalTurns, s2.resultTurns,
-                formatTokenCount(s2.estimatedTokens),
-            ));
-        } else {
-            out.push_str(&format!(
-                "S2  {} msgs  ~{} tok\n",
-                s2.resultTurns,
-                formatTokenCount(s2.estimatedTokens),
-            ));
-        }
-    }
-
-    if raw.resultTurns > 0 {
-        out.push_str(&format!(
-            "Raw {} msgs  ~{} tok\n",
-            raw.resultTurns,
-            formatTokenCount(raw.estimatedTokens),
-        ));
-    }
-
-    // Topics.
-    if !state.topics.is_empty() {
-        out.push_str(&format!(
-            "\nTopics ({})\n", state.topics.len(),
-        ));
-        for topic in &state.topics {
-            let marker = if topic.isCurrent {
-                " \u{2190}"
-            } else {
-                ""
-            };
-            // Truncate long labels to fit panel.
-            let label = truncateLabel(&topic.label, 24);
-            out.push_str(&format!(
-                "  {label}{marker}  {} blk\n",
-                topic.blockCount,
-            ));
-        }
-    }
-
-    out.trim_end().to_string()
-}
-
-/// Append a layer block (status line + optional detail line).
-fn formatLayerInto(
-    out: &mut String,
-    name: &str,
-    exhausted: bool,
-    threshold: usize,
-    currentTokens: usize,
-    detail: &str,
-) {
-    let (symbol, status) = if exhausted {
-        ("\u{2713}\u{FE0E}", "exhausted")
-    } else if currentTokens >= threshold {
-        ("\u{25C6}", "armed")
-    } else {
-        ("\u{25CB}", "idle")
-    };
-    out.push_str(&format!("{name}  {symbol} {status}\n"));
-    if detail != "\u{2014}" {
-        out.push_str(&format!("  {detail}\n"));
-    }
-}
-
-/// Format S1 detail string.
-fn formatS1Detail(dedups: usize, truncations: usize) -> String {
-    if dedups == 0 && truncations == 0 {
-        return "\u{2014}".to_string();
-    }
-    let mut parts = Vec::new();
-    if dedups > 0 {
-        parts.push(format!("{dedups} dedup"));
-    }
-    if truncations > 0 {
-        parts.push(format!("{truncations} trunc"));
-    }
-    parts.join(" \u{00B7} ")
-}
-
-/// Format S2/S3/S4 compression detail.
-fn formatCompressDetail(
-    inputCount: usize,
-    outputCount: usize,
-    outputLabel: &str,
-) -> String {
-    if outputCount == 0 {
-        return "\u{2014}".to_string();
-    }
-    format!("{inputCount} \u{2192} {outputCount} {outputLabel}")
 }
 
 /// Format a token count with K/M suffixes.
-fn formatTokenCount(count: usize) -> String {
+pub fn formatTokenCount(count: usize) -> String {
     if count >= 1_000_000 {
         format!("{:.1}M", count as f64 / 1_000_000.0)
     } else if count >= 10_000 {
@@ -950,16 +806,6 @@ fn formatTokenCount(count: usize) -> String {
         format!("{:.1}k", count as f64 / 1_000.0)
     } else {
         format!("{count}")
-    }
-}
-
-/// Truncate a label to fit within `maxLen` chars.
-fn truncateLabel(label: &str, maxLen: usize) -> String {
-    if label.len() <= maxLen {
-        label.to_string()
-    } else {
-        let truncated = &label[..label.floor_char_boundary(maxLen - 1)];
-        format!("{truncated}\u{2026}")
     }
 }
 
@@ -1098,7 +944,7 @@ mod tests {
         /// Mirrors session.rs:1182-1187 — content recorded before tool calls.
         fn assistant(&mut self, content: &str, reasoning: Option<&str>) {
             let id = self.transcript
-                .recordAssistant(content, reasoning)
+                .recordAssistant(content, reasoning, None)
                 .unwrap();
             self.headTurnId = Some(id);
         }

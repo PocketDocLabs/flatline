@@ -387,7 +387,7 @@ async fn maybeSummarize(
         .complete(&messages, Some(&config.utility.model))
         .await
     {
-        Ok(summary) => summary,
+        Ok((summary, _usage)) => summary,
         Err(e) => {
             tracing::warn!("Sidecar summarization failed: {e}");
             format!("{content}\n\n(Summarization failed: {e})")

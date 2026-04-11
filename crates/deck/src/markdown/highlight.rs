@@ -260,7 +260,6 @@ pub fn renderCodeBlock(
         }
 
         // Right border.
-        let rightStart = buf.len();
         buf.push_str(rightChar);
 
         // Padding + right border share the right style.

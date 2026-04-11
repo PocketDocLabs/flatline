@@ -145,6 +145,9 @@ pub async fn run() -> Result<()> {
 
     let config = construct::config::load()?;
     let contextWindow = config.main.contextWindow;
+    let rollingBaseline = construct::cost::rollingWindowCost(
+        config.projectRoot.as_deref().and_then(|p| p.to_str()),
+    );
 
     let mut agentPanel = AgentPanel::new();
     let mut focus = Focus::Terminal;
@@ -423,6 +426,17 @@ pub async fn run() -> Result<()> {
                                 .send(SessionEvent::CommandResult(result))
                                 .await;
                         }
+                        Some(CommandAction::ShowContext) => {
+                            let state = session.buildContextState();
+                            let _ = eventTx
+                                .send(SessionEvent::ContextDisplay(state))
+                                .await;
+                        }
+                        Some(CommandAction::Shutdown) => {
+                            session.shutdownLsp().await;
+                            session.shutdownMcp().await;
+                            break;
+                        }
                         Some(action) => {
                             let result = session.executeCommand(&action).await;
                             let _ = eventTx
@@ -451,8 +465,12 @@ pub async fn run() -> Result<()> {
         &cancelTx,
         &steerTx,
         contextWindow,
+        rollingBaseline,
     )
     .await;
+
+    // Gracefully shut down background services before exiting.
+    let _ = commandTx.send(CommandAction::Shutdown).await;
 
     disable_raw_mode()?;
     execute!(
@@ -485,8 +503,11 @@ async fn runLoop(
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
     contextWindow: usize,
+    rollingBaseline: f64,
 ) -> Result<()> {
     let mut tokenCount: usize = 0;
+    let mut sessionCost: f64 = 0.0;
+    let mut rollingCost: f64 = rollingBaseline;
     let mut sessionPicker: Option<SessionPicker> = None;
     let mut rewindPicker: Option<RewindPicker> = None;
     let mut forkPicker: Option<ForkPicker> = None;
@@ -502,19 +523,23 @@ async fn runLoop(
         .unwrap_or_default();
     let mut needsRedraw = true;
     let mut lastQuitPress: Option<Instant> = None;
+    // Cap draws at ~30fps. Prevents strobing when the PTY floods us with
+    // updates (rich progress bars, keystroke echo) — ratatui's buffer diff
+    // absorbs all the intermediate state into one frame.
+    const DRAW_MIN_INTERVAL: Duration = Duration::from_millis(33);
+    let mut lastDraw = Instant::now() - DRAW_MIN_INTERVAL;
 
     loop {
-        // Full screen clear when terminal content changed — resets ratatui's
-        // diff state so cursor-drift from the terminal flush can't persist
-        // into the border or agent panel.
+        // Mark the frame dirty when the VT emulator has new content. Ratatui's
+        // buffer diff handles the update — no full clear needed.
         if termState.takeDirty() {
-            terminal.clear()?;
             needsRedraw = true;
         }
 
-        // Draw only when state has changed.
-        if needsRedraw {
+        // Draw only when state has changed and the throttle allows it.
+        if needsRedraw && lastDraw.elapsed() >= DRAW_MIN_INTERVAL {
         needsRedraw = false;
+        lastDraw = Instant::now();
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -696,10 +721,18 @@ async fn runLoop(
 
             let leftText = format!(" [{modeStr}]  {controls}");
             let tokenStr = formatTokens(tokenCount, contextWindow);
+            let costStr = formatCostPair(sessionCost, rollingCost);
+            let rightStr = if costStr.is_empty() {
+                tokenStr
+            } else if tokenStr.is_empty() {
+                costStr
+            } else {
+                format!("{costStr}  \u{2502}  {tokenStr}")
+            };
             let barWidth = vChunks[1].width as usize;
-            // Pad between left and right-justified token string.
-            let gap = barWidth.saturating_sub(leftText.len() + tokenStr.len() + 1);
-            let statusLine = format!("{leftText}{:>width$} ", tokenStr, width = gap + tokenStr.len());
+            // Pad between left and right-justified status string.
+            let gap = barWidth.saturating_sub(leftText.len() + rightStr.len() + 1);
+            let statusLine = format!("{leftText}{:>width$} ", rightStr, width = gap + rightStr.len());
             let statusBar = Paragraph::new(statusLine)
                 .style(Style::default().bg(barBg).fg(barFg));
             frame.render_widget(statusBar, vChunks[1]);
@@ -800,15 +833,30 @@ async fn runLoop(
                 }
                 SessionEvent::TokenUpdate {
                     contextTokens,
+                    sessionCost: sc,
                     ..
                 } => {
                     tokenCount = contextTokens;
+                    let delta = sc - sessionCost;
+                    sessionCost = sc;
+                    rollingCost += delta;
                 }
                 SessionEvent::Retrying { attempt, maxAttempts } => {
                     agentPanel.showRetrying(attempt, maxAttempts);
                 }
                 SessionEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
+                }
+                SessionEvent::BudgetWarning { sessionCost: sc, limit } => {
+                    let msg = format!(
+                        "\u{26A0}\u{FE0E} Session cost ({}) exceeded limit ({})",
+                        construct::cost::formatCost(sc),
+                        construct::cost::formatCost(limit),
+                    );
+                    agentPanel.pushCommandResult(&msg);
+                }
+                SessionEvent::ContextDisplay(state) => {
+                    agentPanel.pushContextDisplay(state);
                 }
                 SessionEvent::CommandResult(text) => {
                     if forkPicker.is_some() {
@@ -1191,7 +1239,7 @@ async fn handleInput(
                             // Open subagent panel if a subagent is active.
                             if let Some(ref sub) = agentPanel.activeSubagent {
                                 let mut panel = crate::subagent_panel::SubagentPanel::new(
-                                    &sub.agentType, &sub.sessionId,
+                                    &sub.agentType,
                                 );
                                 panel.transcript = sub.transcript.clone();
                                 panel.shellScrollback = sub.shellScrollback.clone();
@@ -1357,6 +1405,7 @@ async fn handleInput(
                             }
                         }
 
+                        let mut navigatingHistory = false;
                         if !completionHandled {
                             // Handle attachment-related keys before borrowing textArea.
                             if ctrl && key.code == KeyCode::Char('d') && agentPanel.attachmentCount() > 0 {
@@ -1386,7 +1435,7 @@ async fn handleInput(
 
                             // Pop queued message on Up before borrowing textArea.
                             if key.code == KeyCode::Up
-                                && (agentPanel.textArea.isEmpty() || agentPanel.textArea.lineCount() == 1)
+                                && agentPanel.textArea.isAtFirstLine()
                                 && agentPanel.isActive()
                                 && agentPanel.queuedCount() > 0
                             {
@@ -1463,7 +1512,8 @@ async fn handleInput(
                                 KeyCode::Home => ta.moveHome(),
                                 KeyCode::End => ta.moveEnd(),
                                 KeyCode::Up => {
-                                    if ta.isEmpty() || ta.lineCount() == 1 {
+                                    if ta.isAtFirstLine() {
+                                        navigatingHistory = true;
                                         let currentText = ta.text().to_string();
                                         if let Some(entry) =
                                             agentPanel.history.navigateUp(&currentText)
@@ -1476,7 +1526,8 @@ async fn handleInput(
                                     }
                                 }
                                 KeyCode::Down => {
-                                    if ta.isEmpty() || ta.lineCount() == 1 {
+                                    if ta.isAtLastLine() {
+                                        navigatingHistory = true;
                                         if let Some(entry) = agentPanel.history.navigateDown() {
                                             let entry = entry.to_string();
                                             ta.setText(&entry);
@@ -1489,6 +1540,11 @@ async fn handleInput(
                                 KeyCode::PageDown => agentPanel.scrollDown(10),
                                 _ => {}
                             }
+                        }
+
+                        // Reset history navigation on any non-navigation key.
+                        if !navigatingHistory {
+                            agentPanel.history.resetCursor();
                         }
 
                         // Update completion after every keystroke.
@@ -1556,7 +1612,7 @@ fn handleMouse(
     agentPanel: &mut AgentPanel,
     termState: &mut TerminalState,
     selState: &mut SelectionState,
-    shellIo: &ShellIo,
+    _shellIo: &ShellIo,
     scrollLock: &mut ScrollAxisLock,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
 ) -> bool {
@@ -1639,7 +1695,7 @@ fn handleMouse(
                     if let Some(ref sub) = agentPanel.activeSubagent {
                         // Live subagent — use cached transcript.
                         let mut panel = crate::subagent_panel::SubagentPanel::new(
-                            &sub.agentType, &sub.sessionId,
+                            &sub.agentType,
                         );
                         panel.transcript = sub.transcript.clone();
                         panel.shellScrollback = sub.shellScrollback.clone();
@@ -1652,7 +1708,7 @@ fn handleMouse(
                         if let Ok(transcript) = construct::transcript::Transcript::open(&sid) {
                             if let Ok(turns) = transcript.loadAll() {
                                 let mut panel = crate::subagent_panel::SubagentPanel::new(
-                                    &agentType, &sid,
+                                    &agentType,
                                 );
                                 replayTranscript(&mut panel.transcriptPanel, &turns);
                                 panel.transcript = panel.transcriptPanel.entries.clone();
@@ -1892,6 +1948,18 @@ fn formatTokens(tokens: usize, window: usize) -> String {
     };
 
     format!("{} / {} ({}%)", fmtK(tokens), fmtK(window), pct)
+}
+
+/// Format session/rolling cost for the status bar: "$0.08 / $1.24".
+fn formatCostPair(session: f64, rolling: f64) -> String {
+    if session == 0.0 && rolling == 0.0 {
+        return String::new();
+    }
+    format!(
+        "{} / {}",
+        construct::cost::formatCost(session),
+        construct::cost::formatCost(rolling),
+    )
 }
 
 /// Extract text from the terminal selection, rejoining soft-wrapped lines.
@@ -2164,8 +2232,6 @@ fn convertAction(action: crate::command::CommandAction) -> CommandAction {
         crate::command::CommandAction::Mcp => CommandAction::Mcp,
         crate::command::CommandAction::Lsp => CommandAction::Lsp,
         crate::command::CommandAction::Permissions => CommandAction::Permissions,
-        crate::command::CommandAction::SavePermissions { defaultMode, rules } => {
-            CommandAction::SavePermissions { defaultMode, rules }
-        }
+        crate::command::CommandAction::ShowCost => CommandAction::ShowCost,
     }
 }

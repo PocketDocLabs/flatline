@@ -11,13 +11,11 @@
 //! - [`render`] — convert markdown text to rendered blocks
 //! - [`RenderedBlock`] — output block: text (wrappable) or code (scrollable)
 //! - [`renderCodeBlock`] — render a code block with borders and horizontal scroll
-//! - [`renderDiff`] — render a file diff with colored lines
 //!
 //! # Dependencies
-//! `pulldown-cmark`, `syntect`, `two-face`, `similar`, `ratatui`
+//! `pulldown-cmark`, `syntect`, `two-face`, `ratatui`
 
 mod block;
-mod diff;
 pub mod highlight;
 mod mermaid;
 mod parse;
@@ -25,7 +23,6 @@ mod table;
 
 use ratatui::text::{Line, Span};
 
-pub use diff::renderDiff;
 pub use highlight::renderCodeBlock;
 
 /// A rendered markdown block — either wrappable text or a scrollable code block.

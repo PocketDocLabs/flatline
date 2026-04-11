@@ -295,56 +295,6 @@ pub fn applyHighlight(selection: &Selection, area: Rect, buf: &mut Buffer, displ
     }
 }
 
-/// Extract text from selected cells in the Buffer.
-///
-/// Only extracts the visible portion of the selection.
-pub fn extractText(selection: &Selection, area: Rect, buf: &Buffer, displayOffset: u16) -> String {
-    if selection.isEmpty() {
-        return String::new();
-    }
-
-    let ((sc, sr), (ec, er)) = selection.sorted();
-    let isRect = selection.rectangular;
-    let rectColStart = sc.min(ec);
-    let rectColEnd = sc.max(ec);
-    let mut lines: Vec<String> = Vec::new();
-
-    for gridLine in sr..=er {
-        let screenRow = match toScreenRow(gridLine, displayOffset, area.height) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let (colStart, colEnd) = if isRect {
-            (rectColStart, rectColEnd)
-        } else {
-            let cs = if gridLine == sr { sc } else { 0 };
-            let ce = if gridLine == er { ec } else { area.width };
-            (cs, ce)
-        };
-
-        let mut line = String::new();
-        for col in colStart..colEnd {
-            if col >= area.width {
-                break;
-            }
-            if let Some(cell) = buf.cell((area.x + col, area.y + screenRow)) {
-                line.push_str(cell.symbol());
-            }
-        }
-
-        let trimmed = line.trim_end().to_string();
-        lines.push(trimmed);
-    }
-
-    // Remove trailing empty lines.
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-
-    lines.join("\n")
-}
-
 // --- Expansion helpers ---
 
 /// Find word boundaries around a position in the Buffer.

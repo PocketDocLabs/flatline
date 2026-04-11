@@ -112,11 +112,6 @@ impl History {
         self.cursor = None;
     }
 
-    /// Whether we're currently navigating history.
-    pub fn isNavigating(&self) -> bool {
-        self.cursor.is_some()
-    }
-
     /// Persist entries to the config file.
     fn save(&self) {
         let Some(path) = &self.filePath else { return };

@@ -34,6 +34,8 @@ struct SessionRow {
     topicRange: String,
     /// Project directory path.
     projectDir: String,
+    /// Formatted cost string (empty if zero).
+    costStr: String,
 }
 
 /// Result of handling a key event in the picker.
@@ -90,6 +92,11 @@ impl SessionPicker {
                     relativeTime: formatRelativeTime(meta.updatedAt, now),
                     topicRange,
                     projectDir: meta.projectDir,
+                    costStr: if meta.totalCost > 0.0 {
+                        construct::cost::formatCost(meta.totalCost)
+                    } else {
+                        String::new()
+                    },
                 }
             })
             .collect();
@@ -293,11 +300,16 @@ impl SessionPicker {
                 let nameText = format!("{marker}{}", truncate(&row.name, contentWidth - 3));
                 renderLine(buf, inner.x, y, contentWidth, &nameText, nameStyle);
 
-                // Line 2: relative time + topic range.
-                let metaText = if row.topicRange.is_empty() {
-                    format!("  {}", row.relativeTime)
+                // Line 2: relative time + cost + topic range.
+                let timeCost = if row.costStr.is_empty() {
+                    row.relativeTime.clone()
                 } else {
-                    format!("  {}  {}", row.relativeTime, row.topicRange)
+                    format!("{}  {}", row.relativeTime, row.costStr)
+                };
+                let metaText = if row.topicRange.is_empty() {
+                    format!("  {}", timeCost)
+                } else {
+                    format!("  {}  {}", timeCost, row.topicRange)
                 };
                 renderLine(
                     buf,
@@ -400,6 +412,11 @@ impl SessionPicker {
                     relativeTime: formatRelativeTime(meta.updatedAt, now),
                     topicRange,
                     projectDir: meta.projectDir,
+                    costStr: if meta.totalCost > 0.0 {
+                        construct::cost::formatCost(meta.totalCost)
+                    } else {
+                        String::new()
+                    },
                 }
             })
             .collect();

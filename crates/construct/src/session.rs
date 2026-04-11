@@ -123,10 +123,20 @@ pub enum SessionEvent {
         promptTokens: usize,
         completionTokens: usize,
         contextTokens: usize,
+        /// USD cost of this turn (None if provider doesn't report cost).
+        turnCost: Option<f64>,
+        /// Running session total in USD.
+        sessionCost: f64,
     },
+
+    /// Session cost exceeded the configured warning threshold.
+    BudgetWarning { sessionCost: f64, limit: f64 },
 
     /// Result of a slash command execution.
     CommandResult(String),
+
+    /// Context display data for /context.
+    ContextDisplay(crate::context::ContextState),
 
     /// Permissions status data for the /permissions panel.
     PermissionsStatus {
@@ -261,6 +271,8 @@ pub enum CommandAction {
     Resume { sessionId: Option<String> },
     /// Start a fresh session (keep the shell).
     Clear,
+    /// Show cost breakdown.
+    ShowCost,
     /// Show MCP server status.
     Mcp,
     /// Show LSP server status.
@@ -272,6 +284,8 @@ pub enum CommandAction {
         defaultMode: crate::permissions::PermitMode,
         rules: Vec<crate::permissions::Rule>,
     },
+    /// Gracefully shut down all background services (LSP, MCP).
+    Shutdown,
 }
 
 /// Agent session — owns the conversation and drives the turn loop.
@@ -286,6 +300,9 @@ pub struct Session {
     transcript: Transcript,
     compactionLog: CompactionLog,
     compactionTracker: compaction_trigger::Tracker,
+    costTracker: crate::cost::CostTracker,
+    /// Hard budget limit (USD). None = no limit.
+    maxBudgetUsd: Option<f64>,
     topicTracker: TopicTracker,
     checkpoint: Option<CheckpointManager>,
     filesRead: HashMap<String, [u8; 20]>,
@@ -373,6 +390,8 @@ impl Session {
             transcript,
             compactionLog,
             compactionTracker,
+            costTracker: crate::cost::CostTracker::new(),
+            maxBudgetUsd: None,
             topicTracker: TopicTracker::new(),
             checkpoint: None,
             filesRead: HashMap::new(),
@@ -401,6 +420,11 @@ impl Session {
     /// Used by subagent execution to restrict tools.
     pub fn setTools(&mut self, tools: Vec<ToolDef>) {
         self.tools = tools;
+    }
+
+    /// Set a hard budget limit (USD). The session will stop when exceeded.
+    pub fn setMaxBudget(&mut self, limit: f64) {
+        self.maxBudgetUsd = Some(limit);
     }
 
     /// Resume an existing session.
@@ -569,6 +593,14 @@ impl Session {
             transcript,
             compactionLog,
             compactionTracker,
+            costTracker: {
+                let mut ct = crate::cost::CostTracker::new();
+                if let Some(ref m) = meta {
+                    ct.seed(m.totalCost);
+                }
+                ct
+            },
+            maxBudgetUsd: None,
             topicTracker,
             checkpoint: None,
             filesRead,
@@ -946,10 +978,21 @@ impl Session {
                 TurnResult::ToolCalls { calls, content, reasoning, promptTokens } => {
                     retryCount = 0;
                     // Update token count but don't trigger compaction mid-loop.
-                    // Compaction fires at TurnResult::Done to avoid duplicate
-                    // history content and latency stalls between tool calls.
                     if let Some(tokens) = promptTokens {
                         self.compactionTracker.updateTokens(tokens);
+                    }
+                    // Hard budget enforcement.
+                    if let Some(limit) = self.maxBudgetUsd {
+                        if self.costTracker.sessionCost() >= limit {
+                            let msg = format!(
+                                "Budget limit reached ({} / {}). Stopping.",
+                                crate::cost::formatCost(self.costTracker.sessionCost()),
+                                crate::cost::formatCost(limit),
+                            );
+                            tracing::warn!(%msg, "hard budget limit hit");
+                            let _ = eventTx.send(SessionEvent::Error(msg)).await;
+                            break 'turns Ok(());
+                        }
                     }
                     tracing::info!(
                         callCount = calls.len(),
@@ -1522,7 +1565,7 @@ impl Session {
                         if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
                             if !contentBuf.is_empty() {
                                 let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
-                                match self.transcript.recordAssistant(&contentBuf, reasonRef) {
+                                match self.transcript.recordAssistant(&contentBuf, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
                                     Ok(turnId) => self.headTurnId = Some(turnId),
                                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                                 }
@@ -1565,14 +1608,31 @@ impl Session {
 
         // Emit token usage from the API response.
         if let Some(ref u) = lastUsage {
+            // Record cost before emitting the event.
+            if let Some(cost) = u.cost {
+                self.costTracker.record(cost, &self.config.main.model);
+            }
             let contextTokens = u.promptTokens + u.completionTokens;
             let _ = tx
                 .send(SessionEvent::TokenUpdate {
                     promptTokens: u.promptTokens,
                     completionTokens: u.completionTokens,
                     contextTokens,
+                    turnCost: u.cost,
+                    sessionCost: self.costTracker.sessionCost(),
                 })
                 .await;
+            // Check budget warning threshold.
+            if let Some(limit) = self.config.budget.sessionLimit {
+                if self.costTracker.checkWarning(limit) {
+                    let _ = tx
+                        .send(SessionEvent::BudgetWarning {
+                            sessionCost: self.costTracker.sessionCost(),
+                            limit,
+                        })
+                        .await;
+                }
+            }
         } else {
             tracing::warn!("no usage data received from API — provider may not support stream_options.include_usage");
         }
@@ -1590,7 +1650,7 @@ impl Session {
             // Record any text content or reasoning that accompanied the tool calls.
             let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
             if !contentBuf.is_empty() || reasonRef.is_some() {
-                match self.transcript.recordAssistant(&contentBuf, reasonRef) {
+                match self.transcript.recordAssistant(&contentBuf, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                 }
@@ -1622,7 +1682,7 @@ impl Session {
             if content.is_some() || reasoning.is_some() {
                 let textRef = content.as_deref().unwrap_or("");
                 let reasonRef = reasoning.as_deref();
-                match self.transcript.recordAssistant(textRef, reasonRef) {
+                match self.transcript.recordAssistant(textRef, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                 }
@@ -1806,6 +1866,10 @@ impl Session {
                 return false;
             }
         };
+        // Record utility model cost from S2 compaction.
+        if let Some(cost) = s2Result.cost {
+            self.costTracker.record(cost, &self.config.utility.model);
+        }
         if !s2Result.didWork {
             self.compactionTracker.markExhausted(compaction_trigger::StagePick::S2);
             tracing::debug!("S2 exhausted \u{2014} no blocks to compact");
@@ -1870,6 +1934,10 @@ impl Session {
                 return false;
             }
         };
+        // Record utility model cost from S3 compaction.
+        if let Some(cost) = s3Result.cost {
+            self.costTracker.record(cost, &self.config.utility.model);
+        }
         if !s3Result.didWork {
             self.compactionTracker.markExhausted(compaction_trigger::StagePick::S3);
             tracing::debug!("S3 exhausted \u{2014} no topics to compact");
@@ -1932,6 +2000,10 @@ impl Session {
             }
         };
 
+        // Record utility model cost from S4 compaction.
+        if let Some(cost) = s4Result.cost {
+            self.costTracker.record(cost, &self.config.utility.model);
+        }
         if !s4Result.didWork {
             self.compactionTracker
                 .markExhausted(compaction_trigger::StagePick::S4);
@@ -2626,10 +2698,23 @@ impl Session {
             topics: self.topicTracker.topics().to_vec(),
             headTurn: self.headTurnId.clone(),
             forks: existingMeta.map(|m| m.forks).unwrap_or_default(),
+            totalCost: self.costTracker.sessionCost(),
         };
         if let Err(e) = self.transcript.writeMeta(&meta) {
             tracing::warn!("meta write failed: {e}");
         }
+    }
+
+    /// Build context state for the /context display.
+    pub fn buildContextState(&self) -> context::ContextState {
+        let input = context::BuildStateInput {
+            contextWindow: self.config.main.contextWindow,
+            compactionLog: &self.compactionLog,
+            reportedTokens: self.compactionTracker.lastTokens(),
+            transcript: &self.transcript,
+            headTurnId: self.headTurnId.as_deref().unwrap_or(""),
+        };
+        context::buildState(&input)
     }
 
     /// Execute a command action (from slash commands).
@@ -2642,31 +2727,8 @@ impl Session {
     pub async fn executeCommand(&mut self, action: &CommandAction) -> String {
         match action {
             CommandAction::ShowContext => {
-                let input = context::BuildStateInput {
-                    history: &self.history,
-                    contextWindow: self.config.main.contextWindow,
-                    compactRatio: self.config.compactRatio,
-                    compactionLog: &self.compactionLog,
-                    reportedTokens: self.compactionTracker.lastTokens(),
-                    s1Exhausted: self.compactionTracker.isExhausted(
-                        compaction_trigger::StagePick::S1,
-                    ),
-                    s2Exhausted: self.compactionTracker.isExhausted(
-                        compaction_trigger::StagePick::S2,
-                    ),
-                    s3Exhausted: self.compactionTracker.isExhausted(
-                        compaction_trigger::StagePick::S3,
-                    ),
-                    s4Exhausted: self.compactionTracker.isExhausted(
-                        compaction_trigger::StagePick::S4,
-                    ),
-                    topics: self.topicTracker.topics(),
-                    currentTopicId: self.topicTracker.currentTopicId(),
-                    transcript: &self.transcript,
-                    headTurnId: self.headTurnId.as_deref().unwrap_or(""),
-                };
-                let state = context::buildState(&input);
-                context::formatState(&state)
+                // Handled separately via buildContextState — should not reach here.
+                String::new()
             }
             CommandAction::Undo => {
                 match &self.checkpoint {
@@ -2725,6 +2787,41 @@ impl Session {
                     }
                 }
             }
+            CommandAction::ShowCost => {
+                let mut out = String::new();
+                out.push_str(&format!(
+                    "Session              {}\n",
+                    crate::cost::formatCost(self.costTracker.sessionCost()),
+                ));
+
+                let perModel = self.costTracker.perModel();
+                if !perModel.is_empty() {
+                    let mut models: Vec<_> = perModel.iter().collect();
+                    models.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let last = models.len() - 1;
+                    for (i, (model, cost)) in models.iter().enumerate() {
+                        let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+                        // Shorten the model id for display.
+                        let short = model.rsplit('/').next().unwrap_or(model);
+                        out.push_str(&format!(
+                            "{branch} {:<20} {}\n",
+                            short,
+                            crate::cost::formatCost(**cost),
+                        ));
+                    }
+                }
+
+                let projectDir = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let rolling = crate::cost::rollingWindowCost(Some(&projectDir));
+                out.push_str(&format!(
+                    "\n16h rolling          {}",
+                    crate::cost::formatCost(rolling),
+                ));
+
+                out
+            }
             // Handled by the spawned task before reaching executeCommand.
             CommandAction::Clear => "Session cleared.".to_string(),
             // Handled specially by the session task — shouldn't reach here.
@@ -2738,6 +2835,8 @@ impl Session {
             | CommandAction::Forks { .. } => {
                 "Use /rewind or /forks in the TUI.".to_string()
             }
+            // Handled by the session task directly.
+            CommandAction::Shutdown => String::new(),
         }
     }
 

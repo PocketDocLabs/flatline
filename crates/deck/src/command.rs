@@ -88,6 +88,11 @@ pub const COMMANDS: &[CommandDef] = &[
         aliases: &["perms"],
         description: "View and manage permission rules",
     },
+    CommandDef {
+        name: "cost",
+        aliases: &[],
+        description: "Show session and rolling cost breakdown",
+    },
 ];
 
 /// Return commands whose name or aliases start with the given prefix.
@@ -125,11 +130,8 @@ pub enum CommandAction {
     Lsp,
     /// Show permissions panel.
     Permissions,
-    /// Save permissions from the panel.
-    SavePermissions {
-        defaultMode: construct::permissions::PermitMode,
-        rules: Vec<construct::permissions::Rule>,
-    },
+    /// Show cost breakdown.
+    ShowCost,
 }
 
 /// How command output should be rendered.
@@ -198,6 +200,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "mcp" => CommandOutput::Action(CommandAction::Mcp),
         "lsp" => CommandOutput::Action(CommandAction::Lsp),
         "permissions" => CommandOutput::Action(CommandAction::Permissions),
+        "cost" => CommandOutput::Action(CommandAction::ShowCost),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }
 }

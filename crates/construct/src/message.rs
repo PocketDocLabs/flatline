@@ -268,6 +268,8 @@ pub struct TokenUsage {
     pub promptTokens: usize,
     pub completionTokens: usize,
     pub totalTokens: usize,
+    /// USD cost reported by the provider (OpenRouter). None if not available.
+    pub cost: Option<f64>,
 }
 
 /// Raw SSE chunk from the API (for deserialization).
@@ -283,6 +285,8 @@ pub(crate) struct ChunkUsage {
     pub prompt_tokens: Option<usize>,
     pub completion_tokens: Option<usize>,
     pub total_tokens: Option<usize>,
+    /// USD cost from OpenRouter.
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,9 +298,11 @@ pub(crate) struct StreamChoice {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChunkDelta {
     pub content: Option<String>,
-    /// Simple reasoning string (used by some providers like DeepSeek/Kimi).
+    /// Simple reasoning string (DeepSeek/Kimi via OpenRouter).
     pub reasoning: Option<String>,
-    /// Structured reasoning details (used by Claude via OpenRouter).
+    /// Reasoning content (Fireworks format — Kimi, DeepSeek, etc.).
+    pub reasoning_content: Option<String>,
+    /// Structured reasoning details (Claude via OpenRouter).
     pub reasoning_details: Option<Vec<ReasoningDetail>>,
     pub tool_calls: Option<Vec<ChunkToolCall>>,
 }
@@ -304,6 +310,8 @@ pub(crate) struct ChunkDelta {
 /// A single reasoning detail entry from structured reasoning.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReasoningDetail {
+    // NOTE: Required by serde for deserialization but not read by Rust code.
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     pub detailType: Option<String>,
     pub text: Option<String>,

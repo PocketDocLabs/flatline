@@ -45,6 +45,8 @@ pub struct CompactedTopic {
 pub struct S3Result {
     pub didWork: bool,
     pub compacted: Vec<CompactedTopic>,
+    /// Total USD cost of all utility model calls in this S3 pass.
+    pub cost: Option<f64>,
 }
 
 /// Run S3 topic-level compaction.
@@ -65,56 +67,20 @@ pub async fn run(
 ) -> Result<S3Result> {
     let turns = transcript.loadAll()?;
     if turns.is_empty() || topics.is_empty() {
-        return Ok(S3Result { didWork: false, compacted: Vec::new() });
+        return Ok(S3Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     let ops = compactionLog.loadAll()?;
-
-    // Topics already compacted at S3 level.
-    let alreadyCompacted: HashSet<String> = ops
-        .iter()
-        .filter_map(|op| match op {
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                sourceBlockIds.first().cloned()
-            }
-            _ => None,
-        })
-        .collect();
-
-    // Compacted block sizes (shared zone infrastructure).
-    let compactedSizes = crate::compaction::compactedBlockSizes(&ops);
-
-    // Group transcript turns by blockId for content retrieval.
     let blockContent = groupTurnsByBlock(&turns);
-
-    // Build topicId → distinct block IDs from the transcript turns.
-    let topicBlockMap = buildTopicBlockMap(&turns);
-
-    // Walk the active branch and compute the 30% zone.
-    let activeTurns = crate::transcript::walkBranchTurns(&turns, headTurnId);
-    if activeTurns.is_empty() {
-        return Ok(S3Result { didWork: false, compacted: Vec::new() });
-    }
-    let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, 0.30);
-
-    let eligible = findEligibleTopics(
-        topics,
-        &topicBlockMap,
-        &zone,
-        &compactedSizes,
-        &alreadyCompacted,
-    );
+    let eligible = resolveEligible(&turns, &ops, headTurnId, topics);
 
     if eligible.is_empty() {
         tracing::debug!(
             topicCount = topics.len(),
-            topicBlockMapKeys = ?topicBlockMap.keys().collect::<Vec<_>>(),
-            compactedCount = compactedSizes.len(),
-            zoneBlockCount = zone.len(),
-            activeTurnCount = activeTurns.len(),
+            eligibleCount = 0,
             "S3: no eligible topics found"
         );
-        return Ok(S3Result { didWork: false, compacted: Vec::new() });
+        return Ok(S3Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     // Fire parallel compaction calls.
@@ -125,13 +91,17 @@ pub async fn run(
         })
         .collect();
 
-    let results = join_all(futures).await;
+    let results: Vec<Result<(String, Option<f64>)>> = join_all(futures).await;
 
     let mut compacted = Vec::new();
+    let mut totalCost: f64 = 0.0;
     for (i, result) in results.into_iter().enumerate() {
         let topic = &eligible[i];
         match result {
-            Ok(summary) => {
+            Ok((summary, topicCost)) => {
+                if let Some(c) = topicCost {
+                    totalCost += c;
+                }
                 compacted.push(CompactedTopic {
                     topicId: topic.topicId.clone(),
                     topicLabel: topic.label.clone(),
@@ -152,7 +122,44 @@ pub async fn run(
     }
 
     let didWork = !compacted.is_empty();
-    Ok(S3Result { didWork, compacted })
+    let cost = if totalCost > 0.0 { Some(totalCost) } else { None };
+    Ok(S3Result { didWork, compacted, cost })
+}
+
+/// Resolve which topics are eligible for S3 compaction.
+///
+/// Builds the zone, filters superseded blocks, and finds topics with
+/// >= 2 S2'd blocks in the zone. This is the complete eligibility
+/// pipeline that `run` uses — extracted so tests can verify it without
+/// needing an API client.
+fn resolveEligible(
+    turns: &[Turn],
+    ops: &[CompactionOp],
+    headTurnId: &str,
+    topics: &[TopicInfo],
+) -> Vec<EligibleTopic> {
+    let alreadyCompacted: HashSet<String> = ops
+        .iter()
+        .filter_map(|op| match op {
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
+                sourceBlockIds.first().cloned()
+            }
+            _ => None,
+        })
+        .collect();
+
+    let compactedSizes = crate::compaction::compactedBlockSizes(ops);
+    let topicBlockMap = buildTopicBlockMap(turns);
+
+    let activeTurns = crate::transcript::walkBranchTurns(turns, headTurnId);
+    if activeTurns.is_empty() {
+        return Vec::new();
+    }
+
+    let superseded = crate::compaction::supersededBlocks(ops);
+    let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, &superseded, 0.30);
+
+    findEligibleTopics(topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted)
 }
 
 /// An eligible topic ready for compaction.
@@ -345,7 +352,7 @@ async fn compactTopic(
     blockContent: &HashMap<String, BlockTurns>,
     client: &api::Client,
     utilityModel: &str,
-) -> Result<String> {
+) -> Result<(String, Option<f64>)> {
     let mut topicParts: Vec<String> = Vec::new();
 
     for bid in &topic.blockIds {
@@ -410,9 +417,10 @@ async fn compactTopic(
         },
     ];
 
-    let response = client.complete(&messages, Some(utilityModel)).await?;
+    let (response, usage) = client.complete(&messages, Some(utilityModel)).await?;
+    let cost = usage.and_then(|u| u.cost);
     let summary = extractCompactedString(&response);
-    Ok(summary)
+    Ok((summary, cost))
 }
 
 /// Extract content from `<compacted_monolithic_string>` tags, or return raw.
@@ -509,6 +517,7 @@ mod tests {
             toolCallId: None,
             reasoning: None,
             attachments: None,
+            cost: None,
         }
     }
 
@@ -540,7 +549,7 @@ mod tests {
         ];
 
         let compactedSizes = HashMap::new();
-        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &HashSet::new(), 0.30);
 
         assert!(zone.contains("b_aaa"), "first block should be in zone");
         assert!(!zone.contains("b_ddd"), "last block should NOT be in zone");
@@ -566,7 +575,7 @@ mod tests {
         compactedSizes.insert("b_aaa".to_string(), 10_usize);
         compactedSizes.insert("b_bbb".to_string(), 10_usize);
 
-        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &HashSet::new(), 0.30);
 
         // Without compacted sizes: 30% of 800 = 240 → only aaa+bbb (400 raw) would fill it.
         // With compacted sizes: 30% of 420 = 126 → aaa(10)+bbb(10)+ccc(200) fills it.
@@ -599,7 +608,7 @@ mod tests {
         for id in &["b_aaa", "b_bbb", "b_ccc", "b_ddd"] {
             compactedSizes.insert(id.to_string(), 50_usize);
         }
-        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &HashSet::new(), 0.30);
         let alreadyCompacted: HashSet<String> = HashSet::new();
 
         let eligible = findEligibleTopics(
@@ -632,7 +641,7 @@ mod tests {
         let mut compactedSizes = HashMap::new();
         compactedSizes.insert("b_aaa".to_string(), 50_usize);
         compactedSizes.insert("b_bbb".to_string(), 50_usize);
-        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.30);
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &HashSet::new(), 0.30);
         let alreadyCompacted: HashSet<String> = HashSet::new();
 
         let eligible = findEligibleTopics(
@@ -642,5 +651,196 @@ mod tests {
         assert_eq!(eligible.len(), 1, "topic-01 should be eligible (partial)");
         assert_eq!(eligible[0].blockIds.len(), 2, "only the 2 in-zone S2'd blocks");
         assert_eq!(eligible[0].blockIds, vec!["b_aaa", "b_bbb"]);
+    }
+
+    /// Helper: build compaction ops for a set of S2'd blocks, an S3 topic,
+    /// and an S4 briefing covering those blocks.
+    fn makeOps(
+        s2BlockIds: &[String],
+        s3TopicLabel: &str,
+        s3SourceBlockIds: &[String],
+        s4SourceIds: &[String],
+    ) -> Vec<CompactionOp> {
+        let mut ops = Vec::new();
+        let summary800 = "s".repeat(800);
+        for bid in s2BlockIds {
+            ops.push(CompactionOp::BlockCompact {
+                stage: "s2".into(),
+                blockId: bid.clone(),
+                summary: summary800.clone(),
+                sourceIds: vec![],
+                afterTurn: "t_head".into(),
+                ts: 0,
+            });
+        }
+        if !s3SourceBlockIds.is_empty() {
+            ops.push(CompactionOp::TopicCompact {
+                stage: "s3".into(),
+                topicLabel: s3TopicLabel.into(),
+                summary: "topic summary".into(),
+                sourceBlockIds: s3SourceBlockIds.to_vec(),
+                afterTurn: "t_head".into(),
+                ts: 0,
+            });
+        }
+        if !s4SourceIds.is_empty() {
+            ops.push(CompactionOp::FullCompact {
+                stage: "s4".into(),
+                summary: "full briefing".into(),
+                sourceIds: s4SourceIds.to_vec(),
+                afterTurn: "t_head".into(),
+                ts: 0,
+            });
+        }
+        ops
+    }
+
+    /// Reproduces the real-world S3 starvation bug: after S4 runs, its
+    /// covered blocks should be excluded from the zone so S3 can reach
+    /// newer S2'd blocks with eligible topics.
+    ///
+    /// Uses resolveEligible (the production code path) — no manual zone
+    /// or superseded set construction.
+    #[test]
+    fn s3_starved_when_s4_blocks_inflate_zone() {
+        let mut turns = Vec::new();
+        let mut parentId: Option<&str> = None;
+        let mut turnNum = 0;
+
+        // 20 S4-covered blocks (topic-01).
+        let mut s4BlockIds = Vec::new();
+        for i in 0..20 {
+            let bid = format!("b_s4_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-01", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-01", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            s4BlockIds.push(bid);
+        }
+
+        // 6 S2'd blocks: 3 in topic-02, 3 in topic-03.
+        let mut t2Ids = Vec::new();
+        let mut t3Ids = Vec::new();
+        for i in 0..3 {
+            let bid = format!("b_t2_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            t2Ids.push(bid);
+        }
+        for i in 0..3 {
+            let bid = format!("b_t3_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-03", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-03", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            t3Ids.push(bid);
+        }
+
+        // 4 raw blocks (topic-04).
+        for i in 0..4 {
+            let bid = format!("b_raw_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-04", TurnRole::User, &"x".repeat(500), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-04", TurnRole::Assistant, &"y".repeat(500), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+        }
+
+        let headTurnId = turns.last().unwrap().id.clone();
+        let allBlockIds: Vec<String> = s4BlockIds.iter()
+            .chain(t2Ids.iter()).chain(t3Ids.iter())
+            .cloned().collect();
+
+        let ops = makeOps(&allBlockIds, "Old Topic", &s4BlockIds, &s4BlockIds);
+
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "Old".into(), startBlock: s4BlockIds[0].clone(), blockCount: 20 },
+            TopicInfo { topicId: "topic-02".into(), label: "Middle A".into(), startBlock: t2Ids[0].clone(), blockCount: 3 },
+            TopicInfo { topicId: "topic-03".into(), label: "Middle B".into(), startBlock: t3Ids[0].clone(), blockCount: 3 },
+            TopicInfo { topicId: "topic-04".into(), label: "Recent".into(), startBlock: "b_raw_000".into(), blockCount: 4 },
+        ];
+
+        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);
+
+        assert!(
+            !eligible.is_empty(),
+            "topic-02 should be S3-eligible — S4 blocks must not inflate zone"
+        );
+    }
+
+    /// Same bug at scale: 40 S4-covered, 20 S2'd across 2 topics, 10 raw.
+    #[test]
+    fn s3_starved_at_scale_with_many_s4_blocks() {
+        let mut turns = Vec::new();
+        let mut parentId: Option<&str> = None;
+        let mut turnNum = 0;
+
+        let mut s4Ids = Vec::new();
+        for i in 0..40 {
+            let bid = format!("b_s4_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-01", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-01", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            s4Ids.push(bid);
+        }
+
+        let mut t2Ids = Vec::new();
+        let mut t3Ids = Vec::new();
+        for i in 0..10 {
+            let bid = format!("b_t2_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            t2Ids.push(bid);
+        }
+        for i in 0..10 {
+            let bid = format!("b_t3_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-03", TurnRole::User, &"x".repeat(2000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-03", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+            t3Ids.push(bid);
+        }
+
+        for i in 0..10 {
+            let bid = format!("b_raw_{i:03}");
+            let uid = format!("t{turnNum}"); turnNum += 1;
+            let aid = format!("t{turnNum}"); turnNum += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-04", TurnRole::User, &"x".repeat(1000), parentId));
+            turns.push(makeTurn(&aid, &bid, "topic-04", TurnRole::Assistant, &"y".repeat(1000), Some(&uid)));
+            parentId = Some(Box::leak(aid.into_boxed_str()));
+        }
+
+        let headTurnId = turns.last().unwrap().id.clone();
+        let allS2Ids: Vec<String> = s4Ids.iter()
+            .chain(t2Ids.iter()).chain(t3Ids.iter())
+            .cloned().collect();
+
+        let ops = makeOps(&allS2Ids, "Old Topic", &s4Ids, &s4Ids);
+
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "Old".into(), startBlock: s4Ids[0].clone(), blockCount: 40 },
+            TopicInfo { topicId: "topic-02".into(), label: "Middle A".into(), startBlock: t2Ids[0].clone(), blockCount: 10 },
+            TopicInfo { topicId: "topic-03".into(), label: "Middle B".into(), startBlock: t3Ids[0].clone(), blockCount: 10 },
+            TopicInfo { topicId: "topic-04".into(), label: "Recent".into(), startBlock: "b_raw_000".into(), blockCount: 10 },
+        ];
+
+        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);
+
+        assert!(
+            eligible.len() >= 2,
+            "topic-02 and topic-03 should both be S3-eligible, got {} eligible",
+            eligible.len(),
+        );
     }
 }

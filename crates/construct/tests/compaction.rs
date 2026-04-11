@@ -109,22 +109,22 @@ async fn test_s2_eligible_blocks() {
 
     // Record 3 exchange blocks with tool calls.
     let t1 = transcript.recordUser("first question", None, None).unwrap();
-    transcript.recordAssistant("thinking about it...", None).unwrap();
+    transcript.recordAssistant("thinking about it...", None, None).unwrap();
     transcript.recordToolCall("tc_a", "shell", &serde_json::json!({"command": "ls"})).unwrap();
     transcript.recordToolResult("tc_a", "file1.rs\nfile2.rs", None).unwrap();
-    transcript.recordAssistant("here are the files", None).unwrap();
+    transcript.recordAssistant("here are the files", None, None).unwrap();
 
     let t2 = transcript.recordUser("second question", Some(&t1), None).unwrap();
-    transcript.recordAssistant("let me check...", None).unwrap();
+    transcript.recordAssistant("let me check...", None, None).unwrap();
     transcript.recordToolCall("tc_b", "readFile", &serde_json::json!({"path": "/tmp/foo.rs"})).unwrap();
     transcript.recordToolResult("tc_b", &"y".repeat(2000), None).unwrap();
-    transcript.recordAssistant("read it", None).unwrap();
+    transcript.recordAssistant("read it", None, None).unwrap();
 
     let t3 = transcript.recordUser("third question", Some(&t2), None).unwrap();
-    transcript.recordAssistant("sure thing", None).unwrap();
+    transcript.recordAssistant("sure thing", None, None).unwrap();
     transcript.recordToolCall("tc_c", "shell", &serde_json::json!({"command": "echo hi"})).unwrap();
     let headTurn = transcript.recordToolResult("tc_c", "hi", None).unwrap();
-    transcript.recordAssistant("done", None).unwrap();
+    transcript.recordAssistant("done", None, None).unwrap();
 
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
@@ -157,29 +157,29 @@ async fn test_s3_finds_and_compacts_topics() {
     // topic-01: blocks 1-2, topic-02: blocks 3-4.
     transcript.setTopicId("topic-01");
     let t1 = transcript.recordUser("topic one start", None, None).unwrap();
-    transcript.recordAssistant("working on topic one", None).unwrap();
+    transcript.recordAssistant("working on topic one", None, None).unwrap();
     transcript.recordToolCall("tc_1", "shell", &serde_json::json!({"command": "ls"})).unwrap();
     transcript.recordToolResult("tc_1", "output1", None).unwrap();
-    transcript.recordAssistant("done with block 1", None).unwrap();
+    transcript.recordAssistant("done with block 1", None, None).unwrap();
 
     let t2 = transcript.recordUser("still topic one", Some(&t1), None).unwrap();
-    transcript.recordAssistant("continuing", None).unwrap();
+    transcript.recordAssistant("continuing", None, None).unwrap();
     transcript.recordToolCall("tc_2", "readFile", &serde_json::json!({"path": "/a.rs"})).unwrap();
     transcript.recordToolResult("tc_2", "content of a.rs", None).unwrap();
-    transcript.recordAssistant("read it", None).unwrap();
+    transcript.recordAssistant("read it", None, None).unwrap();
 
     transcript.setTopicId("topic-02");
     let t3 = transcript.recordUser("new topic here", Some(&t2), None).unwrap();
-    transcript.recordAssistant("switching gears", None).unwrap();
+    transcript.recordAssistant("switching gears", None, None).unwrap();
     transcript.recordToolCall("tc_3", "shell", &serde_json::json!({"command": "cargo build"})).unwrap();
     transcript.recordToolResult("tc_3", "Compiling...", None).unwrap();
-    transcript.recordAssistant("built", None).unwrap();
+    transcript.recordAssistant("built", None, None).unwrap();
 
     let t4 = transcript.recordUser("more topic two", Some(&t3), None).unwrap();
-    transcript.recordAssistant("sure", None).unwrap();
+    transcript.recordAssistant("sure", None, None).unwrap();
     transcript.recordToolCall("tc_4", "readFile", &serde_json::json!({"path": "/b.rs"})).unwrap();
     let headTurn = transcript.recordToolResult("tc_4", "content of b.rs", None).unwrap();
-    transcript.recordAssistant("got b.rs", None).unwrap();
+    transcript.recordAssistant("got b.rs", None, None).unwrap();
 
     // Grab the actual block IDs from the recorded turns.
     let allTurns = transcript.loadAll().unwrap();

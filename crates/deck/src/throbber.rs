@@ -226,15 +226,6 @@ impl Throbber {
         }
     }
 
-    /// Force the next shape event. If `idx` is Some, use that shape;
-    /// otherwise pick randomly. Sets countdown to 0 so it triggers next tick.
-    /// Force the next shape event. If `idx` is Some, use that shape;
-    /// otherwise pick randomly. Sets countdown to 0 so it triggers next tick.
-    pub fn forceNextShape(&mut self, idx: Option<usize>) {
-        self.ticksUntilShape = 0;
-        self.forcedShape = idx.map(|i| i % SHAPE_COUNT);
-    }
-
     /// Advance one animation tick. Call at ~8 FPS.
     pub fn tick(&mut self) {
         // Evolve the noise seed.

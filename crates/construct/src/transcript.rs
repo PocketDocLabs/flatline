@@ -61,6 +61,9 @@ pub struct Turn {
     /// Image attachments persisted for session resume.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attachments: Option<Vec<TurnAttachment>>,
+    /// USD cost of this turn (assistant turns only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost: Option<f64>,
 }
 
 /// An image attachment stored in the transcript.
@@ -104,6 +107,9 @@ pub struct SessionMeta {
     pub headTurn: Option<String>,
     #[serde(default)]
     pub forks: Vec<Fork>,
+    /// Total USD cost accumulated in this session.
+    #[serde(default)]
+    pub totalCost: f64,
 }
 
 /// Handle to an open session transcript.
@@ -264,12 +270,18 @@ impl Transcript {
             toolCallId: None,
             reasoning: None,
             attachments,
+            cost: None,
         };
         self.writeTurn(&turn)
     }
 
     /// Record an assistant response (in the current block).
-    pub fn recordAssistant(&mut self, content: &str, reasoning: Option<&str>) -> Result<String> {
+    pub fn recordAssistant(
+        &mut self,
+        content: &str,
+        reasoning: Option<&str>,
+        cost: Option<f64>,
+    ) -> Result<String> {
         let turn = Turn {
             id: randomHexId("t"),
             blockId: self.currentBlockId.clone(),
@@ -283,6 +295,7 @@ impl Transcript {
             toolCallId: None,
             reasoning: reasoning.map(|s| s.to_string()),
             attachments: None,
+            cost,
         };
         self.writeTurn(&turn)
     }
@@ -307,6 +320,7 @@ impl Transcript {
             toolCallId: Some(callId.to_string()),
             reasoning: None,
             attachments: None,
+            cost: None,
         };
         self.writeTurn(&turn)
     }
@@ -331,6 +345,7 @@ impl Transcript {
             toolCallId: Some(callId.to_string()),
             reasoning: None,
             attachments,
+            cost: None,
         };
         self.writeTurn(&turn)
     }
@@ -487,6 +502,7 @@ mod tests {
                     data: "iVBORw0KGgo=".into(),
                 },
             ]),
+            cost: None,
         };
 
         let json = serde_json::to_string(&turn).unwrap();

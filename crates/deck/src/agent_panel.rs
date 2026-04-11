@@ -40,7 +40,7 @@ pub enum PanelEntry {
     ToolAutoDenied { name: String, summary: String },
     ToolResult { name: String, output: String },
     /// A tool is currently executing (shown with throbber + elapsed time).
-    ToolActive { name: String, summary: String },
+    ToolActive { summary: String },
     /// Subagent activity — renders as a single bordered panel.
     SubagentBlock {
         agentType: String,
@@ -60,6 +60,7 @@ pub enum PanelEntry {
     },
     Error(String),
     CommandResult(String),
+    ContextDisplay(construct::context::ContextState),
     /// Non-copyable informational notice (e.g. session resumed).
     SessionNotice(String),
     /// Visual marker showing where compaction replaced content.
@@ -69,9 +70,7 @@ pub enum PanelEntry {
 
 /// Tracked state for a running subagent (for the overlay panel).
 pub struct ActiveSubagent {
-    pub sessionId: String,
     pub agentType: String,
-    pub prompt: String,
     pub startTime: Instant,
     /// Structured transcript entries for the overlay panel.
     pub transcript: Vec<PanelEntry>,
@@ -639,9 +638,7 @@ impl AgentPanel {
             self.entries.pop();
         }
         self.activeSubagent = Some(ActiveSubagent {
-            sessionId: sessionId.into(),
             agentType: agentType.into(),
-            prompt: prompt.into(),
             startTime: Instant::now(),
             transcript: Vec::new(),
             shellScrollback: Vec::new(),
@@ -697,9 +694,9 @@ impl AgentPanel {
         }
     }
 
-    pub fn subagentComplete(&mut self, agentType: &str, turns: usize, finalContent: &str) {
+    pub fn subagentComplete(&mut self, _agentType: &str, turns: usize, finalContent: &str) {
         if !self.turnActive { return; }
-        if let Some(PanelEntry::SubagentBlock { done, turns: t, content, contentExpanded, .. }) = self.entries.iter_mut().rev()
+        if let Some(PanelEntry::SubagentBlock { done, turns: t, content, contentExpanded: _, .. }) = self.entries.iter_mut().rev()
             .find(|e| matches!(e, PanelEntry::SubagentBlock { done: false, .. }))
         {
             *done = true;
@@ -760,13 +757,12 @@ impl AgentPanel {
             .push(PanelEntry::ToolApproved { name: name.into() });
     }
 
-    pub fn toolStarted(&mut self, name: &str, summary: &str) {
+    pub fn toolStarted(&mut self, _name: &str, summary: &str) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
         self.toolActive = true;
         self.toolStartTime = Some(Instant::now());
         self.entries.push(PanelEntry::ToolActive {
-            name: name.into(),
             summary: summary.into(),
         });
         self.scrollOffset = 0;
@@ -827,6 +823,15 @@ impl AgentPanel {
     /// turnActive/isStreaming flags that pushUser sets.
     pub fn pushCommandResult(&mut self, text: &str) {
         self.entries.push(PanelEntry::CommandResult(text.into()));
+        self.turnActive = false;
+        self.isStreaming = false;
+        self.thinkingStartTime = None;
+        self.scrollOffset = 0;
+    }
+
+    /// Push a /context display and reset turn state.
+    pub fn pushContextDisplay(&mut self, state: construct::context::ContextState) {
+        self.entries.push(PanelEntry::ContextDisplay(state));
         self.turnActive = false;
         self.isStreaming = false;
         self.thinkingStartTime = None;
@@ -2277,7 +2282,7 @@ impl AgentPanel {
                 ))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
             }
-            PanelEntry::ToolActive { name: _, summary } => {
+            PanelEntry::ToolActive { summary } => {
                 let elapsed = self.toolStartTime
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
@@ -2623,6 +2628,163 @@ impl AgentPanel {
                     entryIndex, &self.codeScrollX, &self.codeExpanded,
                     codeBlockRanges, &self.copiedFlash,
                 );
+            }
+            PanelEntry::ContextDisplay(state) => {
+                use construct::context::formatTokenCount;
+                let prefixPad: usize = 2;
+                let w = (width as usize).saturating_sub(prefixPad);
+                let innerW = w.saturating_sub(2);
+                let indent = " ".repeat(prefixPad);
+                let borderStyle = Style::default().fg(Color::DarkGray);
+                let dimStyle = Style::default().fg(Color::DarkGray);
+                let labelStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+                let tokens = if state.reportedTokens > 0 {
+                    state.reportedTokens
+                } else {
+                    state.estimatedTokens
+                };
+                let prefix = if state.reportedTokens > 0 { "" } else { "~" };
+
+                // Progress bar.
+                let barLen = innerW.saturating_sub(2);
+                let filled = if state.contextWindow > 0 {
+                    (tokens as f64 / state.contextWindow as f64 * barLen as f64).round() as usize
+                } else {
+                    0
+                };
+                let filled = filled.min(barLen);
+                let empty = barLen.saturating_sub(filled);
+                lines.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("Context ", Style::default().fg(Color::White)),
+                    Span::styled(
+                        "\u{25B0}".repeat(filled),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        "\u{25B1}".repeat(empty),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!(" {}{} / {}", prefix, formatTokenCount(tokens), formatTokenCount(state.contextWindow)),
+                        dimStyle,
+                    ),
+                ]));
+                cont.push(false);
+
+                // Helper: bordered content line.
+                let mkLine = |content: &str, style: Style, indent: &str| -> Line<'static> {
+                    use unicode_width::UnicodeWidthStr;
+                    let truncated = truncateToWidth(content, innerW);
+                    let truncW = UnicodeWidthStr::width(truncated.as_str());
+                    let pad = innerW.saturating_sub(truncW);
+                    let body = format!("{truncated}{}", " ".repeat(pad));
+                    Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled("\u{2502}".to_string(), borderStyle),
+                        Span::styled(body, style),
+                        Span::styled("\u{2502}".to_string(), borderStyle),
+                    ])
+                };
+
+                // Collect layers: (title, content_lines).
+                let mut layers: Vec<(&str, Vec<(String, Style)>)> = Vec::new();
+
+                if let Some(ref s4) = state.s4 {
+                    let mut contentLines = Vec::new();
+                    contentLines.push((
+                        format!(" {} earlier topics merged", s4.topicsMerged),
+                        Style::default().fg(Color::White),
+                    ));
+                    if s4.priorBriefings > 0 {
+                        contentLines.push((
+                            format!(" {} prior briefings", s4.priorBriefings),
+                            Style::default().fg(Color::White),
+                        ));
+                    }
+                    contentLines.push((
+                        format!(" ~{} tok", formatTokenCount(s4.estimatedTokens)),
+                        dimStyle,
+                    ));
+                    layers.push(("S4 Briefing", contentLines));
+                }
+
+                if let Some(ref s3) = state.s3 {
+                    let mut contentLines: Vec<(String, Style)> = s3.topicLabels.iter()
+                        .map(|l| {
+                            let truncated = if l.len() > 28 {
+                                format!("{}\u{2026}", &l[..l.floor_char_boundary(27)])
+                            } else {
+                                l.clone()
+                            };
+                            (format!(" {truncated}"), Style::default().fg(Color::White))
+                        })
+                        .collect();
+                    contentLines.push((
+                        format!(
+                            " {} turns condensed \u{00B7} ~{} tok",
+                            s3.turnsCondensed,
+                            formatTokenCount(s3.estimatedTokens),
+                        ),
+                        dimStyle,
+                    ));
+                    layers.push(("S3 Topic summaries", contentLines));
+                }
+
+                if let Some(ref s2) = state.s2 {
+                    layers.push(("S2 Summaries", vec![(
+                        format!(
+                            " {} turns condensed \u{00B7} ~{} tok",
+                            s2.turnsCondensed,
+                            formatTokenCount(s2.estimatedTokens),
+                        ),
+                        dimStyle,
+                    )]));
+                }
+
+                layers.push(("Raw", vec![(
+                    format!(
+                        " {} turns \u{00B7} ~{} tok",
+                        state.raw.turns,
+                        formatTokenCount(state.raw.estimatedTokens),
+                    ),
+                    dimStyle,
+                )]));
+
+                // Render layers with box-drawing.
+                for (i, (title, contentLines)) in layers.iter().enumerate() {
+                    use unicode_width::UnicodeWidthStr;
+                    let titleW = UnicodeWidthStr::width(*title);
+                    let ruleLen = innerW.saturating_sub(titleW + 2);
+                    let (left, right) = if i == 0 {
+                        ("\u{256D}", "\u{256E}")
+                    } else {
+                        ("\u{251C}", "\u{2524}")
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.clone()),
+                        Span::styled(left.to_string(), borderStyle),
+                        Span::styled(format!(" {title} "), labelStyle),
+                        Span::styled("\u{2500}".repeat(ruleLen), borderStyle),
+                        Span::styled(right.to_string(), borderStyle),
+                    ]));
+                    cont.push(false);
+
+                    for (text, style) in contentLines {
+                        lines.push(mkLine(text, *style, &indent));
+                        cont.push(false);
+                    }
+                }
+
+                // Bottom border.
+                lines.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled("\u{2570}".to_string(), borderStyle),
+                    Span::styled("\u{2500}".repeat(innerW), borderStyle),
+                    Span::styled("\u{256F}".to_string(), borderStyle),
+                ]));
+                cont.push(false);
             }
             PanelEntry::Error(msg) => {
                 let style = Style::default().fg(Color::Red);
@@ -2978,13 +3140,11 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
 fn truncateToWidth(s: &str, maxWidth: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     let mut width = 0;
-    let mut end = 0;
     for (i, ch) in s.char_indices() {
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
         // Reserve 1 column for the ellipsis.
         if width + cw > maxWidth.saturating_sub(1) {
-            end = i;
-            if width == 0 { end = s.len(); } // Don't produce empty string.
+            let end = if width == 0 { s.len() } else { i };
             return format!("{}\u{2026}", &s[..end]);
         }
         width += cw;

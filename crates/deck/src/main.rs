@@ -16,7 +16,6 @@ mod app;
 mod command;
 mod fork_picker;
 mod history;
-mod image_util;
 mod markdown;
 mod lsp_panel;
 mod mcp_panel;
@@ -103,6 +102,10 @@ struct ExecArgs {
     /// Ephemeral session.
     #[arg(long)]
     ephemeral: bool,
+
+    /// Maximum budget in USD (hard stop).
+    #[arg(long)]
+    maxBudgetUsd: Option<f64>,
 }
 
 /// Resolve ExecArgs into a prompt string and RunConfig.
@@ -155,6 +158,7 @@ fn resolveExecArgs(args: ExecArgs) -> Result<(String, construct::runner::RunConf
         mcpConfigPath: None,
         strictMcp: args.strictMcp,
         ephemeral: args.ephemeral,
+        maxBudgetUsd: args.maxBudgetUsd,
     };
 
     Ok((prompt, config))
@@ -334,12 +338,14 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
         SessionEvent::TurnCancelled => serde_json::json!({
             "type": "turnCancelled",
         }),
-        SessionEvent::TokenUpdate { promptTokens, completionTokens, contextTokens } => {
+        SessionEvent::TokenUpdate { promptTokens, completionTokens, contextTokens, turnCost, sessionCost } => {
             serde_json::json!({
                 "type": "tokenUpdate",
                 "promptTokens": promptTokens,
                 "completionTokens": completionTokens,
                 "contextTokens": contextTokens,
+                "turnCost": turnCost,
+                "sessionCost": sessionCost,
             })
         }
         SessionEvent::CompactionStarted { stage } => serde_json::json!({
@@ -367,6 +373,9 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
         SessionEvent::SubagentComplete { sessionId, agentType, content, turns } => serde_json::json!({
             "type": "subagentComplete", "sessionId": sessionId,
             "agentType": agentType, "content": content, "turns": turns,
+        }),
+        SessionEvent::BudgetWarning { sessionCost, limit } => serde_json::json!({
+            "type": "budgetWarning", "sessionCost": sessionCost, "limit": limit,
         }),
         SessionEvent::Error(msg) => serde_json::json!({
             "type": "error", "message": msg,

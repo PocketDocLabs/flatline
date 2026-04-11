@@ -22,8 +22,6 @@
 //! # Dependencies
 //! `crate::api`, `crate::compaction`, `crate::transcript`, `futures`
 
-use std::collections::HashSet;
-
 use anyhow::Result;
 use futures::future::join_all;
 
@@ -45,6 +43,8 @@ pub struct CompactedBlock {
 pub struct S2Result {
     pub didWork: bool,
     pub compacted: Vec<CompactedBlock>,
+    /// Total USD cost of all utility model calls in this S2 pass.
+    pub cost: Option<f64>,
 }
 
 /// Run S2 block-level compaction.
@@ -63,25 +63,26 @@ pub async fn run(
 ) -> Result<S2Result> {
     let allTurns = transcript.loadAll()?;
     if allTurns.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new() });
+        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     // Walk the active branch only — dead branches from rewinds
     // must not consume the char budget.
     let turns = crate::transcript::walkBranchTurns(&allTurns, headTurnId);
     if turns.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new() });
+        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     // Build compacted sizes map and zone from shared infrastructure.
     let ops = compactionLog.loadAll()?;
     let compactedSizes = crate::compaction::compactedBlockSizes(&ops);
-    let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, 0.60);
+    let superseded = crate::compaction::supersededBlocks(&ops);
+    let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &superseded, 0.60);
 
     // Group turns by blockId, preserving order.
     let blocks = groupByBlock(&turns);
     if blocks.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new() });
+        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     // Filter to eligible blocks: in zone, not already compacted, has agent content.
@@ -100,7 +101,7 @@ pub async fn run(
     }
 
     if eligible.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new() });
+        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
     }
 
     // Build and fire parallel compaction calls.
@@ -116,12 +117,16 @@ pub async fn run(
     let results = join_all(futures).await;
 
     let mut compacted = Vec::new();
+    let mut totalCost: f64 = 0.0;
     for (resultIdx, result) in results.into_iter().enumerate() {
         let blockIdx = eligible[resultIdx];
         let block = &blocks[blockIdx];
 
         match result {
-            Ok(summary) => {
+            Ok((summary, blockCost)) => {
+                if let Some(c) = blockCost {
+                    totalCost += c;
+                }
                 compacted.push(CompactedBlock {
                     blockId: block.blockId.clone(),
                     summary,
@@ -140,7 +145,8 @@ pub async fn run(
     }
 
     let didWork = !compacted.is_empty();
-    Ok(S2Result { didWork, compacted })
+    let cost = if totalCost > 0.0 { Some(totalCost) } else { None };
+    Ok(S2Result { didWork, compacted, cost })
 }
 
 /// A block of turns grouped by blockId.
@@ -257,7 +263,7 @@ async fn compactBlock(
     followupUser: Option<&str>,
     client: &api::Client,
     utilityModel: &str,
-) -> Result<String> {
+) -> Result<(String, Option<f64>)> {
     // Build the <compact_this> content from agent/tool turns.
     let mut compactParts: Vec<String> = Vec::new();
     for turn in &block.agentTurns {
@@ -321,11 +327,12 @@ async fn compactBlock(
         },
     ];
 
-    let response = client.complete(&messages, Some(utilityModel)).await?;
+    let (response, usage) = client.complete(&messages, Some(utilityModel)).await?;
 
     // Extract from <compacted_monolithic_string> tags if present.
+    let cost = usage.and_then(|u| u.cost);
     let summary = extractCompactedString(&response);
-    Ok(summary)
+    Ok((summary, cost))
 }
 
 /// Extract content from `<compacted_monolithic_string>` tags, or return raw.
@@ -536,6 +543,7 @@ mod tests {
             toolCallId: None,
             reasoning: None,
             attachments: None,
+            cost: None,
         }
     }
 

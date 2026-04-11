@@ -252,7 +252,7 @@ pub async fn classifyPrepared(
     utilityModel: String,
 ) -> TopicDecision {
     match client.complete(&messages, Some(&utilityModel)).await {
-        Ok(response) => parseTopicResponse(&response),
+        Ok((response, _usage)) => parseTopicResponse(&response),
         Err(e) => {
             tracing::warn!("topic classification failed, assuming same: {e}");
             TopicDecision::Same

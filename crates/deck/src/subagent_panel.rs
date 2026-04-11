@@ -30,7 +30,6 @@ pub enum SubagentTab {
 /// Read-only overlay for inspecting subagent activity.
 pub struct SubagentPanel {
     pub agentType: String,
-    pub sessionId: String,
     pub tab: SubagentTab,
     /// Real agent panel for transcript rendering — same code as the main panel.
     pub transcriptPanel: AgentPanel,
@@ -40,10 +39,9 @@ pub struct SubagentPanel {
 }
 
 impl SubagentPanel {
-    pub fn new(agentType: &str, sessionId: &str) -> Self {
+    pub fn new(agentType: &str) -> Self {
         Self {
             agentType: agentType.into(),
-            sessionId: sessionId.into(),
             tab: SubagentTab::Transcript,
             transcriptPanel: AgentPanel::new(),
             transcript: Vec::new(),

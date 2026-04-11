@@ -62,24 +62,6 @@ impl TextArea {
         &self.text
     }
 
-    pub fn isEmpty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    /// Number of logical lines (newline-delimited).
-    pub fn lineCount(&self) -> usize {
-        if self.text.is_empty() {
-            1
-        } else {
-            self.text.lines().count() + if self.text.ends_with('\n') { 1 } else { 0 }
-        }
-    }
-
-    /// Whether the input buffer contains a large paste (>5 lines).
-    pub fn isLargePaste(&self) -> bool {
-        self.pasteRegion.is_some()
-    }
-
     /// Desired widget height for the current content at the given width.
     ///
     /// `width` should be the content width (area minus prefix).
@@ -237,15 +219,7 @@ impl TextArea {
         }
     }
 
-    /// Clear the entire buffer.
-    pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursorPos = 0;
-        self.scroll = 0;
-        self.pasteRegion = None;
-        self.selAnchor = None;
-        self.selEnd = None;
-    }
+
 
     /// Submit: take the text and reset. Returns None if empty.
     pub fn submit(&mut self) -> Option<String> {
@@ -640,24 +614,6 @@ impl TextArea {
         (lineStart, self.cursorPos - lineStart)
     }
 
-    /// Compute wrapped visual lines for the current text.
-    fn wrappedLines(&self, width: u16) -> Vec<&str> {
-        let w = width.max(1) as usize;
-        let mut lines = Vec::new();
-
-        for logicalLine in self.text.split('\n') {
-            if logicalLine.is_empty() {
-                lines.push("");
-                continue;
-            }
-            let segments = wrapSegmentsFor(logicalLine, w);
-            for seg in &segments {
-                lines.push(&logicalLine[seg.byteStart..seg.byteEnd]);
-            }
-        }
-        lines
-    }
-
     /// Find the visual (line, column) of the cursor (0-indexed).
     fn cursorVisualPosition(&self, contentWidth: usize) -> (usize, usize) {
         self.byteToVisual(self.cursorPos, contentWidth)
@@ -798,10 +754,6 @@ impl TextArea {
         lines
     }
 
-    /// Byte offset of the start of the Nth logical line (0-indexed).
-    fn logicalLineByteStart(&self, lineIdx: usize) -> usize {
-        logicalLineByteStartIn(&self.text, lineIdx)
-    }
 }
 
 /// Build spans for a single wrapped segment, handling cursor and paste placeholder styling.
@@ -998,7 +950,7 @@ fn wrapSegmentsFor(line: &str, width: usize) -> Vec<WrapSegment> {
                 isLast: false,
             });
             segStart = breakAt;
-            colWidth = line[breakAt..=i]
+            colWidth = line[breakAt..i + ch.len_utf8()]
                 .chars()
                 .map(unicode_display_width)
                 .sum::<usize>();

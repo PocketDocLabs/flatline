@@ -45,7 +45,6 @@ pub enum RewindAction {
 
 /// A selectable exchange block in the picker.
 struct PickerItem {
-    blockId: String,
     userPreview: String,
     assistantPreview: String,
     turnCount: usize,
@@ -74,7 +73,6 @@ impl RewindPicker {
             .into_iter()
             .filter(|b| !b.rewindTo.is_empty())
             .map(|b| PickerItem {
-                blockId: b.blockId,
                 userPreview: b.userPreview,
                 assistantPreview: b.assistantPreview,
                 turnCount: b.turnCount,
@@ -300,7 +298,6 @@ impl RewindPicker {
 // ---- data helpers ----
 
 struct BlockData {
-    blockId: String,
     userPreview: String,
     assistantPreview: String,
     turnCount: usize,
@@ -332,7 +329,6 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
             if !currentBlockId.is_empty() && turnCount > 0 {
                 let rewindTo = prevBlockLastTurn.clone();
                 blocks.push(BlockData {
-                    blockId: currentBlockId.clone(),
                     userPreview: if userPreview.is_empty() { "(no message)".into() } else { userPreview.clone() },
                     assistantPreview: if assistantPreview.is_empty() { "(no response)".into() } else { assistantPreview.clone() },
                     turnCount,
@@ -370,7 +366,6 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
 
     if !currentBlockId.is_empty() && turnCount > 0 {
         blocks.push(BlockData {
-            blockId: currentBlockId,
             userPreview: if userPreview.is_empty() { "(no message)".into() } else { userPreview },
             assistantPreview: if assistantPreview.is_empty() { "(no response)".into() } else { assistantPreview },
             turnCount,

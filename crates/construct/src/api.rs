@@ -35,10 +35,11 @@ impl std::fmt::Display for PermanentApiError {
 
 impl std::error::Error for PermanentApiError {}
 
-/// OpenRouter API client.
+/// LLM API client. Supports OpenRouter and Fireworks (any OpenAI-compatible endpoint).
 #[derive(Clone)]
 pub struct Client {
-    http: reqwest::Client,
+    mainHttp: reqwest::Client,
+    utilityHttp: reqwest::Client,
     main: ModelConfig,
     utility: ModelConfig,
 }
@@ -47,26 +48,17 @@ impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
         if config.main.key.is_empty() {
-            bail!("API key not set. Edit config.toml (main.key or OPENROUTER_API_KEY)");
+            bail!("API key not set. Set main.key in config.toml, or OPENROUTER_API_KEY / FIREWORKS_API_KEY");
         }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse()?);
-        headers.insert(
-            AUTHORIZATION,
-            format!("Bearer {}", config.main.key).parse()?,
-        );
-        // OpenRouter-specific headers.
-        headers.insert("X-Title", "Flatline".parse()?);
-
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let mainHttp = buildHttpClient(&config.main)
+            .context("Failed to build main HTTP client")?;
+        let utilityHttp = buildHttpClient(&config.utility)
+            .context("Failed to build utility HTTP client")?;
 
         Ok(Self {
-            http,
+            mainHttp,
+            utilityHttp,
             main: config.main.clone(),
             utility: config.utility.clone(),
         })
@@ -88,7 +80,7 @@ impl Client {
 
         let mut body = serde_json::json!({
             "model": self.main.model,
-            "messages": messages,
+            "messages": adaptMessages(messages, &self.main.provider),
             "stream": true,
             "stream_options": { "include_usage": true },
         });
@@ -103,10 +95,19 @@ impl Client {
         }
 
         if let Some(r) = reasoning {
-            body["reasoning"] = serde_json::to_value(r)?;
+            if self.main.provider == "fireworks" {
+                // Fireworks uses a top-level `reasoning_effort` string.
+                if let Some(ref effort) = r.effort {
+                    body["reasoning_effort"] = serde_json::json!(effort);
+                }
+            } else {
+                // OpenRouter uses a nested `reasoning` object.
+                body["reasoning"] = serde_json::to_value(r)?;
+            }
         }
 
-        if !self.main.providerOrder.is_empty() {
+        // OpenRouter-specific provider routing.
+        if self.main.provider == "openrouter" && !self.main.providerOrder.is_empty() {
             body["provider"] = serde_json::json!({
                 "order": self.main.providerOrder,
                 "allow_fallbacks": false,
@@ -122,9 +123,9 @@ impl Client {
         );
         tracing::trace!(body = %body, "request body");
 
+        let http = self.mainHttp.clone();
         let response = (|| async {
-            let response = self
-                .http
+            let response = http
                 .post(&url)
                 .json(&body)
                 .send()
@@ -184,7 +185,7 @@ impl Client {
         &self,
         messages: &[Message],
         model: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<TokenUsage>)> {
         let url = format!("{}/chat/completions", self.utility.baseUrl);
         let modelId = model.unwrap_or(&self.utility.model);
 
@@ -194,7 +195,8 @@ impl Client {
             "stream": false,
         });
 
-        if !self.utility.providerOrder.is_empty() {
+        // OpenRouter-specific provider routing.
+        if self.utility.provider == "openrouter" && !self.utility.providerOrder.is_empty() {
             body["provider"] = serde_json::json!({
                 "order": self.utility.providerOrder,
                 "allow_fallbacks": false,
@@ -207,9 +209,9 @@ impl Client {
             "sending utility completion request"
         );
 
+        let http = self.utilityHttp.clone();
         let response = (|| async {
-            let response = self
-                .http
+            let response = http
                 .post(&url)
                 .json(&body)
                 .send()
@@ -254,14 +256,68 @@ impl Client {
             .unwrap_or("")
             .to_string();
 
+        let usage = responseBody.get("usage").and_then(|u| {
+            Some(TokenUsage {
+                promptTokens: u.get("prompt_tokens")?.as_u64()? as usize,
+                completionTokens: u.get("completion_tokens")?.as_u64()? as usize,
+                totalTokens: u.get("total_tokens")?.as_u64()? as usize,
+                cost: u.get("cost").and_then(|c| c.as_f64()),
+            })
+        });
+
         tracing::debug!(
             model = %modelId,
             responseLen = content.len(),
+            cost = ?usage.as_ref().and_then(|u| u.cost),
             "utility completion received"
         );
 
-        Ok(content)
+        Ok((content, usage))
     }
+}
+
+/// Serialize messages with provider-specific field names.
+///
+/// Fireworks uses `reasoning_content` where OpenRouter uses `reasoning`
+/// on assistant messages. This translates at the JSON boundary so the
+/// internal Message type stays provider-agnostic.
+fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
+    let mut value = serde_json::to_value(messages).unwrap_or_default();
+    if provider == "fireworks" {
+        if let serde_json::Value::Array(ref mut arr) = value {
+            for msg in arr.iter_mut() {
+                if let serde_json::Value::Object(map) = msg {
+                    if map.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if let Some(reasoning) = map.remove("reasoning") {
+                            map.insert("reasoning_content".to_string(), reasoning);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
+/// Build an HTTP client for a specific model config, with provider-appropriate headers.
+fn buildHttpClient(config: &ModelConfig) -> Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "application/json".parse()?);
+    headers.insert(
+        AUTHORIZATION,
+        format!("Bearer {}", config.key).parse()?,
+    );
+
+    // OpenRouter-specific headers.
+    if config.provider == "openrouter" {
+        headers.insert("X-Title", "Flatline".parse()?);
+    }
+
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")
 }
 
 /// Read an SSE stream and emit events.
@@ -488,11 +544,13 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
             promptTokens: u.prompt_tokens.unwrap_or(0),
             completionTokens: u.completion_tokens.unwrap_or(0),
             totalTokens: u.total_tokens.unwrap_or(0),
+            cost: u.cost,
         };
         tracing::info!(
             promptTokens = tu.promptTokens,
             completionTokens = tu.completionTokens,
             totalTokens = tu.totalTokens,
+            cost = ?tu.cost,
             "token usage"
         );
         tu
@@ -508,18 +566,34 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
                     }
                 }
 
-                // Prefer simple reasoning field (DeepSeek, Kimi).
-                // Fall back to structured reasoning_details (Claude via OpenRouter).
-                // Only use one to avoid duplicate output.
+                // Reasoning tokens arrive under different field names per provider:
+                //   - `reasoning` — OpenRouter (DeepSeek, Kimi)
+                //   - `reasoning_content` — Fireworks (Kimi, DeepSeek, etc.)
+                //   - `reasoning_details` — OpenRouter (Claude structured)
+                // Check all three, but only emit once to avoid duplicates.
                 let mut hadReasoning = false;
+
+                // Simple reasoning field (OpenRouter).
                 if let Some(reasoning) = delta.reasoning {
                     if !reasoning.is_empty() {
-                        tracing::trace!(len = reasoning.len(), "reasoning delta (simple)");
+                        tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning)");
                         events.push(StreamEvent::ReasoningDelta(reasoning));
                         hadReasoning = true;
                     }
                 }
 
+                // Fireworks reasoning_content field.
+                if !hadReasoning {
+                    if let Some(reasoning) = delta.reasoning_content {
+                        if !reasoning.is_empty() {
+                            tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning_content)");
+                            events.push(StreamEvent::ReasoningDelta(reasoning));
+                            hadReasoning = true;
+                        }
+                    }
+                }
+
+                // Structured reasoning details (Claude via OpenRouter).
                 if !hadReasoning {
                     if let Some(details) = delta.reasoning_details {
                         for detail in details {

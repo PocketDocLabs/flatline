@@ -35,13 +35,6 @@ use dashmap::DashMap;
 
 use super::config::ResolvedServer;
 
-/// Re-export the Url type from lsp-types (via async-lsp) for use in other modules.
-pub use async_lsp::lsp_types::Url as LspUrl;
-
-/// Re-export Diagnostic for use in other modules.
-pub use async_lsp::lsp_types::Diagnostic as LspDiagnostic;
-pub use async_lsp::lsp_types::DiagnosticSeverity as LspDiagnosticSeverity;
-
 /// Connection state for a single language server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -147,10 +140,7 @@ impl LspConnection {
 
         // Process group isolation for clean shutdown.
         #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| {
             self.state = ConnectionState::Failed(format!("Failed to spawn: {e}"));
@@ -408,6 +398,12 @@ impl LspConnection {
     /// Shutdown the language server gracefully.
     pub async fn shutdown(&mut self) {
         self.state = ConnectionState::ShuttingDown;
+
+        // Close all tracked files before shutting down.
+        let openPaths: Vec<String> = self.versions.keys().cloned().collect();
+        for path in &openPaths {
+            self.didClose(path);
+        }
 
         if let Some(server) = self.server.take() {
             // Send shutdown request, then exit notification.
