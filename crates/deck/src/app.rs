@@ -20,8 +20,9 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
     Terminal as RatatuiTerminal,
 };
 use tokio::sync::{mpsc, watch};
@@ -118,6 +119,11 @@ fn resetTerminalTitle() {
 
 /// Run the deck TUI.
 pub async fn run() -> Result<()> {
+    // Load config BEFORE touching the terminal — a config error here would
+    // otherwise skip the cleanup block and leave the terminal in raw mode
+    // with mouse capture still on.
+    let config = construct::config::load()?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -133,18 +139,46 @@ pub async fn run() -> Result<()> {
     )?;
     setTerminalTitle(None);
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = RatatuiTerminal::new(backend)?;
+    // From here until cleanup, any `?` bypasses terminal restore — wrap
+    // fallible setup so errors get cleaned up before propagating.
+    let setupResult = (|| -> Result<_> {
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = RatatuiTerminal::new(backend)?;
+        let size = terminal.size()?;
+        // Terminal gets ~60% width minus borders, full height minus status bar and borders.
+        let termCols = (size.width * 3 / 5).saturating_sub(2);
+        let termRows = size.height.saturating_sub(3);
+        let (shell, shellIo) = spawnShell(termCols, termRows)?;
+        let termState = TerminalState::new(termCols, termRows);
+        Ok((terminal, shell, shellIo, termState, termCols, termRows))
+    })();
 
-    let size = terminal.size()?;
-    // Terminal gets ~60% width minus borders, full height minus status bar and borders.
-    let termCols = (size.width * 3 / 5).saturating_sub(2);
-    let termRows = size.height.saturating_sub(3);
-    let (shell, mut shellIo) = spawnShell(termCols, termRows)?;
-    let mut termState = TerminalState::new(termCols, termRows);
+    let (mut terminal, shell, mut shellIo, mut termState, _termCols, _termRows) =
+        match setupResult {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(
+                    io::stdout(),
+                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
+                    crossterm::event::PopKeyboardEnhancementFlags,
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::DisableBracketedPaste,
+                    LeaveAlternateScreen,
+                );
+                resetTerminalTitle();
+                return Err(e);
+            }
+        };
 
-    let config = construct::config::load()?;
-    let contextWindow = config.main.contextWindow;
+    let contextWindow = config.heavy.contextWindow;
+    let cachingEnabled = config.heavy.cachingActive();
+    tracing::info!(
+        model = %config.heavy.model,
+        cachingEnabled,
+        supportsAnthropicCache = ?config.heavy.supportsAnthropicCache,
+        "deck startup cache config"
+    );
     let rollingBaseline = construct::cost::rollingWindowCost(
         config.projectRoot.as_deref().and_then(|p| p.to_str()),
     );
@@ -437,6 +471,26 @@ pub async fn run() -> Result<()> {
                             session.shutdownMcp().await;
                             break;
                         }
+                        Some(CommandAction::RetryLastTurn) => {
+                            cancelRx.borrow_and_update();
+                            if let Err(e) = session.retryLastTurn(
+                                &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx,
+                            ).await {
+                                let _ = eventTx
+                                    .send(SessionEvent::Error(format!("Retry failed: {e}")))
+                                    .await;
+                            }
+                        }
+                        Some(CommandAction::ContinueLastTurn) => {
+                            cancelRx.borrow_and_update();
+                            if let Err(e) = session.continueLastTurn(
+                                &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx,
+                            ).await {
+                                let _ = eventTx
+                                    .send(SessionEvent::Error(format!("Continue failed: {e}")))
+                                    .await;
+                            }
+                        }
                         Some(action) => {
                             let result = session.executeCommand(&action).await;
                             let _ = eventTx
@@ -466,6 +520,7 @@ pub async fn run() -> Result<()> {
         &steerTx,
         contextWindow,
         rollingBaseline,
+        cachingEnabled,
     )
     .await;
 
@@ -504,10 +559,13 @@ async fn runLoop(
     steerTx: &mpsc::Sender<construct::session::UserInput>,
     contextWindow: usize,
     rollingBaseline: f64,
+    cachingEnabled: bool,
 ) -> Result<()> {
     let mut tokenCount: usize = 0;
     let mut sessionCost: f64 = 0.0;
-    let mut rollingCost: f64 = rollingBaseline;
+    let mut lastCacheHitAt: Option<Instant> = None;
+    let mut helpPopupOpen = false;
+    let _ = rollingBaseline; // No longer displayed; kept in signature for API stability.
     let mut sessionPicker: Option<SessionPicker> = None;
     let mut rewindPicker: Option<RewindPicker> = None;
     let mut forkPicker: Option<ForkPicker> = None;
@@ -691,27 +749,21 @@ async fn runLoop(
                 if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
                     frame.set_cursor_position(ratatui::layout::Position::new(col, row));
                 }
+            } else if *focus == Focus::Terminal {
+                if let Some((col, row)) = termState.cursorViewportPos() {
+                    frame.set_cursor_position(ratatui::layout::Position::new(
+                        termInner.x + col,
+                        termInner.y + row,
+                    ));
+                }
             }
 
-            // Status bar.
-            let modeStr = match focus {
-                Focus::Terminal => "terminal",
-                Focus::Agent => "agent",
-            };
-
-            // Show "press again" hint briefly after a single Ctrl+Q tap.
+            // Status bar. Minimal layout: right-aligned cost + ctx% + cache.
+            // The "press Ctrl+Q again to quit" hint still hijacks the bar
+            // briefly — it's a load-bearing safety affordance.
             let quitHintActive = lastQuitPress
                 .map(|t| t.elapsed() < Duration::from_secs(1))
                 .unwrap_or(false);
-            let controls = if quitHintActive {
-                "\u{25B8} press Ctrl+Q again to quit"
-            } else if agentPanel.isActive() && agentPanel.queuedCount() > 0 {
-                "\u{2191}: edit last  Esc: cancel  Ctrl+Q\u{00d7}2: quit"
-            } else if agentPanel.isActive() {
-                "Esc: cancel  Ctrl+Q\u{00d7}2: quit"
-            } else {
-                "Tab: switch  Ctrl+Q\u{00d7}2: quit"
-            };
 
             let (barBg, barFg) = if quitHintActive {
                 (Color::Yellow, Color::Black)
@@ -719,21 +771,56 @@ async fn runLoop(
                 (Color::DarkGray, Color::White)
             };
 
-            let leftText = format!(" [{modeStr}]  {controls}");
-            let tokenStr = formatTokens(tokenCount, contextWindow);
-            let costStr = formatCostPair(sessionCost, rollingCost);
-            let rightStr = if costStr.is_empty() {
-                tokenStr
-            } else if tokenStr.is_empty() {
-                costStr
-            } else {
-                format!("{costStr}  \u{2502}  {tokenStr}")
-            };
             let barWidth = vChunks[1].width as usize;
-            // Pad between left and right-justified status string.
-            let gap = barWidth.saturating_sub(leftText.len() + rightStr.len() + 1);
-            let statusLine = format!("{leftText}{:>width$} ", rightStr, width = gap + rightStr.len());
-            let statusBar = Paragraph::new(statusLine)
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+
+            if quitHintActive {
+                let hint = " \u{25B8} press Ctrl+Q again to quit";
+                spans.push(Span::raw(hint.to_string()));
+                let pad = barWidth.saturating_sub(hint.chars().count());
+                spans.push(Span::raw(" ".repeat(pad)));
+            } else {
+                let costStr = if sessionCost > 0.0 {
+                    construct::cost::formatCost(sessionCost)
+                } else {
+                    String::new()
+                };
+                let ctxStr = formatContextPct(tokenCount, contextWindow);
+                let cacheSpans = cacheHeatSpans(
+                    cachingEnabled, lastCacheHitAt, barBg, barFg,
+                );
+
+                // Assemble right-aligned spans: cost  ctx  cache-glyph cache-word.
+                let mut rightSpans: Vec<Span<'static>> = Vec::with_capacity(6);
+                if !costStr.is_empty() {
+                    rightSpans.push(Span::raw(costStr));
+                }
+                if !ctxStr.is_empty() {
+                    if !rightSpans.is_empty() {
+                        rightSpans.push(Span::raw("  "));
+                    }
+                    rightSpans.push(Span::raw(ctxStr));
+                }
+                if !cacheSpans.is_empty() {
+                    if !rightSpans.is_empty() {
+                        rightSpans.push(Span::raw("  "));
+                    }
+                    rightSpans.extend(cacheSpans);
+                    rightSpans.push(Span::raw(" cache"));
+                }
+
+                let rightWidth: usize = rightSpans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum();
+                // Trailing space + 1 char leading pad keeps the bar breathing.
+                let pad = barWidth.saturating_sub(rightWidth + 1);
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.extend(rightSpans);
+                spans.push(Span::raw(" "));
+            }
+
+            let statusBar = Paragraph::new(Line::from(spans))
                 .style(Style::default().bg(barBg).fg(barFg));
             frame.render_widget(statusBar, vChunks[1]);
 
@@ -770,6 +857,11 @@ async fn runLoop(
             // Subagent panel overlay.
             if let Some(ref mut panel) = subagentPanel {
                 panel.render(area, frame.buffer_mut());
+            }
+
+            // Help popup overlay.
+            if helpPopupOpen {
+                renderHelpPopup(area, frame.buffer_mut());
             }
         })?;
         }
@@ -834,18 +926,25 @@ async fn runLoop(
                 SessionEvent::TokenUpdate {
                     contextTokens,
                     sessionCost: sc,
+                    cacheReadTokens,
                     ..
                 } => {
                     tokenCount = contextTokens;
-                    let delta = sc - sessionCost;
                     sessionCost = sc;
-                    rollingCost += delta;
+                    if cacheReadTokens > 0 {
+                        lastCacheHitAt = Some(Instant::now());
+                    }
                 }
                 SessionEvent::Retrying { attempt, maxAttempts } => {
                     agentPanel.showRetrying(attempt, maxAttempts);
                 }
                 SessionEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
+                    // A fatal error ends the turn — stop the throbber so the
+                    // user isn't misled into thinking the model is still
+                    // working, and surface the retry/continue hint.
+                    agentPanel.finishTurn();
+                    agentPanel.errorHint = true;
                 }
                 SessionEvent::BudgetWarning { sessionCost: sc, limit } => {
                     let msg = format!(
@@ -1047,6 +1146,7 @@ async fn runLoop(
             &mut subagentPermitTx,
             &projectDir,
             &mut lastQuitPress,
+            &mut helpPopupOpen,
         )
         .await?;
         if quit {
@@ -1091,6 +1191,7 @@ async fn handleInput(
     subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
+    helpPopupOpen: &mut bool,
 ) -> Result<(bool, bool, bool)> {
     // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
@@ -1140,6 +1241,43 @@ async fn handleInput(
                 {
                     resized = true;
                     break;
+                }
+
+                // Ctrl+H: toggle the hotkey-tips popup.
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('h')
+                {
+                    *helpPopupOpen = !*helpPopupOpen;
+                    break;
+                }
+
+                // Any key dismisses the help popup (and does not propagate).
+                if *helpPopupOpen {
+                    *helpPopupOpen = false;
+                    break;
+                }
+
+                // Error-mode recovery bindings. Only active when the last
+                // turn fatally errored (hint is showing). Both discard the
+                // error state before dispatching the command.
+                if agentPanel.errorHint
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    match key.code {
+                        KeyCode::Char('r') => {
+                            agentPanel.errorHint = false;
+                            let _ = cancelTx.send(false);
+                            let _ = commandTx.send(CommandAction::RetryLastTurn).await;
+                            break;
+                        }
+                        KeyCode::Char(' ') => {
+                            agentPanel.errorHint = false;
+                            let _ = cancelTx.send(false);
+                            let _ = commandTx.send(CommandAction::ContinueLastTurn).await;
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Subagent panel overlay intercepts ALL keys when active (including Esc, Tab).
@@ -1482,6 +1620,8 @@ async fn handleInput(
                                             let _ = cancelTx.send(false);
                                             agentPanel.history.push(&msg);
                                             agentPanel.pushUser(&msg);
+                                            // New user input — supersedes any prior error state.
+                                            agentPanel.errorHint = false;
                                             let input = construct::session::UserInput {
                                                 text: msg,
                                                 attachments: agentPanel.takeAttachments(),
@@ -1579,9 +1719,30 @@ async fn handleInput(
             }
             Event::Paste(text) => {
                 hadInput = true;
-                if *focus == Focus::Agent && !agentPanel.pendingPermit {
-                    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                    agentPanel.textArea.insertStr(&normalized);
+                match *focus {
+                    Focus::Agent if !agentPanel.pendingPermit => {
+                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        agentPanel.textArea.insertStr(&normalized);
+                    }
+                    Focus::Terminal => {
+                        if termState.displayOffset() > 0 {
+                            termState.scrollToBottom();
+                        }
+                        // Shells treat CR as "execute"; normalize to LF so multi-line
+                        // pastes land as a single buffered command when possible.
+                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        let payload = if termState.bracketedPaste() {
+                            let mut buf = Vec::with_capacity(normalized.len() + 12);
+                            buf.extend_from_slice(b"\x1b[200~");
+                            buf.extend_from_slice(normalized.as_bytes());
+                            buf.extend_from_slice(b"\x1b[201~");
+                            buf
+                        } else {
+                            normalized.into_bytes()
+                        };
+                        let _ = shellIo.inputTx.try_send(payload);
+                    }
+                    _ => {}
                 }
             }
             Event::Resize(cols, rows) => {
@@ -1925,41 +2086,104 @@ fn keyToBytes(key: &event::KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-/// Format token usage for the status bar: "42.1k / 256k (16%)".
-fn formatTokens(tokens: usize, window: usize) -> String {
-    if tokens == 0 {
-        return String::new();
+/// Status-bar cache-heat indicator — just the glyph.
+///
+/// Returns a single glyph span, color-coded by how long it's been since the
+/// last cache hit. Empty vec when caching is disabled. The caller appends
+/// the literal word " cache" so the user can't mistake the glyph for a
+/// sampling-temperature indicator.
+fn cacheHeatSpans(
+    enabled: bool,
+    lastHit: Option<Instant>,
+    barBg: Color,
+    _barFg: Color,
+) -> Vec<Span<'static>> {
+    if !enabled {
+        return Vec::new();
     }
 
-    let fmtK = |n: usize| -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1_000.0)
+    let glyphSpan = if let Some(ts) = lastHit {
+        let elapsed = ts.elapsed().as_secs();
+        let (glyph, fg, dim) = if elapsed < 60 {
+            ("\u{2668}\u{FE0E}", Color::Red, false)
+        } else if elapsed < 180 {
+            ("\u{2668}\u{FE0E}", Color::LightRed, false)
+        } else if elapsed < 300 {
+            ("\u{2668}\u{FE0E}", Color::Yellow, true)
         } else {
-            format!("{n}")
+            ("\u{2744}\u{FE0E}", Color::Cyan, false)
+        };
+        let mut style = Style::default().bg(barBg).fg(fg);
+        if dim {
+            style = style.add_modifier(Modifier::DIM);
         }
-    };
-
-    let pct = if window > 0 {
-        (tokens as f64 / window as f64 * 100.0) as usize
+        Span::styled(glyph.to_string(), style)
     } else {
-        0
+        // Caching configured but no hit yet this session.
+        Span::styled(
+            "\u{25CB}".to_string(),
+            Style::default().bg(barBg).fg(Color::Cyan),
+        )
     };
 
-    format!("{} / {} ({}%)", fmtK(tokens), fmtK(window), pct)
+    vec![glyphSpan]
 }
 
-/// Format session/rolling cost for the status bar: "$0.08 / $1.24".
-fn formatCostPair(session: f64, rolling: f64) -> String {
-    if session == 0.0 && rolling == 0.0 {
+/// Short "ctx 3%" string for the status bar. Empty when no context consumed yet.
+fn formatContextPct(tokens: usize, window: usize) -> String {
+    if tokens == 0 || window == 0 {
         return String::new();
     }
-    format!(
-        "{} / {}",
-        construct::cost::formatCost(session),
-        construct::cost::formatCost(rolling),
-    )
+    let pct = (tokens as f64 / window as f64 * 100.0).round() as usize;
+    format!("ctx {pct}%")
+}
+
+/// Render the hotkey-tips popup — a centered dialog listing every bound
+/// shortcut. Dismisses on any keypress (handled in input loop).
+fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    const ROWS: &[(&str, &str)] = &[
+        ("Tab",         "Switch focus between terminal and agent"),
+        ("Esc",         "Cancel running turn / close overlay"),
+        ("Ctrl+Q \u{00d7}2", "Quit flatline (double-tap)"),
+        ("Ctrl+L",      "Force terminal redraw"),
+        ("Ctrl+H",      "Toggle this help"),
+        ("\u{2191} / \u{2193}", "Scroll / history navigation in agent panel"),
+    ];
+
+    // Center a 56x(rows+4) box inside the given area.
+    let innerW: u16 = 56;
+    let innerH: u16 = ROWS.len() as u16 + 4;
+    let w = innerW.min(area.width.saturating_sub(2));
+    let h = innerH.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    // Clear underlying cells so the popup reads cleanly.
+    Clear.render(popup, buf);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" hotkeys \u{2014} any key to dismiss ")
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+
+    let lines: Vec<Line<'static>> = ROWS
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<10}", key),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(*desc),
+            ])
+        })
+        .collect();
+    Paragraph::new(lines).render(inner, buf);
 }
 
 /// Extract text from the terminal selection, rejoining soft-wrapped lines.

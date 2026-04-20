@@ -3,10 +3,22 @@
 //! Builds the system prompt from composable pieces:
 //! base persona + interface module + domain module(s) + project context.
 //!
+//! The output is split into two regions joined by [`CACHE_BOUNDARY`]: a
+//! byte-stable static prefix (persona, instructions) and a volatile runtime
+//! suffix (cwd, date, project context, MCP status). The API client splits on
+//! this sentinel to put a 1-hour `cache_control` breakpoint between them,
+//! letting the static prefix cache survive across flatline instances.
+//!
 //! # Public API
 //! - [`InterfaceMode`] — how the agent is being driven
 //! - [`DomainModule`] — task-specific skill sets
 //! - [`build`] — assembles the final prompt string
+//! - [`CACHE_BOUNDARY`] — in-band marker separating static / dynamic regions
+
+/// Marker separating the cacheable static prefix from volatile runtime
+/// context in an assembled system prompt. Recognized by `api.rs` to place
+/// a 1-hour cache breakpoint on the static portion.
+pub const CACHE_BOUNDARY: &str = "<!--flatline:cache-boundary-->";
 
 /// How the agent is being driven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +49,8 @@ pub fn build(
     domains: &[DomainModule],
     promptThinking: bool,
 ) -> String {
-    let mut parts = Vec::with_capacity(5);
-
+    // Static region — byte-stable across processes in the same profile.
+    let mut staticParts = Vec::with_capacity(3 + domains.len());
     let mut persona = basePersona();
     if promptThinking {
         if let (Some(start), Some(end)) = (
@@ -49,22 +61,29 @@ pub fn build(
             persona.replace_range(start..endTag, &thinkingPromptWithScratchpad());
         }
     }
-    parts.push(persona);
-
-    parts.push(interfaceModule(interface));
-
+    staticParts.push(persona);
+    staticParts.push(interfaceModule(interface));
     for domain in domains {
-        parts.push(domainModule(domain));
+        staticParts.push(domainModule(domain));
     }
+    let staticRegion = staticParts.join("\n\n");
 
+    // Dynamic region — cwd/date/project context/MCP all go after the
+    // boundary. MCP status is appended later in session::initMcp; it lands
+    // at the end of whatever's here.
+    let mut dynamicParts: Vec<String> = Vec::with_capacity(2);
+    dynamicParts.push(runtimeBlock());
     if let Some(ctx) = projectContext() {
-        parts.push(format!("<project-context>\n{ctx}\n</project-context>"));
+        dynamicParts.push(format!("<project-context>\n{ctx}\n</project-context>"));
     }
+    let dynamicRegion = dynamicParts.join("\n\n");
 
-    parts.join("\n\n")
+    format!("{staticRegion}\n\n{CACHE_BOUNDARY}\n\n{dynamicRegion}")
 }
 
-fn basePersona() -> String {
+/// Runtime-varying block — cwd, platform, date. Lives in the dynamic region
+/// below [`CACHE_BOUNDARY`] so the static prefix stays byte-stable.
+fn runtimeBlock() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -76,7 +95,6 @@ fn basePersona() -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Simple date formatting without chrono dependency.
         let days = now / 86400;
         let mut y = 1970i64;
         let mut remaining = days as i64;
@@ -105,13 +123,15 @@ fn basePersona() -> String {
     };
 
     format!(
+        "<runtime>\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}\n</runtime>"
+    )
+}
+
+fn basePersona() -> String {
+    String::from(
         "\
 <identity>
 You are Flatline, a general-purpose agent.
-
-Working directory: {cwd}
-Platform: {platform}
-Date: {date}
 </identity>
 
 <communication>
@@ -377,8 +397,9 @@ scratchpad earned you that right.
         .into()
 }
 
-/// Short rider prefixed to the user message content as a per-turn reminder.
-pub const THINKING_RIDER: &str = "<CRITICAL_INSTRUCTION>Open with <scratchpad>, reason fully, close with </scratchpad>, then respond.</CRITICAL_INSTRUCTION>\n\n";
+/// Body of the thinking rider.
+pub const THINKING_RIDER_BODY: &str =
+    "Open with <scratchpad>, reason fully, close with </scratchpad>, then respond.";
 
 /// Search for AGENTS.md in the working directory and ancestors.
 fn projectContext() -> Option<String> {
@@ -449,6 +470,46 @@ mod tests {
             let opens = prompt.matches(&format!("<{tag}")).count();
             let closes = prompt.matches(&format!("</{tag}>")).count();
             assert_eq!(opens, closes, "unbalanced <{tag}> tags");
+        }
+    }
+
+    #[test]
+    fn buildEmitsCacheBoundary() {
+        let prompt = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], false);
+        // Exactly one sentinel, separating a non-empty static region from a
+        // non-empty dynamic region.
+        let hits: Vec<_> = prompt.match_indices(CACHE_BOUNDARY).collect();
+        assert_eq!(hits.len(), 1, "expected one CACHE_BOUNDARY sentinel");
+        let (staticPart, _) = prompt.split_once(CACHE_BOUNDARY).unwrap();
+        assert!(staticPart.contains("<identity>"));
+        assert!(staticPart.contains("You are Flatline"));
+    }
+
+    #[test]
+    fn staticRegionDoesNotEmbedRuntimeValues() {
+        // The static half must not contain cwd / date / platform — those
+        // are the very values that would break cross-instance caching.
+        let prompt = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], false);
+        let (staticPart, dynamicPart) = prompt.split_once(CACHE_BOUNDARY).unwrap();
+        assert!(!staticPart.contains("Working directory:"),
+            "cwd leaked into the static (cacheable) region");
+        assert!(!staticPart.contains("Date:"),
+            "date leaked into the static (cacheable) region");
+        assert!(dynamicPart.contains("Working directory:"));
+        assert!(dynamicPart.contains("Date:"));
+    }
+
+    #[test]
+    fn buildStaticRegionIsStableAcrossCalls() {
+        // Run 50 times and verify the static portion (bytes before the
+        // sentinel) is byte-identical every call. Catches any hidden
+        // non-determinism like randomly-ordered domain iteration.
+        let first = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], true);
+        let (firstStatic, _) = first.split_once(CACHE_BOUNDARY).unwrap();
+        for _ in 0..50 {
+            let p = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], true);
+            let (nextStatic, _) = p.split_once(CACHE_BOUNDARY).unwrap();
+            assert_eq!(firstStatic, nextStatic, "static region drifted between calls");
         }
     }
 }

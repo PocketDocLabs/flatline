@@ -270,6 +270,11 @@ pub struct TokenUsage {
     pub totalTokens: usize,
     /// USD cost reported by the provider (OpenRouter). None if not available.
     pub cost: Option<f64>,
+    /// Input tokens served from Anthropic prompt cache (0 on non-Claude routes
+    /// or when caching is inactive).
+    pub cacheReadTokens: usize,
+    /// Input tokens written to Anthropic prompt cache this turn.
+    pub cacheCreationTokens: usize,
 }
 
 /// Raw SSE chunk from the API (for deserialization).
@@ -287,6 +292,23 @@ pub(crate) struct ChunkUsage {
     pub total_tokens: Option<usize>,
     /// USD cost from OpenRouter.
     pub cost: Option<f64>,
+    /// OpenRouter's nested cache breakdown (OpenAI-compat shape).
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Anthropic-direct: cache read (prefix cache hit, 0.1x input).
+    /// OpenRouter routes expose this via prompt_tokens_details instead.
+    pub cache_read_input_tokens: Option<usize>,
+    /// Anthropic-direct: cache write (prefix cache miss, 1.25x for 5m).
+    pub cache_creation_input_tokens: Option<usize>,
+}
+
+/// OpenAI-compatible nested prompt token breakdown — OpenRouter surfaces
+/// Anthropic cache activity here, not in Anthropic's native top-level keys.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromptTokensDetails {
+    /// Tokens read from prompt cache (cache hit).
+    pub cached_tokens: Option<usize>,
+    /// Tokens written to prompt cache (cache miss).
+    pub cache_write_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

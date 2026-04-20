@@ -14,6 +14,7 @@
 mod agent_panel;
 mod app;
 mod command;
+mod export;
 mod fork_picker;
 mod history;
 mod markdown;
@@ -52,6 +53,33 @@ enum Commands {
         /// Shell to generate for (bash, zsh, fish, powershell, elvish).
         shell: clap_complete::Shell,
     },
+
+    /// Export session transcripts as SFT training data (OpenAI-format JSON).
+    Export {
+        /// Session ID (e.g. ses_abc123). Omit when using --all.
+        sessionId: Option<String>,
+        /// Export every session that has snapshots, merged into one array.
+        #[arg(long, conflicts_with = "sessionId")]
+        all: bool,
+        /// With --all, only include sessions whose projectDir matches.
+        #[arg(long, requires = "all")]
+        project: Option<std::path::PathBuf>,
+        /// Output file. Stdout if omitted.
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+        /// Drop the `reasoning` field from emitted examples.
+        #[arg(long)]
+        noReasoning: bool,
+        /// Minimum messages required per emitted example.
+        #[arg(long, default_value_t = 2)]
+        minMessages: usize,
+        /// Print stats without writing any examples.
+        #[arg(long)]
+        dryRun: bool,
+        /// Include cancelled turns as training targets (default: skip).
+        #[arg(long)]
+        includeCancelled: bool,
+    },
 }
 
 #[derive(Args)]
@@ -70,6 +98,20 @@ struct ExecArgs {
     /// Model override.
     #[arg(long)]
     model: Option<String>,
+
+    /// Profile to use for the heavy tier (overrides `heavyProfile` in config).
+    #[arg(long, alias = "profile")]
+    heavyProfile: Option<String>,
+
+    /// Profile to use for the light tier (overrides `lightProfile`).
+    /// Defaults to the heavy profile when unset.
+    #[arg(long)]
+    lightProfile: Option<String>,
+
+    /// Profile to use for the utility tier (overrides `utilityProfile`).
+    /// Defaults to the light profile when unset.
+    #[arg(long)]
+    utilityProfile: Option<String>,
 
     /// Replace the system prompt.
     #[arg(long, group = "sysprompt")]
@@ -150,6 +192,9 @@ fn resolveExecArgs(args: ExecArgs) -> Result<(String, construct::runner::RunConf
 
     let config = construct::runner::RunConfig {
         maxTurns: args.maxTurns,
+        heavyProfile: args.heavyProfile,
+        lightProfile: args.lightProfile,
+        utilityProfile: args.utilityProfile,
         model: args.model,
         systemPrompt,
         allowedTools: args.allowedTools,
@@ -192,6 +237,17 @@ async fn main() -> Result<()> {
 
             let outputMode = args.output.clone();
             let (prompt, runConfig) = resolveExecArgs(args)?;
+            // Apply tier overrides before load so the resolver picks the right profiles.
+            // SAFETY: single-threaded CLI startup; nothing else reads these yet.
+            if let Some(ref profile) = runConfig.heavyProfile {
+                unsafe { std::env::set_var("FLATLINE_HEAVY_PROFILE", profile) };
+            }
+            if let Some(ref profile) = runConfig.lightProfile {
+                unsafe { std::env::set_var("FLATLINE_LIGHT_PROFILE", profile) };
+            }
+            if let Some(ref profile) = runConfig.utilityProfile {
+                unsafe { std::env::set_var("FLATLINE_UTILITY_PROFILE", profile) };
+            }
             let config = construct::config::load()?;
 
             match outputMode.as_str() {
@@ -253,6 +309,40 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+
+        Some(Commands::Export {
+            sessionId,
+            all,
+            project,
+            output,
+            noReasoning,
+            minMessages,
+            dryRun,
+            includeCancelled,
+        }) => {
+            let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_env_filter(envFilter)
+                .init();
+
+            if sessionId.is_none() && !all {
+                anyhow::bail!("provide a sessionId or pass --all");
+            }
+
+            export::run(export::ExportArgs {
+                sessionId,
+                all,
+                project,
+                output,
+                noReasoning,
+                minMessages,
+                dryRun,
+                includeCancelled,
+            })
         }
 
         Some(Commands::Completions { shell }) => {
@@ -338,7 +428,15 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
         SessionEvent::TurnCancelled => serde_json::json!({
             "type": "turnCancelled",
         }),
-        SessionEvent::TokenUpdate { promptTokens, completionTokens, contextTokens, turnCost, sessionCost } => {
+        SessionEvent::TokenUpdate {
+            promptTokens,
+            completionTokens,
+            contextTokens,
+            turnCost,
+            sessionCost,
+            cacheReadTokens,
+            cacheCreationTokens,
+        } => {
             serde_json::json!({
                 "type": "tokenUpdate",
                 "promptTokens": promptTokens,
@@ -346,6 +444,8 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
                 "contextTokens": contextTokens,
                 "turnCost": turnCost,
                 "sessionCost": sessionCost,
+                "cacheReadTokens": cacheReadTokens,
+                "cacheCreationTokens": cacheCreationTokens,
             })
         }
         SessionEvent::CompactionStarted { stage } => serde_json::json!({

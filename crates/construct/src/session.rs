@@ -29,7 +29,7 @@ use crate::compaction_trigger;
 use crate::config::Config;
 use crate::context;
 use crate::message::{
-    FunctionCall, Message, ReasoningConfig, StreamEvent, TokenUsage, ToolCall, ToolDef,
+    Content, FunctionCall, Message, ReasoningConfig, StreamEvent, TokenUsage, ToolCall, ToolDef,
 };
 use crate::permissions::{PermitMode, Permissions, Verdict};
 use crate::prompt::{self, DomainModule, InterfaceMode};
@@ -127,6 +127,11 @@ pub enum SessionEvent {
         turnCost: Option<f64>,
         /// Running session total in USD.
         sessionCost: f64,
+        /// Input tokens served from prompt cache this turn (0 when caching
+        /// is off or inactive).
+        cacheReadTokens: usize,
+        /// Input tokens written to prompt cache this turn.
+        cacheCreationTokens: usize,
     },
 
     /// Session cost exceeded the configured warning threshold.
@@ -286,6 +291,129 @@ pub enum CommandAction {
     },
     /// Gracefully shut down all background services (LSP, MCP).
     Shutdown,
+    /// Re-run the last user turn from scratch. Drops the errored assistant
+    /// response (if any) from history so the model responds fresh.
+    RetryLastTurn,
+    /// Resume streaming from where the last turn was cut off. Keeps the
+    /// errored assistant in history as a prefill so the model continues
+    /// from its partial response.
+    ContinueLastTurn,
+}
+
+/// A scaffolding instruction prepended to the latest User message at API
+/// call time. Riders never appear in `self.history`, the transcript, or
+/// snapshots — they're ephemeral nudges to reinforce system-prompt behavior.
+///
+/// All active riders render into a single `<CRITICAL_INSTRUCTIONS>` block
+/// placed above the user's text in the API request copy only.
+#[derive(Debug, Clone)]
+pub struct Rider {
+    /// Tag name used inside the `<CRITICAL_INSTRUCTIONS>` wrapper
+    /// (e.g. `"THINKING"`, `"MODE"`). Kept as a `&'static str` so each
+    /// rider's identity is fixed at compile time.
+    pub id: &'static str,
+    /// Body text. Must not contain the outer wrapper tags.
+    pub content: String,
+}
+
+/// Build the active rider list for a session from its config.
+fn buildRiders(config: &Config) -> Vec<Rider> {
+    let mut riders = Vec::new();
+    if config.heavy.promptThinking {
+        riders.push(Rider {
+            id: "THINKING",
+            content: crate::prompt::THINKING_RIDER_BODY.to_string(),
+        });
+    }
+    riders
+}
+
+/// Render active riders into the prefix that goes before the user's text.
+/// Returns an empty string when no riders are active.
+fn renderRiderPrefix(riders: &[Rider]) -> String {
+    if riders.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<CRITICAL_INSTRUCTIONS>\n");
+    for r in riders {
+        out.push_str(&format!("<{id}>\n{body}\n</{id}>\n", id = r.id, body = r.content));
+    }
+    out.push_str("</CRITICAL_INSTRUCTIONS>\n\n");
+    out
+}
+
+/// Build the messages array sent to the API from the clean `history`.
+///
+/// Two transforms happen here — neither touches `self.history`:
+/// 1. The latest User message gets a `<CRITICAL_INSTRUCTIONS>` prefix when
+///    any riders are active.
+/// 2. When `promptThinking` is on, assistant messages' `reasoning` field
+///    is baked into their `content` as `<scratchpad>...</scratchpad>` so
+///    the model sees the pattern it's being asked to produce. Models in
+///    this mode don't get a separate `reasoning` JSON key.
+fn buildRequestMessages(
+    history: &[Message],
+    riders: &[Rider],
+    promptThinking: bool,
+) -> Vec<Message> {
+    let prefix = renderRiderPrefix(riders);
+    let lastUserIdx = history
+        .iter()
+        .rposition(|m| matches!(m, Message::User { .. }));
+
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| match msg {
+            Message::User { content } if Some(i) == lastUserIdx && !prefix.is_empty() => {
+                Message::User {
+                    content: prependToContent(content, &prefix),
+                }
+            }
+            Message::Assistant { content, tool_calls, reasoning } if promptThinking => {
+                let merged = match (reasoning.as_ref(), content.as_ref()) {
+                    (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
+                    (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
+                    (None, c) => c.cloned(),
+                };
+                Message::Assistant {
+                    content: merged,
+                    tool_calls: tool_calls.clone(),
+                    reasoning: None,
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Prepend `prefix` to a `Content`'s text portion. Preserves multimodal
+/// structure — riders attach to the first text block, image blocks
+/// keep their position.
+fn prependToContent(content: &Content, prefix: &str) -> Content {
+    use crate::message::ContentBlock;
+    match content {
+        Content::Text(s) => Content::Text(format!("{prefix}{s}")),
+        Content::Blocks(blocks) => {
+            let mut out = Vec::with_capacity(blocks.len() + 1);
+            let mut attached = false;
+            for b in blocks {
+                match b {
+                    ContentBlock::Text { text } if !attached => {
+                        out.push(ContentBlock::Text {
+                            text: format!("{prefix}{text}"),
+                        });
+                        attached = true;
+                    }
+                    other => out.push(other.clone()),
+                }
+            }
+            if !attached {
+                out.insert(0, ContentBlock::Text { text: prefix.to_string() });
+            }
+            Content::Blocks(out)
+        }
+    }
 }
 
 /// Agent session — owns the conversation and drives the turn loop.
@@ -298,6 +426,7 @@ pub struct Session {
     permissions: Permissions,
     shell: Shell,
     transcript: Transcript,
+    snapshots: crate::snapshot::SnapshotStore,
     compactionLog: CompactionLog,
     compactionTracker: compaction_trigger::Tracker,
     costTracker: crate::cost::CostTracker,
@@ -312,8 +441,10 @@ pub struct Session {
     mcpConfigs: HashMap<String, mcp::config::ServerConfig>,
     lspManager: lsp::LspManager,
     lspWarmedUp: bool,
-    /// One-shot system message injected on the first API call after resume, then cleared.
-    resumeNotice: Option<String>,
+    /// Active riders — prepended to the latest User message's text inside
+    /// a `<CRITICAL_INSTRUCTIONS>` wrapper at API call time. Never stored
+    /// in `history` or the transcript.
+    riders: Vec<Rider>,
     /// Stored for rebuild on rewind/fork switch.
     systemPrompt: String,
     /// Active branch head turn ID. None for fresh sessions with no messages yet.
@@ -324,6 +455,10 @@ pub struct Session {
     pendingTopicBlockId: Option<String>,
     /// Pending checkpoint snapshot (must resolve before tool dispatch).
     pendingCheckpoint: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// Count of assistant turns that have returned usage, used to distinguish
+    /// the first turn (expected cache miss) from later turns (expected hit)
+    /// in the cache-watchdog trace.
+    turnsWithUsage: usize,
 }
 
 impl Session {
@@ -351,12 +486,12 @@ impl Session {
         let client = api::Client::new(&config)?;
         let tools = tool::builtinDefs();
 
-        let reasoning = config.main.reasoning.as_ref().map(|r| ReasoningConfig {
+        let reasoning = config.heavy.reasoning.as_ref().map(|r| ReasoningConfig {
             effort: r.effort.clone(),
             summary: r.summary.clone(),
         });
 
-        let systemPrompt = prompt::build(interface, domains, config.main.promptThinking);
+        let systemPrompt = prompt::build(interface, domains, config.heavy.promptThinking);
 
         let history = vec![Message::System {
             content: systemPrompt.clone(),
@@ -364,9 +499,10 @@ impl Session {
 
         let sessionId = transcript::newSessionId();
         let transcript = Transcript::create(&sessionId)?;
+        let snapshots = crate::snapshot::SnapshotStore::open(transcript.sessionDir())?;
         let compactionLog = CompactionLog::open(transcript.sessionDir())?;
         let compactionTracker = compaction_trigger::Tracker::new(
-            config.main.contextWindow,
+            config.heavy.contextWindow,
             config.compactRatio,
         );
         // System prompt is ephemeral — never recorded in transcript.
@@ -388,6 +524,7 @@ impl Session {
             permissions,
             shell,
             transcript,
+            snapshots,
             compactionLog,
             compactionTracker,
             costTracker: crate::cost::CostTracker::new(),
@@ -401,12 +538,13 @@ impl Session {
             mcpConfigs: HashMap::new(),
             lspManager,
             lspWarmedUp: false,
-            resumeNotice: None,
+            riders: buildRiders(config),
             systemPrompt,
             headTurnId: None,
             pendingTopicEval: None,
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
+            turnsWithUsage: 0,
         })
     }
 
@@ -464,13 +602,13 @@ impl Session {
         };
         let tools = tool::builtinDefs();
 
-        let reasoning = config.main.reasoning.as_ref().map(|r| ReasoningConfig {
+        let reasoning = config.heavy.reasoning.as_ref().map(|r| ReasoningConfig {
             effort: r.effort.clone(),
             summary: r.summary.clone(),
         });
 
         // System prompt is rebuilt from current config, not from transcript.
-        let systemPrompt = prompt::build(interface, domains, config.main.promptThinking);
+        let systemPrompt = prompt::build(interface, domains, config.heavy.promptThinking);
 
         let mut transcript = match Transcript::open(sessionId) {
             Ok(t) => t,
@@ -478,6 +616,10 @@ impl Session {
         };
         let compactionLog = match CompactionLog::open(transcript.sessionDir()) {
             Ok(c) => c,
+            Err(e) => return Err((e, shell)),
+        };
+        let snapshots = match crate::snapshot::SnapshotStore::open(transcript.sessionDir()) {
+            Ok(s) => s,
             Err(e) => return Err((e, shell)),
         };
 
@@ -499,7 +641,7 @@ impl Session {
 
         // Reconstruct conversation from the active branch.
         let reconstructed = match &headTurnId {
-            Some(head) => match context::reconstruct(&transcript, &compactionLog, head, config.main.promptThinking) {
+            Some(head) => match context::reconstruct(&transcript, &compactionLog, head) {
                 Ok(h) => h,
                 Err(e) => return Err((e, shell)),
             },
@@ -513,7 +655,7 @@ impl Session {
         history.extend(reconstructed);
 
         let compactionTracker = compaction_trigger::Tracker::new(
-            config.main.contextWindow,
+            config.heavy.contextWindow,
             config.compactRatio,
         );
 
@@ -562,12 +704,6 @@ impl Session {
             }
         }
 
-        // Ephemeral resume notice — injected into API calls but never persisted.
-        // Cleared after the model's first shell command.
-        let resumeNotice = Some("[Session resumed] This conversation was restored from a saved session. \
-            The shell environment is fresh \u{2014} working directory, environment variables, \
-            and running processes from the prior session are not preserved.".to_string());
-
         tracing::info!(
             sessionId = %sessionId,
             historyLen = history.len(),
@@ -591,6 +727,7 @@ impl Session {
             permissions,
             shell,
             transcript,
+            snapshots,
             compactionLog,
             compactionTracker,
             costTracker: {
@@ -610,12 +747,13 @@ impl Session {
             mcpConfigs: HashMap::new(),
             lspManager,
             lspWarmedUp: false,
-            resumeNotice,
+            riders: buildRiders(config),
             systemPrompt,
             headTurnId,
             pendingTopicEval: None,
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
+            turnsWithUsage: 0,
         })
     }
 
@@ -844,42 +982,101 @@ impl Session {
             self.lspManager.warmUp(&projectDir).await;
         }
 
-        // Inject ephemeral resume notice before the user message so the model
-        // sees it in context. Stripped at end of send(); re-injected next call
-        // until cleared by a shell command.
-        if self.resumeNotice.is_some() {
-            self.history.push(Message::System {
-                content: self.resumeNotice.as_ref().unwrap().clone(),
-            });
-        }
-
-        // When prompt thinking is active, prefix the user message with a
-        // short rider reminding the model to use its scratchpad.
-        let historyText = if self.config.main.promptThinking {
-            format!("{}{}", prompt::THINKING_RIDER, userMessage)
-        } else {
-            userMessage.to_string()
-        };
-
-        // Build content — multimodal if attachments present.
-        let (content, turnAttachments) = buildUserContent(&historyText, &input.attachments);
+        // Build content — multimodal if attachments present. Riders are
+        // applied later against the API-call copy; `self.history` and the
+        // transcript get the clean user text.
+        let (content, turnAttachments) = buildUserContent(userMessage, &input.attachments);
         self.history.push(Message::User { content });
         match self.transcript.recordUser(userMessage, self.headTurnId.as_deref(), turnAttachments) {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
 
-        let result = self.sendInner(eventTx, permitRx, cancelRx, steerRx).await;
-
-        // Always strip injected messages from history so they don't accumulate.
-        self.removeResumeInjection();
-
-        result
+        self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
         })
     }
 
-    /// Inner turn loop — separated from `send()` so the ephemeral resume
-    /// notice cleanup runs unconditionally regardless of how the loop exits.
+    /// Re-run the last user turn. Drops a trailing errored-or-cancelled
+    /// assistant message from history if present so the model responds
+    /// fresh. Returns early with a no-op if history doesn't end with a
+    /// user message (i.e. there's nothing to retry).
+    ///
+    /// In-memory only — the committed Errored transcript entry stays as a
+    /// dead branch, and the new assistant turn becomes a sibling child of
+    /// the user turn. This mirrors how `rewind` + new-user-send would look,
+    /// minus the fork bookkeeping.
+    pub fn retryLastTurn<'a>(
+        &'a mut self,
+        eventTx: &'a mpsc::Sender<SessionEvent>,
+        permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        cancelRx: &'a mut watch::Receiver<bool>,
+        steerRx: &'a mut mpsc::Receiver<UserInput>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            while steerRx.try_recv().is_ok() {}
+
+            // Pop the trailing partial assistant, if any.
+            if matches!(self.history.last(), Some(Message::Assistant { .. })) {
+                self.history.pop();
+            }
+
+            // If history doesn't end with a user message, there's nothing to
+            // retry — bail out cleanly.
+            if !matches!(self.history.last(), Some(Message::User { .. })) {
+                tracing::warn!("retryLastTurn called but history has no trailing user message");
+                return Ok(());
+            }
+
+            // Walk headTurnId back to the user turn so the new assistant's
+            // transcript entry parents onto the user, not the errored turn.
+            if let Some(erroredId) = self.headTurnId.clone() {
+                if let Ok(turns) = self.transcript.loadAll() {
+                    if let Some(t) = turns.iter().find(|t| t.id == erroredId) {
+                        if matches!(t.role, crate::transcript::TurnRole::Assistant) {
+                            if let Some(parentId) = t.parentId.clone() {
+                                if let Some(parent) = turns.iter().find(|t| t.id == parentId) {
+                                    self.transcript.setHead(&parentId, &parent.blockId);
+                                    self.headTurnId = Some(parentId);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::info!("retrying last turn");
+            self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
+        })
+    }
+
+    /// Resume streaming from where the last turn was cut off. The errored
+    /// assistant (with its partial content/reasoning) stays in history and
+    /// acts as a prefill for the model to continue from.
+    ///
+    /// Anthropic treats a trailing assistant message as a continuation
+    /// point; the model picks up where the previous one left off.
+    pub fn continueLastTurn<'a>(
+        &'a mut self,
+        eventTx: &'a mpsc::Sender<SessionEvent>,
+        permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        cancelRx: &'a mut watch::Receiver<bool>,
+        steerRx: &'a mut mpsc::Receiver<UserInput>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            while steerRx.try_recv().is_ok() {}
+
+            // For continue we need a trailing assistant (the prefill).
+            if !matches!(self.history.last(), Some(Message::Assistant { .. })) {
+                tracing::warn!("continueLastTurn called with no trailing assistant to continue");
+                return Ok(());
+            }
+
+            tracing::info!("continuing from partial assistant response");
+            self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
+        })
+    }
+
+    /// Inner turn loop.
     async fn sendInner(
         &mut self,
         eventTx: &mpsc::Sender<SessionEvent>,
@@ -1016,8 +1213,7 @@ impl Session {
                     }
 
                     self.history.push(buildAssistantMessage(
-                        content, Some(calls.clone()), reasoning,
-                        self.config.main.promptThinking,
+                        content, Some(calls.clone()), reasoning
                     ));
 
                     // Checkpoint must complete before tools modify files.
@@ -1260,9 +1456,6 @@ impl Session {
                             }
                             // Race tool execution against cancellation for shell commands.
                             else if matches!(action, tool::ToolAction::Shell { .. }) {
-                                // Shell is now warm — drop the ephemeral resume notice.
-                                self.resumeNotice = None;
-
                                 loop {
                                 tokio::select! {
                                     result = tool::execute(&action, &self.shell) => {
@@ -1475,26 +1668,54 @@ impl Session {
     ) -> Result<TurnResult> {
         // When prompt-injected thinking is active, don't send the reasoning
         // config (we're faking it via prompt) and set up the content extractor.
-        let reasoning = if self.config.main.promptThinking {
+        let reasoning = if self.config.heavy.promptThinking {
             None
         } else {
             self.reasoning.as_ref()
         };
-        let mut thinkingExtractor = if self.config.main.promptThinking {
+        let mut thinkingExtractor = if self.config.heavy.promptThinking {
             Some(crate::api::ThinkingExtractor::new())
         } else {
             None
         };
 
+        // Capture snapshot of the exact request before it goes over the wire.
+        // NOTE: If a future change introduces history-mutating behavior inside
+        // Client::stream, this capture point must move into a body-building
+        // stage shared with the send.
+        let snapshotHash = crate::snapshot::captureSnapshot(
+            &mut self.snapshots,
+            crate::snapshot::BuildCtx {
+                history: &self.history,
+                tools: &self.tools,
+                reasoning,
+                cfg: &self.config.heavy,
+            },
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "snapshot capture failed; turn will be recorded without snapshotHash");
+            e
+        })
+        .ok();
+
+        // Build the API-call copy. Riders and promptThinking-mode scratchpad
+        // baking apply here, not to `self.history`.
+        let requestMessages = buildRequestMessages(
+            &self.history,
+            &self.riders,
+            self.config.heavy.promptThinking,
+        );
+
         let mut rx = self
             .client
-            .stream(&self.history, &self.tools, reasoning)
+            .stream(&requestMessages, &self.tools, reasoning)
             .await?;
 
         let mut contentBuf = String::new();
         let mut reasoningBuf = String::new();
         let mut toolAccum = ToolCallAccumulator::new();
         let mut lastUsage: Option<TokenUsage> = None;
+        let mut lastFinishReason: Option<String> = None;
 
         loop {
             tokio::select! {
@@ -1533,9 +1754,12 @@ impl Session {
                         }) => {
                             toolAccum.accumulate(index, id, name, arguments);
                         }
-                        Some(StreamEvent::Done { usage, .. }) => {
+                        Some(StreamEvent::Done { usage, finishReason }) => {
                             if let Some(u) = usage {
                                 lastUsage = Some(u);
+                            }
+                            if let Some(reason) = finishReason {
+                                lastFinishReason = Some(reason);
                             }
                             // Don't break — usage may arrive in a subsequent chunk.
                         }
@@ -1551,6 +1775,48 @@ impl Session {
                             if !hadContent && isTransientError(&msg) {
                                 return Ok(TurnResult::TransientError(msg));
                             }
+
+                            // Fatal path — commit any partial content to
+                            // history/transcript so the user can resume
+                            // from where we were cut off. Mirrors the
+                            // cancel path but with Errored status.
+                            if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
+                                let reasonRef = if reasoningBuf.is_empty() {
+                                    None
+                                } else {
+                                    Some(reasoningBuf.as_str())
+                                };
+                                if !contentBuf.is_empty() {
+                                    let meta = transcript::AssistantMeta {
+                                        reasoning: reasonRef,
+                                        cost: lastUsage.as_ref().and_then(|u| u.cost),
+                                        promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                                        completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                                        model: Some(self.config.heavy.model.as_str()),
+                                        finishReason: lastFinishReason.as_deref(),
+                                        snapshotHash: snapshotHash.as_deref(),
+                                        status: transcript::TurnStatus::Errored,
+                                    };
+                                    match self.transcript.recordAssistant(&contentBuf, meta) {
+                                        Ok(turnId) => self.headTurnId = Some(turnId),
+                                        Err(e) => tracing::warn!("transcript write failed: {e}"),
+                                    }
+                                }
+                                let content = if contentBuf.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut contentBuf))
+                                };
+                                let reasoning = if reasoningBuf.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut reasoningBuf))
+                                };
+                                self.history.push(buildAssistantMessage(
+                                    content, None, reasoning,
+                                ));
+                            }
+
                             let _ = tx.send(SessionEvent::Error(msg.clone())).await;
                             bail!("Stream error: {msg}");
                         }
@@ -1565,7 +1831,17 @@ impl Session {
                         if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
                             if !contentBuf.is_empty() {
                                 let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
-                                match self.transcript.recordAssistant(&contentBuf, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
+                                let meta = transcript::AssistantMeta {
+                                    reasoning: reasonRef,
+                                    cost: lastUsage.as_ref().and_then(|u| u.cost),
+                                    promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                                    completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                                    model: Some(self.config.heavy.model.as_str()),
+                                    finishReason: lastFinishReason.as_deref(),
+                                    snapshotHash: snapshotHash.as_deref(),
+                                    status: transcript::TurnStatus::Cancelled,
+                                };
+                                match self.transcript.recordAssistant(&contentBuf, meta) {
                                     Ok(turnId) => self.headTurnId = Some(turnId),
                                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                                 }
@@ -1573,8 +1849,7 @@ impl Session {
                             let content = if contentBuf.is_empty() { None } else { Some(contentBuf) };
                             let reasoning = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf) };
                             self.history.push(buildAssistantMessage(
-                                content, None, reasoning,
-                                self.config.main.promptThinking,
+                                content, None, reasoning
                             ));
                         }
                         return Ok(TurnResult::Cancelled);
@@ -1610,7 +1885,7 @@ impl Session {
         if let Some(ref u) = lastUsage {
             // Record cost before emitting the event.
             if let Some(cost) = u.cost {
-                self.costTracker.record(cost, &self.config.main.model);
+                self.costTracker.record(cost, &self.config.heavy.model);
             }
             let contextTokens = u.promptTokens + u.completionTokens;
             let _ = tx
@@ -1620,6 +1895,8 @@ impl Session {
                     contextTokens,
                     turnCost: u.cost,
                     sessionCost: self.costTracker.sessionCost(),
+                    cacheReadTokens: u.cacheReadTokens,
+                    cacheCreationTokens: u.cacheCreationTokens,
                 })
                 .await;
             // Check budget warning threshold.
@@ -1633,6 +1910,25 @@ impl Session {
                         .await;
                 }
             }
+
+            // Cache watchdog: if we requested caching and this isn't the
+            // first usage-reporting turn, we expect to see activity. Zero on
+            // both counters means the provider silently ignored our markers
+            // (regression like the March 2026 1h→5m TTL drop in Claude Code).
+            if self.config.heavy.cachingActive()
+                && self.turnsWithUsage >= 1
+                && u.cacheReadTokens == 0
+                && u.cacheCreationTokens == 0
+            {
+                tracing::warn!(
+                    model = %self.config.heavy.model,
+                    provider = %self.config.heavy.provider,
+                    providerOrder = ?self.config.heavy.providerOrder,
+                    "requested cache_control but provider returned zero cache activity \
+                     — caching may be silently disabled"
+                );
+            }
+            self.turnsWithUsage = self.turnsWithUsage.saturating_add(1);
         } else {
             tracing::warn!("no usage data received from API — provider may not support stream_options.include_usage");
         }
@@ -1650,7 +1946,17 @@ impl Session {
             // Record any text content or reasoning that accompanied the tool calls.
             let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
             if !contentBuf.is_empty() || reasonRef.is_some() {
-                match self.transcript.recordAssistant(&contentBuf, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
+                let meta = transcript::AssistantMeta {
+                    reasoning: reasonRef,
+                    cost: lastUsage.as_ref().and_then(|u| u.cost),
+                    promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                    completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                    model: Some(self.config.heavy.model.as_str()),
+                    finishReason: lastFinishReason.as_deref(),
+                    snapshotHash: snapshotHash.as_deref(),
+                status: transcript::TurnStatus::Completed,
+                };
+                match self.transcript.recordAssistant(&contentBuf, meta) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                 }
@@ -1682,15 +1988,24 @@ impl Session {
             if content.is_some() || reasoning.is_some() {
                 let textRef = content.as_deref().unwrap_or("");
                 let reasonRef = reasoning.as_deref();
-                match self.transcript.recordAssistant(textRef, reasonRef, lastUsage.as_ref().and_then(|u| u.cost)) {
+                let meta = transcript::AssistantMeta {
+                    reasoning: reasonRef,
+                    cost: lastUsage.as_ref().and_then(|u| u.cost),
+                    promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                    completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                    model: Some(self.config.heavy.model.as_str()),
+                    finishReason: lastFinishReason.as_deref(),
+                    snapshotHash: snapshotHash.as_deref(),
+                status: transcript::TurnStatus::Completed,
+                };
+                match self.transcript.recordAssistant(textRef, meta) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
                     Err(e) => tracing::warn!("transcript write failed: {e}"),
                 }
             }
 
             self.history.push(buildAssistantMessage(
-                content, None, reasoning,
-                self.config.main.promptThinking,
+                content, None, reasoning
             ));
 
             Ok(TurnResult::Done { promptTokens: reportedTokens })
@@ -1856,7 +2171,7 @@ impl Session {
             &headTurn,
             &self.client,
             &self.config.utility.model,
-            self.config.main.contextWindow,
+            self.config.heavy.contextWindow,
             self.config.compactRatio,
         ).await {
             Ok(r) => r,
@@ -1892,7 +2207,7 @@ impl Session {
         }
         // Reconstruct live history from transcript + updated compaction log.
         let headId = self.headTurnId.as_deref().unwrap_or("");
-        match context::reconstruct(&self.transcript, &self.compactionLog, headId, self.config.main.promptThinking) {
+        match context::reconstruct(&self.transcript, &self.compactionLog, headId) {
             Ok(h) => self.history = h,
             Err(e) => {
                 tracing::error!("failed to reconstruct history after S2: {e}");
@@ -1924,7 +2239,7 @@ impl Session {
             self.topicTracker.topics(),
             &self.client,
             &self.config.utility.model,
-            self.config.main.contextWindow,
+            self.config.heavy.contextWindow,
             self.config.compactRatio,
         ).await {
             Ok(r) => r,
@@ -1959,7 +2274,7 @@ impl Session {
             }
         }
         let headId = self.headTurnId.as_deref().unwrap_or("");
-        match context::reconstruct(&self.transcript, &self.compactionLog, headId, self.config.main.promptThinking) {
+        match context::reconstruct(&self.transcript, &self.compactionLog, headId) {
             Ok(h) => self.history = h,
             Err(e) => {
                 tracing::error!("failed to reconstruct history after S3: {e}");
@@ -2026,7 +2341,7 @@ impl Session {
         self.filesRead.clear();
 
         let headId = self.headTurnId.as_deref().unwrap_or("");
-        match context::reconstruct(&self.transcript, &self.compactionLog, headId, self.config.main.promptThinking) {
+        match context::reconstruct(&self.transcript, &self.compactionLog, headId) {
             Ok(h) => self.history = h,
             Err(e) => {
                 tracing::error!("failed to reconstruct history after S4: {e}");
@@ -2254,7 +2569,7 @@ impl Session {
         }
 
         // Merge MCP tool defs with builtins.
-        let contextBudget = self.config.main.contextWindow;
+        let contextBudget = self.config.heavy.contextWindow;
         let mcpDefs = mgr.toolDefs(contextBudget).await;
         if !mcpDefs.is_empty() {
             self.tools.extend(mcpDefs);
@@ -2303,11 +2618,14 @@ impl Session {
 
         let preset = runner::agentPreset(agentType);
 
-        // Clone config. For cheap agents, swap to utility model config.
+        // Clone config. Swap the child's heavy slot to the chosen tier so
+        // Client code stays tier-agnostic (it always streams from heavy).
         let mut childConfig = self.config.clone();
-        if preset.useUtilityModel {
-            childConfig.main = childConfig.utility.clone();
-        }
+        childConfig.heavy = match preset.tier {
+            runner::AgentTier::Heavy => childConfig.heavy.clone(),
+            runner::AgentTier::Light => childConfig.light.clone(),
+            runner::AgentTier::Utility => childConfig.utility.clone(),
+        };
 
         // Spawn an isolated shell for the subagent.
         let (childShell, childIo) = match crate::shell::spawnShell(120, 40) {
@@ -2566,7 +2884,7 @@ impl Session {
 
         let statuses = mgr.serverStatuses();
         let totalTools = mgr.toolCount().await;
-        let searchMode = mgr.isSearchMode(self.config.main.contextWindow).await;
+        let searchMode = mgr.isSearchMode(self.config.heavy.contextWindow).await;
 
         let registry = mgr.registry().read().await;
 
@@ -2629,20 +2947,6 @@ impl Session {
     }
 
     /// Push a tool result to history and record to transcript.
-    /// Remove the ephemeral resume notice from history (if present).
-    /// Called at the end of `send()` so the injected System message doesn't
-    /// persist across calls — it's re-injected at the start of the next
-    /// `send()` if `self.resumeNotice` is still `Some`.
-    fn removeResumeInjection(&mut self) {
-        let notice = match &self.resumeNotice {
-            Some(n) => n.clone(),
-            None => return,
-        };
-        self.history.retain(|msg| {
-            !matches!(msg, Message::System { content } if content == &notice)
-        });
-    }
-
     fn pushToolResult(&mut self, callId: &str, content: crate::message::Content) {
         // Extract image attachments for transcript persistence.
         let turnAttachments = if content.hasImages() {
@@ -2708,7 +3012,7 @@ impl Session {
     /// Build context state for the /context display.
     pub fn buildContextState(&self) -> context::ContextState {
         let input = context::BuildStateInput {
-            contextWindow: self.config.main.contextWindow,
+            contextWindow: self.config.heavy.contextWindow,
             compactionLog: &self.compactionLog,
             reportedTokens: self.compactionTracker.lastTokens(),
             transcript: &self.transcript,
@@ -2837,6 +3141,12 @@ impl Session {
             }
             // Handled by the session task directly.
             CommandAction::Shutdown => String::new(),
+            // Both go through retryLastTurn / continueLastTurn on the
+            // session task, not executeCommand — they need the same event/
+            // permit/cancel plumbing as send().
+            CommandAction::RetryLastTurn | CommandAction::ContinueLastTurn => {
+                "Handled by the session task directly.".to_string()
+            }
         }
     }
 
@@ -2876,7 +3186,7 @@ impl Session {
         }
 
         // Rebuild history.
-        match context::reconstruct(&self.transcript, &self.compactionLog, targetTurnId, self.config.main.promptThinking) {
+        match context::reconstruct(&self.transcript, &self.compactionLog, targetTurnId) {
             Ok(h) => {
                 self.history = vec![Message::System {
                     content: self.systemPrompt.clone(),
@@ -2959,7 +3269,7 @@ impl Session {
         }
 
         // Rebuild.
-        match context::reconstruct(&self.transcript, &self.compactionLog, &fork.headTurn, self.config.main.promptThinking) {
+        match context::reconstruct(&self.transcript, &self.compactionLog, &fork.headTurn) {
             Ok(h) => {
                 self.history = vec![Message::System {
                     content: self.systemPrompt.clone(),
@@ -3168,32 +3478,16 @@ fn extractSnippet(text: &str, queryLower: &str) -> String {
     text[start..end].replace('\n', " ")
 }
 
-/// Build an `Assistant` message for history. When `promptThinking` is true,
-/// reasoning is baked into content as `<thinking>` blocks so the model sees
-/// a consistent pattern across turns (instead of the `reasoning` JSON key).
+/// Build an `Assistant` message for history.
 fn buildAssistantMessage(
     content: Option<String>,
     toolCalls: Option<Vec<ToolCall>>,
     reasoning: Option<String>,
-    promptThinking: bool,
 ) -> Message {
-    if promptThinking {
-        let merged = match (reasoning, content) {
-            (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
-            (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
-            (None, c) => c,
-        };
-        Message::Assistant {
-            content: merged,
-            tool_calls: toolCalls,
-            reasoning: None,
-        }
-    } else {
-        Message::Assistant {
-            content,
-            tool_calls: toolCalls,
-            reasoning,
-        }
+    Message::Assistant {
+        content,
+        tool_calls: toolCalls,
+        reasoning,
     }
 }
 
@@ -3366,3 +3660,128 @@ impl ToolCallAccumulator {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Content;
+
+    #[test]
+    fn noRidersLeavesHistoryUnchanged() {
+        let history = vec![
+            Message::User { content: Content::Text("hello".into()) },
+        ];
+        let out = buildRequestMessages(&history, &[], false);
+        assert_eq!(out.len(), 1);
+        if let Message::User { content } = &out[0] {
+            assert_eq!(content.textContent(), "hello");
+        } else {
+            panic!("expected user");
+        }
+    }
+
+    #[test]
+    fn singleRiderWrapsInCriticalInstructions() {
+        let history = vec![
+            Message::User { content: Content::Text("fix the bug".into()) },
+        ];
+        let riders = vec![Rider {
+            id: "THINKING",
+            content: "Body text.".into(),
+        }];
+        let out = buildRequestMessages(&history, &riders, false);
+        let text = if let Message::User { content } = &out[0] {
+            content.textContent().to_string()
+        } else {
+            panic!("expected user");
+        };
+        let expected = "<CRITICAL_INSTRUCTIONS>\n<THINKING>\nBody text.\n</THINKING>\n</CRITICAL_INSTRUCTIONS>\n\nfix the bug";
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn multipleRidersStackInOneWrapper() {
+        let history = vec![
+            Message::User { content: Content::Text("do stuff".into()) },
+        ];
+        let riders = vec![
+            Rider { id: "THINKING", content: "Think first.".into() },
+            Rider { id: "MODE", content: "Review only.".into() },
+        ];
+        let out = buildRequestMessages(&history, &riders, false);
+        let text = if let Message::User { content } = &out[0] {
+            content.textContent().to_string()
+        } else {
+            panic!();
+        };
+        assert!(text.starts_with("<CRITICAL_INSTRUCTIONS>\n"));
+        assert!(text.contains("<THINKING>\nThink first.\n</THINKING>"));
+        assert!(text.contains("<MODE>\nReview only.\n</MODE>"));
+        assert!(text.ends_with("do stuff"));
+        // One outer wrapper only.
+        assert_eq!(text.matches("<CRITICAL_INSTRUCTIONS>").count(), 1);
+    }
+
+    #[test]
+    fn ridersApplyOnlyToLatestUserMessage() {
+        let history = vec![
+            Message::User { content: Content::Text("first".into()) },
+            Message::Assistant {
+                content: Some("ok".into()),
+                tool_calls: None,
+                reasoning: None,
+            },
+            Message::User { content: Content::Text("second".into()) },
+        ];
+        let riders = vec![Rider { id: "X", content: "body".into() }];
+        let out = buildRequestMessages(&history, &riders, false);
+        assert_eq!(out.len(), 3);
+        if let Message::User { content } = &out[0] {
+            assert_eq!(content.textContent(), "first", "first user untouched");
+        }
+        if let Message::User { content } = &out[2] {
+            assert!(content.textContent().contains("<CRITICAL_INSTRUCTIONS>"));
+            assert!(content.textContent().ends_with("second"));
+        }
+    }
+
+    #[test]
+    fn promptThinkingBakesScratchpadAtApiBoundary() {
+        let history = vec![
+            Message::User { content: Content::Text("q".into()) },
+            Message::Assistant {
+                content: Some("answer".into()),
+                tool_calls: None,
+                reasoning: Some("thought".into()),
+            },
+            Message::User { content: Content::Text("followup".into()) },
+        ];
+        let out = buildRequestMessages(&history, &[], true);
+        if let Message::Assistant { content, reasoning, .. } = &out[1] {
+            assert_eq!(
+                content.as_deref(),
+                Some("<scratchpad>\nthought\n</scratchpad>\nanswer"),
+            );
+            assert!(reasoning.is_none(), "reasoning field cleared in promptThinking mode");
+        } else {
+            panic!("expected assistant at idx 1");
+        }
+    }
+
+    #[test]
+    fn promptThinkingOffLeavesReasoningSeparate() {
+        let history = vec![
+            Message::Assistant {
+                content: Some("answer".into()),
+                tool_calls: None,
+                reasoning: Some("thought".into()),
+            },
+        ];
+        let out = buildRequestMessages(&history, &[], false);
+        if let Message::Assistant { content, reasoning, .. } = &out[0] {
+            assert_eq!(content.as_deref(), Some("answer"));
+            assert_eq!(reasoning.as_deref(), Some("thought"));
+        } else {
+            panic!();
+        }
+    }
+}

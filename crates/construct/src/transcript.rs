@@ -37,6 +37,30 @@ pub enum TurnRole {
     System,
 }
 
+/// Outcome state for an assistant turn. Other roles always use `Completed`.
+///
+/// Used at export time to filter training targets — cancelled or errored
+/// assistant responses shouldn't become SFT labels, since their content is
+/// partial or diverged from what the user wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    /// Stream finished normally. Default for turns missing the field.
+    Completed,
+    /// User interrupted mid-stream. Content may be partial.
+    Cancelled,
+    /// Transport-level error cut the stream short (broken pipe, network
+    /// drop, mid-stream provider error). Content may be partial; a later
+    /// turn may want to resume from where this one was cut off.
+    Errored,
+}
+
+impl Default for TurnStatus {
+    fn default() -> Self {
+        Self::Completed
+    }
+}
+
 /// A single turn in the transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +88,42 @@ pub struct Turn {
     /// USD cost of this turn (assistant turns only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost: Option<f64>,
+    /// Prompt tokens reported by the API (assistant turns only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub promptTokens: Option<usize>,
+    /// Completion tokens reported by the API (assistant turns only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completionTokens: Option<usize>,
+    /// Model identifier used to generate this turn (assistant turns only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// Provider-reported finish reason, e.g. "stop", "tool_calls", "length".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub finishReason: Option<String>,
+    /// Content-addressed hash of the request snapshot that produced this turn.
+    /// See `snapshot::RequestSnapshot`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub snapshotHash: Option<String>,
+    /// Outcome state. Omitted on disk when equal to the default (`Completed`).
+    #[serde(default, skip_serializing_if = "isCompleted")]
+    pub status: TurnStatus,
+}
+
+fn isCompleted(s: &TurnStatus) -> bool {
+    matches!(s, TurnStatus::Completed)
+}
+
+/// Metadata attached to an assistant turn.
+#[derive(Debug, Clone, Default)]
+pub struct AssistantMeta<'a> {
+    pub reasoning: Option<&'a str>,
+    pub cost: Option<f64>,
+    pub promptTokens: Option<usize>,
+    pub completionTokens: Option<usize>,
+    pub model: Option<&'a str>,
+    pub finishReason: Option<&'a str>,
+    pub snapshotHash: Option<&'a str>,
+    pub status: TurnStatus,
 }
 
 /// An image attachment stored in the transcript.
@@ -271,6 +331,12 @@ impl Transcript {
             reasoning: None,
             attachments,
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         };
         self.writeTurn(&turn)
     }
@@ -279,8 +345,7 @@ impl Transcript {
     pub fn recordAssistant(
         &mut self,
         content: &str,
-        reasoning: Option<&str>,
-        cost: Option<f64>,
+        meta: AssistantMeta<'_>,
     ) -> Result<String> {
         let turn = Turn {
             id: randomHexId("t"),
@@ -293,9 +358,15 @@ impl Transcript {
             tool: None,
             args: None,
             toolCallId: None,
-            reasoning: reasoning.map(|s| s.to_string()),
+            reasoning: meta.reasoning.map(|s| s.to_string()),
             attachments: None,
-            cost,
+            cost: meta.cost,
+            promptTokens: meta.promptTokens,
+            completionTokens: meta.completionTokens,
+            model: meta.model.map(|s| s.to_string()),
+            finishReason: meta.finishReason.map(|s| s.to_string()),
+            snapshotHash: meta.snapshotHash.map(|s| s.to_string()),
+            status: meta.status,
         };
         self.writeTurn(&turn)
     }
@@ -321,6 +392,12 @@ impl Transcript {
             reasoning: None,
             attachments: None,
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         };
         self.writeTurn(&turn)
     }
@@ -346,6 +423,12 @@ impl Transcript {
             reasoning: None,
             attachments,
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         };
         self.writeTurn(&turn)
     }
@@ -415,7 +498,16 @@ pub fn newSessionId() -> String {
 }
 
 /// Path to the sessions directory.
+///
+/// Overridable via the `FLATLINE_SESSIONS_DIR` env var — used by integration
+/// tests and advanced workflows that need to isolate sessions from the normal
+/// user-data location.
 pub fn sessionsDir() -> PathBuf {
+    if let Ok(explicit) = std::env::var("FLATLINE_SESSIONS_DIR") {
+        if !explicit.is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("flatline")
@@ -503,6 +595,12 @@ mod tests {
                 },
             ]),
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         };
 
         let json = serde_json::to_string(&turn).unwrap();

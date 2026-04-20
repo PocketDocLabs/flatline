@@ -501,6 +501,7 @@ Target length: 1-3 short paragraphs depending on topic complexity.";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::TurnStatus;
     use std::collections::HashMap;
 
     fn makeTurn(id: &str, blockId: &str, topicId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
@@ -518,6 +519,12 @@ mod tests {
             reasoning: None,
             attachments: None,
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         }
     }
 

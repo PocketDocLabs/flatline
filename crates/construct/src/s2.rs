@@ -527,6 +527,7 @@ true. Note: user wants -v shorthand, not --verbose.\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::TurnStatus;
     use std::collections::HashMap;
 
     fn makeTurn(id: &str, blockId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
@@ -544,6 +545,12 @@ mod tests {
             reasoning: None,
             attachments: None,
             cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
         }
     }
 

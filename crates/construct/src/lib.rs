@@ -33,6 +33,7 @@ pub mod s3;
 pub mod s4;
 pub mod session;
 pub mod shell;
+pub mod snapshot;
 pub mod text;
 pub mod tool;
 pub mod topic;

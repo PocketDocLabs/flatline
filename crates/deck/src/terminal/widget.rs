@@ -23,7 +23,7 @@ use alacritty_terminal::{
     event::VoidListener,
     grid::{Dimensions, Scroll},
     index::{Column, Line},
-    term::{Config, cell::Flags},
+    term::{Config, TermMode, cell::Flags},
     vte::ansi::{self, Processor},
 };
 
@@ -167,6 +167,27 @@ impl TerminalState {
     /// Current display offset (0 = at bottom, positive = scrolled up).
     pub fn displayOffset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    /// Whether the inner app has enabled bracketed paste mode.
+    pub fn bracketedPaste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Cursor position within the viewport as (col, row), or None when hidden
+    /// or scrolled out of view.
+    pub fn cursorViewportPos(&self) -> Option<(u16, u16)> {
+        if !self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let displayOffset = grid.display_offset() as i32;
+        let row = grid.cursor.point.line.0 + displayOffset;
+        if row < 0 || row as usize >= grid.screen_lines() {
+            return None;
+        }
+        let col = grid.cursor.point.column.0;
+        Some((col as u16, row as u16))
     }
 
     /// Number of lines currently in the scrollback buffer.
@@ -382,7 +403,6 @@ impl StatefulWidget for Terminal {
             let line = &grid[Line(row as i32 - displayOffset as i32)];
             for col in 0..area.width.min(numCols as u16) {
                 let cell = &line[Column(col as usize)];
-                let ch = cell.c;
 
                 // Mark wide char spacer cells as continuations so ratatui
                 // knows to skip them during buffer diff rendering.
@@ -393,6 +413,17 @@ impl StatefulWidget for Terminal {
                     }
                     continue;
                 }
+
+                // Sanitize control bytes. alacritty_terminal stores some
+                // control characters (notably `\t`) in the cell where
+                // the cursor sat when they arrived. Passing them through
+                // to ratatui makes the host terminal re-interpret them
+                // as cursor commands, shifting every following cell on
+                // the row and bleeding past the panel border.
+                let ch = match cell.c {
+                    c if (c as u32) < 0x20 || c == '\u{7f}' => ' ',
+                    c => c,
+                };
 
                 let mut style = Style::default();
                 if let Some(fg) = mapColor(&cell.fg) {

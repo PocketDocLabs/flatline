@@ -205,6 +205,12 @@ impl ToolRegistry {
     }
 
     /// Rebuild cached ToolDefs and token count from current registry.
+    ///
+    /// Sorted by qualified tool name so the serialized tools array is
+    /// byte-identical across processes. HashMap iteration order is
+    /// non-deterministic in Rust's default hasher — without the sort, two
+    /// flatline instances with the same MCP servers would send differently
+    /// ordered tool arrays and neither could read the other's prompt cache.
     fn rebuildCache(&mut self) {
         self.cachedDefs = self
             .tools
@@ -218,6 +224,8 @@ impl ToolRegistry {
                 },
             })
             .collect();
+        self.cachedDefs
+            .sort_by(|a, b| a.function.name.cmp(&b.function.name));
 
         // Estimate token cost of all defs.
         let jsonStr = serde_json::to_string(&self.cachedDefs).unwrap_or_default();
@@ -396,6 +404,33 @@ mod tests {
         let defs = reg.toolDefs(1_000_000);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].function.name, "mcp__small__one");
+    }
+
+    #[test]
+    fn toolDefsSortedByName() {
+        // Register tools across two servers in mixed insertion order. Output
+        // must be sorted by qualified name so the serialized tools array is
+        // byte-stable across processes (otherwise HashMap iteration would
+        // scramble it differently every run).
+        let mut reg = ToolRegistry::new();
+        reg.registerServer("zeta", vec![
+            makeTool("charlie", "Tool C"),
+            makeTool("alpha", "Tool A"),
+        ]);
+        reg.registerServer("alpha", vec![
+            makeTool("bravo", "Tool B"),
+        ]);
+
+        let defs = reg.toolDefs(1_000_000);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(names, expected, "tool defs not sorted by qualified name");
+
+        // Run the conversion again; order must be identical.
+        let defs2 = reg.toolDefs(1_000_000);
+        let names2: Vec<&str> = defs2.iter().map(|d| d.function.name.as_str()).collect();
+        assert_eq!(names, names2, "tool def order differs between calls");
     }
 
     #[test]

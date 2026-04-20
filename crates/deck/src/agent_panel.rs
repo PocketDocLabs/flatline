@@ -137,6 +137,10 @@ pub struct AgentPanel {
     isStreaming: bool,
     /// True from pushUser() until TurnComplete/TurnCancelled.
     turnActive: bool,
+    /// When true, the separator row shows an error-mode hint instead of
+    /// the plain divider. Set by deck when the last turn fatally errored,
+    /// cleared on new user input / clear / rewind / retry / continue.
+    pub errorHint: bool,
     pub textArea: TextArea,
     pub history: History,
     pub pendingPermit: bool,
@@ -228,6 +232,7 @@ impl AgentPanel {
             streamingReasoning: String::new(),
             isStreaming: false,
             turnActive: false,
+            errorHint: false,
             textArea: TextArea::new(),
             history: History::new(),
             pendingPermit: false,
@@ -282,6 +287,7 @@ impl AgentPanel {
         self.streamingReasoning.clear();
         self.isStreaming = false;
         self.turnActive = false;
+        self.errorHint = false;
         self.pendingPermit = false;
         self.pendingToolName.clear();
         self.thinkingStartTime = None;
@@ -1388,6 +1394,16 @@ impl AgentPanel {
             if let Some(line) = headerLines.into_iter().next() {
                 Paragraph::new(line).render(separatorArea, buf);
             }
+        } else if self.errorHint {
+            // Error hint takes over the separator slot to show the user
+            // what recovery actions are available.
+            let hintText =
+                " \u{21BB} Ctrl+R retry   \u{23F5}\u{FE0E} Ctrl+Space continue ";
+            let padW = separatorArea.width as usize;
+            let padded = format!("{:^width$}", hintText, width = padW);
+            Paragraph::new(padded)
+                .style(Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD))
+                .render(separatorArea, buf);
         } else if !self.pendingPermit {
             let sep = "\u{2500}".repeat(separatorArea.width as usize);
             Paragraph::new(sep)

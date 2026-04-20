@@ -4,12 +4,34 @@
 //! lives at `<project-root>/.flatline/config.toml`, with an optional
 //! gitignored `config.local.toml` for personal overrides.
 //!
+//! Model settings live in **named profiles**. Each profile is one flat
+//! `ModelConfig` — a single model identity. Users select which profile
+//! plays each tier via top-level `heavyProfile` / `lightProfile` /
+//! `utilityProfile` keys (or `FLATLINE_HEAVY_PROFILE` /
+//! `FLATLINE_LIGHT_PROFILE` / `FLATLINE_UTILITY_PROFILE` env vars).
+//! Fallback chain: light → heavy; utility → light → heavy.
+//!
+//! Profiles are **atomic** across layers — if two layers both define
+//! `[profile.foo]`, the higher-priority layer fully wins; fields do not
+//! composite. This prevents provider-specific fields (e.g. OpenRouter
+//! `providerOrder`) from leaking into other-provider configs.
+//!
+//! Non-profile sections (permissions, lsp, web, budget) continue to
+//! composite field-by-field across layers.
+//!
 //! # Public API
 //! - [`Config`] — the resolved configuration struct
-//! - [`ModelConfig`] — per-model API settings (main and utility)
+//! - [`ModelConfig`] — a model identity (profile contents)
 //! - [`load`] — load and merge config from all layers
 //! - [`discoverProjectRoot`] — find the project root by walking up to `.git`
 //! - [`persistPermissionRule`] — write an "always allow" rule to project config
+//!
+//! # Env vars
+//! - `FLATLINE_CONFIG` — explicit config file path (bypasses layer discovery)
+//! - `FLATLINE_HEAVY_PROFILE` — override `heavyProfile` selection
+//! - `FLATLINE_LIGHT_PROFILE` — override `lightProfile` selection
+//! - `FLATLINE_UTILITY_PROFILE` — override `utilityProfile` selection
+//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `EXA_API_KEY` — API keys
 //!
 //! # Dependencies
 //! `serde`, `toml`, `dirs`
@@ -28,40 +50,49 @@ const CONFIG_FILE: &str = "config.toml";
 const PROJECT_DIR: &str = ".flatline";
 const PROJECT_CONFIG: &str = "config.toml";
 const LOCAL_CONFIG: &str = "config.local.toml";
+const DEFAULT_PROFILE: &str = "default";
 
-/// Resolved application configuration (all layers merged, no Option fields).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Resolved application configuration (profiles selected and resolved).
+#[derive(Debug, Clone)]
 pub struct Config {
-    /// Main conversation model settings.
-    #[serde(default = "defaults::mainModel")]
-    pub main: ModelConfig,
+    /// Name of the profile chosen for the heavy tier (display / debugging).
+    pub heavyProfile: String,
 
-    /// Utility model settings (topic tracking, compaction, web summaries).
-    #[serde(default = "defaults::utilityModel")]
+    /// Name of the profile chosen for the light tier (display / debugging).
+    /// Falls back to `heavyProfile` when unset.
+    pub lightProfile: String,
+
+    /// Name of the profile chosen for the utility tier (display / debugging).
+    /// Falls back to `lightProfile`, then `heavyProfile` when unset.
+    pub utilityProfile: String,
+
+    /// Heavy tier — primary pair-programmer session. Resolved from `heavyProfile`.
+    pub heavy: ModelConfig,
+
+    /// Light tier — mid-weight subagents. Resolved from `lightProfile`,
+    /// falling back to `heavyProfile` when unset.
+    pub light: ModelConfig,
+
+    /// Utility tier — topics, compaction, web summaries. Resolved from
+    /// `utilityProfile`, falling back to `lightProfile` / `heavyProfile`.
     pub utility: ModelConfig,
 
     /// Context usage ratio (0.0–1.0) at which to trigger compaction.
-    #[serde(default = "defaults::compactRatio")]
     pub compactRatio: f64,
 
     /// Web tool settings (Exa API).
-    #[serde(default)]
     pub web: WebConfig,
 
     /// LSP server configuration overrides. Keys are server IDs.
-    #[serde(default)]
     pub lsp: crate::lsp::LspConfig,
 
     /// Permission rules. None means use built-in defaults (allowReadOnly).
-    #[serde(default, skip_serializing)]
     pub permissions: Option<Permissions>,
 
     /// Budget and cost warning settings.
-    #[serde(default)]
     pub budget: BudgetConfig,
 
     /// Discovered project root (not serialized — derived at load time).
-    #[serde(skip)]
     pub projectRoot: Option<PathBuf>,
 }
 
@@ -86,7 +117,6 @@ pub struct WebConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// API provider: "openrouter" or "fireworks".
-    #[serde(default = "defaults::provider")]
     pub provider: String,
 
     /// API key.
@@ -94,25 +124,25 @@ pub struct ModelConfig {
     pub key: String,
 
     /// Model identifier.
-    #[serde(default = "defaults::model")]
     pub model: String,
 
     /// Base URL override.
-    #[serde(default = "defaults::baseUrl")]
     pub baseUrl: String,
 
     /// Reasoning config for thinking models.
     #[serde(default)]
     pub reasoning: Option<ReasoningSettings>,
 
-    /// Prompt-injected thinking — tells the model to reason in <thinking> blocks
-    /// instead of using the official thinking API. Avoids reasoning summarization.
-    #[serde(default = "defaults::promptThinkingDefault")]
+    /// Prompt-injected thinking — tells the model to reason in <thinking>
+    /// blocks instead of using the official thinking API. Avoids reasoning
+    /// summarization.
     pub promptThinking: bool,
 
-    /// Preferred OpenRouter providers in priority order (e.g. ["Moonshot", "Fireworks"]).
-    /// When set, disables fallbacks automatically.
-    #[serde(default = "defaults::providerOrder")]
+    /// Preferred OpenRouter providers in priority order (e.g. ["Moonshot",
+    /// "Fireworks"]). When set, disables fallbacks automatically.
+    /// Only meaningful for the OpenRouter provider; defaults to empty for
+    /// other providers.
+    #[serde(default)]
     pub providerOrder: Vec<String>,
 
     /// Maximum completion tokens per response.
@@ -120,8 +150,31 @@ pub struct ModelConfig {
     pub maxTokens: Option<usize>,
 
     /// Model context window size in tokens.
-    #[serde(default = "defaults::contextWindow")]
     pub contextWindow: usize,
+
+    /// Enable Anthropic-style prompt caching (cache_control markers on
+    /// outgoing requests). None = auto-detect from model name; explicit
+    /// true/false overrides. Auto-detect returns true for any model string
+    /// containing "claude" or prefixed "anthropic/".
+    #[serde(default)]
+    pub supportsAnthropicCache: Option<bool>,
+}
+
+/// Heuristic: does this model string route to a Claude model that supports
+/// Anthropic prompt caching? Matches "anthropic/…", "claude-…", or any
+/// model string containing "claude" (Bedrock/Vertex variants).
+pub fn isClaudeModel(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.starts_with("anthropic/") || lower.contains("claude")
+}
+
+impl ModelConfig {
+    /// Resolved answer to "should we send cache_control markers?" —
+    /// explicit override wins, otherwise auto-detected from model name.
+    pub fn cachingActive(&self) -> bool {
+        self.supportsAnthropicCache
+            .unwrap_or_else(|| isClaudeModel(&self.model))
+    }
 }
 
 /// Reasoning/thinking settings.
@@ -131,68 +184,100 @@ pub struct ReasoningSettings {
     pub summary: Option<String>,
 }
 
-mod defaults {
-    use super::ModelConfig;
+/// Which tier a profile is resolving for. Drives which set of defaults fills
+/// in missing fields when the user's profile table is empty.
+#[derive(Debug, Clone, Copy)]
+enum Tier {
+    Heavy,
+    Light,
+    Utility,
+}
 
-    pub fn mainModel() -> ModelConfig {
-        ModelConfig {
-            provider: provider(),
+/// Provider-aware defaults for a ModelConfig.
+///
+/// `baseUrl` and `providerOrder` default based on the provider — this is
+/// the root fix for the old leak where e.g. `providerOrder = ["Anthropic"]`
+/// would flow into a Fireworks config.
+///
+/// `promptThinking` defaults to `false` regardless of provider or model —
+/// it's an instruction-tuned technique that works with anything, so the
+/// safe default is off and users flip it on per profile when they want it.
+fn modelDefaults(provider: &str) -> ModelConfig {
+    match provider {
+        "fireworks" => ModelConfig {
+            provider: "fireworks".into(),
             key: String::new(),
-            model: model(),
-            baseUrl: baseUrl(),
+            model: "accounts/fireworks/models/kimi-k2p5".into(),
+            baseUrl: "https://api.fireworks.ai/inference/v1".into(),
             reasoning: None,
-            promptThinking: promptThinkingDefault(),
-            providerOrder: providerOrder(),
-            maxTokens: maxTokens(),
-            contextWindow: contextWindow(),
-        }
-    }
-
-    pub fn utilityModel() -> ModelConfig {
-        ModelConfig {
-            provider: provider(),
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(8_000),
+            contextWindow: 256_000,
+            supportsAnthropicCache: None,
+        },
+        // Default to OpenRouter for anything unrecognized.
+        _ => ModelConfig {
+            provider: "openrouter".into(),
             key: String::new(),
-            model: model(),
-            baseUrl: baseUrl(),
+            model: "anthropic/claude-sonnet-4-6".into(),
+            baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
-            promptThinking: promptThinkingDefault(),
-            providerOrder: providerOrder(),
-            maxTokens: maxTokens(),
-            contextWindow: contextWindow(),
-        }
+            promptThinking: false,
+            providerOrder: vec!["Anthropic".into()],
+            maxTokens: Some(100_000),
+            contextWindow: 250_000,
+            supportsAnthropicCache: None,
+        },
     }
+}
 
-    pub fn provider() -> String {
-        "openrouter".into()
+/// Tier-specific starter defaults, used when the profile map is empty entirely.
+/// Heavy = Opus w/ prompt-thinking, Light = Sonnet w/ prompt-thinking,
+/// Utility = Kimi K2.5 on OpenRouter, no prompt-thinking.
+fn tierDefaults(tier: Tier) -> ModelConfig {
+    match tier {
+        Tier::Heavy => ModelConfig {
+            provider: "openrouter".into(),
+            key: String::new(),
+            model: "anthropic/claude-opus-4-6".into(),
+            baseUrl: "https://openrouter.ai/api/v1".into(),
+            reasoning: None,
+            promptThinking: true,
+            providerOrder: vec!["Anthropic".into()],
+            maxTokens: Some(100_000),
+            contextWindow: 250_000,
+            supportsAnthropicCache: None,
+        },
+        Tier::Light => ModelConfig {
+            provider: "openrouter".into(),
+            key: String::new(),
+            model: "anthropic/claude-sonnet-4-6".into(),
+            baseUrl: "https://openrouter.ai/api/v1".into(),
+            reasoning: None,
+            promptThinking: true,
+            providerOrder: vec!["Anthropic".into()],
+            maxTokens: Some(100_000),
+            contextWindow: 250_000,
+            supportsAnthropicCache: None,
+        },
+        Tier::Utility => ModelConfig {
+            provider: "openrouter".into(),
+            key: String::new(),
+            model: "moonshotai/kimi-k2.5".into(),
+            baseUrl: "https://openrouter.ai/api/v1".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(8_000),
+            contextWindow: 256_000,
+            supportsAnthropicCache: None,
+        },
     }
+}
 
-    pub fn model() -> String {
-        "anthropic/claude-sonnet-4-6".into()
-    }
-
-    pub fn baseUrl() -> String {
-        "https://openrouter.ai/api/v1".into()
-    }
-
-    pub fn contextWindow() -> usize {
-        1_000_000
-    }
-
-    pub fn maxTokens() -> Option<usize> {
-        Some(100_000)
-    }
-
-    pub fn compactRatio() -> f64 {
-        0.8
-    }
-
-    pub fn promptThinkingDefault() -> bool {
-        true
-    }
-
-    pub fn providerOrder() -> Vec<String> {
-        vec!["Anthropic".into()]
-    }
+fn defaultCompactRatio() -> f64 {
+    0.8
 }
 
 /// Get the user config directory path.
@@ -205,43 +290,38 @@ pub fn configDir() -> PathBuf {
 /// Load config from all layers, merge, and resolve.
 ///
 /// Layer order (lowest → highest priority):
-/// 1. Defaults (hardcoded)
+/// 1. Defaults (hardcoded, provider-aware)
 /// 2. User (`~/.config/flatline/config.toml`)
 /// 3. Project (`.flatline/config.toml`)
 /// 4. Local (`.flatline/config.local.toml`, gitignored)
-/// 5. Env vars (`OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `EXA_API_KEY`)
+/// 5. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
+///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`,
+///    `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
+    // Explicit-path override: FLATLINE_CONFIG=/path/to/config.toml bypasses
+    // user/project/local discovery and loads exactly that file.
+    if let Ok(explicit) = std::env::var("FLATLINE_CONFIG") {
+        if !explicit.is_empty() {
+            return loadExplicit(PathBuf::from(explicit));
+        }
+    }
+
     let userDir = configDir();
     let userPath = userDir.join(CONFIG_FILE);
 
-    // Layer 1+2: defaults merged with user config.
-    let userLayer = loadPartial(&userPath)?;
-
-    // If no user config exists, create a default one.
+    // If no user config exists, create a default one in new-profile shape.
     if !userPath.exists() {
-        let defaultConfig = Config {
-            main: defaults::mainModel(),
-            utility: defaults::utilityModel(),
-            compactRatio: defaults::compactRatio(),
-            web: WebConfig::default(),
-            lsp: HashMap::new(),
-            permissions: None,
-            budget: BudgetConfig::default(),
-            projectRoot: None,
-        };
         fs::create_dir_all(&userDir)
             .with_context(|| format!("Failed to create config dir: {}", userDir.display()))?;
-        let contents =
-            toml::to_string_pretty(&defaultConfig).context("Failed to serialize config")?;
-        fs::write(&userPath, &contents)
+        fs::write(&userPath, defaultConfigToml())
             .with_context(|| format!("Failed to write config: {}", userPath.display()))?;
     }
 
-    // Discover project root and load project/local layers.
+    let userLayer = loadPartial(&userPath)?;
+
     let projectRoot = discoverProjectRoot();
     let mut merged = userLayer;
 
-    // Track which layer last set [permissions] for source tagging.
     let mut permsSource = if merged.permissions.is_some() {
         PermissionsSource::User
     } else {
@@ -251,7 +331,6 @@ pub fn load() -> Result<Config> {
     if let Some(ref root) = projectRoot {
         let projectDir = root.join(PROJECT_DIR);
 
-        // Layer 3: project config.
         let projectPath = projectDir.join(PROJECT_CONFIG);
         let projectLayer = loadPartial(&projectPath)?;
         if projectLayer.permissions.is_some() {
@@ -259,7 +338,6 @@ pub fn load() -> Result<Config> {
         }
         merged = merged.merge(projectLayer);
 
-        // Layer 4: local config (personal, gitignored).
         let localPath = projectDir.join(LOCAL_CONFIG);
         let localLayer = loadPartial(&localPath)?;
         if localLayer.permissions.is_some() {
@@ -267,24 +345,36 @@ pub fn load() -> Result<Config> {
         }
         merged = merged.merge(localLayer);
 
-        // Ensure config.local.toml is gitignored.
         if projectDir.exists() {
             ensureLocalGitignored(&projectDir);
         }
     }
 
-    // Resolve partial into full config.
-    let mut config = merged.resolve();
+    let heavyEnv = std::env::var("FLATLINE_HEAVY_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let lightEnv = std::env::var("FLATLINE_LIGHT_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let utilityEnv = std::env::var("FLATLINE_UTILITY_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut config = resolveMerged(
+        merged,
+        ProfileOverrides {
+            heavy: heavyEnv.as_deref(),
+            light: lightEnv.as_deref(),
+            utility: utilityEnv.as_deref(),
+        },
+    )?;
     config.projectRoot = projectRoot;
 
-    // Tag permissions with their source layer.
     if let Some(ref mut perms) = config.permissions {
         perms.source = permsSource;
     }
 
-    // Layer 5: env vars always win.
-    // Apply provider-specific API key env vars.
-    applyEnvKey(&mut config.main);
+    applyEnvKey(&mut config.heavy);
+    applyEnvKey(&mut config.light);
     applyEnvKey(&mut config.utility);
 
     if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
@@ -296,6 +386,38 @@ pub fn load() -> Result<Config> {
     Ok(config)
 }
 
+/// Load a single config file (no user/project/local discovery).
+fn loadExplicit(path: PathBuf) -> Result<Config> {
+    let layer = loadPartial(&path)?;
+    let heavyEnv = std::env::var("FLATLINE_HEAVY_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let lightEnv = std::env::var("FLATLINE_LIGHT_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let utilityEnv = std::env::var("FLATLINE_UTILITY_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut config = resolveMerged(
+        layer,
+        ProfileOverrides {
+            heavy: heavyEnv.as_deref(),
+            light: lightEnv.as_deref(),
+            utility: utilityEnv.as_deref(),
+        },
+    )?;
+    config.projectRoot = discoverProjectRoot();
+    applyEnvKey(&mut config.heavy);
+    applyEnvKey(&mut config.light);
+    applyEnvKey(&mut config.utility);
+    if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
+        if !exaKey.is_empty() {
+            config.web.searchKey = exaKey;
+        }
+    }
+    Ok(config)
+}
+
 /// Apply provider-specific env var to a model config if its key is empty.
 fn applyEnvKey(config: &mut ModelConfig) {
     if !config.key.is_empty() {
@@ -304,7 +426,6 @@ fn applyEnvKey(config: &mut ModelConfig) {
 
     let envVar = match config.provider.as_str() {
         "fireworks" => "FIREWORKS_API_KEY",
-        // Default to OpenRouter for backward compatibility.
         _ => "OPENROUTER_API_KEY",
     };
 
@@ -318,7 +439,6 @@ fn applyEnvKey(config: &mut ModelConfig) {
 // ── Project root discovery ──────────────────────────────────────────
 
 /// Walk from CWD upward to find the project root (first directory containing `.git`).
-/// Falls back to CWD if no `.git` is found.
 pub fn discoverProjectRoot() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
@@ -364,16 +484,29 @@ fn ensureLocalGitignored(projectDir: &Path) {
 /// Partial config — every field optional for layer merging.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PartialConfig {
-    main: Option<PartialModelConfig>,
-    utility: Option<PartialModelConfig>,
+    #[serde(default)]
+    heavyProfile: Option<String>,
+    #[serde(default)]
+    lightProfile: Option<String>,
+    #[serde(default)]
+    utilityProfile: Option<String>,
+    /// Map of profile name → flat ModelConfig. Each profile is a single
+    /// model identity; `heavyProfile` / `lightProfile` / `utilityProfile`
+    /// select which one plays which tier.
+    #[serde(default)]
+    profile: HashMap<String, PartialModelConfig>,
+    #[serde(default)]
     compactRatio: Option<f64>,
+    #[serde(default)]
     web: Option<PartialWebConfig>,
+    #[serde(default)]
     lsp: Option<crate::lsp::LspConfig>,
+    #[serde(default)]
     permissions: Option<Permissions>,
+    #[serde(default)]
     budget: Option<BudgetConfig>,
 }
 
-/// Partial model config — mirrors ModelConfig with all fields optional.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PartialModelConfig {
     provider: Option<String>,
@@ -385,74 +518,84 @@ struct PartialModelConfig {
     providerOrder: Option<Vec<String>>,
     maxTokens: Option<usize>,
     contextWindow: Option<usize>,
+    supportsAnthropicCache: Option<bool>,
 }
 
-/// Partial web config.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PartialWebConfig {
     searchKey: Option<String>,
 }
 
-/// Load a config file as a PartialConfig. Returns default (all None) if file doesn't exist.
+/// Load a config file as a PartialConfig, detecting legacy shapes first.
 fn loadPartial(path: &Path) -> Result<PartialConfig> {
     if !path.exists() {
         return Ok(PartialConfig::default());
     }
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
+
+    // Legacy detection: top-level [main] or [utility] means pre-profile config.
+    detectLegacy(&contents, path)?;
+
     toml::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Emit a human-readable error and exit(2) if the config uses the old
+/// top-level `[main]` / `[utility]` shape. Called from `loadPartial`.
+fn detectLegacy(contents: &str, path: &Path) -> Result<()> {
+    let parsed: toml::Value = match toml::from_str(contents) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // let the real parser emit the error below
+    };
+    let Some(table) = parsed.as_table() else {
+        return Ok(());
+    };
+    if table.contains_key("main") || table.contains_key("utility") {
+        eprintln!(
+            "error: legacy config format detected at {}\n\n\
+             Model settings must now live inside named profiles. Each\n\
+             profile is one flat ModelConfig; top-level `heavyProfile` /\n\
+             `lightProfile` / `utilityProfile` pick which profile plays\n\
+             which tier. Example:\n\n    \
+             heavyProfile   = \"default\"\n    \
+             # lightProfile   = \"default\"   # defaults to heavyProfile when unset\n    \
+             # utilityProfile = \"default\"   # defaults to lightProfile when unset\n\n    \
+             [profile.default]\n    \
+             provider = \"...\"\n    \
+             model = \"...\"\n    \
+             ...\n",
+            path.display()
+        );
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 impl PartialConfig {
-    /// Merge self (base) with overlay (higher priority). Overlay wins for set fields.
-    fn merge(self, overlay: Self) -> Self {
+    /// Merge self (base) with overlay (higher priority).
+    ///
+    /// Profile map entries are **atomic**: whichever layer defines
+    /// `profile.foo` last fully owns it. No field-level merge inside
+    /// a profile. Non-profile fields keep their existing composite
+    /// semantics.
+    fn merge(mut self, overlay: Self) -> Self {
+        // Atomic profile replace: overlay's profile.foo fully replaces base's.
+        for (name, profile) in overlay.profile {
+            self.profile.insert(name, profile);
+        }
+
         Self {
-            main: mergePartialModel(self.main, overlay.main),
-            utility: mergePartialModel(self.utility, overlay.utility),
+            heavyProfile: overlay.heavyProfile.or(self.heavyProfile),
+            lightProfile: overlay.lightProfile.or(self.lightProfile),
+            utilityProfile: overlay.utilityProfile.or(self.utilityProfile),
+            profile: self.profile,
             compactRatio: overlay.compactRatio.or(self.compactRatio),
             web: mergePartialWeb(self.web, overlay.web),
             lsp: mergeLsp(self.lsp, overlay.lsp),
-            // Permissions use replace semantics — overlay wins entirely.
             permissions: overlay.permissions.or(self.permissions),
             budget: overlay.budget.or(self.budget),
         }
-    }
-
-    /// Resolve partial config into a full Config by filling in defaults.
-    fn resolve(self) -> Config {
-        Config {
-            main: resolveModel(self.main, defaults::mainModel()),
-            utility: resolveModel(self.utility, defaults::utilityModel()),
-            compactRatio: self.compactRatio.unwrap_or_else(defaults::compactRatio),
-            web: resolveWeb(self.web),
-            lsp: self.lsp.unwrap_or_default(),
-            permissions: self.permissions,
-            budget: self.budget.unwrap_or_default(),
-            projectRoot: None,
-        }
-    }
-}
-
-fn mergePartialModel(
-    base: Option<PartialModelConfig>,
-    overlay: Option<PartialModelConfig>,
-) -> Option<PartialModelConfig> {
-    match (base, overlay) {
-        (None, None) => None,
-        (Some(b), None) => Some(b),
-        (None, Some(o)) => Some(o),
-        (Some(b), Some(o)) => Some(PartialModelConfig {
-            provider: o.provider.or(b.provider),
-            key: o.key.or(b.key),
-            model: o.model.or(b.model),
-            baseUrl: o.baseUrl.or(b.baseUrl),
-            reasoning: o.reasoning.or(b.reasoning),
-            promptThinking: o.promptThinking.or(b.promptThinking),
-            providerOrder: o.providerOrder.or(b.providerOrder),
-            maxTokens: o.maxTokens.or(b.maxTokens),
-            contextWindow: o.contextWindow.or(b.contextWindow),
-        }),
     }
 }
 
@@ -479,7 +622,6 @@ fn mergeLsp(
         (Some(b), None) => Some(b),
         (None, Some(o)) => Some(o),
         (Some(mut b), Some(o)) => {
-            // Deep merge: overlay entries override base entries by key.
             for (k, v) in o {
                 b.insert(k, v);
             }
@@ -488,20 +630,106 @@ fn mergeLsp(
     }
 }
 
-fn resolveModel(partial: Option<PartialModelConfig>, fallback: ModelConfig) -> ModelConfig {
-    match partial {
-        None => fallback,
-        Some(p) => ModelConfig {
-            provider: p.provider.unwrap_or(fallback.provider),
-            key: p.key.unwrap_or(fallback.key),
-            model: p.model.unwrap_or(fallback.model),
-            baseUrl: p.baseUrl.unwrap_or(fallback.baseUrl),
-            reasoning: p.reasoning.or(fallback.reasoning),
-            promptThinking: p.promptThinking.unwrap_or(fallback.promptThinking),
-            providerOrder: p.providerOrder.unwrap_or(fallback.providerOrder),
-            maxTokens: p.maxTokens.or(fallback.maxTokens),
-            contextWindow: p.contextWindow.unwrap_or(fallback.contextWindow),
-        },
+/// Overrides passed from the CLI / env layer to influence which profiles
+/// get picked without threading env-var reads into the resolver itself.
+#[derive(Debug, Clone, Default)]
+struct ProfileOverrides<'a> {
+    heavy: Option<&'a str>,
+    light: Option<&'a str>,
+    utility: Option<&'a str>,
+}
+
+/// Resolve a PartialConfig into a full Config by:
+/// 1. Picking `heavyProfile` (override > field > "default")
+/// 2. Picking `lightProfile` (override > field > heavyProfile)
+/// 3. Picking `utilityProfile` (override > field > lightProfile)
+/// 4. Looking each up in the profile map and resolving with tier-aware defaults
+/// 5. Filling remaining top-level fields
+fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Result<Config> {
+    let heavyName = overrides
+        .heavy
+        .map(|s| s.to_string())
+        .or(partial.heavyProfile.clone())
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    let lightName = overrides
+        .light
+        .map(|s| s.to_string())
+        .or(partial.lightProfile.clone())
+        .unwrap_or_else(|| heavyName.clone());
+    let utilityName = overrides
+        .utility
+        .map(|s| s.to_string())
+        .or(partial.utilityProfile.clone())
+        .unwrap_or_else(|| lightName.clone());
+
+    // Always route through lookupProfile so empty configs get tier-specific
+    // defaults. When the profile map has entries, two tiers pointing at the
+    // same named profile naturally resolve to identical ModelConfigs.
+    let heavy = lookupProfile(&partial.profile, &heavyName, "heavyProfile", Tier::Heavy)?;
+    let light = lookupProfile(&partial.profile, &lightName, "lightProfile", Tier::Light)?;
+    let utility = lookupProfile(&partial.profile, &utilityName, "utilityProfile", Tier::Utility)?;
+
+    Ok(Config {
+        heavyProfile: heavyName,
+        lightProfile: lightName,
+        utilityProfile: utilityName,
+        heavy,
+        light,
+        utility,
+        compactRatio: partial.compactRatio.unwrap_or_else(defaultCompactRatio),
+        web: resolveWeb(partial.web),
+        lsp: partial.lsp.unwrap_or_default(),
+        permissions: partial.permissions,
+        budget: partial.budget.unwrap_or_default(),
+        projectRoot: None,
+    })
+}
+
+/// Look up a profile by name and resolve it, applying provider-aware defaults.
+///
+/// If the map is empty entirely, synthesizes tier-appropriate defaults (so
+/// an empty config gets Opus/Sonnet/Kimi for heavy/light/utility). Otherwise
+/// a missing-but-referenced profile is a hard error.
+fn lookupProfile(
+    profiles: &HashMap<String, PartialModelConfig>,
+    name: &str,
+    role: &str,
+    tier: Tier,
+) -> Result<ModelConfig> {
+    if profiles.is_empty() {
+        return Ok(tierDefaults(tier));
+    }
+    match profiles.get(name) {
+        Some(p) => Ok(resolveModel(Some(p.clone()))),
+        None => anyhow::bail!(
+            "{role} references profile {name:?}, which is not defined. Available: {:?}",
+            profiles.keys().collect::<Vec<_>>()
+        ),
+    }
+}
+
+/// Fill a PartialModelConfig with provider-aware defaults.
+///
+/// The provider field is picked first (from partial or default), then the
+/// remaining fields fall back to defaults keyed off that provider.
+fn resolveModel(partial: Option<PartialModelConfig>) -> ModelConfig {
+    let partial = partial.unwrap_or_default();
+    let provider = partial
+        .provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
+    let defaults = modelDefaults(&provider);
+    ModelConfig {
+        provider,
+        key: partial.key.unwrap_or(defaults.key),
+        model: partial.model.unwrap_or(defaults.model),
+        baseUrl: partial.baseUrl.unwrap_or(defaults.baseUrl),
+        reasoning: partial.reasoning.or(defaults.reasoning),
+        promptThinking: partial.promptThinking.unwrap_or(defaults.promptThinking),
+        providerOrder: partial.providerOrder.unwrap_or(defaults.providerOrder),
+        maxTokens: partial.maxTokens.or(defaults.maxTokens),
+        contextWindow: partial.contextWindow.unwrap_or(defaults.contextWindow),
+        supportsAnthropicCache: partial.supportsAnthropicCache.or(defaults.supportsAnthropicCache),
     }
 }
 
@@ -514,13 +742,42 @@ fn resolveWeb(partial: Option<PartialWebConfig>) -> WebConfig {
     }
 }
 
+/// TOML text written when no user config exists yet.
+///
+/// Three-tier starter config: Opus (heavy), Sonnet (light), Kimi K2.5 via
+/// OpenRouter (utility). All three profiles share the OpenRouter provider
+/// so a user with only `OPENROUTER_API_KEY` gets a working setup out of
+/// the box. Swap the utility profile to Fireworks direct if you have a
+/// Firepass account.
+fn defaultConfigToml() -> String {
+    format!(
+        "heavyProfile   = \"opus\"\n\
+         lightProfile   = \"sonnet\"\n\
+         utilityProfile = \"kimi\"\n\
+         compactRatio   = {compact}\n\n\
+         [profile.opus]\n\
+         provider       = \"openrouter\"\n\
+         model          = \"anthropic/claude-opus-4-6\"\n\
+         promptThinking = true\n\
+         providerOrder  = [\"Anthropic\"]\n\
+         contextWindow  = 250000\n\n\
+         [profile.sonnet]\n\
+         provider       = \"openrouter\"\n\
+         model          = \"anthropic/claude-sonnet-4-6\"\n\
+         promptThinking = true\n\
+         providerOrder  = [\"Anthropic\"]\n\
+         contextWindow  = 250000\n\n\
+         [profile.kimi]\n\
+         provider       = \"openrouter\"\n\
+         model          = \"moonshotai/kimi-k2.5\"\n\
+         contextWindow  = 256000\n",
+        compact = defaultCompactRatio(),
+    )
+}
+
 // ── Permission persistence ──────────────────────────────────────────
 
 /// Persist a new permission rule to `.flatline/config.toml`.
-///
-/// If no `[permissions]` section exists yet, snapshots the current effective
-/// rules as the starting set before appending the new rule. Creates the
-/// `.flatline/` directory and config file if needed.
 pub fn persistPermissionRule(
     projectRoot: &Path,
     currentPermissions: &Permissions,
@@ -534,7 +791,6 @@ pub fn persistPermissionRule(
     fs::create_dir_all(&projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
 
-    // Load existing project config (or empty).
     let existing = if configPath.exists() {
         fs::read_to_string(&configPath)
             .with_context(|| format!("failed to read {}", configPath.display()))?
@@ -552,7 +808,6 @@ pub fn persistPermissionRule(
     };
 
     if doc.contains_key("permissions") {
-        // Append to existing permissions section.
         if let Some(toml::Value::Table(permTable)) = doc.get_mut("permissions") {
             let rules = permTable
                 .entry("rules")
@@ -562,7 +817,6 @@ pub fn persistPermissionRule(
             }
         }
     } else {
-        // Snapshot current effective rules + new rule.
         let mut rules: Vec<toml::Value> = currentPermissions
             .rules
             .iter()
@@ -583,7 +837,6 @@ pub fn persistPermissionRule(
     fs::write(&configPath, &output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
 
-    // Ensure local config is gitignored while we're here.
     ensureLocalGitignored(&projectDir);
 
     Ok(())
@@ -599,7 +852,7 @@ fn ruleToToml(rule: &Rule) -> toml::Value {
     toml::Value::Table(table)
 }
 
-/// Save a full permissions set to `.flatline/config.toml`, replacing the existing section.
+/// Save a full permissions set to `.flatline/config.toml`.
 pub fn savePermissions(
     projectRoot: &Path,
     defaultMode: &PermitMode,
@@ -620,7 +873,6 @@ pub fn savePermissions(
 
     let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
 
-    // Build the full permissions section.
     let ruleValues: Vec<toml::Value> = rules.iter().map(ruleToToml).collect();
     let mut permTable = toml::Table::new();
     permTable.insert(
@@ -643,5 +895,207 @@ fn permitModeToStr(mode: &PermitMode) -> &'static str {
         PermitMode::Ask => "ask",
         PermitMode::Deny => "deny",
         PermitMode::Abort => "abort",
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parseToml(src: &str) -> PartialConfig {
+        toml::from_str(src).expect("parse test toml")
+    }
+
+    fn resolveOk(partial: PartialConfig) -> Config {
+        resolveMerged(partial, ProfileOverrides::default()).expect("resolve")
+    }
+
+    fn resolveWithHeavy(partial: PartialConfig, heavy: &str) -> Config {
+        resolveMerged(
+            partial,
+            ProfileOverrides { heavy: Some(heavy), light: None, utility: None },
+        )
+        .expect("resolve")
+    }
+
+    #[test]
+    fn atomicProfileReplace() {
+        // Base defines provider=openrouter + providerOrder. Overlay redefines
+        // profile.foo to fireworks/kimi with no providerOrder. Merge must NOT
+        // carry over base's providerOrder — that's the leak we're killing.
+        let base = parseToml(
+            r#"
+            heavyProfile = "foo"
+            [profile.foo]
+            provider = "openrouter"
+            model = "anthropic/claude-opus-4-6"
+            providerOrder = ["Anthropic"]
+            "#,
+        );
+        let overlay = parseToml(
+            r#"
+            [profile.foo]
+            provider = "fireworks"
+            model = "accounts/fireworks/models/kimi-k2p5"
+            "#,
+        );
+        let merged = base.merge(overlay);
+        let cfg = resolveOk(merged);
+
+        assert_eq!(cfg.heavy.provider, "fireworks");
+        assert_eq!(cfg.heavy.providerOrder, Vec::<String>::new());
+        assert_eq!(cfg.heavy.baseUrl, "https://api.fireworks.ai/inference/v1");
+    }
+
+    #[test]
+    fn profileMapUnionsAcrossLayers() {
+        let base = parseToml(
+            r#"
+            [profile.foo]
+            provider = "openrouter"
+            model = "a"
+            "#,
+        );
+        let overlay = parseToml(
+            r#"
+            [profile.bar]
+            provider = "fireworks"
+            model = "b"
+            "#,
+        );
+        let merged = base.merge(overlay);
+        assert_eq!(merged.profile.len(), 2);
+        assert!(merged.profile.contains_key("foo"));
+        assert!(merged.profile.contains_key("bar"));
+    }
+
+    #[test]
+    fn lightAndUtilityDefaultToHeavy() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "x"
+            [profile.x]
+            provider = "fireworks"
+            model = "my-model"
+            "#,
+        ));
+        assert_eq!(cfg.heavy.model, "my-model");
+        assert_eq!(cfg.light.model, "my-model");
+        assert_eq!(cfg.utility.model, "my-model");
+        assert_eq!(cfg.heavyProfile, "x");
+        assert_eq!(cfg.lightProfile, "x");
+        assert_eq!(cfg.utilityProfile, "x");
+    }
+
+    #[test]
+    fn utilityFallsBackToLightNotHeavy() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "big"
+            lightProfile = "mid"
+            [profile.big]
+            provider = "fireworks"
+            model = "big-model"
+            [profile.mid]
+            provider = "fireworks"
+            model = "mid-model"
+            "#,
+        ));
+        assert_eq!(cfg.heavy.model, "big-model");
+        assert_eq!(cfg.light.model, "mid-model");
+        assert_eq!(cfg.utility.model, "mid-model");
+        assert_eq!(cfg.utilityProfile, "mid");
+    }
+
+    #[test]
+    fn allThreeTiersIndependent() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "big"
+            lightProfile = "mid"
+            utilityProfile = "small"
+            [profile.big]
+            provider = "fireworks"
+            model = "big-model"
+            [profile.mid]
+            provider = "fireworks"
+            model = "mid-model"
+            [profile.small]
+            provider = "fireworks"
+            model = "small-model"
+            "#,
+        ));
+        assert_eq!(cfg.heavy.model, "big-model");
+        assert_eq!(cfg.light.model, "mid-model");
+        assert_eq!(cfg.utility.model, "small-model");
+        assert_eq!(cfg.heavyProfile, "big");
+        assert_eq!(cfg.lightProfile, "mid");
+        assert_eq!(cfg.utilityProfile, "small");
+    }
+
+    #[test]
+    fn providerAwareDefaults() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "x"
+            [profile.x]
+            provider = "fireworks"
+            model = "m"
+            "#,
+        ));
+        assert_eq!(cfg.heavy.baseUrl, "https://api.fireworks.ai/inference/v1");
+        assert!(cfg.heavy.providerOrder.is_empty());
+        assert!(!cfg.heavy.promptThinking);
+    }
+
+    #[test]
+    fn heavyProfileOverrideWins() {
+        let cfg = resolveWithHeavy(
+            parseToml(
+                r#"
+                heavyProfile = "default"
+                [profile.default]
+                model = "wrong"
+                [profile.picked]
+                provider = "fireworks"
+                model = "right"
+                "#,
+            ),
+            "picked",
+        );
+        assert_eq!(cfg.heavy.model, "right");
+        assert_eq!(cfg.heavyProfile, "picked");
+    }
+
+    #[test]
+    fn missingNamedProfileIsError() {
+        let result = resolveMerged(
+            parseToml(
+                r#"
+                heavyProfile = "nope"
+                [profile.default]
+                model = "x"
+                "#,
+            ),
+            ProfileOverrides::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn emptyConfigSynthesizesTierAppropriateDefaults() {
+        // No profiles defined anywhere — each tier gets its own starter
+        // (Opus for heavy, Sonnet for light, Kimi for utility) instead of
+        // all three sharing the heavy default.
+        let cfg = resolveOk(PartialConfig::default());
+        assert_eq!(cfg.heavyProfile, "default");
+        assert!(cfg.heavy.model.contains("opus"));
+        assert!(cfg.heavy.promptThinking);
+        assert!(cfg.light.model.contains("sonnet"));
+        assert!(cfg.light.promptThinking);
+        assert!(cfg.utility.model.contains("kimi"));
+        assert!(!cfg.utility.promptThinking);
     }
 }

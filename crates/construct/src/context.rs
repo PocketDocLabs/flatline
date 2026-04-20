@@ -34,7 +34,6 @@ pub fn reconstruct(
     transcript: &Transcript,
     compactionLog: &CompactionLog,
     headTurnId: &str,
-    promptThinking: bool,
 ) -> Result<Vec<Message>> {
     let allTurns = transcript.loadAll()?;
     let chain = walkChain(&allTurns, headTurnId);
@@ -46,7 +45,7 @@ pub fn reconstruct(
     let ops = filterOpsForChain(allOps, &activeBlockIds);
 
     let transformed = applyOps(&chain, &ops);
-    Ok(assembleMessages(&transformed, promptThinking))
+    Ok(assembleMessages(&transformed))
 }
 
 /// Walk the parent-child chain from `headTurnId` to root.
@@ -301,7 +300,7 @@ struct PendingAssistant {
 /// When an Assistant text turn is immediately followed by ToolCall turns,
 /// the text is merged into the tool-call Assistant message rather than
 /// emitting two consecutive Assistant messages.
-fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Message> {
+fn assembleMessages(turns: &[TransformedTurn]) -> Vec<Message> {
     let mut history: Vec<Message> = Vec::new();
     let mut pendingCalls: Vec<ToolCall> = Vec::new();
     // Assistant content waiting to see if tool calls follow.
@@ -310,7 +309,7 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
     for tt in turns {
         match tt {
             TransformedTurn::Summary { content, blockId, kind, sourceBlockIds } => {
-                flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
+                flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                 let wrapped = match kind {
                     SummaryKind::Block => formatBlockSummary(content, blockId),
                     SummaryKind::Topic => formatTopicSummary(content, sourceBlockIds),
@@ -345,33 +344,25 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
                     }
                     TurnRole::Assistant => {
                         // Flush any prior pending state before holding this one.
-                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
-
-                        let (finalContent, finalReasoning) = if promptThinking {
-                            let merged = match (&turn.reasoning, content.is_empty()) {
-                                (Some(r), false) => format!("<scratchpad>\n{r}\n</scratchpad>\n{content}"),
-                                (Some(r), true) => format!("<scratchpad>\n{r}\n</scratchpad>"),
-                                (None, _) => content,
-                            };
-                            (Some(merged), None)
-                        } else {
-                            (Some(content), turn.reasoning.clone())
-                        };
+                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
 
                         // Hold — don't emit yet. If ToolCall turns follow,
                         // this content will be merged into that message.
+                        // Trim leading/trailing whitespace on reasoning loaded
+                        // from older sessions where we didn't normalize on write.
+                        let reasoning = turn.reasoning.as_ref().map(|r| r.trim().to_string());
                         pendingAssistant = Some(PendingAssistant {
-                            content: finalContent,
-                            reasoning: finalReasoning,
+                            content: Some(content),
+                            reasoning,
                         });
                     }
                     TurnRole::User => {
-                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
+                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                         let msgContent = rebuildContent(&content, &turn.attachments);
                         history.push(Message::User { content: msgContent });
                     }
                     TurnRole::ToolResult => {
-                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
+                        flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                         let msgContent = rebuildContent(&content, &turn.attachments);
                         history.push(Message::Tool {
                             tool_call_id: turn.toolCallId.clone().unwrap_or_default(),
@@ -384,7 +375,7 @@ fn assembleMessages(turns: &[TransformedTurn], promptThinking: bool) -> Vec<Mess
         }
     }
 
-    flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls, promptThinking);
+    flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
     history
 }
 
@@ -415,7 +406,6 @@ fn flushPending(
     history: &mut Vec<Message>,
     pendingAssistant: &mut Option<PendingAssistant>,
     pendingCalls: &mut Vec<ToolCall>,
-    _promptThinking: bool,
 ) {
     if !pendingCalls.is_empty() {
         // Merge any pending assistant content into the tool-call message.
@@ -943,8 +933,12 @@ mod tests {
         /// Record assistant text (and optional reasoning).
         /// Mirrors session.rs:1182-1187 — content recorded before tool calls.
         fn assistant(&mut self, content: &str, reasoning: Option<&str>) {
+            let meta = crate::transcript::AssistantMeta {
+                reasoning,
+                ..Default::default()
+            };
             let id = self.transcript
-                .recordAssistant(content, reasoning, None)
+                .recordAssistant(content, meta)
                 .unwrap();
             self.headTurnId = Some(id);
         }
@@ -968,10 +962,10 @@ mod tests {
         }
 
         /// Reconstruct messages from the current head.
-        fn reconstruct(&self, promptThinking: bool) -> Vec<Message> {
+        fn reconstruct(&self) -> Vec<Message> {
             let head = self.headTurnId.as_ref().expect("no turns recorded");
             let log = self.compactionLog();
-            reconstruct(&self.transcript, &log, head, promptThinking).unwrap()
+            reconstruct(&self.transcript, &log, head).unwrap()
         }
     }
 
@@ -1049,7 +1043,7 @@ mod tests {
         s.user("Hello");
         s.assistant("Hi there!", None);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         assert_eq!(msgs.len(), 2);
         assert_eq!(assertUser(&msgs[0]), "Hello");
         let (content, calls, _) = assertAssistant(&msgs[1]);
@@ -1063,7 +1057,7 @@ mod tests {
         s.user("Explain this");
         s.assistant("Here's my answer.", Some("Thought carefully"));
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         let (content, _, hasReasoning) = assertAssistant(&msgs[1]);
         assert_eq!(content, Some("Here's my answer."));
         assert!(hasReasoning);
@@ -1081,7 +1075,7 @@ mod tests {
         s.toolCall("c01", "readFile", serde_json::json!({"path": "/tmp/foo.txt"}));
         s.toolResult("c01", "file contents here");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         assert_eq!(msgs.len(), 3);
         assert_eq!(assertUser(&msgs[0]), "Read /tmp/foo.txt");
         let (content, calls, _) = assertAssistant(&msgs[1]);
@@ -1102,7 +1096,7 @@ mod tests {
         s.toolResult("c10", "aaa");
         s.toolResult("c11", "bbb");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         assert_eq!(msgs.len(), 4, "User + Assistant(2 calls) + Tool + Tool");
         let (_, calls, _) = assertAssistant(&msgs[1]);
         assert_eq!(calls, 2);
@@ -1122,7 +1116,7 @@ mod tests {
         }));
         s.toolResult("c20", "ok");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         match &msgs[1] {
             Message::Assistant { tool_calls: Some(calls), .. } => {
                 let args: serde_json::Value =
@@ -1157,7 +1151,7 @@ mod tests {
         // Round 3: model responds.
         s.assistant("Fixed. The bug() call was replaced with fix().", None);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("tool_loop_no_user_between", &msgs);
 
         // [0] User
@@ -1201,7 +1195,7 @@ mod tests {
         s.toolCall("c40", "readFile", serde_json::json!({"path": "/tmp/bar.txt"}));
         s.toolResult("c40", "bar contents");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("content_plus_tool_calls_merged", &msgs);
 
         assert_eq!(msgs.len(), 3, "User + Assistant(content+tool_calls) + Tool");
@@ -1224,7 +1218,7 @@ mod tests {
         s.toolCall("c50", "readFile", serde_json::json!({"path": "config.toml"}));
         s.toolResult("c50", "[settings]\nfoo = true");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("content_plus_reasoning_plus_tool_calls_merged", &msgs);
 
         assert_eq!(msgs.len(), 3, "User + Assistant(content+reasoning+tool_calls) + Tool");
@@ -1255,7 +1249,7 @@ mod tests {
         s.toolCall("c61", "readFile", serde_json::json!({"path": "/tmp/y"}));
         s.toolResult("c61", "y contents");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("multi_turn_interleaved", &msgs);
 
         // [0] User [1] Asst(calls) [2] Tool [3] Asst(text) [4] User [5] Asst(calls) [6] Tool
@@ -1282,52 +1276,13 @@ mod tests {
         s.user("Step 3");
         s.assistant("Done 3.", None);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("three_block_chain", &msgs);
 
         let userMsgs: Vec<&str> = msgs.iter().filter_map(|m| {
             if let Message::User { content } = m { Some(content.textContent()) } else { None }
         }).collect();
         assert_eq!(userMsgs, vec!["Step 1", "Step 2", "Step 3"]);
-    }
-
-    // -----------------------------------------------------------------------
-    // Prompt thinking mode (scratchpad)
-    // -----------------------------------------------------------------------
-
-    /// With promptThinking=true, reasoning is merged into content as
-    /// `<scratchpad>` tags instead of the reasoning field.
-    #[test]
-    fn prompt_thinking_merges_reasoning() {
-        let mut s = TestSession::new();
-        s.user("Explain this");
-        s.assistant("Here's the answer.", Some("Let me think step by step"));
-
-        let msgs = s.reconstruct(true);
-
-        let (content, _, hasReasoning) = assertAssistant(&msgs[1]);
-        assert!(!hasReasoning, "reasoning field should be None in promptThinking mode");
-        let text = content.unwrap();
-        assert!(text.contains("<scratchpad>"), "content should contain scratchpad open tag");
-        assert!(text.contains("Let me think step by step"), "reasoning text in scratchpad");
-        assert!(text.contains("Here's the answer."), "content text after scratchpad");
-    }
-
-    /// promptThinking with reasoning-only (no content text).
-    #[test]
-    fn prompt_thinking_reasoning_only() {
-        let mut s = TestSession::new();
-        s.user("Think");
-        // Empty content, reasoning only.
-        s.assistant("", Some("Internal monologue"));
-
-        let msgs = s.reconstruct(true);
-
-        let (content, _, hasReasoning) = assertAssistant(&msgs[1]);
-        assert!(!hasReasoning);
-        let text = content.unwrap();
-        assert!(text.contains("<scratchpad>"));
-        assert!(text.contains("Internal monologue"));
     }
 
     // -----------------------------------------------------------------------
@@ -1342,7 +1297,7 @@ mod tests {
         s.user("Do nothing");
         s.assistant("", None);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         assert_eq!(msgs.len(), 2);
         let (content, _, _) = assertAssistant(&msgs[1]);
         assert_eq!(content, Some(""));
@@ -1356,7 +1311,7 @@ mod tests {
         s.toolCall("c80", "shell", serde_json::json!({"cmd": "true"}));
         s.toolResult("c80", "");
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         assert_eq!(msgs.len(), 3);
         let (_, body) = assertTool(&msgs[2]);
         assert_eq!(body, "");
@@ -1389,7 +1344,7 @@ mod tests {
         // Final text response.
         s.assistant("All done.", None);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("long_tool_chain", &msgs);
 
         // Each tool call round = Assistant(calls) + Tool = 2 messages.
@@ -1432,7 +1387,7 @@ mod tests {
         log.recordMiddleOut(vec!["c100".into()], &afterTurn, 200).unwrap();
         drop(log);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
 
         let (_, body) = assertTool(&msgs[2]);
         assert!(body.len() < bigContent.len(), "tool result should be truncated");
@@ -1455,7 +1410,7 @@ mod tests {
         log.recordFileDedup(vec!["c110".into()], &afterTurn).unwrap();
         drop(log);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("file_dedup", &msgs);
 
         let toolIds: Vec<&str> = msgs.iter().filter_map(|m| {
@@ -1488,7 +1443,7 @@ mod tests {
         log.recordBlockCompact(&blockId, "User listed files, found file1 and file2.", vec![], &afterTurn).unwrap();
         drop(log);
 
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("block_compact", &msgs);
 
         let hasCompressed = msgs.iter().any(|m| {
@@ -1529,7 +1484,7 @@ mod tests {
         // Rewind to turn 1 — images should be in the reconstructed history.
         let msgs = {
             let log = s.compactionLog();
-            reconstruct(&s.transcript, &log, &turn1Head, false).unwrap()
+            reconstruct(&s.transcript, &log, &turn1Head).unwrap()
         };
         dump("image_rewind", &msgs);
 
@@ -1559,7 +1514,7 @@ mod tests {
         s.assistant("No problem.", None);
 
         // Full chain should preserve images on the first user message.
-        let msgs = s.reconstruct(false);
+        let msgs = s.reconstruct();
         dump("image_full_chain", &msgs);
 
         if let Message::User { content } = &msgs[0] {

@@ -25,14 +25,24 @@ use crate::shell;
 
 use crate::tool::ToolSet;
 
+/// Which tier a subagent runs on. Drives which profile its session uses in
+/// `executeTask` — the tier's `ModelConfig` gets swapped into the child's
+/// `heavy` slot so Client code stays tier-agnostic.
+#[derive(Debug, Clone, Copy)]
+pub enum AgentTier {
+    Heavy,
+    Light,
+    Utility,
+}
+
 /// Agent preset for subagent execution.
 pub struct AgentPreset {
     pub toolSet: ToolSet,
     pub permissions: Permissions,
     pub interface: InterfaceMode,
     pub maxTurns: usize,
-    /// If true, use the cheap utility model instead of the parent's model.
-    pub useUtilityModel: bool,
+    /// Which tier this agent runs on.
+    pub tier: AgentTier,
     /// Appended to the system prompt for role-specific instructions.
     pub systemSuffix: &'static str,
 }
@@ -45,7 +55,7 @@ pub fn agentPreset(name: &str) -> AgentPreset {
             permissions: Permissions::allowReadOnly(),
             interface: InterfaceMode::MultiAgent,
             maxTurns: 20,
-            useUtilityModel: true,
+            tier: AgentTier::Utility,
             systemSuffix: "You are an exploration agent. \
                 Investigate the codebase and report findings. \
                 You cannot modify files — use read-only tools only.",
@@ -55,7 +65,7 @@ pub fn agentPreset(name: &str) -> AgentPreset {
             permissions: Permissions::askForEverything(),
             interface: InterfaceMode::MultiAgent,
             maxTurns: 50,
-            useUtilityModel: false,
+            tier: AgentTier::Heavy,
             systemSuffix: "You are a subtask agent. \
                 Complete the assigned task and return your result. \
                 Be thorough but focused — do the work, report what you did.",
@@ -74,6 +84,17 @@ pub enum SystemPromptOverride {
 /// Execution parameters for a headless run.
 pub struct RunConfig {
     pub maxTurns: usize,
+    /// Profile name for the heavy tier (overrides `heavyProfile`). Applied
+    /// before `load()` via the `FLATLINE_HEAVY_PROFILE` env var by the caller.
+    pub heavyProfile: Option<String>,
+
+    /// Profile name for the light tier (overrides `lightProfile`).
+    /// Defaults to heavy when unset.
+    pub lightProfile: Option<String>,
+
+    /// Profile name for the utility tier (overrides `utilityProfile`).
+    /// Defaults to light when unset.
+    pub utilityProfile: Option<String>,
     pub model: Option<String>,
     pub systemPrompt: Option<SystemPromptOverride>,
     pub allowedTools: Option<Vec<String>>,
@@ -117,8 +138,8 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
     // since pinned providers are model-specific.
     let mut config = config.clone();
     if let Some(ref model) = runConfig.model {
-        config.main.model = model.clone();
-        config.main.providerOrder = Vec::new();
+        config.heavy.model = model.clone();
+        config.heavy.providerOrder = Vec::new();
     }
 
     // Build permissions based on --allowed-tools, config, or defaults.
