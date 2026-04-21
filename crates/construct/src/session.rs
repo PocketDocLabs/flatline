@@ -10,7 +10,7 @@
 //!
 //! # Public API
 //! - [`Session`] — owns conversation state and drives the agent loop
-//! - [`SessionEvent`] — events emitted during a turn
+//! - [`crate::control::LogEvent`] — events emitted during a turn
 //!
 //! # Dependencies
 //! `tokio`, `serde_json`
@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api;
 use crate::checkpoint::CheckpointManager;
@@ -28,6 +28,7 @@ use crate::compaction::CompactionLog;
 use crate::compaction_trigger;
 use crate::config::Config;
 use crate::context;
+use crate::control::{LogEvent, PermitOrigin, SessionRequest};
 use crate::message::{
     Content, FunctionCall, Message, ReasoningConfig, StreamEvent, TokenUsage, ToolCall, ToolDef,
 };
@@ -68,237 +69,8 @@ impl From<String> for UserInput {
     }
 }
 
-/// Events emitted by the session during a turn.
-#[derive(Debug, Clone)]
-pub enum SessionEvent {
-    /// Streaming text content from the assistant.
-    ContentDelta(String),
-
-    /// Streaming reasoning/thinking content.
-    ReasoningDelta(String),
-
-    /// A tool call needs permission before execution.
-    /// The consumer must send `true`/`false` on the permit channel.
-    ToolRequest {
-        name: String,
-        summary: String,
-        args: String,
-        diff: Option<String>,
-        /// Model-provided explanation (shell commands only).
-        explanation: Option<String>,
-        /// Impact tier for visual treatment.
-        impact: crate::tool::ShellImpact,
-    },
-
-    /// A tool was auto-approved by the permission config.
-    ToolAutoApproved { name: String, summary: String },
-
-    /// A tool has started executing (after approval, before result).
-    ToolStarted { name: String, summary: String },
-
-    /// A tool was executed (after approval).
-    ToolResult { name: String, output: String },
-
-    /// A tool call was denied by a user action (pressing [n]).
-    ToolDenied { name: String },
-
-    /// A tool call was auto-denied by a permission rule.
-    ToolAutoDenied { name: String, summary: String },
-
-    /// Turn aborted because a tool call was denied under Abort mode.
-    TurnAborted { name: String },
-
-    /// The full turn is complete.
-    TurnComplete,
-
-    /// The turn was cancelled by the user.
-    TurnCancelled,
-
-    /// Queued user messages were injected into the conversation.
-    SteerInjected { texts: Vec<String> },
-
-    /// Token usage update from the API.
-    /// contextTokens = prompt + completion (what the next call will see as input).
-    TokenUpdate {
-        promptTokens: usize,
-        completionTokens: usize,
-        contextTokens: usize,
-        /// USD cost of this turn (None if provider doesn't report cost).
-        turnCost: Option<f64>,
-        /// Running session total in USD.
-        sessionCost: f64,
-        /// Input tokens served from prompt cache this turn (0 when caching
-        /// is off or inactive).
-        cacheReadTokens: usize,
-        /// Input tokens written to prompt cache this turn.
-        cacheCreationTokens: usize,
-    },
-
-    /// Session cost exceeded the configured warning threshold.
-    BudgetWarning { sessionCost: f64, limit: f64 },
-
-    /// Result of a slash command execution.
-    CommandResult(String),
-
-    /// Context display data for /context.
-    ContextDisplay(crate::context::ContextState),
-
-    /// Permissions status data for the /permissions panel.
-    PermissionsStatus {
-        defaultMode: crate::permissions::PermitMode,
-        rules: Vec<crate::permissions::Rule>,
-        source: crate::permissions::PermissionsSource,
-        configPath: String,
-    },
-
-    /// A compaction stage started running.
-    CompactionStarted { stage: String },
-
-    /// A compaction stage finished.
-    CompactionComplete {
-        stage: String,
-        reduction: String,
-        /// Block index where the marker should be inserted in the panel.
-        /// None for stages that don't replace whole blocks (S1).
-        markerBlock: Option<usize>,
-    },
-
-    /// Session resume finished (success or failure).
-    ResumeComplete { success: bool, message: String },
-
-    /// Session was cleared — deck should wipe the display.
-    Cleared,
-
-    /// Session restored with transcript history for display replay.
-    SessionRestored {
-        turns: Vec<crate::transcript::Turn>,
-        /// Compaction markers to insert: `(stage, blockIdx)`.
-        markers: Vec<(String, usize)>,
-    },
-
-    /// MCP server status response.
-    McpStatus {
-        /// Vec of (name, state, toolCount, tools: Vec<(qualifiedName, description)>, transport).
-        servers: Vec<(String, String, usize, Vec<(String, String)>, String)>,
-        totalTools: usize,
-        searchMode: bool,
-        configPath: String,
-    },
-
-    /// An LSP server is not installed but could enhance the experience.
-    LspHint { serverId: String, installHint: String },
-
-    /// LSP server status for the /lsp panel.
-    LspStatus {
-        servers: Vec<crate::lsp::FullServerStatus>,
-    },
-
-    /// The current topic label changed (for title bar updates).
-    TopicChanged { label: String },
-
-    /// Conversation was rewound to a prior turn.
-    Rewound { targetTurnId: String },
-
-    /// Transcript turns for the rewind picker.
-    RewindPickerData {
-        turns: Vec<crate::transcript::Turn>,
-    },
-
-    /// Saved forks for the interactive fork picker.
-    ForkPickerData {
-        forks: Vec<crate::transcript::Fork>,
-    },
-
-    /// A subagent has started executing.
-    SubagentStarted {
-        sessionId: String,
-        agentType: String,
-        prompt: String,
-    },
-
-    /// An event from a running subagent (wraps a child SessionEvent).
-    SubagentEvent {
-        sessionId: String,
-        event: Box<SessionEvent>,
-    },
-
-    /// A subagent needs permission — the TUI should show a prompt and
-    /// send the response on the escalation channel.
-    SubagentPermitRequest {
-        sessionId: String,
-        name: String,
-        summary: String,
-        args: String,
-        diff: Option<String>,
-        /// Model-provided explanation (shell commands only).
-        explanation: Option<String>,
-        /// Impact tier for visual treatment.
-        impact: crate::tool::ShellImpact,
-        /// One-shot channel for the TUI to send the response back.
-        responseTx: mpsc::Sender<crate::permissions::PermitResponse>,
-    },
-
-    /// Raw shell output bytes from a subagent's PTY.
-    SubagentShellOutput {
-        sessionId: String,
-        data: Vec<u8>,
-    },
-
-    /// A subagent has completed.
-    SubagentComplete {
-        sessionId: String,
-        agentType: String,
-        content: String,
-        turns: usize,
-    },
-
-    /// A transient API error is being retried silently.
-    Retrying { attempt: u32, maxAttempts: u32 },
-
-    /// An error occurred.
-    Error(String),
-}
-
-/// Actions that require session state to execute (from slash commands).
-#[derive(Debug)]
-pub enum CommandAction {
-    /// Show context usage stats.
-    ShowContext,
-    /// Restore project to before the last file-modifying tool.
-    Undo,
-    /// Rewind conversation to a prior turn (destructive).
-    Rewind { target: String },
-    /// Fork current branch, then rewind.
-    ForkAndRewind { target: String },
-    /// List saved forks or switch to one.
-    Forks { forkId: Option<String> },
-    /// List sessions or get info about a specific one.
-    Resume { sessionId: Option<String> },
-    /// Start a fresh session (keep the shell).
-    Clear,
-    /// Show cost breakdown.
-    ShowCost,
-    /// Show MCP server status.
-    Mcp,
-    /// Show LSP server status.
-    Lsp,
-    /// Show permissions panel.
-    Permissions,
-    /// Save permissions from the panel.
-    SavePermissions {
-        defaultMode: crate::permissions::PermitMode,
-        rules: Vec<crate::permissions::Rule>,
-    },
-    /// Gracefully shut down all background services (LSP, MCP).
-    Shutdown,
-    /// Re-run the last user turn from scratch. Drops the errored assistant
-    /// response (if any) from history so the model responds fresh.
-    RetryLastTurn,
-    /// Resume streaming from where the last turn was cut off. Keeps the
-    /// errored assistant in history as a prefill so the model continues
-    /// from its partial response.
-    ContinueLastTurn,
-}
+// Session events and control requests live in `crate::control` — this module
+// only holds the `Session` struct and turn-loop logic.
 
 /// A scaffolding instruction prepended to the latest User message at API
 /// call time. Riders never appear in `self.history`, the transcript, or
@@ -766,7 +538,7 @@ impl Session {
     ///
     /// Called at the end of sendInner so the title updates within the
     /// same turn, not deferred to the next user message.
-    async fn collectTopicEval(&mut self, eventTx: &mpsc::Sender<SessionEvent>) {
+    async fn collectTopicEval(&mut self, logTx: &mpsc::Sender<LogEvent>) {
         if let Some(handle) = self.pendingTopicEval.take() {
             let prevBlockId = self.pendingTopicBlockId.take().unwrap_or_default();
             match handle.await {
@@ -780,8 +552,8 @@ impl Session {
                             "new topic segment"
                         );
                     }
-                    let _ = eventTx
-                        .send(SessionEvent::TopicChanged {
+                    let _ = logTx
+                        .send(LogEvent::TopicChanged {
                             label: result.label.clone(),
                         })
                         .await;
@@ -952,19 +724,19 @@ impl Session {
 
     /// Send a user message and run the full turn loop.
     ///
-    /// The `permitRx` channel is used when a tool call verdict is `NeedsApproval`
-    /// and the permit mode is `Ask`. If the mode is `Deny` or `Abort`, the
-    /// permit channel is not consulted.
+    /// When a tool call verdict is `NeedsApproval` and the permit mode is
+    /// `Ask`, the session emits `SessionRequest::Permit` on
+    /// `sessionRequestTx` and awaits the `oneshot` reply carried inside it.
     ///
     /// Args:
     ///     input: The user's input (text + optional image attachments).
-    ///     eventTx: Channel for session events.
-    ///     permitRx: Channel for permission responses.
+    ///     logTx: Channel for monotone log events.
+    ///     sessionRequestTx: Channel for session → consumer requests (permits).
     pub fn send<'a>(
         &'a mut self,
         input: &'a UserInput,
-        eventTx: &'a mpsc::Sender<SessionEvent>,
-        permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        logTx: &'a mpsc::Sender<LogEvent>,
+        sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
@@ -992,7 +764,7 @@ impl Session {
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
 
-        self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
+        self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
         })
     }
 
@@ -1007,8 +779,8 @@ impl Session {
     /// minus the fork bookkeeping.
     pub fn retryLastTurn<'a>(
         &'a mut self,
-        eventTx: &'a mpsc::Sender<SessionEvent>,
-        permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        logTx: &'a mpsc::Sender<LogEvent>,
+        sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
@@ -1045,7 +817,7 @@ impl Session {
             }
 
             tracing::info!("retrying last turn");
-            self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
         })
     }
 
@@ -1057,8 +829,8 @@ impl Session {
     /// point; the model picks up where the previous one left off.
     pub fn continueLastTurn<'a>(
         &'a mut self,
-        eventTx: &'a mpsc::Sender<SessionEvent>,
-        permitRx: &'a mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        logTx: &'a mpsc::Sender<LogEvent>,
+        sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
@@ -1072,15 +844,15 @@ impl Session {
             }
 
             tracing::info!("continuing from partial assistant response");
-            self.sendInner(eventTx, permitRx, cancelRx, steerRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
         })
     }
 
     /// Inner turn loop.
     async fn sendInner(
         &mut self,
-        eventTx: &mpsc::Sender<SessionEvent>,
-        permitRx: &mut mpsc::Receiver<crate::permissions::PermitResponse>,
+        logTx: &mpsc::Sender<LogEvent>,
+        sessionRequestTx: &mpsc::Sender<SessionRequest>,
         cancelRx: &mut watch::Receiver<bool>,
         steerRx: &mut mpsc::Receiver<UserInput>,
     ) -> Result<()> {
@@ -1119,7 +891,7 @@ impl Session {
             // Check for cancellation between turns.
             if *cancelRx.borrow() {
                 tracing::info!("turn cancelled before streaming");
-                let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                let _ = logTx.send(LogEvent::TurnCancelled).await;
                 break 'turns Ok(());
             }
 
@@ -1128,13 +900,13 @@ impl Session {
             // or a transient one that already exhausted the API client's own
             // 8-attempt retry loop. Don't retry again here — only retry
             // mid-stream SSE errors (returned as TurnResult::TransientError).
-            let turnResult = self.streamOneTurn(eventTx, cancelRx).await?;
+            let turnResult = self.streamOneTurn(logTx, cancelRx).await?;
 
             match turnResult {
                 TurnResult::TransientError(msg) => {
                     retryCount += 1;
                     if retryCount > MAX_RETRIES {
-                        let _ = eventTx.send(SessionEvent::Error(msg)).await;
+                        let _ = logTx.send(LogEvent::Error(msg)).await;
                         break 'turns Ok(());
                     }
                     tracing::warn!(
@@ -1143,7 +915,7 @@ impl Session {
                         error = %msg,
                         "transient API error, retrying"
                     );
-                    let _ = eventTx.send(SessionEvent::Retrying {
+                    let _ = logTx.send(LogEvent::Retrying {
                         attempt: retryCount,
                         maxAttempts: MAX_RETRIES,
                     }).await;
@@ -1156,20 +928,20 @@ impl Session {
                     retryCount = 0;
                     if let Some(tokens) = promptTokens {
                         self.compactionTracker.updateTokens(tokens);
-                        self.checkCompactionTrigger(eventTx).await;
+                        self.checkCompactionTrigger(logTx).await;
                     }
                     // Extend turn if user queued messages during streaming.
-                    if self.drainSteer(steerRx, eventTx).await {
+                    if self.drainSteer(steerRx, logTx).await {
                         tracing::info!("extending turn with queued user messages");
                         continue;
                     }
                     tracing::info!("turn complete (no tool calls)");
-                    let _ = eventTx.send(SessionEvent::TurnComplete).await;
+                    let _ = logTx.send(LogEvent::TurnComplete).await;
                     break 'turns Ok(());
                 }
                 TurnResult::Cancelled => {
                     tracing::info!("turn cancelled during streaming");
-                    let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                    let _ = logTx.send(LogEvent::TurnCancelled).await;
                     break 'turns Ok(());
                 }
                 TurnResult::ToolCalls { calls, content, reasoning, promptTokens } => {
@@ -1187,7 +959,7 @@ impl Session {
                                 crate::cost::formatCost(limit),
                             );
                             tracing::warn!(%msg, "hard budget limit hit");
-                            let _ = eventTx.send(SessionEvent::Error(msg)).await;
+                            let _ = logTx.send(LogEvent::Error(msg)).await;
                             break 'turns Ok(());
                         }
                     }
@@ -1234,7 +1006,7 @@ impl Session {
                             for remaining in &calls[callIdx..] {
                                 self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                             }
-                            let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                            let _ = logTx.send(LogEvent::TurnCancelled).await;
                             break 'turns Ok(());
                         }
 
@@ -1271,8 +1043,8 @@ impl Session {
 
                         let approved = match verdict {
                             Verdict::Allow => {
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolAutoApproved {
+                                let _ = logTx
+                                    .send(LogEvent::ToolAutoApproved {
                                         name: call.function.name.clone(),
                                         summary: summary.clone(),
                                     })
@@ -1280,8 +1052,8 @@ impl Session {
                                 true
                             }
                             Verdict::Deny => {
-                                let _ = eventTx
-                                    .send(SessionEvent::ToolAutoDenied {
+                                let _ = logTx
+                                    .send(LogEvent::ToolAutoDenied {
                                         name: call.function.name.clone(),
                                         summary: summary.clone(),
                                     })
@@ -1295,24 +1067,27 @@ impl Session {
                                         let explanation = crate::permissions::toolExplanation(&action)
                                             .map(|s| s.to_string());
                                         let impact = crate::permissions::toolImpact(&action);
-                                        let _ = eventTx
-                                            .send(SessionEvent::ToolRequest {
+                                        let (replyTx, replyRx) = oneshot::channel();
+                                        let _ = sessionRequestTx
+                                            .send(SessionRequest::Permit {
+                                                origin: PermitOrigin::Top,
                                                 name: call.function.name.clone(),
                                                 summary,
                                                 args: call.function.arguments.clone(),
                                                 diff,
                                                 explanation,
                                                 impact,
+                                                reply: replyTx,
                                             })
                                             .await;
 
                                         // Wait for supervisor response or cancellation.
                                         tokio::select! {
-                                            permit = permitRx.recv() => {
+                                            permit = replyRx => {
                                                 use crate::permissions::PermitResponse;
                                                 match permit {
-                                                    Some(PermitResponse::Allow) => true,
-                                                    Some(PermitResponse::AlwaysAllow { pattern }) => {
+                                                    Ok(PermitResponse::Allow) => true,
+                                                    Ok(PermitResponse::AlwaysAllow { pattern }) => {
                                                         let (toolName, _) = crate::permissions::actionKey(&action);
                                                         self.permissions.addRule(crate::permissions::Rule {
                                                             tool: toolName.into(),
@@ -1333,7 +1108,7 @@ impl Session {
                                                         }
                                                         true
                                                     }
-                                                    Some(PermitResponse::AlwaysDeny { pattern }) => {
+                                                    Ok(PermitResponse::AlwaysDeny { pattern }) => {
                                                         let (toolName, _) = crate::permissions::actionKey(&action);
                                                         self.permissions.addRule(crate::permissions::Rule {
                                                             tool: toolName.into(),
@@ -1353,7 +1128,8 @@ impl Session {
                                                         }
                                                         false
                                                     }
-                                                    Some(PermitResponse::Deny) | None => false,
+                                                    // Deny or disconnected reply → reject.
+                                                    Ok(PermitResponse::Deny) | Err(_) => false,
                                                 }
                                             }
                                             _ = cancelRx.changed() => {
@@ -1361,22 +1137,22 @@ impl Session {
                                                 for remaining in &calls[callIdx..] {
                                                     self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                                 }
-                                                let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                                                let _ = logTx.send(LogEvent::TurnCancelled).await;
                                                 break 'turns Ok(());
                                             }
                                         }
                                     }
                                     PermitMode::Deny => {
-                                        let _ = eventTx
-                                            .send(SessionEvent::ToolDenied {
+                                        let _ = logTx
+                                            .send(LogEvent::ToolDenied {
                                                 name: call.function.name.clone(),
                                             })
                                             .await;
                                         false
                                     }
                                     PermitMode::Abort => {
-                                        let _ = eventTx
-                                            .send(SessionEvent::TurnAborted {
+                                        let _ = logTx
+                                            .send(LogEvent::TurnAborted {
                                                 name: call.function.name.clone(),
                                             })
                                             .await;
@@ -1413,7 +1189,7 @@ impl Session {
                                 if let Some((ref path, ref original)) = lspPreemptive {
                                     self.lspManager.touchFile(path, original).await;
                                 }
-                                let _ = eventTx.send(SessionEvent::ToolResult {
+                                let _ = logTx.send(LogEvent::ToolResult {
                                     name: call.function.name.clone(),
                                     output: rejection.clone(),
                                 }).await;
@@ -1433,13 +1209,13 @@ impl Session {
                                     }
                                     _ => unreachable!(),
                                 };
-                                let result = self.executeTask(&taskPrompt, &taskAgent, eventTx, cancelRx).await;
+                                let result = self.executeTask(&taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx).await;
                                 // NOTE: No ToolResult event — SubagentComplete already notified the TUI.
                                 crate::message::Content::text(result)
                             } else {
                             // Emit ToolStarted for non-task tools.
-                            let _ = eventTx
-                                .send(SessionEvent::ToolStarted {
+                            let _ = logTx
+                                .send(LogEvent::ToolStarted {
                                     name: call.function.name.clone(),
                                     summary: tool::summarize(&action),
                                 })
@@ -1477,7 +1253,7 @@ impl Session {
                                         for remaining in &calls[callIdx + 1..] {
                                             self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
                                         }
-                                        let _ = eventTx.send(SessionEvent::TurnCancelled).await;
+                                        let _ = logTx.send(LogEvent::TurnCancelled).await;
                                         break 'turns Ok(());
                                     }
                                 }
@@ -1494,8 +1270,8 @@ impl Session {
                             }
                             } // Close the else block for non-task tools.
                         } else {
-                            let _ = eventTx
-                                .send(SessionEvent::ToolDenied {
+                            let _ = logTx
+                                .send(LogEvent::ToolDenied {
                                     name: call.function.name.clone(),
                                 })
                                 .await;
@@ -1516,7 +1292,7 @@ impl Session {
                                     // Sync file with LSP server (lazy spawn if needed).
                                     if let Ok(content) = std::fs::read_to_string(&norm) {
                                         if let Some(hint) = self.lspManager.touchFile(&norm, &content).await {
-                                            let _ = eventTx.send(SessionEvent::LspHint {
+                                            let _ = logTx.send(LogEvent::LspHint {
                                                 serverId: hint.serverId,
                                                 installHint: hint.installHint,
                                             }).await;
@@ -1577,7 +1353,7 @@ impl Session {
                                         }
                                     }
                                     if let Some(hint) = hint {
-                                        let _ = eventTx.send(SessionEvent::LspHint {
+                                        let _ = logTx.send(LogEvent::LspHint {
                                             serverId: hint.serverId,
                                             installHint: hint.installHint,
                                         }).await;
@@ -1587,23 +1363,30 @@ impl Session {
                         }
 
                         // Emit ToolResult AFTER diagnostics injection so the TUI
-                        // shows the same content the model sees.
-                        let _ = eventTx
-                            .send(SessionEvent::ToolResult {
-                                name: call.function.name.clone(),
-                                output: output.textContent().to_string(),
-                            })
-                            .await;
+                        // shows the same content the model sees. Skip the emit
+                        // when the tool was denied — `ToolDenied` already told
+                        // the TUI, and re-rendering "User denied this action."
+                        // as a tool-result block duplicates that signal. The
+                        // transcript/history still gets the content below so
+                        // the model sees the denial.
+                        if approved {
+                            let _ = logTx
+                                .send(LogEvent::ToolResult {
+                                    name: call.function.name.clone(),
+                                    output: output.textContent().to_string(),
+                                })
+                                .await;
+                        }
 
                         self.pushToolResult(&call.id, output);
                     }
 
                     if aborted {
-                        let _ = eventTx.send(SessionEvent::TurnComplete).await;
+                        let _ = logTx.send(LogEvent::TurnComplete).await;
                         break 'turns Ok(());
                     }
                     // Inject queued user messages before the next API call.
-                    self.drainSteer(steerRx, eventTx).await;
+                    self.drainSteer(steerRx, logTx).await;
                 }
             }
         }
@@ -1611,7 +1394,7 @@ impl Session {
 
         // Collect topic classification before returning — the eval ran
         // concurrently with the turn loop and should be done by now.
-        self.collectTopicEval(eventTx).await;
+        self.collectTopicEval(logTx).await;
 
         // Always persist meta after the turn completes so headTurn reflects
         // the latest assistant/tool turn, not the stale user turn written
@@ -1631,7 +1414,7 @@ impl Session {
     async fn drainSteer(
         &mut self,
         steerRx: &mut mpsc::Receiver<UserInput>,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         let mut allTexts: Vec<String> = Vec::new();
         let mut allAttachments: Vec<Attachment> = Vec::new();
@@ -1656,14 +1439,14 @@ impl Session {
             Err(e) => tracing::warn!("steer transcript write failed: {e}"),
         }
 
-        let _ = eventTx.send(SessionEvent::SteerInjected { texts: allTexts }).await;
+        let _ = logTx.send(LogEvent::SteerInjected { texts: allTexts }).await;
         true
     }
 
     /// Stream one API call and return what happened.
     async fn streamOneTurn(
         &mut self,
-        tx: &mpsc::Sender<SessionEvent>,
+        tx: &mpsc::Sender<LogEvent>,
         cancelRx: &mut watch::Receiver<bool>,
     ) -> Result<TurnResult> {
         // When prompt-injected thinking is active, don't send the reasoning
@@ -1728,23 +1511,23 @@ impl Session {
                                     match extracted {
                                         StreamEvent::ContentDelta(t) => {
                                             contentBuf.push_str(&t);
-                                            let _ = tx.send(SessionEvent::ContentDelta(t)).await;
+                                            let _ = tx.send(LogEvent::ContentDelta(t)).await;
                                         }
                                         StreamEvent::ReasoningDelta(t) => {
                                             reasoningBuf.push_str(&t);
-                                            let _ = tx.send(SessionEvent::ReasoningDelta(t)).await;
+                                            let _ = tx.send(LogEvent::ReasoningDelta(t)).await;
                                         }
                                         _ => {}
                                     }
                                 }
                             } else {
                                 contentBuf.push_str(&text);
-                                let _ = tx.send(SessionEvent::ContentDelta(text)).await;
+                                let _ = tx.send(LogEvent::ContentDelta(text)).await;
                             }
                         }
                         Some(StreamEvent::ReasoningDelta(text)) => {
                             reasoningBuf.push_str(&text);
-                            let _ = tx.send(SessionEvent::ReasoningDelta(text)).await;
+                            let _ = tx.send(LogEvent::ReasoningDelta(text)).await;
                         }
                         Some(StreamEvent::ToolCallDelta {
                             index,
@@ -1817,7 +1600,7 @@ impl Session {
                                 ));
                             }
 
-                            let _ = tx.send(SessionEvent::Error(msg.clone())).await;
+                            let _ = tx.send(LogEvent::Error(msg.clone())).await;
                             bail!("Stream error: {msg}");
                         }
                     }
@@ -1864,11 +1647,11 @@ impl Session {
                 match extracted {
                     StreamEvent::ContentDelta(t) => {
                         contentBuf.push_str(&t);
-                        let _ = tx.send(SessionEvent::ContentDelta(t)).await;
+                        let _ = tx.send(LogEvent::ContentDelta(t)).await;
                     }
                     StreamEvent::ReasoningDelta(t) => {
                         reasoningBuf.push_str(&t);
-                        let _ = tx.send(SessionEvent::ReasoningDelta(t)).await;
+                        let _ = tx.send(LogEvent::ReasoningDelta(t)).await;
                     }
                     _ => {}
                 }
@@ -1889,7 +1672,7 @@ impl Session {
             }
             let contextTokens = u.promptTokens + u.completionTokens;
             let _ = tx
-                .send(SessionEvent::TokenUpdate {
+                .send(LogEvent::TokenUpdate {
                     promptTokens: u.promptTokens,
                     completionTokens: u.completionTokens,
                     contextTokens,
@@ -1903,7 +1686,7 @@ impl Session {
             if let Some(limit) = self.config.budget.sessionLimit {
                 if self.costTracker.checkWarning(limit) {
                     let _ = tx
-                        .send(SessionEvent::BudgetWarning {
+                        .send(LogEvent::BudgetWarning {
                             sessionCost: self.costTracker.sessionCost(),
                             limit,
                         })
@@ -2017,7 +1800,7 @@ impl Session {
     /// Loops on exhaustion: if a stage exhausts without reducing context,
     /// re-evaluates and tries the next cheapest stage. Stops when a stage
     /// does work, nothing is returned, or all stages are exhausted.
-    async fn checkCompactionTrigger(&mut self, eventTx: &mpsc::Sender<SessionEvent>) {
+    async fn checkCompactionTrigger(&mut self, logTx: &mpsc::Sender<LogEvent>) {
         loop {
             let tokens = self.compactionTracker.lastTokens();
             let stage = match self.compactionTracker.evaluate(tokens) {
@@ -2034,8 +1817,8 @@ impl Session {
             );
 
             let stageStr = format!("{stage}");
-            let _ = eventTx
-                .send(SessionEvent::CompactionStarted {
+            let _ = logTx
+                .send(LogEvent::CompactionStarted {
                     stage: stageStr.clone(),
                 })
                 .await;
@@ -2044,16 +1827,16 @@ impl Session {
             // If false, we loop to try the next stage.
             let didWork = match stage {
                 compaction_trigger::StagePick::S1 => {
-                    self.runS1(&stageStr, eventTx).await
+                    self.runS1(&stageStr, logTx).await
                 }
                 compaction_trigger::StagePick::S2 => {
-                    self.runS2(&stageStr, eventTx).await
+                    self.runS2(&stageStr, logTx).await
                 }
                 compaction_trigger::StagePick::S3 => {
-                    self.runS3(&stageStr, eventTx).await
+                    self.runS3(&stageStr, logTx).await
                 }
                 compaction_trigger::StagePick::S4 => {
-                    self.runS4Trigger(&stageStr, eventTx).await
+                    self.runS4Trigger(&stageStr, logTx).await
                 }
             };
 
@@ -2068,7 +1851,7 @@ impl Session {
     async fn runS1(
         &mut self,
         stageStr: &str,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         // Build toolCallId → blockId map so truncation markers
         // can point the model to historyFetch for full content.
@@ -2143,8 +1926,8 @@ impl Session {
                 s1Result.dedupedCallIds.len(),
                 s1Result.middleOutCallIds.len()
             );
-            let _ = eventTx
-                .send(SessionEvent::CompactionComplete {
+            let _ = logTx
+                .send(LogEvent::CompactionComplete {
                     stage: stageStr.to_string(),
                     reduction,
                     markerBlock: None,
@@ -2162,7 +1945,7 @@ impl Session {
     async fn runS2(
         &mut self,
         stageStr: &str,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         let headTurn = self.headTurnId.clone().unwrap_or_default();
         let s2Result = match crate::s2::run(
@@ -2217,7 +2000,7 @@ impl Session {
         self.compactionTracker.clearExhaustion();
         let reduction = format!("compressed {blockCount} blocks");
         // S2 zone always starts at the oldest block (index 0).
-        let _ = eventTx.send(SessionEvent::CompactionComplete {
+        let _ = logTx.send(LogEvent::CompactionComplete {
             stage: stageStr.to_string(),
             reduction,
             markerBlock: Some(0),
@@ -2229,7 +2012,7 @@ impl Session {
     async fn runS3(
         &mut self,
         stageStr: &str,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         let headId = self.headTurnId.as_deref().unwrap_or("");
         let s3Result = match crate::s3::run(
@@ -2283,7 +2066,7 @@ impl Session {
         }
         self.compactionTracker.clearExhaustion();
         let reduction = format!("compressed {topicCount} topics");
-        let _ = eventTx.send(SessionEvent::CompactionComplete {
+        let _ = logTx.send(LogEvent::CompactionComplete {
             stage: stageStr.to_string(),
             reduction,
             markerBlock: Some(0),
@@ -2297,7 +2080,7 @@ impl Session {
     async fn runS4Trigger(
         &mut self,
         stageStr: &str,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         let s4Result = match crate::s4::run(
             &self.compactionLog,
@@ -2353,7 +2136,7 @@ impl Session {
         let reduction = format!(
             "merged {blockCount} source blocks into briefing ({summaryLen} chars)"
         );
-        let _ = eventTx.send(SessionEvent::CompactionComplete {
+        let _ = logTx.send(LogEvent::CompactionComplete {
             stage: stageStr.to_string(),
             reduction,
             markerBlock: Some(0),
@@ -2607,11 +2390,15 @@ impl Session {
     ///
     /// Spawns a child session with its own context, shell, and tool set,
     /// runs the task to completion, and returns the child's final text.
+    /// Child log events are wrapped as `SubagentEvent` and forwarded on the
+    /// parent log channel; child permit requests are rewrapped with
+    /// `PermitOrigin::Subagent` and forwarded on the parent request channel.
     async fn executeTask(
         &mut self,
         prompt: &str,
         agentType: &str,
-        parentEventTx: &mpsc::Sender<SessionEvent>,
+        parentLogTx: &mpsc::Sender<LogEvent>,
+        parentSessionRequestTx: &mpsc::Sender<SessionRequest>,
         parentCancelRx: &mut watch::Receiver<bool>,
     ) -> String {
         use crate::runner;
@@ -2651,13 +2438,13 @@ impl Session {
         let childSessionId = child.sessionId().to_string();
 
         // Forward child shell output to parent as SubagentShellOutput events.
-        let shellForwardTx = parentEventTx.clone();
+        let shellForwardTx = parentLogTx.clone();
         let shellForwardId = childSessionId.clone();
         tokio::spawn(async move {
             let mut rx: tokio::sync::mpsc::Receiver<Vec<u8>> = childIo.outputRx;
             while let Some(data) = rx.recv().await {
                 let _ = shellForwardTx
-                    .send(SessionEvent::SubagentShellOutput {
+                    .send(LogEvent::SubagentShellOutput {
                         sessionId: shellForwardId.clone(),
                         data,
                     })
@@ -2666,8 +2453,8 @@ impl Session {
         });
 
         // Notify parent that subagent has started.
-        let _ = parentEventTx
-            .send(SessionEvent::SubagentStarted {
+        let _ = parentLogTx
+            .send(LogEvent::SubagentStarted {
                 sessionId: childSessionId.clone(),
                 agentType: agentType.into(),
                 prompt: prompt.into(),
@@ -2681,68 +2468,43 @@ impl Session {
         );
 
         // Set up channels for the child session.
-        let (childEventTx, mut childEventRx) = mpsc::channel::<SessionEvent>(256);
-        let (childPermitTx, mut childPermitRx) =
-            mpsc::channel::<crate::permissions::PermitResponse>(1);
+        let (childLogTx, mut childLogRx) = mpsc::channel::<LogEvent>(256);
+        let (childRequestTx, mut childRequestRx) = mpsc::channel::<SessionRequest>(16);
 
         // Clone cancel receiver for the child — parent cancel propagates.
         let mut childCancelRx = parentCancelRx.clone();
 
-        // Forwarding task: relay child events to parent, handle permission escalation.
-        let forwardSessionId = childSessionId.clone();
-        let forwardParentTx = parentEventTx.clone();
-        let forwardHandle = tokio::spawn(async move {
+        // Log forwarder: wrap child log events as SubagentEvent on the parent log channel,
+        // accumulate assistant content, and count TurnComplete to report final turn count.
+        let logSessionId = childSessionId.clone();
+        let logParentTx = parentLogTx.clone();
+        let logHandle = tokio::spawn(async move {
             let mut content = String::new();
             let mut turns: usize = 0;
-            while let Some(event) = childEventRx.recv().await {
+            while let Some(event) = childLogRx.recv().await {
                 match &event {
-                    SessionEvent::ContentDelta(text) => {
-                        content.push_str(text);
-                        let _ = forwardParentTx
-                            .send(SessionEvent::SubagentEvent {
-                                sessionId: forwardSessionId.clone(),
-                                event: Box::new(event),
-                            })
-                            .await;
-                    }
-                    SessionEvent::TurnComplete => turns += 1,
-
-                    // Permission escalation: forward to parent TUI and relay response.
-                    SessionEvent::ToolRequest { name, summary, args, diff, explanation, impact, .. } => {
-                        let (responseTx, mut responseRx) =
-                            mpsc::channel::<crate::permissions::PermitResponse>(1);
-                        let _ = forwardParentTx
-                            .send(SessionEvent::SubagentPermitRequest {
-                                sessionId: forwardSessionId.clone(),
-                                name: name.clone(),
-                                summary: summary.clone(),
-                                args: args.clone(),
-                                diff: diff.clone(),
-                                explanation: explanation.clone(),
-                                impact: impact.clone(),
-                                responseTx,
-                            })
-                            .await;
-                        // Wait for the parent TUI's response.
-                        if let Some(response) = responseRx.recv().await {
-                            let _ = childPermitTx.send(response).await;
-                        } else {
-                            // Parent closed — deny.
-                            let _ = childPermitTx
-                                .send(crate::permissions::PermitResponse::Deny)
-                                .await;
-                        }
-                    }
-
-                    // Forward other relevant events.
-                    SessionEvent::ToolStarted { .. }
-                    | SessionEvent::ToolAutoApproved { .. }
-                    | SessionEvent::ToolResult { .. }
-                    | SessionEvent::ToolDenied { .. }
-                    | SessionEvent::Error(_) => {
-                        let _ = forwardParentTx
-                            .send(SessionEvent::SubagentEvent {
-                                sessionId: forwardSessionId.clone(),
+                    LogEvent::ContentDelta(text) => content.push_str(text),
+                    LogEvent::TurnComplete => turns += 1,
+                    _ => {}
+                }
+                // Forward visible events; skip noisy internals. The outer match
+                // only reads for accounting — all variants flow through the
+                // wrap below unless explicitly filtered.
+                match &event {
+                    LogEvent::ContentDelta(_)
+                    | LogEvent::ReasoningDelta(_)
+                    | LogEvent::ToolStarted { .. }
+                    | LogEvent::ToolAutoApproved { .. }
+                    | LogEvent::ToolResult { .. }
+                    | LogEvent::ToolDenied { .. }
+                    | LogEvent::ToolAutoDenied { .. }
+                    | LogEvent::TurnAborted { .. }
+                    | LogEvent::TurnComplete
+                    | LogEvent::TurnCancelled
+                    | LogEvent::Error(_) => {
+                        let _ = logParentTx
+                            .send(LogEvent::SubagentEvent {
+                                sessionId: logSessionId.clone(),
                                 event: Box::new(event),
                             })
                             .await;
@@ -2753,21 +2515,73 @@ impl Session {
             (content, turns)
         });
 
+        // Permit forwarder: rewrap each child permit request with origin=Subagent and
+        // plumb the parent's reply back into the child's original oneshot.
+        let permitSessionId = childSessionId.clone();
+        let permitParentTx = parentSessionRequestTx.clone();
+        let permitHandle = tokio::spawn(async move {
+            while let Some(req) = childRequestRx.recv().await {
+                match req {
+                    SessionRequest::Permit {
+                        origin: _,
+                        name,
+                        summary,
+                        args,
+                        diff,
+                        explanation,
+                        impact,
+                        reply: childReply,
+                    } => {
+                        let (parentReplyTx, parentReplyRx) = oneshot::channel();
+                        if permitParentTx
+                            .send(SessionRequest::Permit {
+                                origin: PermitOrigin::Subagent {
+                                    sessionId: permitSessionId.clone(),
+                                },
+                                name,
+                                summary,
+                                args,
+                                diff,
+                                explanation,
+                                impact,
+                                reply: parentReplyTx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            // Parent closed — deny.
+                            let _ = childReply.send(crate::permissions::PermitResponse::Deny);
+                            continue;
+                        }
+                        match parentReplyRx.await {
+                            Ok(response) => {
+                                let _ = childReply.send(response);
+                            }
+                            Err(_) => {
+                                let _ = childReply.send(crate::permissions::PermitResponse::Deny);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Run the child session. Subagents don't support mid-turn steering.
         let childInput = UserInput::from(prompt.to_string());
         let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
         let sendResult = child
-            .send(&childInput, &childEventTx, &mut childPermitRx, &mut childCancelRx, &mut childSteerRx)
+            .send(&childInput, &childLogTx, &childRequestTx, &mut childCancelRx, &mut childSteerRx)
             .await;
 
-        // Drop sender so forwarding task exits.
-        drop(childEventTx);
+        // Drop senders so forwarding tasks exit.
+        drop(childLogTx);
+        drop(childRequestTx);
 
-        let (content, turns) = match forwardHandle.await {
+        let (content, turns) = match logHandle.await {
             Ok(r) => r,
             Err(e) => {
-                let _ = parentEventTx
-                    .send(SessionEvent::SubagentComplete {
+                let _ = parentLogTx
+                    .send(LogEvent::SubagentComplete {
                         sessionId: childSessionId.clone(),
                         agentType: agentType.into(),
                         content: String::new(),
@@ -2777,10 +2591,12 @@ impl Session {
                 return format!("Subagent forwarding failed: {e}");
             }
         };
+        // Permit forwarder has nothing to return; await to clean up.
+        let _ = permitHandle.await;
 
         // Notify parent that subagent completed.
-        let _ = parentEventTx
-            .send(SessionEvent::SubagentComplete {
+        let _ = parentLogTx
+            .send(LogEvent::SubagentComplete {
                 sessionId: childSessionId.clone(),
                 agentType: agentType.into(),
                 content: content.clone(),
@@ -3021,133 +2837,83 @@ impl Session {
         context::buildState(&input)
     }
 
-    /// Execute a command action (from slash commands).
-    ///
-    /// Args:
-    ///     action: The command to execute.
-    ///
-    /// Returns:
-    ///     String: The result text to display to the user.
-    pub async fn executeCommand(&mut self, action: &CommandAction) -> String {
-        match action {
-            CommandAction::ShowContext => {
-                // Handled separately via buildContextState — should not reach here.
-                String::new()
-            }
-            CommandAction::Undo => {
-                match &self.checkpoint {
-                    Some(cp) => match cp.undo().await {
-                        Ok(turnId) => format!("Restored to checkpoint: {turnId}"),
-                        Err(e) => format!("Undo failed: {e}"),
-                    },
-                    None => "Checkpoint system not initialized.".to_string(),
+    /// Restore project files to the last checkpoint.
+    pub async fn undoCheckpoint(&self) -> crate::control::CommandAck {
+        match &self.checkpoint {
+            Some(cp) => match cp.undo().await {
+                Ok(turnId) => crate::control::CommandAck::ok(
+                    format!("Restored to checkpoint: {turnId}"),
+                ),
+                Err(e) => crate::control::CommandAck::err(format!("Undo failed: {e}")),
+            },
+            None => crate::control::CommandAck::err("Checkpoint system not initialized."),
+        }
+    }
+
+    /// Format the list of saved sessions as a text listing (for `/resume` without id).
+    pub fn listSessionsText(&self) -> String {
+        match transcript::listSessions(None) {
+            Ok(sessions) => {
+                if sessions.is_empty() {
+                    return "No saved sessions found.".to_string();
                 }
-            }
-            CommandAction::Resume { sessionId } => {
-                match sessionId {
-                    Some(id) => {
-                        // Return info about the session for the caller to act on.
-                        match Transcript::loadMeta(
-                            &crate::transcript::sessionsDir().join(id),
-                        ) {
-                            Ok(meta) => format!(
-                                "Session {}: project={}, topics={}, updated={}",
-                                id,
-                                meta.projectDir,
-                                meta.topicLabels.join(", "),
-                                meta.updatedAt,
-                            ),
-                            Err(e) => format!("Failed to load session {id}: {e}"),
-                        }
-                    }
-                    None => {
-                        // List available sessions.
-                        match transcript::listSessions(None) {
-                            Ok(sessions) => {
-                                if sessions.is_empty() {
-                                    return "No saved sessions found.".to_string();
-                                }
-                                let mut output = String::from("Available sessions:\n\n");
-                                for (i, meta) in sessions.iter().take(20).enumerate() {
-                                    let name = meta.name.as_deref().unwrap_or("unnamed");
-                                    let topics = if meta.topicLabels.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!(" \u{2014} {}", meta.topicLabels.join(", "))
-                                    };
-                                    output.push_str(&format!(
-                                        "{}. {} [{}]{}\n   {}\n\n",
-                                        i + 1,
-                                        meta.sessionId,
-                                        name,
-                                        topics,
-                                        meta.projectDir,
-                                    ));
-                                }
-                                output
-                            }
-                            Err(e) => format!("Failed to list sessions: {e}"),
-                        }
-                    }
+                let mut output = String::from("Available sessions:\n\n");
+                for (i, meta) in sessions.iter().take(20).enumerate() {
+                    let name = meta.name.as_deref().unwrap_or("unnamed");
+                    let topics = if meta.topicLabels.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" \u{2014} {}", meta.topicLabels.join(", "))
+                    };
+                    output.push_str(&format!(
+                        "{}. {} [{}]{}\n   {}\n\n",
+                        i + 1,
+                        meta.sessionId,
+                        name,
+                        topics,
+                        meta.projectDir,
+                    ));
                 }
+                output
             }
-            CommandAction::ShowCost => {
-                let mut out = String::new();
+            Err(e) => format!("Failed to list sessions: {e}"),
+        }
+    }
+
+    /// Format the cost breakdown as a text report.
+    pub fn formatCostBreakdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Session              {}\n",
+            crate::cost::formatCost(self.costTracker.sessionCost()),
+        ));
+
+        let perModel = self.costTracker.perModel();
+        if !perModel.is_empty() {
+            let mut models: Vec<_> = perModel.iter().collect();
+            models.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let last = models.len() - 1;
+            for (i, (model, cost)) in models.iter().enumerate() {
+                let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+                let short = model.rsplit('/').next().unwrap_or(model);
                 out.push_str(&format!(
-                    "Session              {}\n",
-                    crate::cost::formatCost(self.costTracker.sessionCost()),
+                    "{branch} {:<20} {}\n",
+                    short,
+                    crate::cost::formatCost(**cost),
                 ));
-
-                let perModel = self.costTracker.perModel();
-                if !perModel.is_empty() {
-                    let mut models: Vec<_> = perModel.iter().collect();
-                    models.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let last = models.len() - 1;
-                    for (i, (model, cost)) in models.iter().enumerate() {
-                        let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
-                        // Shorten the model id for display.
-                        let short = model.rsplit('/').next().unwrap_or(model);
-                        out.push_str(&format!(
-                            "{branch} {:<20} {}\n",
-                            short,
-                            crate::cost::formatCost(**cost),
-                        ));
-                    }
-                }
-
-                let projectDir = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                let rolling = crate::cost::rollingWindowCost(Some(&projectDir));
-                out.push_str(&format!(
-                    "\n16h rolling          {}",
-                    crate::cost::formatCost(rolling),
-                ));
-
-                out
-            }
-            // Handled by the spawned task before reaching executeCommand.
-            CommandAction::Clear => "Session cleared.".to_string(),
-            // Handled specially by the session task — shouldn't reach here.
-            CommandAction::Mcp => "Use the /mcp command in the TUI.".to_string(),
-            CommandAction::Lsp => "Use the /lsp command in the TUI.".to_string(),
-            CommandAction::Permissions => "Use /permissions in the TUI.".to_string(),
-            CommandAction::SavePermissions { .. } => "Handled by TUI.".to_string(),
-            // Dispatched as special cases — need eventTx, so not handled here.
-            CommandAction::Rewind { .. }
-            | CommandAction::ForkAndRewind { .. }
-            | CommandAction::Forks { .. } => {
-                "Use /rewind or /forks in the TUI.".to_string()
-            }
-            // Handled by the session task directly.
-            CommandAction::Shutdown => String::new(),
-            // Both go through retryLastTurn / continueLastTurn on the
-            // session task, not executeCommand — they need the same event/
-            // permit/cancel plumbing as send().
-            CommandAction::RetryLastTurn | CommandAction::ContinueLastTurn => {
-                "Handled by the session task directly.".to_string()
             }
         }
+
+        let projectDir = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let rolling = crate::cost::rollingWindowCost(Some(&projectDir));
+        out.push_str(&format!(
+            "\n16h rolling          {}",
+            crate::cost::formatCost(rolling),
+        ));
+
+        out
     }
 
     /// Rewind conversation to a prior turn.
@@ -3158,7 +2924,7 @@ impl Session {
         &mut self,
         targetTurnId: &str,
         saveFork: bool,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
         let mut meta = match Transcript::loadMeta(self.transcript.sessionDir()) {
             Ok(m) => m,
@@ -3209,13 +2975,13 @@ impl Session {
         // Emit events for panel replay.
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
         let markers = self.compactionMarkers();
-        let _ = eventTx
-            .send(SessionEvent::Rewound {
+        let _ = logTx
+            .send(LogEvent::Rewound {
                 targetTurnId: targetTurnId.to_string(),
             })
             .await;
-        let _ = eventTx
-            .send(SessionEvent::SessionRestored {
+        let _ = logTx
+            .send(LogEvent::SessionRestored {
                 turns: branchTurns,
                 markers,
             })
@@ -3223,8 +2989,8 @@ impl Session {
         // Update window title to the topic at the rewind point.
         let label = self.topicTracker.currentLabel();
         if !label.is_empty() {
-            let _ = eventTx
-                .send(SessionEvent::TopicChanged {
+            let _ = logTx
+                .send(LogEvent::TopicChanged {
                     label: label.to_string(),
                 })
                 .await;
@@ -3237,7 +3003,7 @@ impl Session {
     pub async fn switchFork(
         &mut self,
         forkId: &str,
-        eventTx: &mpsc::Sender<SessionEvent>,
+        logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
         let mut meta = match Transcript::loadMeta(self.transcript.sessionDir()) {
             Ok(m) => m,
@@ -3291,13 +3057,13 @@ impl Session {
 
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
         let markers = self.compactionMarkers();
-        let _ = eventTx
-            .send(SessionEvent::Rewound {
+        let _ = logTx
+            .send(LogEvent::Rewound {
                 targetTurnId: fork.headTurn,
             })
             .await;
-        let _ = eventTx
-            .send(SessionEvent::SessionRestored {
+        let _ = logTx
+            .send(LogEvent::SessionRestored {
                 turns: branchTurns,
                 markers,
             })
@@ -3305,8 +3071,8 @@ impl Session {
         // Update window title to the topic on this fork.
         let label = self.topicTracker.currentLabel();
         if !label.is_empty() {
-            let _ = eventTx
-                .send(SessionEvent::TopicChanged {
+            let _ = logTx
+                .send(LogEvent::TopicChanged {
                     label: label.to_string(),
                 })
                 .await;

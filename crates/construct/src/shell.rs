@@ -537,8 +537,8 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     // Echo the command in the terminal so the user sees what ran.
                     // Sent directly on outputTx, bypassing the PTY/filter.
                     // Dim cyan to distinguish agent commands from user input.
-                    let cmdEcho = format!("\x1b[2;36m{}\x1b[0m\r\n", req.command);
-                    let echoBytes = cmdEcho.into_bytes();
+                    let cmdEcho = format!("\x1b[2;36m{}\x1b[0m\n", req.command);
+                    let echoBytes = toTermBytes(&cmdEcho);
                     feedVt(&echoBytes);
                     let _ = outputTx.try_send(echoBytes);
 
@@ -789,6 +789,30 @@ fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
         output: cleaned,
         exitCode,
     }
+}
+
+/// Convert a synthesized display string into terminal bytes.
+///
+/// The PTY byte stream follows terminal-protocol line discipline (CRLF).
+/// Bytes coming FROM the shell already do. Bytes we build ourselves from
+/// a Rust `&str` (LF convention) must be translated before they join the
+/// stream — otherwise bare `\n` moves the cursor down without returning
+/// to column 0, producing a staircase in multi-line content.
+///
+/// Use this at every boundary where synthesized text enters `outputTx`
+/// or `feedVt`: agent-command echoes, injected banners, status lines.
+/// Idempotent on existing CRLF.
+fn toTermBytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 8);
+    let mut prev = 0u8;
+    for &b in s.as_bytes() {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
 }
 
 /// Byte-level `rfind` for a needle in a haystack. Returns the byte

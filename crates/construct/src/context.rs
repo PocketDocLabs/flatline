@@ -1063,6 +1063,24 @@ mod tests {
         assert!(hasReasoning);
     }
 
+    /// Reasoning loaded from older sessions with leading/trailing whitespace
+    /// gets trimmed on reconstruct so it doesn't re-feed the model's drift.
+    #[test]
+    fn reasoning_trimmed_on_load() {
+        let mut s = TestSession::new();
+        s.user("Explain this");
+        s.assistant("answer", Some("\n\n  thought\n\n"));
+
+        let msgs = s.reconstruct();
+        match &msgs[1] {
+            Message::Assistant { reasoning, .. } => {
+                let r = reasoning.as_deref().expect("reasoning present");
+                assert_eq!(r, "thought", "reasoning should be trimmed");
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Tool call basics
     // -----------------------------------------------------------------------

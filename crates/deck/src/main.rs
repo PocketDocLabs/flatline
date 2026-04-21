@@ -278,27 +278,27 @@ async fn main() -> Result<()> {
                 }
                 _ => {
                     use std::io::Write;
-                    let (handle, mut eventRx) = construct::runner::runStreaming(
+                    let (handle, mut logRx) = construct::runner::runStreaming(
                         &config, &prompt, &runConfig,
                     ).await?;
-                    while let Some(event) = eventRx.recv().await {
-                        use construct::session::SessionEvent;
+                    while let Some(event) = logRx.recv().await {
+                        use construct::control::LogEvent;
                         match event {
-                            SessionEvent::ContentDelta(text) => {
+                            LogEvent::ContentDelta(text) => {
                                 print!("{text}");
                                 std::io::stdout().flush().ok();
                             }
-                            SessionEvent::ToolStarted { name, summary } => {
+                            LogEvent::ToolStarted { name, summary } => {
                                 eprint!("\x1b[2m\u{25b8} {name}: {summary}...\x1b[0m");
                             }
-                            SessionEvent::ToolAutoApproved { name, summary } => {
+                            LogEvent::ToolAutoApproved { name, summary } => {
                                 eprintln!("\x1b[2m\u{25b8} {name}: {summary}\x1b[0m");
                             }
-                            SessionEvent::ToolResult { name, .. } => {
+                            LogEvent::ToolResult { name, .. } => {
                                 eprint!("\r\x1b[K");
                                 tracing::debug!(tool = %name, "tool result");
                             }
-                            SessionEvent::Error(msg) => {
+                            LogEvent::Error(msg) => {
                                 eprintln!("\x1b[31merror: {msg}\x1b[0m");
                             }
                             _ => {}
@@ -390,45 +390,44 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Serialize a SessionEvent to a JSON line for NDJSON output.
-fn formatEventJson(event: &construct::session::SessionEvent) -> String {
-    use construct::session::SessionEvent;
+/// Serialize a LogEvent to a JSON line for NDJSON output.
+fn formatEventJson(event: &construct::control::LogEvent) -> String {
+    use construct::control::LogEvent;
     let val = match event {
-        SessionEvent::ContentDelta(text) => serde_json::json!({
+        LogEvent::ContentDelta(text) => serde_json::json!({
             "type": "contentDelta", "text": text,
         }),
-        SessionEvent::ReasoningDelta(text) => serde_json::json!({
+        LogEvent::ReasoningDelta(text) => serde_json::json!({
             "type": "reasoningDelta", "text": text,
         }),
-        SessionEvent::ToolRequest { name, summary, args, diff, .. } => serde_json::json!({
-            "type": "toolRequest", "name": name, "summary": summary,
-            "args": args, "diff": diff,
-        }),
-        SessionEvent::ToolStarted { name, summary } => serde_json::json!({
+        LogEvent::ToolStarted { name, summary } => serde_json::json!({
             "type": "toolStarted", "name": name, "summary": summary,
         }),
-        SessionEvent::ToolAutoApproved { name, summary } => serde_json::json!({
+        LogEvent::ToolAutoApproved { name, summary } => serde_json::json!({
             "type": "toolAutoApproved", "name": name, "summary": summary,
         }),
-        SessionEvent::ToolResult { name, output } => serde_json::json!({
+        LogEvent::ToolResult { name, output } => serde_json::json!({
             "type": "toolResult", "name": name, "output": output,
         }),
-        SessionEvent::ToolDenied { name } => serde_json::json!({
+        LogEvent::ToolDenied { name } => serde_json::json!({
             "type": "toolDenied", "name": name,
         }),
-        SessionEvent::ToolAutoDenied { name, summary } => serde_json::json!({
+        LogEvent::ToolAutoDenied { name, summary } => serde_json::json!({
             "type": "toolAutoDenied", "name": name, "summary": summary,
         }),
-        SessionEvent::TurnAborted { name } => serde_json::json!({
+        LogEvent::TurnAborted { name } => serde_json::json!({
             "type": "turnAborted", "name": name,
         }),
-        SessionEvent::TurnComplete => serde_json::json!({
+        LogEvent::TurnComplete => serde_json::json!({
             "type": "turnComplete",
         }),
-        SessionEvent::TurnCancelled => serde_json::json!({
+        LogEvent::TurnCancelled => serde_json::json!({
             "type": "turnCancelled",
         }),
-        SessionEvent::TokenUpdate {
+        LogEvent::SteerInjected { texts } => serde_json::json!({
+            "type": "steerInjected", "texts": texts,
+        }),
+        LogEvent::TokenUpdate {
             promptTokens,
             completionTokens,
             contextTokens,
@@ -448,40 +447,52 @@ fn formatEventJson(event: &construct::session::SessionEvent) -> String {
                 "cacheCreationTokens": cacheCreationTokens,
             })
         }
-        SessionEvent::CompactionStarted { stage } => serde_json::json!({
+        LogEvent::CompactionStarted { stage } => serde_json::json!({
             "type": "compactionStarted", "stage": stage,
         }),
-        SessionEvent::CompactionComplete { stage, reduction, markerBlock } => serde_json::json!({
+        LogEvent::CompactionComplete { stage, reduction, markerBlock } => serde_json::json!({
             "type": "compactionComplete", "stage": stage,
             "reduction": reduction, "markerBlock": markerBlock,
         }),
-        SessionEvent::SubagentStarted { sessionId, agentType, prompt } => serde_json::json!({
+        LogEvent::Cleared => serde_json::json!({ "type": "cleared" }),
+        LogEvent::SessionRestored { turns, markers } => serde_json::json!({
+            "type": "sessionRestored",
+            "turnCount": turns.len(),
+            "markers": markers,
+        }),
+        LogEvent::TopicChanged { label } => serde_json::json!({
+            "type": "topicChanged", "label": label,
+        }),
+        LogEvent::Rewound { targetTurnId } => serde_json::json!({
+            "type": "rewound", "targetTurnId": targetTurnId,
+        }),
+        LogEvent::LspHint { serverId, installHint } => serde_json::json!({
+            "type": "lspHint", "serverId": serverId, "installHint": installHint,
+        }),
+        LogEvent::SubagentStarted { sessionId, agentType, prompt } => serde_json::json!({
             "type": "subagentStarted", "sessionId": sessionId,
             "agentType": agentType, "prompt": prompt,
         }),
-        SessionEvent::SubagentEvent { sessionId, event } => serde_json::json!({
+        LogEvent::SubagentEvent { sessionId, event } => serde_json::json!({
             "type": "subagentEvent", "sessionId": sessionId,
             "event": formatEventJson(event),
         }),
-        SessionEvent::SubagentShellOutput { sessionId, .. } => serde_json::json!({
+        LogEvent::SubagentShellOutput { sessionId, .. } => serde_json::json!({
             "type": "subagentShellOutput", "sessionId": sessionId,
         }),
-        SessionEvent::SubagentPermitRequest { sessionId, name, summary, .. } => serde_json::json!({
-            "type": "subagentPermitRequest", "sessionId": sessionId,
-            "name": name, "summary": summary,
-        }),
-        SessionEvent::SubagentComplete { sessionId, agentType, content, turns } => serde_json::json!({
+        LogEvent::SubagentComplete { sessionId, agentType, content, turns } => serde_json::json!({
             "type": "subagentComplete", "sessionId": sessionId,
             "agentType": agentType, "content": content, "turns": turns,
         }),
-        SessionEvent::BudgetWarning { sessionCost, limit } => serde_json::json!({
+        LogEvent::Retrying { attempt, maxAttempts } => serde_json::json!({
+            "type": "retrying", "attempt": attempt, "maxAttempts": maxAttempts,
+        }),
+        LogEvent::BudgetWarning { sessionCost, limit } => serde_json::json!({
             "type": "budgetWarning", "sessionCost": sessionCost, "limit": limit,
         }),
-        SessionEvent::Error(msg) => serde_json::json!({
+        LogEvent::Error(msg) => serde_json::json!({
             "type": "error", "message": msg,
         }),
-        // TUI-specific events — emit type only for completeness.
-        _ => serde_json::json!({ "type": "other" }),
     };
     serde_json::to_string(&val).unwrap_or_else(|_| r#"{"type":"serializationError"}"#.into())
 }

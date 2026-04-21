@@ -17,6 +17,7 @@
 pub mod api;
 pub mod checkpoint;
 pub mod compaction;
+pub mod control;
 pub mod cost;
 pub mod compaction_trigger;
 pub mod config;

@@ -25,11 +25,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
     Terminal as RatatuiTerminal,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
+use construct::control::{LogEvent, SessionRequest, TuiRequest};
 use construct::permissions::Permissions;
 use construct::prompt::{DomainModule, InterfaceMode};
-use construct::session::{CommandAction, Session, SessionEvent};
+use construct::session::Session;
 use construct::shell::{ShellIo, spawnShell};
 
 use crate::agent_panel::AgentPanel;
@@ -54,6 +55,24 @@ fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
 enum Focus {
     Terminal,
     Agent,
+}
+
+/// Internal deck-update messages. Produced by tasks that await oneshot replies
+/// to `TuiRequest`s; drained by `runLoop` alongside `LogEvent`s so slash
+/// commands don't block the TUI while the session task is mid-turn.
+enum DeckUpdate {
+    McpStatus(construct::control::McpStatus),
+    LspStatus(construct::control::LspStatus),
+    PermissionsStatus(construct::control::PermissionsStatus),
+    ContextDisplay(construct::context::ContextState),
+    RewindOptions(Vec<construct::transcript::Turn>),
+    Forks(Vec<construct::transcript::Fork>),
+    /// Generic string result to show in the panel (e.g. cost, session list).
+    ShowResult(String),
+    /// Result of a mutation (rewind, fork switch, save permissions, clear).
+    CommandAck(construct::control::CommandAck),
+    /// Resume completed — picker should close on ok, show error on failure.
+    ResumeResult(construct::control::CommandAck),
 }
 
 /// Axis lock for trackpad scroll — prevents diagonal scrolling.
@@ -187,13 +206,15 @@ pub async fn run() -> Result<()> {
     let mut focus = Focus::Terminal;
     let mut selState = SelectionState::new();
     let mut scrollLock = ScrollAxisLock::new();
-    // Session channels.
-    let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
-    let (permitTx, permitRx) = mpsc::channel::<construct::permissions::PermitResponse>(1);
+    // Session channels — Log (session → TUI), SessionRequest (session → TUI),
+    // TuiRequest (TUI → session), plus user input / cancel / steer.
+    let (logTx, mut logRx) = mpsc::channel::<LogEvent>(256);
+    let (sessionRequestTx, mut sessionRequestRx) = mpsc::channel::<SessionRequest>(16);
     let (userInputTx, mut userInputRx) = mpsc::channel::<construct::session::UserInput>(16);
-    let (commandTx, mut commandRx) = mpsc::channel::<CommandAction>(16);
+    let (requestTx, mut requestRx) = mpsc::channel::<TuiRequest>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
     let (steerTx, steerRx) = mpsc::channel::<construct::session::UserInput>(16);
+    let (deckUpdateTx, mut deckUpdateRx) = mpsc::channel::<DeckUpdate>(32);
 
     // Spawn the agent session task.
     let mut cancelRx = cancelRx;
@@ -202,8 +223,8 @@ pub async fn run() -> Result<()> {
         let config = match construct::config::load() {
             Ok(c) => c,
             Err(e) => {
-                let _ = eventTx
-                    .send(SessionEvent::Error(format!("Config error: {e}")))
+                let _ = logTx
+                    .send(LogEvent::Error(format!("Config error: {e}")))
                     .await;
                 return;
             }
@@ -222,8 +243,8 @@ pub async fn run() -> Result<()> {
         ) {
             Ok(s) => s,
             Err(e) => {
-                let _ = eventTx
-                    .send(SessionEvent::Error(format!("Session error: {e}")))
+                let _ = logTx
+                    .send(LogEvent::Error(format!("Session error: {e}")))
                     .await;
                 return;
             }
@@ -238,8 +259,6 @@ pub async fn run() -> Result<()> {
             _ => {}
         }
 
-        let mut permitRx = permitRx;
-
         loop {
             tokio::select! {
                 msg = userInputRx.recv() => {
@@ -247,18 +266,18 @@ pub async fn run() -> Result<()> {
                         Some(msg) => {
                             // Clear any stale cancel notification from a previous turn.
                             cancelRx.borrow_and_update();
-                            if let Err(e) = session.send(&msg, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx).await {
-                                let _ = eventTx
-                                    .send(SessionEvent::Error(format!("Agent error: {e}")))
+                            if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx).await {
+                                let _ = logTx
+                                    .send(LogEvent::Error(format!("Agent error: {e}")))
                                     .await;
                             }
                         }
                         None => break,
                     }
                 }
-                cmd = commandRx.recv() => {
-                    match cmd {
-                        Some(CommandAction::Resume { sessionId: Some(id) }) => {
+                req = requestRx.recv() => {
+                    match req {
+                        Some(TuiRequest::ResumeSession { sessionId: id, reply }) => {
                             // Consume old session, keep the shell.
                             let shell = session.intoShell();
                             match Session::resume(
@@ -284,32 +303,26 @@ pub async fn run() -> Result<()> {
                                     // past the rewind point until the user sends a new message.
                                     let turns = session.loadDisplayTurns().unwrap_or_default();
                                     let markers = session.compactionMarkers();
-                                    let _ = eventTx
-                                        .send(SessionEvent::SessionRestored { turns, markers })
+                                    let _ = logTx
+                                        .send(LogEvent::SessionRestored { turns, markers })
                                         .await;
                                     // Set window title to the current topic on resume.
                                     let label = session.currentTopicLabel();
                                     if !label.is_empty() {
-                                        let _ = eventTx
-                                            .send(SessionEvent::TopicChanged {
+                                        let _ = logTx
+                                            .send(LogEvent::TopicChanged {
                                                 label: label.to_string(),
                                             })
                                             .await;
                                     }
-                                    let _ = eventTx
-                                        .send(SessionEvent::ResumeComplete {
-                                            success: true,
-                                            message: format!("Resumed session {id}"),
-                                        })
-                                        .await;
+                                    let _ = reply.send(construct::control::CommandAck::ok(
+                                        format!("Resumed session {id}"),
+                                    ));
                                 }
                                 Err((e, shell)) => {
-                                    let _ = eventTx
-                                        .send(SessionEvent::ResumeComplete {
-                                            success: false,
-                                            message: format!("Failed to resume {id}: {e}"),
-                                        })
-                                        .await;
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to resume {id}: {e}"),
+                                    ));
                                     // Shell returned — recreate a fresh session.
                                     match Session::new(
                                         &config,
@@ -329,8 +342,8 @@ pub async fn run() -> Result<()> {
                                             session = s;
                                         }
                                         Err(e2) => {
-                                            let _ = eventTx
-                                                .send(SessionEvent::Error(
+                                            let _ = logTx
+                                                .send(LogEvent::Error(
                                                     format!("Session lost after failed resume: {e2}"),
                                                 ))
                                                 .await;
@@ -340,7 +353,7 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                         }
-                        Some(CommandAction::Clear) => {
+                        Some(TuiRequest::Clear { reply }) => {
                             let shell = session.intoShell();
                             match Session::new(
                                 &config,
@@ -359,49 +372,42 @@ pub async fn run() -> Result<()> {
                                         _ => {}
                                     }
 
-                                    let _ = eventTx.send(SessionEvent::Cleared).await;
+                                    let _ = logTx.send(LogEvent::Cleared).await;
+                                    let _ = reply.send(construct::control::CommandAck::ok("Session cleared."));
                                 }
                                 Err(e) => {
-                                    let _ = eventTx
-                                        .send(SessionEvent::Error(
-                                            format!("Failed to create new session: {e}"),
-                                        ))
-                                        .await;
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to create new session: {e}"),
+                                    ));
                                     return;
                                 }
                             }
                         }
-                        Some(CommandAction::Lsp) => {
+                        Some(TuiRequest::GetLsp { reply }) => {
                             let servers = session.lspStatusData();
-                            let _ = eventTx
-                                .send(SessionEvent::LspStatus { servers })
-                                .await;
+                            let _ = reply.send(construct::control::LspStatus { servers });
                         }
-                        Some(CommandAction::Mcp) => {
+                        Some(TuiRequest::GetMcp { reply }) => {
                             let (servers, totalTools, searchMode, configPath) =
                                 session.mcpStatusData().await;
-                            let _ = eventTx
-                                .send(SessionEvent::McpStatus {
-                                    servers,
-                                    totalTools,
-                                    searchMode,
-                                    configPath,
-                                })
-                                .await;
+                            let _ = reply.send(construct::control::McpStatus {
+                                servers,
+                                totalTools,
+                                searchMode,
+                                configPath,
+                            });
                         }
-                        Some(CommandAction::Permissions) => {
+                        Some(TuiRequest::GetPermissions { reply }) => {
                             let (defaultMode, rules, source, configPath) =
                                 session.permissionsStatusData();
-                            let _ = eventTx
-                                .send(SessionEvent::PermissionsStatus {
-                                    defaultMode,
-                                    rules,
-                                    source,
-                                    configPath,
-                                })
-                                .await;
+                            let _ = reply.send(construct::control::PermissionsStatus {
+                                defaultMode,
+                                rules,
+                                source,
+                                configPath,
+                            });
                         }
-                        Some(CommandAction::SavePermissions { defaultMode, rules }) => {
+                        Some(TuiRequest::SavePermissions { defaultMode, rules, reply }) => {
                             if let Some(ref root) = config.projectRoot {
                                 match construct::config::savePermissions(
                                     root,
@@ -414,88 +420,92 @@ pub async fn run() -> Result<()> {
                                             rules,
                                             source: construct::permissions::PermissionsSource::Project,
                                         });
-                                        let _ = eventTx
-                                            .send(SessionEvent::CommandResult(
-                                                "Permissions saved.".into(),
-                                            ))
-                                            .await;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            "Permissions saved.",
+                                        ));
                                     }
                                     Err(e) => {
-                                        let _ = eventTx
-                                            .send(SessionEvent::CommandResult(
-                                                format!("Failed to save permissions: {e}"),
-                                            ))
-                                            .await;
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Failed to save permissions: {e}"),
+                                        ));
                                     }
                                 }
+                            } else {
+                                let _ = reply.send(construct::control::CommandAck::err(
+                                    "No project root; permissions not persisted.",
+                                ));
                             }
                         }
-                        Some(CommandAction::Rewind { target }) if target.is_empty() => {
+                        Some(TuiRequest::GetRewindOptions { reply }) => {
                             let turns = session.loadDisplayTurns().unwrap_or_default();
-                            let _ = eventTx
-                                .send(SessionEvent::RewindPickerData { turns })
-                                .await;
+                            let _ = reply.send(turns);
                         }
-                        Some(CommandAction::Rewind { target }) => {
-                            let result = session.rewind(&target, false, &eventTx).await;
-                            let _ = eventTx
-                                .send(SessionEvent::CommandResult(result))
-                                .await;
+                        Some(TuiRequest::Rewind { target, saveFork, reply }) => {
+                            let result = session.rewind(&target, saveFork, &logTx).await;
+                            let _ = reply.send(construct::control::CommandAck::ok(result));
                         }
-                        Some(CommandAction::ForkAndRewind { target }) => {
-                            let result = session.rewind(&target, true, &eventTx).await;
-                            let _ = eventTx
-                                .send(SessionEvent::CommandResult(result))
-                                .await;
-                        }
-                        Some(CommandAction::Forks { forkId: None }) => {
+                        Some(TuiRequest::GetForks { reply }) => {
                             let forks = session.listForks();
-                            let _ = eventTx
-                                .send(SessionEvent::ForkPickerData { forks })
-                                .await;
+                            let _ = reply.send(forks);
                         }
-                        Some(CommandAction::Forks { forkId: Some(id) }) => {
-                            let result = session.switchFork(&id, &eventTx).await;
-                            let _ = eventTx
-                                .send(SessionEvent::CommandResult(result))
-                                .await;
+                        Some(TuiRequest::SwitchFork { forkId, reply }) => {
+                            let result = session.switchFork(&forkId, &logTx).await;
+                            let _ = reply.send(construct::control::CommandAck::ok(result));
                         }
-                        Some(CommandAction::ShowContext) => {
+                        Some(TuiRequest::ShowContext { reply }) => {
                             let state = session.buildContextState();
-                            let _ = eventTx
-                                .send(SessionEvent::ContextDisplay(state))
-                                .await;
+                            let _ = reply.send(state);
                         }
-                        Some(CommandAction::Shutdown) => {
+                        Some(TuiRequest::Undo { reply }) => {
+                            let ack = session.undoCheckpoint().await;
+                            let _ = reply.send(ack);
+                        }
+                        Some(TuiRequest::ListSessions { reply }) => {
+                            let _ = reply.send(session.listSessionsText());
+                        }
+                        Some(TuiRequest::ShowCost { reply }) => {
+                            let _ = reply.send(session.formatCostBreakdown());
+                        }
+                        Some(TuiRequest::Shutdown) => {
                             session.shutdownLsp().await;
                             session.shutdownMcp().await;
                             break;
                         }
-                        Some(CommandAction::RetryLastTurn) => {
+                        Some(TuiRequest::RetryLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
-                            if let Err(e) = session.retryLastTurn(
-                                &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx,
+                            match session.retryLastTurn(
+                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx,
                             ).await {
-                                let _ = eventTx
-                                    .send(SessionEvent::Error(format!("Retry failed: {e}")))
-                                    .await;
+                                Ok(()) => {
+                                    let _ = reply.send(construct::control::CommandAck::ok(""));
+                                }
+                                Err(e) => {
+                                    let _ = logTx
+                                        .send(LogEvent::Error(format!("Retry failed: {e}")))
+                                        .await;
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Retry failed: {e}"),
+                                    ));
+                                }
                             }
                         }
-                        Some(CommandAction::ContinueLastTurn) => {
+                        Some(TuiRequest::ContinueLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
-                            if let Err(e) = session.continueLastTurn(
-                                &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx,
+                            match session.continueLastTurn(
+                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx,
                             ).await {
-                                let _ = eventTx
-                                    .send(SessionEvent::Error(format!("Continue failed: {e}")))
-                                    .await;
+                                Ok(()) => {
+                                    let _ = reply.send(construct::control::CommandAck::ok(""));
+                                }
+                                Err(e) => {
+                                    let _ = logTx
+                                        .send(LogEvent::Error(format!("Continue failed: {e}")))
+                                        .await;
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Continue failed: {e}"),
+                                    ));
+                                }
                             }
-                        }
-                        Some(action) => {
-                            let result = session.executeCommand(&action).await;
-                            let _ = eventTx
-                                .send(SessionEvent::CommandResult(result))
-                                .await;
                         }
                         None => break,
                     }
@@ -512,10 +522,12 @@ pub async fn run() -> Result<()> {
         &mut focus,
         &mut selState,
         &mut scrollLock,
-        &mut eventRx,
-        &permitTx,
+        &mut logRx,
+        &mut sessionRequestRx,
+        &mut deckUpdateRx,
         &userInputTx,
-        &commandTx,
+        &requestTx,
+        &deckUpdateTx,
         &cancelTx,
         &steerTx,
         contextWindow,
@@ -525,7 +537,7 @@ pub async fn run() -> Result<()> {
     .await;
 
     // Gracefully shut down background services before exiting.
-    let _ = commandTx.send(CommandAction::Shutdown).await;
+    let _ = requestTx.send(TuiRequest::Shutdown).await;
 
     disable_raw_mode()?;
     execute!(
@@ -551,10 +563,12 @@ async fn runLoop(
     focus: &mut Focus,
     selState: &mut SelectionState,
     scrollLock: &mut ScrollAxisLock,
-    eventRx: &mut mpsc::Receiver<SessionEvent>,
-    permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
+    logRx: &mut mpsc::Receiver<LogEvent>,
+    sessionRequestRx: &mut mpsc::Receiver<SessionRequest>,
+    deckUpdateRx: &mut mpsc::Receiver<DeckUpdate>,
     userInputTx: &mpsc::Sender<construct::session::UserInput>,
-    commandTx: &mpsc::Sender<CommandAction>,
+    requestTx: &mpsc::Sender<TuiRequest>,
+    deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
     contextWindow: usize,
@@ -575,7 +589,10 @@ async fn runLoop(
     let mut lspPanel: Option<LspPanel> = None;
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
-    let mut subagentPermitTx: Option<mpsc::Sender<construct::permissions::PermitResponse>> = None;
+    // Stash for the oneshot reply to the currently-open permit prompt (either
+    // top-level or subagent). Set when we receive a `SessionRequest::Permit`
+    // and show the prompt; consumed when the user responds.
+    let mut pendingPermitReply: Option<oneshot::Sender<construct::permissions::PermitResponse>> = None;
     let projectDir = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -643,7 +660,12 @@ async fn runLoop(
             // Capture content rects for mouse hit-testing.
             selState.termContentRect = termInner;
 
-            // Agent panel.
+            // Agent panel. When the popup is open showing a subagent permit,
+            // suppress the duplicate prompt in the main panel — they share
+            // permit state, so a visible duplicate would scroll/copy in
+            // lockstep with the popup version.
+            agentPanel.permitDisplaySuppressed = subagentPanel.is_some()
+                && agentPanel.pendingPermitIsSubagent();
             let agentChatArea = agentPanel.render(hChunks[1], frame.buffer_mut(), *focus == Focus::Agent);
             // Full chat area for hit-testing (includes prefix columns).
             selState.agentPanelRect = agentChatArea;
@@ -856,7 +878,7 @@ async fn runLoop(
 
             // Subagent panel overlay.
             if let Some(ref mut panel) = subagentPanel {
-                panel.render(area, frame.buffer_mut());
+                panel.render(area, frame.buffer_mut(), agentPanel);
             }
 
             // Help popup overlay.
@@ -872,58 +894,55 @@ async fn runLoop(
             needsRedraw = true;
         }
 
-        // Drain session events.
-        while let Ok(event) = eventRx.try_recv() {
+        // Drain session log events (monotone stream, no replies).
+        while let Ok(event) = logRx.try_recv() {
             needsRedraw = true;
             match event {
-                SessionEvent::ContentDelta(text) => agentPanel.appendContent(&text),
-                SessionEvent::ReasoningDelta(text) => agentPanel.appendReasoning(&text),
-                SessionEvent::ToolRequest { name, summary, args, diff, explanation, impact } => {
-                    agentPanel.showToolRequest(&name, &summary, &args, diff, explanation, impact);
-                }
-                SessionEvent::ToolResult { name, output } => {
+                LogEvent::ContentDelta(text) => agentPanel.appendContent(&text),
+                LogEvent::ReasoningDelta(text) => agentPanel.appendReasoning(&text),
+                LogEvent::ToolResult { name, output } => {
                     // Task tool results are handled by SubagentComplete — don't double-render.
                     if name != "task" {
                         agentPanel.pushToolResult(&name, &output);
                     }
                 }
-                SessionEvent::ToolStarted { name, summary } => {
+                LogEvent::ToolStarted { name, summary } => {
                     if name != "task" {
                         agentPanel.toolStarted(&name, &summary);
                     }
                 }
-                SessionEvent::ToolAutoApproved { name, summary } => {
+                LogEvent::ToolAutoApproved { name, summary } => {
                     agentPanel.toolApproved(&format!("{name}: {summary}"));
                 }
-                SessionEvent::ToolDenied { name } => {
+                LogEvent::ToolDenied { name } => {
                     agentPanel.toolDenied(&name);
                 }
-                SessionEvent::ToolAutoDenied { name, summary } => {
+                LogEvent::ToolAutoDenied { name, summary } => {
                     agentPanel.toolAutoDenied(&name, &summary);
                 }
-                SessionEvent::TurnAborted { name } => {
+                LogEvent::TurnAborted { name } => {
                     agentPanel.pushError(&format!("Turn aborted: {name} not permitted"));
                 }
-                SessionEvent::TurnComplete => {
+                LogEvent::TurnComplete => {
                     agentPanel.finishTurn();
                 }
-                SessionEvent::TurnCancelled => {
+                LogEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
                 }
-                SessionEvent::SteerInjected { texts } => {
+                LogEvent::SteerInjected { texts } => {
                     agentPanel.promoteQueue(&texts);
                 }
-                SessionEvent::TopicChanged { label } => {
+                LogEvent::TopicChanged { label } => {
                     setTerminalTitle(Some(&label));
                 }
-                SessionEvent::LspHint { serverId, installHint } => {
+                LogEvent::LspHint { serverId, installHint } => {
                     let msg = format!(
                         "\u{2699}\u{FE0E} {} not found \u{2014} `{}`",
                         serverId, installHint,
                     );
                     agentPanel.pushCommandResult(&msg);
                 }
-                SessionEvent::TokenUpdate {
+                LogEvent::TokenUpdate {
                     contextTokens,
                     sessionCost: sc,
                     cacheReadTokens,
@@ -935,10 +954,10 @@ async fn runLoop(
                         lastCacheHitAt = Some(Instant::now());
                     }
                 }
-                SessionEvent::Retrying { attempt, maxAttempts } => {
+                LogEvent::Retrying { attempt, maxAttempts } => {
                     agentPanel.showRetrying(attempt, maxAttempts);
                 }
-                SessionEvent::Error(msg) => {
+                LogEvent::Error(msg) => {
                     agentPanel.pushError(&msg);
                     // A fatal error ends the turn — stop the throbber so the
                     // user isn't misled into thinking the model is still
@@ -946,7 +965,7 @@ async fn runLoop(
                     agentPanel.finishTurn();
                     agentPanel.errorHint = true;
                 }
-                SessionEvent::BudgetWarning { sessionCost: sc, limit } => {
+                LogEvent::BudgetWarning { sessionCost: sc, limit } => {
                     let msg = format!(
                         "\u{26A0}\u{FE0E} Session cost ({}) exceeded limit ({})",
                         construct::cost::formatCost(sc),
@@ -954,34 +973,21 @@ async fn runLoop(
                     );
                     agentPanel.pushCommandResult(&msg);
                 }
-                SessionEvent::ContextDisplay(state) => {
-                    agentPanel.pushContextDisplay(state);
-                }
-                SessionEvent::CommandResult(text) => {
-                    if forkPicker.is_some() {
-                        // Fork switch failed — Rewound would have cleared the picker first.
-                        if let Some(ref mut picker) = forkPicker {
-                            picker.switchFailed(text);
-                        }
-                    } else {
-                        agentPanel.pushCommandResult(&text);
-                    }
-                }
-                SessionEvent::CompactionStarted { stage } => {
+                LogEvent::CompactionStarted { stage } => {
                     tracing::info!(stage = %stage, "compaction started");
                 }
-                SessionEvent::CompactionComplete { stage, reduction, markerBlock } => {
+                LogEvent::CompactionComplete { stage, reduction, markerBlock } => {
                     tracing::info!(stage = %stage, reduction = %reduction, "compaction complete");
                     if let Some(blockIdx) = markerBlock {
                         agentPanel.pushCompactionMarker(&stage, blockIdx);
                     }
                 }
-                SessionEvent::Cleared => {
+                LogEvent::Cleared => {
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     setTerminalTitle(None);
                 }
-                SessionEvent::Rewound { targetTurnId } => {
+                LogEvent::Rewound { targetTurnId } => {
                     rewindPicker = None;
                     forkPicker = None;
                     agentPanel.clearDisplay();
@@ -1006,7 +1012,7 @@ async fn runLoop(
                     }
                     tracing::info!(target = %targetTurnId, "conversation rewound");
                 }
-                SessionEvent::SessionRestored { turns, markers } => {
+                LogEvent::SessionRestored { turns, markers } => {
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     replayTranscript(agentPanel, &turns);
@@ -1014,48 +1020,19 @@ async fn runLoop(
                         agentPanel.pushCompactionMarker(stage, *blockIdx);
                     }
                 }
-                SessionEvent::McpStatus { servers, totalTools, searchMode, configPath } => {
-                    mcpPanel = Some(McpPanel::new(servers, totalTools, searchMode, configPath));
-                }
-                SessionEvent::LspStatus { servers } => {
-                    lspPanel = Some(LspPanel::new(servers));
-                }
-                SessionEvent::PermissionsStatus { defaultMode, rules, source, configPath } => {
-                    permissionsPanel = Some(crate::permissions_panel::PermissionsPanel::new(
-                        defaultMode, rules, source, configPath,
-                    ));
-                }
-                SessionEvent::RewindPickerData { turns } => {
-                    rewindPicker = Some(RewindPicker::new(&turns));
-                }
-                SessionEvent::ForkPickerData { forks } => {
-                    forkPicker = Some(ForkPicker::new(&forks));
-                }
-                SessionEvent::ResumeComplete { success, message } => {
-                    if success {
-                        sessionPicker = None;
-                        agentPanel.entries.push(
-                            crate::agent_panel::PanelEntry::SessionNotice(message),
-                        );
-                    } else if let Some(ref mut picker) = sessionPicker {
-                        picker.resumeFailed(message);
-                    } else {
-                        agentPanel.pushError(&message);
-                    }
-                }
-                SessionEvent::SubagentStarted { sessionId, agentType, prompt } => {
+                LogEvent::SubagentStarted { sessionId, agentType, prompt } => {
                     tracing::info!(agent = %agentType, "subagent started");
                     agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
                 }
-                SessionEvent::SubagentEvent { sessionId: _, event } => {
+                LogEvent::SubagentEvent { sessionId: _, event } => {
                     match *event {
-                        SessionEvent::ToolAutoApproved { ref name, ref summary } => {
+                        LogEvent::ToolAutoApproved { ref name, ref summary } => {
                             agentPanel.subagentToolLine(name, summary);
                         }
-                        SessionEvent::ToolStarted { ref name, ref summary } => {
+                        LogEvent::ToolStarted { ref name, ref summary } => {
                             agentPanel.subagentToolLine(name, summary);
                         }
-                        SessionEvent::ToolResult { ref name, ref output } => {
+                        LogEvent::ToolResult { ref name, ref output } => {
                             // Brief one-liner for the inline block.
                             let brief = if output.len() > 60 {
                                 format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
@@ -1066,39 +1043,111 @@ async fn runLoop(
                             // Full output for the overlay transcript.
                             agentPanel.subagentToolResult(name, output);
                         }
-                        SessionEvent::ContentDelta(ref text) => {
+                        LogEvent::ContentDelta(ref text) => {
                             agentPanel.subagentContent(text);
                         }
-                        SessionEvent::Error(ref msg) => {
+                        LogEvent::Error(ref msg) => {
                             agentPanel.subagentToolLine("error", msg);
                         }
                         _ => {}
                     }
                 }
-                SessionEvent::SubagentPermitRequest {
-                    sessionId: _, name, summary, args, diff, explanation, impact, responseTx,
-                } => {
-                    // Show permission prompt for the subagent (reuse same UI).
-                    agentPanel.showToolRequest(
-                        &name, &summary, &args, diff,
-                        explanation, impact,
-                    );
-                    subagentPermitTx = Some(responseTx);
+                LogEvent::SubagentShellOutput { data, .. } => {
+                    agentPanel.feedSubagentShell(&data);
                 }
-                SessionEvent::SubagentShellOutput { data, .. } => {
-                    if let Some(ref mut sub) = agentPanel.activeSubagent {
-                        // Cap at 512KB.
-                        const MAX: usize = 512 * 1024;
-                        if sub.shellScrollback.len() + data.len() > MAX {
-                            let excess = (sub.shellScrollback.len() + data.len()) - MAX;
-                            sub.shellScrollback.drain(..excess.min(sub.shellScrollback.len()));
-                        }
-                        sub.shellScrollback.extend_from_slice(&data);
-                    }
-                }
-                SessionEvent::SubagentComplete { agentType, turns, content, .. } => {
+                LogEvent::SubagentComplete { agentType, turns, content, .. } => {
                     tracing::info!(agent = %agentType, turns = turns, "subagent completed");
                     agentPanel.subagentComplete(&agentType, turns, &content);
+                }
+            }
+        }
+
+        // Drain session → TUI requests (permits). Each variant carries a
+        // oneshot reply that is resolved when the user responds via the
+        // permit prompt.
+        while let Ok(req) = sessionRequestRx.try_recv() {
+            needsRedraw = true;
+            match req {
+                SessionRequest::Permit {
+                    origin,
+                    name,
+                    summary,
+                    args,
+                    diff,
+                    explanation,
+                    impact,
+                    reply,
+                } => {
+                    let isSubagent = matches!(origin, construct::control::PermitOrigin::Subagent { .. });
+                    agentPanel.showToolRequest(
+                        &name, &summary, &args, diff, explanation, impact, origin,
+                    );
+                    pendingPermitReply = Some(reply);
+                    // Parent permits auto-close the popup so the main-panel
+                    // prompt becomes visible. Subagent permits stay routed
+                    // through the popup (which renders them inline).
+                    if !isSubagent && subagentPanel.is_some() {
+                        subagentPanel = None;
+                    }
+                }
+            }
+        }
+
+        // Drain deck-internal updates (replies to slash-command requests).
+        while let Ok(update) = deckUpdateRx.try_recv() {
+            needsRedraw = true;
+            match update {
+                DeckUpdate::McpStatus(status) => {
+                    mcpPanel = Some(McpPanel::new(
+                        status.servers,
+                        status.totalTools,
+                        status.searchMode,
+                        status.configPath,
+                    ));
+                }
+                DeckUpdate::LspStatus(status) => {
+                    lspPanel = Some(LspPanel::new(status.servers));
+                }
+                DeckUpdate::PermissionsStatus(status) => {
+                    permissionsPanel = Some(crate::permissions_panel::PermissionsPanel::new(
+                        status.defaultMode,
+                        status.rules,
+                        status.source,
+                        status.configPath,
+                    ));
+                }
+                DeckUpdate::ContextDisplay(state) => {
+                    agentPanel.pushContextDisplay(state);
+                }
+                DeckUpdate::RewindOptions(turns) => {
+                    rewindPicker = Some(RewindPicker::new(&turns));
+                }
+                DeckUpdate::Forks(forks) => {
+                    forkPicker = Some(ForkPicker::new(&forks));
+                }
+                DeckUpdate::ShowResult(text) => {
+                    agentPanel.pushCommandResult(&text);
+                }
+                DeckUpdate::CommandAck(ack) => {
+                    if forkPicker.is_some() && !ack.ok {
+                        if let Some(ref mut picker) = forkPicker {
+                            picker.switchFailed(ack.message);
+                        }
+                    } else if !ack.message.is_empty() {
+                        agentPanel.pushCommandResult(&ack.message);
+                    }
+                }
+                DeckUpdate::ResumeResult(ack) => {
+                    if ack.ok {
+                        sessionPicker = None;
+                        agentPanel.entries.push(
+                            crate::agent_panel::PanelEntry::SessionNotice(ack.message),
+                        );
+                    } else if let Some(ref mut picker) = sessionPicker {
+                        picker.resumeFailed(ack.message);
+                    } else {
+                        agentPanel.pushError(&ack.message);
+                    }
                 }
             }
         }
@@ -1129,21 +1178,21 @@ async fn runLoop(
             agentPanel,
             selState,
             scrollLock,
-            permitTx,
             userInputTx,
-            commandTx,
+            requestTx,
+            deckUpdateTx,
             cancelTx,
             steerTx,
             &mut sessionPicker,
             &mut rewindPicker,
             &mut forkPicker,
             &mut pendingRewindMessage,
-        &mut pendingRewindAttachments,
+            &mut pendingRewindAttachments,
             &mut mcpPanel,
             &mut lspPanel,
             &mut subagentPanel,
             &mut permissionsPanel,
-            &mut subagentPermitTx,
+            &mut pendingPermitReply,
             &projectDir,
             &mut lastQuitPress,
             &mut helpPopupOpen,
@@ -1174,9 +1223,9 @@ async fn handleInput(
     agentPanel: &mut AgentPanel,
     selState: &mut SelectionState,
     scrollLock: &mut ScrollAxisLock,
-    permitTx: &mpsc::Sender<construct::permissions::PermitResponse>,
     userInputTx: &mpsc::Sender<construct::session::UserInput>,
-    commandTx: &mpsc::Sender<CommandAction>,
+    requestTx: &mpsc::Sender<TuiRequest>,
+    deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
     sessionPicker: &mut Option<SessionPicker>,
@@ -1188,7 +1237,7 @@ async fn handleInput(
     lspPanel: &mut Option<LspPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
-    subagentPermitTx: &mut Option<mpsc::Sender<construct::permissions::PermitResponse>>,
+    pendingPermitReply: &mut Option<oneshot::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
     helpPopupOpen: &mut bool,
@@ -1267,25 +1316,41 @@ async fn handleInput(
                         KeyCode::Char('r') => {
                             agentPanel.errorHint = false;
                             let _ = cancelTx.send(false);
-                            let _ = commandTx.send(CommandAction::RetryLastTurn).await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                |reply| TuiRequest::RetryLastTurn { reply },
+                            );
                             break;
                         }
                         KeyCode::Char(' ') => {
                             agentPanel.errorHint = false;
                             let _ = cancelTx.send(false);
-                            let _ = commandTx.send(CommandAction::ContinueLastTurn).await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                |reply| TuiRequest::ContinueLastTurn { reply },
+                            );
                             break;
                         }
                         _ => {}
                     }
                 }
 
-                // Subagent panel overlay intercepts ALL keys when active (including Esc, Tab).
+                // Subagent panel overlay. Navigation keys (Tab, scroll, close)
+                // are always consumed. During a subagent permit, action keys
+                // (y/n/A/D, Shift+arrows, custom-pattern chars) fall through
+                // to the permit dispatcher below.
                 if let Some(ref mut panel) = *subagentPanel {
-                    if panel.handleKey(key) {
+                    let consumed = panel.consumedKey(&key, agentPanel);
+                    let shouldClose = panel.handleKey(key, agentPanel);
+                    if shouldClose {
                         *subagentPanel = None;
+                        break;
                     }
-                    break;
+                    if consumed {
+                        break;
+                    }
                 }
 
                 // Cancel running turn with Escape — immediate visual feedback.
@@ -1327,13 +1392,13 @@ async fn handleInput(
                 if agentPanel.pendingPermit {
                     use construct::permissions::PermitResponse;
 
-                    // Helper: send response to subagent escalation or parent permit channel.
+                    // Resolve the oneshot reply stashed when SessionRequest::Permit arrived.
+                    // Same path for top-level and subagent permits — the origin is folded
+                    // into the request variant before it reaches the TUI.
                     macro_rules! sendPermit {
                         ($resp:expr) => {
-                            if let Some(tx) = subagentPermitTx.take() {
-                                let _ = tx.send($resp).await;
-                            } else {
-                                let _ = permitTx.send($resp).await;
+                            if let Some(tx) = pendingPermitReply.take() {
+                                let _ = tx.send($resp);
                             }
                         };
                     }
@@ -1374,14 +1439,12 @@ async fn handleInput(
                             agentPanel.customPatternBackspace();
                         }
                         KeyCode::Char('v') | KeyCode::Char('V') => {
-                            // Open subagent panel if a subagent is active.
-                            if let Some(ref sub) = agentPanel.activeSubagent {
-                                let mut panel = crate::subagent_panel::SubagentPanel::new(
-                                    &sub.agentType,
+                            // Open the subagent panel — Live mode reads
+                            // transcript + shell from agentPanel.activeSubagent.
+                            if agentPanel.activeSubagent.is_some() {
+                                *subagentPanel = Some(
+                                    crate::subagent_panel::SubagentPanel::live(),
                                 );
-                                panel.transcript = sub.transcript.clone();
-                                panel.shellScrollback = sub.shellScrollback.clone();
-                                *subagentPanel = Some(panel);
                             }
                         }
                         _ => {}
@@ -1396,11 +1459,18 @@ async fn handleInput(
                             *sessionPicker = None;
                         }
                         PickerAction::Select(id) => {
-                            // Picker stays open — closed on ResumeComplete event.
-                            let action = CommandAction::Resume {
-                                sessionId: Some(id),
-                            };
-                            let _ = commandTx.send(action).await;
+                            // Picker stays open — closed on ResumeResult reply.
+                            let requestTxC = requestTx.clone();
+                            let deckTx = deckUpdateTx.clone();
+                            tokio::spawn(async move {
+                                let (rTx, rRx) = oneshot::channel();
+                                let _ = requestTxC
+                                    .send(TuiRequest::ResumeSession { sessionId: id, reply: rTx })
+                                    .await;
+                                if let Ok(ack) = rRx.await {
+                                    let _ = deckTx.send(DeckUpdate::ResumeResult(ack)).await;
+                                }
+                            });
                         }
                         PickerAction::None => {}
                     }
@@ -1416,14 +1486,20 @@ async fn handleInput(
                         RewindAction::Rewind { target, userMessage, attachments } => {
                             *pendingRewindMessage = Some(userMessage);
                             *pendingRewindAttachments = attachments;
-                            let action = CommandAction::Rewind { target };
-                            let _ = commandTx.send(action).await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::Rewind { target, saveFork: false, reply },
+                            );
                         }
                         RewindAction::ForkAndRewind { target, userMessage, attachments } => {
                             *pendingRewindMessage = Some(userMessage);
                             *pendingRewindAttachments = attachments;
-                            let action = CommandAction::ForkAndRewind { target };
-                            let _ = commandTx.send(action).await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::Rewind { target, saveFork: true, reply },
+                            );
                         }
                         RewindAction::None => {}
                     }
@@ -1437,8 +1513,11 @@ async fn handleInput(
                             *forkPicker = None;
                         }
                         ForkAction::Switch(id) => {
-                            let action = CommandAction::Forks { forkId: Some(id) };
-                            let _ = commandTx.send(action).await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SwitchFork { forkId: id, reply },
+                            );
                         }
                         ForkAction::None => {}
                     }
@@ -1485,9 +1564,11 @@ async fn handleInput(
                         }
                         PermPanelAction::Save { defaultMode, rules } => {
                             *permissionsPanel = None;
-                            let _ = commandTx
-                                .send(CommandAction::SavePermissions { defaultMode, rules })
-                                .await;
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SavePermissions { defaultMode, rules, reply },
+                            );
                         }
                         PermPanelAction::None => {}
                     }
@@ -1603,8 +1684,11 @@ async fn handleInput(
                                                     *sessionPicker = Some(SessionPicker::new(projectDir));
                                                 }
                                                 crate::command::CommandOutput::Action(action) => {
-                                                    let constructAction = convertAction(action);
-                                                    let _ = commandTx.send(constructAction).await;
+                                                    dispatchSlashCommand(
+                                                        action,
+                                                        requestTx.clone(),
+                                                        deckUpdateTx.clone(),
+                                                    );
                                                 }
                                             }
                                         } else if agentPanel.isActive() {
@@ -1694,18 +1778,20 @@ async fn handleInput(
                 }
             }
             Event::Mouse(mouse) => {
-                // Subagent overlay handles scroll events.
+                // Subagent overlay: route ALL mouse events here when open.
+                // Click-outside closes the popup; click-inside on the permit
+                // overlay falls through to the main mouse handler so the
+                // existing permit click logic (copy button etc.) still works.
                 if let Some(ref mut panel) = *subagentPanel {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            panel.scrollUp();
+                    use crate::subagent_panel::SubagentMouseAction;
+                    match panel.handleMouse(mouse, agentPanel) {
+                        SubagentMouseAction::Handled => {
                             hadInput = true;
                         }
-                        MouseEventKind::ScrollDown => {
-                            panel.scrollDown();
+                        SubagentMouseAction::ClickOutside => {
+                            *subagentPanel = None;
                             hadInput = true;
                         }
-                        _ => {}
                     }
                     break;
                 }
@@ -1719,6 +1805,15 @@ async fn handleInput(
             }
             Event::Paste(text) => {
                 hadInput = true;
+                // Popup overlay swallows paste — main panel input is covered.
+                if subagentPanel.is_some() {
+                    if agentPanel.pendingPermit && agentPanel.isEditingCustom() {
+                        for ch in text.chars() {
+                            agentPanel.customPatternInsert(ch);
+                        }
+                    }
+                    break;
+                }
                 match *focus {
                     Focus::Agent if !agentPanel.pendingPermit => {
                         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1853,14 +1948,9 @@ fn handleMouse(
                 if panel == PanelId::Agent
                     && agentPanel.isSubagentHeaderLine(gridLine)
                 {
-                    if let Some(ref sub) = agentPanel.activeSubagent {
-                        // Live subagent — use cached transcript.
-                        let mut panel = crate::subagent_panel::SubagentPanel::new(
-                            &sub.agentType,
-                        );
-                        panel.transcript = sub.transcript.clone();
-                        panel.shellScrollback = sub.shellScrollback.clone();
-                        *subagentPanel = Some(panel);
+                    if agentPanel.activeSubagent.is_some() {
+                        // Live subagent — popup reads from agentPanel each frame.
+                        *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                         return true;
                     } else if let Some((agentType, sid)) = agentPanel.lastSubagentSession() {
                         // Resumed session — load child transcript on demand.
@@ -1868,12 +1958,16 @@ fn handleMouse(
                         let sid = sid.to_string();
                         if let Ok(transcript) = construct::transcript::Transcript::open(&sid) {
                             if let Ok(turns) = transcript.loadAll() {
-                                let mut panel = crate::subagent_panel::SubagentPanel::new(
-                                    &agentType,
+                                // Build a temporary AgentPanel to replay the
+                                // child transcript into PanelEntries.
+                                let mut tmp = crate::agent_panel::AgentPanel::new();
+                                replayTranscript(&mut tmp, &turns);
+                                let entries = tmp.entries;
+                                *subagentPanel = Some(
+                                    crate::subagent_panel::SubagentPanel::frozen(
+                                        &agentType, entries,
+                                    ),
                                 );
-                                replayTranscript(&mut panel.transcriptPanel, &turns);
-                                panel.transcript = panel.transcriptPanel.entries.clone();
-                                *subagentPanel = Some(panel);
                                 return true;
                             }
                         }
@@ -2443,19 +2537,135 @@ fn loadChildToolLines(sessionId: &str) -> (Vec<(String, String)>, usize) {
     (toolLines, turnCount)
 }
 
-fn convertAction(action: crate::command::CommandAction) -> CommandAction {
-    match action {
-        crate::command::CommandAction::ShowContext => CommandAction::ShowContext,
-        crate::command::CommandAction::Undo => CommandAction::Undo,
-        crate::command::CommandAction::Rewind { target } => CommandAction::Rewind { target },
-        crate::command::CommandAction::Forks { forkId } => CommandAction::Forks { forkId },
-        crate::command::CommandAction::Resume { sessionId } => {
-            CommandAction::Resume { sessionId }
+/// Send a TuiRequest whose reply is a `CommandAck`, and forward the ack
+/// onto the deck update channel.
+fn spawnAckRequest<F>(
+    requestTx: mpsc::Sender<TuiRequest>,
+    deckUpdateTx: mpsc::Sender<DeckUpdate>,
+    build: F,
+)
+where
+    F: FnOnce(oneshot::Sender<construct::control::CommandAck>) -> TuiRequest + Send + 'static,
+{
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let req = build(rTx);
+        let _ = requestTx.send(req).await;
+        if let Ok(ack) = rRx.await {
+            let _ = deckUpdateTx.send(DeckUpdate::CommandAck(ack)).await;
         }
-        crate::command::CommandAction::Clear => CommandAction::Clear,
-        crate::command::CommandAction::Mcp => CommandAction::Mcp,
-        crate::command::CommandAction::Lsp => CommandAction::Lsp,
-        crate::command::CommandAction::Permissions => CommandAction::Permissions,
-        crate::command::CommandAction::ShowCost => CommandAction::ShowCost,
+    });
+}
+
+/// Dispatch a parsed slash-command action. Each variant constructs a
+/// `TuiRequest` with an appropriate oneshot reply channel and spawns a
+/// task to forward the reply to the deck update channel.
+fn dispatchSlashCommand(
+    action: crate::command::CommandAction,
+    requestTx: mpsc::Sender<TuiRequest>,
+    deckUpdateTx: mpsc::Sender<DeckUpdate>,
+) {
+    match action {
+        crate::command::CommandAction::ShowContext => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ShowContext { reply: rTx }).await;
+                if let Ok(state) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ContextDisplay(state)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Undo => {
+            spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::Undo { reply });
+        }
+        crate::command::CommandAction::Rewind { target: _ } => {
+            // /rewind opens the picker. Fetch options first.
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx
+                    .send(TuiRequest::GetRewindOptions { reply: rTx })
+                    .await;
+                if let Ok(turns) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::RewindOptions(turns)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Forks { forkId: None } => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::GetForks { reply: rTx }).await;
+                if let Ok(forks) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::Forks(forks)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Forks { forkId: Some(id) } => {
+            spawnAckRequest(requestTx, deckUpdateTx, move |reply| {
+                TuiRequest::SwitchFork { forkId: id, reply }
+            });
+        }
+        crate::command::CommandAction::Resume { sessionId: Some(id) } => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx
+                    .send(TuiRequest::ResumeSession { sessionId: id, reply: rTx })
+                    .await;
+                if let Ok(ack) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ResumeResult(ack)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Resume { sessionId: None } => {
+            // Opening the interactive picker is handled inline; this branch
+            // is unreachable but handled defensively with a list fallback.
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ListSessions { reply: rTx }).await;
+                if let Ok(text) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Clear => {
+            spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::Clear { reply });
+        }
+        crate::command::CommandAction::Mcp => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::GetMcp { reply: rTx }).await;
+                if let Ok(status) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::McpStatus(status)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Lsp => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::GetLsp { reply: rTx }).await;
+                if let Ok(status) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::LspStatus(status)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::Permissions => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx
+                    .send(TuiRequest::GetPermissions { reply: rTx })
+                    .await;
+                if let Ok(status) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::PermissionsStatus(status)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::ShowCost => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ShowCost { reply: rTx }).await;
+                if let Ok(text) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
+                }
+            });
+        }
     }
 }

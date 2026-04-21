@@ -70,12 +70,28 @@ pub enum PanelEntry {
 
 /// Tracked state for a running subagent (for the overlay panel).
 pub struct ActiveSubagent {
+    /// Child session id — used for matching incoming subagent permits.
+    #[allow(dead_code)]
+    pub sessionId: String,
     pub agentType: String,
     pub startTime: Instant,
     /// Structured transcript entries for the overlay panel.
     pub transcript: Vec<PanelEntry>,
-    /// Raw PTY output bytes for the shell tab.
-    pub shellScrollback: Vec<u8>,
+    /// VT-emulated shell state. Bytes flow in via `feedSubagentShell`.
+    /// Sized to match the construct PTY (120x40, see session.rs spawnShell).
+    pub shellTerm: crate::terminal::TerminalState,
+}
+
+impl ActiveSubagent {
+    pub fn new(sessionId: &str, agentType: &str) -> Self {
+        Self {
+            sessionId: sessionId.into(),
+            agentType: agentType.into(),
+            startTime: Instant::now(),
+            transcript: Vec::new(),
+            shellTerm: crate::terminal::TerminalState::new(120, 40),
+        }
+    }
 }
 
 /// Slash command completion state.
@@ -144,6 +160,15 @@ pub struct AgentPanel {
     pub textArea: TextArea,
     pub history: History,
     pub pendingPermit: bool,
+    /// Origin of the currently-pending permit (Top vs Subagent). Drives popup
+    /// routing — subagent permits render inside the popup, parent permits
+    /// auto-close the popup.
+    pub pendingPermitOrigin: Option<construct::control::PermitOrigin>,
+    /// When true, `renderInput` renders the regular text area instead of the
+    /// permit prompt even if one is pending. The subagent popup sets this
+    /// while it's displaying the permit, so the main panel doesn't render
+    /// a duplicate prompt that would scroll/copy in lockstep.
+    pub permitDisplaySuppressed: bool,
     pendingToolName: String,
     /// Human-readable summary of the tool call (key arg + description).
     pendingToolSummary: String,
@@ -236,6 +261,8 @@ impl AgentPanel {
             textArea: TextArea::new(),
             history: History::new(),
             pendingPermit: false,
+            pendingPermitOrigin: None,
+            permitDisplaySuppressed: false,
             pendingToolName: String::new(),
             pendingToolSummary: String::new(),
             pendingToolExplanation: None,
@@ -289,6 +316,7 @@ impl AgentPanel {
         self.turnActive = false;
         self.errorHint = false;
         self.pendingPermit = false;
+        self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
         self.thinkingStartTime = None;
         self.thinkingExpanded = false;
@@ -485,6 +513,7 @@ impl AgentPanel {
         self.retryStatus = None;
         self.activeSubagent = None;
         self.pendingPermit = false;
+        self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
         self.queuedMessages.clear();
         self.textArea.placeholder = "Type a message...";
@@ -508,6 +537,7 @@ impl AgentPanel {
         diff: Option<String>,
         explanation: Option<String>,
         impact: construct::tool::ShellImpact,
+        origin: construct::control::PermitOrigin,
     ) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
@@ -522,6 +552,7 @@ impl AgentPanel {
         self.entries
             .push(PanelEntry::ToolRequest { summary: summary.into(), diff, command });
         self.pendingPermit = true;
+        self.pendingPermitOrigin = Some(origin);
         self.pendingToolName = name.into();
         self.pendingToolSummary = summary.into();
         self.pendingToolExplanation = explanation;
@@ -544,6 +575,7 @@ impl AgentPanel {
 
     pub fn approvePending(&mut self) {
         self.pendingPermit = false;
+        self.pendingPermitOrigin = None;
         let name = std::mem::take(&mut self.pendingToolName);
         self.permitPatterns.clear();
         self.permitEditingCustom = false;
@@ -554,11 +586,32 @@ impl AgentPanel {
     }
 
     pub fn denyPending(&mut self) {
+        // Clear the permit-prompt UI state only. The ToolDenied entry is
+        // pushed by the event-handler path (`toolDenied`) which is the
+        // single source of truth — covers both user-keypress denial and
+        // `PermitMode::Deny` auto-denial.
         self.pendingPermit = false;
-        let name = std::mem::take(&mut self.pendingToolName);
+        self.pendingPermitOrigin = None;
+        self.pendingToolName.clear();
         self.permitPatterns.clear();
         self.permitEditingCustom = false;
-        self.entries.push(PanelEntry::ToolDenied { name });
+    }
+
+    /// Whether the currently-pending permit was requested by a subagent
+    /// (vs the top-level session). Returns false when no permit is pending.
+    pub fn pendingPermitIsSubagent(&self) -> bool {
+        matches!(
+            self.pendingPermitOrigin,
+            Some(construct::control::PermitOrigin::Subagent { .. })
+        )
+    }
+
+    /// Feed PTY bytes from the running subagent's shell into its VT emulator.
+    /// No-op if no subagent is active.
+    pub fn feedSubagentShell(&mut self, data: &[u8]) {
+        if let Some(ref mut sub) = self.activeSubagent {
+            sub.shellTerm.process(data);
+        }
     }
 
     /// Get the currently selected "always allow" pattern.
@@ -643,12 +696,7 @@ impl AgentPanel {
         if let Some(PanelEntry::ToolRequest { .. }) = self.entries.last() {
             self.entries.pop();
         }
-        self.activeSubagent = Some(ActiveSubagent {
-            agentType: agentType.into(),
-            startTime: Instant::now(),
-            transcript: Vec::new(),
-            shellScrollback: Vec::new(),
-        });
+        self.activeSubagent = Some(ActiveSubagent::new(sessionId, agentType));
         self.entries.push(PanelEntry::SubagentBlock {
             agentType: agentType.into(),
             prompt: prompt.into(),
@@ -1313,6 +1361,13 @@ impl AgentPanel {
         result
     }
 
+    /// True when the permit prompt should render (pending and not suppressed
+    /// by the popup overlay). Used in render paths only — does not affect
+    /// state or key dispatch.
+    fn permitVisible(&self) -> bool {
+        self.pendingPermit && !self.permitDisplaySuppressed
+    }
+
     /// Render the panel. Returns the chat content area Rect.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, focused: bool) -> Rect {
         let borderStyle = if focused {
@@ -1335,7 +1390,7 @@ impl AgentPanel {
 
         // Dynamic input height based on content.
         // Width accounts for: 2 right padding + 2 prompt prefix.
-        let inputHeight = if self.pendingPermit {
+        let inputHeight = if self.permitVisible() {
             // code block (top border + content, no bottom) + header + explanation + blank + 2 keys + blank + patterns + custom.
             let hasCmd = self.pendingCommand().is_some();
             let codeBlockLines: u16 = if hasCmd { 2 } else { 0 };
@@ -1388,7 +1443,7 @@ impl AgentPanel {
 
         // Separator. Non-shell permit: header in separator slot. Shell permit: hidden
         // (header is in input area after the code block). Normal: plain separator.
-        if self.pendingPermit && self.pendingCommand().is_none() {
+        if self.permitVisible() && self.pendingCommand().is_none() {
             let mut headerLines: Vec<Line> = Vec::new();
             self.renderPermitHeaderInline(separatorArea.width, &mut headerLines);
             if let Some(line) = headerLines.into_iter().next() {
@@ -1404,7 +1459,7 @@ impl AgentPanel {
             Paragraph::new(padded)
                 .style(Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD))
                 .render(separatorArea, buf);
-        } else if !self.pendingPermit {
+        } else if !self.permitVisible() {
             let sep = "\u{2500}".repeat(separatorArea.width as usize);
             Paragraph::new(sep)
                 .style(Style::default().fg(Color::DarkGray))
@@ -1416,7 +1471,7 @@ impl AgentPanel {
             self.renderQueueZone(queueRect, buf);
         }
 
-        let inputRightPad: u16 = if self.pendingPermit { 1 } else { 2 };
+        let inputRightPad: u16 = if self.permitVisible() { 1 } else { 2 };
         let paddedInput = Rect {
             x: inputArea.x,
             y: inputArea.y,
@@ -1515,7 +1570,115 @@ impl AgentPanel {
             .render(padded, buf);
     }
 
+    /// Render just the permit prompt UI (header + code block + key grid +
+    /// pattern selector) into a single rect. Used by the subagent overlay
+    /// to inline-render subagent permit prompts.
+    ///
+    /// No-op when no permit is pending.
+    pub fn renderPermitInline(&mut self, area: Rect, buf: &mut Buffer) {
+        if !self.pendingPermit || area.width < 8 || area.height < 4 {
+            return;
+        }
+        let mut lines: Vec<Line> = Vec::new();
 
+        // Optional code block preview (shell commands only).
+        if let Some(cmd) = self.pendingCommand() {
+            let codeLines = vec![vec![Span::raw(cmd.clone())]];
+            let codeWidth = area.width.saturating_sub(1);
+            let mcw = crate::markdown::highlight::maxContentWidth(&codeLines);
+            let innerWidth = codeWidth.saturating_sub(2) as usize;
+            let maxScroll = mcw.saturating_sub(innerWidth) as u16;
+            if self.permitCodeScrollX > maxScroll {
+                self.permitCodeScrollX = maxScroll;
+            }
+            let mut codeBlock = crate::markdown::highlight::renderCodeBlock(
+                &codeLines,
+                Some("sh"),
+                codeWidth,
+                self.permitCodeScrollX,
+                mcw,
+                self.copiedFlash
+                    .as_ref()
+                    .is_some_and(|(bid, t)| bid.0 == usize::MAX && t.elapsed().as_secs() < 2),
+                None,
+                None,
+            );
+            // Drop bottom border so the header line below replaces it.
+            if codeBlock.len() > 1 {
+                codeBlock.pop();
+            }
+            for codeLine in codeBlock {
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(codeLine.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+
+        // Header line (tool name, impact, timeout).
+        self.renderPermitHeaderInline(area.width, &mut lines);
+
+        // Optional explanation, wrapped.
+        if let Some(ref explanation) = self.pendingToolExplanation {
+            let style = Style::default().fg(Color::DarkGray);
+            let maxW = area.width.saturating_sub(4) as usize;
+            let spanLine = Line::from(Span::styled(explanation.clone(), style));
+            let wrapped = wrapSpannedLine(spanLine, maxW);
+            for wLine in wrapped {
+                let mut spans = vec![Span::styled("  ", style)];
+                spans.extend(wLine.spans);
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+        }
+
+        // 2x2 key grid: allow/deny on rows, once/always on columns.
+        lines.push(Line::from(vec![
+            Span::styled("  [y]", Style::default().fg(Color::Green)),
+            Span::styled(" allow  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[A]", Style::default().fg(Color::Rgb(80, 80, 120))),
+            Span::styled(" always allow", Style::default().fg(Color::Rgb(80, 80, 80))),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  [n]", Style::default().fg(Color::Red)),
+            Span::styled(" deny   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[D]", Style::default().fg(Color::Rgb(120, 80, 80))),
+            Span::styled(" always deny", Style::default().fg(Color::Rgb(80, 80, 80))),
+        ]));
+
+        lines.push(Line::from(""));
+
+        // Pattern choices (scope for [A]/[D]).
+        for (i, pattern) in self.permitPatterns.iter().enumerate() {
+            let selected = i == self.permitSelectedPattern && !self.permitEditingCustom;
+            let marker = if selected { " \u{25b8}" } else { "  " };
+            let style = if selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(pattern.clone(), style),
+            ]));
+        }
+
+        // Custom pattern field.
+        let customSelected = self.permitSelectedPattern >= self.permitPatterns.len();
+        let customMarker = if customSelected { " \u{25b8}" } else { "  " };
+        let customStyle = if customSelected {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let cursor = if customSelected { "\u{2502}" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(customMarker, customStyle),
+            Span::styled("custom: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}{cursor}", self.permitCustomPattern), customStyle),
+        ]));
+
+        Paragraph::new(lines).render(area, buf);
+    }
 
     /// Build the permission header line into a Vec<Line> (for renderInput).
     fn renderPermitHeaderInline(&self, w: u16, lines: &mut Vec<Line<'static>>) {
@@ -1620,7 +1783,7 @@ impl AgentPanel {
     }
 
     fn renderInput(&mut self, area: Rect, buf: &mut Buffer, focused: bool) {
-        if self.pendingPermit {
+        if self.permitVisible() {
             let mut lines: Vec<Line> = Vec::new();
 
             // Code block: render command preview — just the content lines with │ borders,

@@ -18,12 +18,28 @@ use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
+use crate::control::{LogEvent, SessionRequest};
 use crate::permissions::Permissions;
 use crate::prompt::{DomainModule, InterfaceMode};
-use crate::session::{Session, SessionEvent};
+use crate::session::Session;
 use crate::shell;
 
 use crate::tool::ToolSet;
+
+/// Spawn a task that auto-denies every permit request arriving on the given
+/// channel. Used by headless runners with no human in the loop — tools that
+/// hit `NeedsApproval` under the configured permissions are rejected.
+fn spawnPermitAutoDeny(mut rx: mpsc::Receiver<SessionRequest>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            match req {
+                SessionRequest::Permit { reply, .. } => {
+                    let _ = reply.send(crate::permissions::PermitResponse::Deny);
+                }
+            }
+        }
+    })
+}
 
 /// Which tier a subagent runs on. Drives which profile its session uses in
 /// `executeTask` — the tier's `ModelConfig` gets swapped into the child's
@@ -211,7 +227,7 @@ pub async fn runStreaming(
     config: &Config,
     prompt: &str,
     runConfig: &RunConfig,
-) -> Result<(tokio::task::JoinHandle<Result<RunResult>>, mpsc::Receiver<SessionEvent>)> {
+) -> Result<(tokio::task::JoinHandle<Result<RunResult>>, mpsc::Receiver<LogEvent>)> {
     let (agentShell, shellIo) = shell::spawnShell(120, 40)?;
 
     // Drain PTY output in the background.
@@ -246,10 +262,13 @@ pub async fn runStreaming(
     let _maxTurns = runConfig.maxTurns;
     let input = crate::session::UserInput::from(prompt.to_string());
 
-    let (eventTx, eventRx) = mpsc::channel::<SessionEvent>(256);
-    let (_, mut permitRx) = mpsc::channel::<crate::permissions::PermitResponse>(1);
+    let (logTx, logRx) = mpsc::channel::<LogEvent>(256);
+    let (sessionRequestTx, sessionRequestRx) = mpsc::channel::<SessionRequest>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
     let mut cancelRx = cancelRx;
+
+    // Headless: auto-deny any permit request.
+    let _permitAutoDeny = spawnPermitAutoDeny(sessionRequestRx);
 
     let handle = tokio::spawn(async move {
         // Keep the sender alive so cancelRx.changed() doesn't resolve immediately.
@@ -259,11 +278,17 @@ pub async fn runStreaming(
         let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
 
         let sendResult = session
-            .send(&input, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx)
+            .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx)
             .await;
 
-        // Drop eventTx so the receiver knows we're done.
-        drop(eventTx);
+        // Shut down background LSP/MCP cleanly so their senders drop before
+        // the tokio runtime unwinds.
+        session.shutdownLsp().await;
+        session.shutdownMcp().await;
+
+        // Drop senders so the receivers know we're done.
+        drop(logTx);
+        drop(sessionRequestTx);
 
         sendResult?;
 
@@ -275,7 +300,7 @@ pub async fn runStreaming(
         })
     });
 
-    Ok((handle, eventRx))
+    Ok((handle, logRx))
 }
 
 /// Run the turn loop on an existing session.
@@ -295,32 +320,35 @@ pub fn runSession<'a>(
     _maxTurns: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RunResult>> + Send + 'a>> {
     Box::pin(async move {
-    let (eventTx, mut eventRx) = mpsc::channel::<SessionEvent>(256);
-    let (_, mut permitRx) = mpsc::channel::<crate::permissions::PermitResponse>(1);
+    let (logTx, mut logRx) = mpsc::channel::<LogEvent>(256);
+    let (sessionRequestTx, sessionRequestRx) = mpsc::channel::<SessionRequest>(16);
     let (_cancelTx, cancelRx) = watch::channel(false);
     let mut cancelRx = cancelRx;
 
     let sessionId = session.sessionId().to_string();
 
-    // Spawn event drain in background. session.send() emits events as it runs,
+    // Headless: auto-deny any permit request.
+    let _permitAutoDeny = spawnPermitAutoDeny(sessionRequestRx);
+
+    // Spawn log drain in background. session.send() emits events as it runs,
     // so we need to consume them concurrently to avoid blocking on a full channel.
     let drainHandle = tokio::spawn(async move {
         let mut content = String::new();
         let mut turns: usize = 0;
-        while let Some(event) = eventRx.recv().await {
+        while let Some(event) = logRx.recv().await {
             match event {
-                SessionEvent::ContentDelta(text) => content.push_str(&text),
-                SessionEvent::TurnComplete => turns += 1,
-                SessionEvent::ToolStarted { name, summary } => {
+                LogEvent::ContentDelta(text) => content.push_str(&text),
+                LogEvent::TurnComplete => turns += 1,
+                LogEvent::ToolStarted { name, summary } => {
                     tracing::info!(tool = %name, summary = %summary, "tool started");
                 }
-                SessionEvent::ToolAutoApproved { name, summary } => {
+                LogEvent::ToolAutoApproved { name, summary } => {
                     tracing::info!(tool = %name, summary = %summary, "tool auto-approved");
                 }
-                SessionEvent::ToolResult { name, .. } => {
+                LogEvent::ToolResult { name, .. } => {
                     tracing::debug!(tool = %name, "tool result received");
                 }
-                SessionEvent::Error(msg) => tracing::error!("session error: {msg}"),
+                LogEvent::Error(msg) => tracing::error!("session error: {msg}"),
                 _ => {}
             }
         }
@@ -333,11 +361,18 @@ pub fn runSession<'a>(
     let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
 
     let sendResult = session
-        .send(&input, &eventTx, &mut permitRx, &mut cancelRx, &mut steerRx)
+        .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx)
         .await;
 
-    // Drop the sender so the drain task exits.
-    drop(eventTx);
+    // Shut down background LSP/MCP cleanly so their senders drop before
+    // the tokio runtime unwinds (async-lsp panics if servers outlive the
+    // runtime shutdown).
+    session.shutdownLsp().await;
+    session.shutdownMcp().await;
+
+    // Drop senders so drain tasks exit.
+    drop(logTx);
+    drop(sessionRequestTx);
 
     let (content, turns) = drainHandle.await?;
 
