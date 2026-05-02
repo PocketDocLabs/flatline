@@ -36,6 +36,20 @@ pub enum LogEvent {
     /// Streaming reasoning/thinking content.
     ReasoningDelta(String),
 
+    /// A tool call is being assembled in the stream — its name just became
+    /// known. Fires once per call index the first time a name is seen.
+    ToolCallPending { index: usize, name: String },
+
+    /// A tool call's arguments are accumulating. `bytes` is the running total
+    /// of JSON arg bytes received for this index.
+    ToolCallProgress { index: usize, bytes: usize },
+
+    /// A tool call's preview string just changed — a key argument value has
+    /// finished streaming and the short human-readable summary has been
+    /// recomputed (e.g. `crates/deck/src/app.rs`). Re-emitted when a later
+    /// field refines the preview.
+    ToolCallPreview { index: usize, preview: String },
+
     /// A tool was auto-approved by the permission config.
     ToolAutoApproved { name: String, summary: String },
 
@@ -131,6 +145,16 @@ pub enum LogEvent {
 
     /// A transient API error is being retried silently.
     Retrying { attempt: u32, maxAttempts: u32 },
+
+    /// The model emitted a malformed `</scratchpad>` close (e.g. `</scratch>`,
+    /// `</scratchpa>`) that the streaming extractor missed; the trailing
+    /// content was retroactively re-classified as visible. Surfaced so the
+    /// user can verify the recovery split looks right.
+    ScratchpadRecovered {
+        matchedTag: String,
+        snippet: String,
+        recoveredChars: usize,
+    },
 
     /// An error occurred.
     Error(String),

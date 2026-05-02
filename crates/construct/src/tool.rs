@@ -203,6 +203,82 @@ pub fn builtinDefs() -> Vec<ToolDef> {
         ToolDef {
             defType: "function".into(),
             function: crate::message::FunctionDef {
+                name: "copyFile".into(),
+                description: "Copy a file or directory tree from source to destination. \
+                    Creates parent directories of dest as needed. Refuses to overwrite \
+                    an existing destination unless overwrite=true.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "src": {"type": "string", "description": "Source path."},
+                        "dest": {"type": "string", "description": "Destination path."},
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Allow overwriting an existing destination. Defaults to false."
+                        }
+                    },
+                    "required": ["src", "dest"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "moveFile".into(),
+                description: "Move or rename a file or directory. Creates parent \
+                    directories of dest as needed. Refuses to overwrite an existing \
+                    destination unless overwrite=true.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "src": {"type": "string", "description": "Source path."},
+                        "dest": {"type": "string", "description": "Destination path."},
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Allow overwriting an existing destination. Defaults to false."
+                        }
+                    },
+                    "required": ["src", "dest"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "deleteFile".into(),
+                description: "Delete a file or empty directory. For directory trees, \
+                    set recursive=true. This operation is destructive and not undoable.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to delete."},
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Recursively delete directory contents. Defaults to false."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "makeDirs".into(),
+                description: "Create a directory and any missing parents. \
+                    Succeeds silently if the directory already exists.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Directory to create."}
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
                 name: "shellHistory".into(),
                 description: "List recent shell commands with their index, exit code, \
                     and output size. Use readOutput to read a specific command's full output.".into(),
@@ -291,7 +367,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "glob".into(),
                 description: "Find files matching a glob pattern. Returns paths sorted \
-                    by modification time (newest first). Capped at 100 results.".into(),
+                    by modification time (newest first). Capped at 100 results. \
+                    Set metadata=true to append size and mtime per file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -302,6 +379,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         "path": {
                             "type": "string",
                             "description": "Directory to search in. Defaults to working directory."
+                        },
+                        "metadata": {
+                            "type": "boolean",
+                            "description": "Append size and mtime to each path. Defaults to false."
                         }
                     },
                     "required": ["pattern"]
@@ -313,8 +394,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "grep".into(),
                 description: "Search file contents for a regex pattern. \
-                    Three output modes: 'files' (file paths only), 'content' (matching \
-                    lines with context), 'count' (match counts per file).".into(),
+                    Uses ripgrep with Rust regex syntax: alternation is `|` \
+                    (not `\\|`), metachars `.+*?()[]{}|^$\\` need escaping. \
+                    Three output modes: 'files' (file paths only), 'content' \
+                    (matching lines with context), 'count' (match counts per file).".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -362,7 +445,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "listDir".into(),
                 description: "List directory contents as an indented tree. Shows directories \
                     first (with trailing /), then files. Excludes .git, node_modules, \
-                    target, __pycache__, .venv. Capped at 200 entries.".into(),
+                    target, __pycache__, .venv. Capped at 200 entries. \
+                    Set metadata=true to append size and mtime per file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -381,6 +465,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum entries to return. Defaults to 200."
+                        },
+                        "metadata": {
+                            "type": "boolean",
+                            "description": "Append size and mtime to each file entry. Defaults to false."
                         }
                     },
                     "required": ["path"]
@@ -763,17 +851,21 @@ pub enum ToolAction {
     WriteFile { path: String, content: String },
     EditFile { path: String, oldString: String, newString: String, replaceAll: bool },
     MultiEdit { path: String, edits: Vec<EditOp> },
+    CopyFile { src: String, dest: String, overwrite: bool },
+    MoveFile { src: String, dest: String, overwrite: bool },
+    DeleteFile { path: String, recursive: bool },
+    MakeDirs { path: String },
     ShellHistory,
     ReadOutput { index: usize, offset: Option<usize>, limit: Option<usize> },
     SearchOutput { index: usize, pattern: String, context: usize },
     ReadTerminal { lines: usize },
-    Glob { pattern: String, path: Option<String> },
+    Glob { pattern: String, path: Option<String>, metadata: bool },
     Grep {
         pattern: String, path: Option<String>, include: Option<String>,
         fileType: Option<String>, outputMode: String, caseSensitive: Option<bool>,
         contextLines: Option<usize>, multiline: bool,
     },
-    ListDir { path: String, depth: usize, offset: usize, limit: usize },
+    ListDir { path: String, depth: usize, offset: usize, limit: usize, metadata: bool },
     StructSearch { pattern: String, language: String, path: Option<String> },
     Diff {
         path: Option<String>, gitRef: Option<String>,
@@ -889,6 +981,22 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::MultiEdit { path, edits } => {
             format!("Multi-edit {path}: {} edits", edits.len())
         }
+        ToolAction::CopyFile { src, dest, overwrite } => {
+            let suffix = if *overwrite { " (overwrite)" } else { "" };
+            format!("Copy {src} \u{2192} {dest}{suffix}")
+        }
+        ToolAction::MoveFile { src, dest, overwrite } => {
+            let suffix = if *overwrite { " (overwrite)" } else { "" };
+            format!("Move {src} \u{2192} {dest}{suffix}")
+        }
+        ToolAction::DeleteFile { path, recursive } => {
+            if *recursive {
+                format!("Delete {path} (recursive)")
+            } else {
+                format!("Delete {path}")
+            }
+        }
+        ToolAction::MakeDirs { path } => format!("Create directory {path}"),
         ToolAction::ShellHistory => "List shell command history".into(),
         ToolAction::ReadOutput { index, offset, limit } => {
             match (offset, limit) {
@@ -901,19 +1009,21 @@ pub fn summarize(action: &ToolAction) -> String {
             format!("Search output #{index} for \"{pattern}\"")
         }
         ToolAction::ReadTerminal { lines } => format!("Read last {lines} terminal lines"),
-        ToolAction::Glob { pattern, path } => {
+        ToolAction::Glob { pattern, path, metadata } => {
             let dir = path.as_deref().unwrap_or(".");
-            format!("Find files: {pattern} in {dir}")
+            let suffix = if *metadata { " +meta" } else { "" };
+            format!("Find files: {pattern} in {dir}{suffix}")
         }
         ToolAction::Grep { pattern, path, outputMode, .. } => {
             let dir = path.as_deref().unwrap_or(".");
             format!("Search ({outputMode}): \"{pattern}\" in {dir}")
         }
-        ToolAction::ListDir { path, depth, offset, limit } => {
+        ToolAction::ListDir { path, depth, offset, limit, metadata } => {
+            let suffix = if *metadata { " +meta" } else { "" };
             if *offset > 0 {
-                format!("List: {path} (depth {depth}, offset {offset}, limit {limit})")
+                format!("List: {path} (depth {depth}, offset {offset}, limit {limit}){suffix}")
             } else {
-                format!("List: {path} (depth {depth})")
+                format!("List: {path} (depth {depth}){suffix}")
             }
         }
         ToolAction::StructSearch { pattern, language, .. } => {
@@ -1124,6 +1234,16 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
             executeEditFile(path, oldString, newString, *replaceAll).into()
         }
         ToolAction::MultiEdit { path, edits } => executeMultiEdit(path, edits).into(),
+        ToolAction::CopyFile { src, dest, overwrite } => {
+            executeCopyFile(src, dest, *overwrite).into()
+        }
+        ToolAction::MoveFile { src, dest, overwrite } => {
+            executeMoveFile(src, dest, *overwrite).into()
+        }
+        ToolAction::DeleteFile { path, recursive } => {
+            executeDeleteFile(path, *recursive).into()
+        }
+        ToolAction::MakeDirs { path } => executeMakeDirs(path).into(),
         ToolAction::ShellHistory => executeShellHistory(shell).into(),
         ToolAction::ReadOutput { index, offset, limit } => {
             executeReadOutput(shell, *index, *offset, *limit).into()
@@ -1132,7 +1252,7 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
             executeSearchOutput(shell, *index, pattern, *context).into()
         }
         ToolAction::ReadTerminal { lines } => shell.readTerminal(*lines).into(),
-        ToolAction::Glob { pattern, path } => executeGlob(pattern, path.as_deref()).await.into(),
+        ToolAction::Glob { pattern, path, metadata } => executeGlob(pattern, path.as_deref(), *metadata).await.into(),
         ToolAction::Grep {
             pattern, path, include, fileType, outputMode,
             caseSensitive, contextLines, multiline,
@@ -1142,8 +1262,8 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
                 outputMode, *caseSensitive, *contextLines, *multiline,
             ).await.into()
         }
-        ToolAction::ListDir { path, depth, offset, limit } => {
-            executeListDir(path, *depth, *offset, *limit).into()
+        ToolAction::ListDir { path, depth, offset, limit, metadata } => {
+            executeListDir(path, *depth, *offset, *limit, *metadata).into()
         }
         ToolAction::StructSearch { pattern, language, path } => {
             executeStructSearch(pattern, language, path.as_deref()).await.into()
@@ -1519,6 +1639,146 @@ fn executeMultiEdit(path: &str, edits: &[EditOp]) -> String {
     }
 }
 
+fn executeCopyFile(src: &str, dest: &str, overwrite: bool) -> String {
+    let srcPath = std::path::Path::new(src);
+    let destPath = std::path::Path::new(dest);
+    if !srcPath.exists() {
+        return format!("Source does not exist: {src}");
+    }
+    if destPath.exists() && !overwrite {
+        return format!(
+            "Destination already exists: {dest}. Set overwrite=true to replace."
+        );
+    }
+    if let Some(parent) = destPath.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return format!("Failed to create parent directories of {dest}: {e}");
+            }
+        }
+    }
+    if srcPath.is_dir() {
+        match copyDirRecursive(srcPath, destPath) {
+            Ok(()) => format!("Copied directory {src} \u{2192} {dest}."),
+            Err(e) => format!("Failed to copy directory: {e}"),
+        }
+    } else {
+        match std::fs::copy(srcPath, destPath) {
+            Ok(bytes) => format!("Copied {src} \u{2192} {dest} ({bytes} bytes)."),
+            Err(e) => format!("Failed to copy file: {e}"),
+        }
+    }
+}
+
+fn copyDirRecursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if kind.is_dir() {
+            copyDirRecursive(&from, &to)?;
+        } else if kind.is_symlink() {
+            // Reproduce symlinks by reading the target.
+            let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to)?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &to)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &to)?;
+                }
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String {
+    let srcPath = std::path::Path::new(src);
+    let destPath = std::path::Path::new(dest);
+    if !srcPath.exists() {
+        return format!("Source does not exist: {src}");
+    }
+    if destPath.exists() && !overwrite {
+        return format!(
+            "Destination already exists: {dest}. Set overwrite=true to replace."
+        );
+    }
+    if let Some(parent) = destPath.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return format!("Failed to create parent directories of {dest}: {e}");
+            }
+        }
+    }
+    // Try a rename first (cheap, atomic when on the same filesystem). Fall back
+    // to copy+delete on EXDEV (cross-device link) or other rename failures.
+    match std::fs::rename(srcPath, destPath) {
+        Ok(()) => format!("Moved {src} \u{2192} {dest}."),
+        Err(_) => {
+            let copyResult = if srcPath.is_dir() {
+                copyDirRecursive(srcPath, destPath)
+            } else {
+                std::fs::copy(srcPath, destPath).map(|_| ())
+            };
+            if let Err(e) = copyResult {
+                return format!("Failed to move (copy phase): {e}");
+            }
+            let removeResult = if srcPath.is_dir() {
+                std::fs::remove_dir_all(srcPath)
+            } else {
+                std::fs::remove_file(srcPath)
+            };
+            match removeResult {
+                Ok(()) => format!("Moved {src} \u{2192} {dest} (cross-device, copy+delete)."),
+                Err(e) => format!(
+                    "Copied {src} \u{2192} {dest} but failed to remove source: {e}"
+                ),
+            }
+        }
+    }
+}
+
+fn executeDeleteFile(path: &str, recursive: bool) -> String {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return format!("Path does not exist: {path}");
+    }
+    if p.is_dir() {
+        if recursive {
+            match std::fs::remove_dir_all(p) {
+                Ok(()) => format!("Deleted directory tree {path}."),
+                Err(e) => format!("Failed to delete directory: {e}"),
+            }
+        } else {
+            match std::fs::remove_dir(p) {
+                Ok(()) => format!("Deleted empty directory {path}."),
+                Err(e) => format!(
+                    "Failed to delete directory: {e}. Set recursive=true to delete contents."
+                ),
+            }
+        }
+    } else {
+        match std::fs::remove_file(p) {
+            Ok(()) => format!("Deleted {path}."),
+            Err(e) => format!("Failed to delete file: {e}"),
+        }
+    }
+}
+
+fn executeMakeDirs(path: &str) -> String {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => format!("Created directory {path}."),
+        Err(e) => format!("Failed to create directory: {e}"),
+    }
+}
+
 fn executeShellHistory(shell: &Shell) -> String {
     let entries = shell.listHistory();
     if entries.is_empty() {
@@ -1704,7 +1964,7 @@ async fn runSubprocess(
 
 // --- Search / structure / diff execute functions ---
 
-async fn executeGlob(pattern: &str, path: Option<&str>) -> String {
+async fn executeGlob(pattern: &str, path: Option<&str>, metadata: bool) -> String {
     let mut args = vec![
         "--files", "--sort", "modified", "--hidden",
         "--glob", pattern, "--glob", "!.git/",
@@ -1723,6 +1983,12 @@ async fn executeGlob(pattern: &str, path: Option<&str>) -> String {
             let mut output = String::new();
             for line in lines.iter().take(MAX_GLOB_RESULTS) {
                 output.push_str(line);
+                if metadata {
+                    if let Some(meta) = formatMetadata(std::path::Path::new(line)) {
+                        output.push_str("  ");
+                        output.push_str(&meta);
+                    }
+                }
                 output.push('\n');
             }
             if total > MAX_GLOB_RESULTS {
@@ -1740,42 +2006,21 @@ async fn executeGlob(pattern: &str, path: Option<&str>) -> String {
 /// Returns sorted (lineNumber, symbolSignature) pairs.
 fn getFileSymbols(path: &str) -> Vec<(usize, String)> {
     let lang = detectLanguage(path);
-    let patterns = outlinePatterns(&lang);
-
-    if patterns.is_empty() {
+    let Some(rule) = outlineRule(&lang) else {
         return Vec::new();
-    }
+    };
 
-    let mut entries: Vec<(usize, String)> = Vec::new();
-
-    for pattern in &patterns {
-        let output = std::process::Command::new("sg")
-            .args(["run", "-p", pattern, "-l", &lang, "--json=compact", path])
-            .output();
-
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-                    let lineNum = obj["range"]["start"]["line"]
-                        .as_u64()
-                        .map(|l| l + 1)
-                        .unwrap_or(0) as usize;
-                    let text = obj["text"].as_str().unwrap_or("");
-                    let firstLine = text.lines().next().unwrap_or("").trim().to_string();
-                    let display = if firstLine.len() > 80 {
-                        format!("{}...", &firstLine[..firstLine.floor_char_boundary(80)])
-                    } else {
-                        firstLine
-                    };
-                    if !display.is_empty() {
-                        entries.push((lineNum, display));
-                    }
-                }
-            }
+    let output = std::process::Command::new("sg")
+        .args(["scan", "--inline-rules", &rule, "--json=stream", path])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = parseSgEntries(&stdout);
+    for (_, sig) in entries.iter_mut() {
+        if sig.len() > 80 {
+            *sig = format!("{}...", &sig[..sig.floor_char_boundary(80)]);
         }
     }
-
     entries.sort_by_key(|(line, _)| *line);
     entries.dedup_by_key(|(line, _)| *line);
     entries
@@ -1869,6 +2114,18 @@ async fn executeGrep(
     contextLines: Option<usize>,
     multiline: bool,
 ) -> String {
+    // Pre-validate pattern syntax. ripgrep uses Rust's regex crate by default,
+    // so this catches the common "I forgot to escape something" cases with a
+    // clear error rather than a silent "No matches found".
+    if let Err(e) = regex::Regex::new(pattern) {
+        return format!(
+            "Invalid regex pattern: {pattern:?}\n\nParser error: {e}\n\n\
+             Hint: ripgrep uses Rust regex syntax. Escape regex metachars \
+             (.+*?()[]{{}}|^$\\) with backslashes. Watch for stray quotes \
+             from JSON escaping."
+        );
+    }
+
     let mut argStrings: Vec<String> = Vec::new();
 
     // Output mode flags.
@@ -1924,7 +2181,24 @@ async fn executeGrep(
     match runSubprocess("rg", &args, "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep").await {
         Ok(stdout) => {
             if stdout.trim().is_empty() {
-                return "No matches found.".into();
+                let scope = path.unwrap_or(".");
+                let mut msg = format!(
+                    "No matches for pattern {pattern:?} in {scope}."
+                );
+                // Surface common foot-guns when a pattern looks suspect.
+                if pattern.ends_with('"') || pattern.ends_with("\\\"") {
+                    msg.push_str(
+                        "\n\nNote: pattern ends with a quote. Likely a JSON \
+                         escaping artifact rather than intended literal.",
+                    );
+                }
+                if pattern.contains("\\|") && !pattern.contains("(?") {
+                    msg.push_str(
+                        "\n\nNote: `\\|` is a literal pipe in Rust regex. \
+                         For alternation use `|` (or wrap in `(a|b)`).",
+                    );
+                }
+                return msg;
             }
             let lines: Vec<&str> = stdout.lines().collect();
             let cap = match outputMode {
@@ -1956,7 +2230,7 @@ async fn executeGrep(
     }
 }
 
-fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize) -> String {
+fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize, metadata: bool) -> String {
     const EXCLUDED: &[&str] = &[".git", "node_modules", "target", "__pycache__", ".venv"];
 
     let rootPath = std::path::Path::new(path);
@@ -1968,7 +2242,7 @@ fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize) -> Stri
     let hardCap = MAX_LISTDIR_ENTRIES.max(offset + limit);
     let mut allEntries = Vec::new();
     let mut count = 0usize;
-    let truncated = listDirRecurse(rootPath, 0, depth, "", &mut allEntries, &mut count, EXCLUDED, hardCap);
+    let truncated = listDirRecurse(rootPath, 0, depth, "", &mut allEntries, &mut count, EXCLUDED, hardCap, metadata);
     let total = allEntries.len();
 
     if total == 0 {
@@ -1999,6 +2273,7 @@ fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize) -> Stri
 }
 
 /// Recursive DFS for listDir. Returns true if truncated.
+#[allow(clippy::too_many_arguments)]
 fn listDirRecurse(
     dir: &std::path::Path,
     currentDepth: usize,
@@ -2008,6 +2283,7 @@ fn listDirRecurse(
     count: &mut usize,
     excluded: &[&str],
     hardCap: usize,
+    metadata: bool,
 ) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -2016,7 +2292,7 @@ fn listDirRecurse(
 
     // Collect and sort: dirs first, then files, alphabetical within each group.
     let mut dirs = Vec::new();
-    let mut files = Vec::new();
+    let mut files: Vec<(String, bool, std::path::PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let fileType = entry.file_type();
@@ -2030,7 +2306,7 @@ fn listDirRecurse(
         if isDir {
             dirs.push((name, isSymlink));
         } else {
-            files.push((name, isSymlink));
+            files.push((name, isSymlink, entry.path()));
         }
     }
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2048,23 +2324,93 @@ fn listDirRecurse(
         if currentDepth + 1 < maxDepth {
             let childIndent = format!("{indent}  ");
             let childPath = dir.join(name);
-            if listDirRecurse(&childPath, currentDepth + 1, maxDepth, &childIndent, output, count, excluded, hardCap) {
+            if listDirRecurse(
+                &childPath, currentDepth + 1, maxDepth, &childIndent,
+                output, count, excluded, hardCap, metadata,
+            ) {
                 return true;
             }
         }
     }
 
     // Then files.
-    for (name, isSymlink) in &files {
+    for (name, isSymlink, path) in &files {
         if *count >= hardCap {
             return true;
         }
         let suffix = if *isSymlink { "@" } else { "" };
-        output.push(format!("{indent}{name}{suffix}"));
+        let mut line = format!("{indent}{name}{suffix}");
+        if metadata {
+            if let Some(meta) = formatMetadata(path) {
+                line.push_str("  ");
+                line.push_str(&meta);
+            }
+        }
+        output.push(line);
         *count += 1;
     }
 
     false
+}
+
+/// Render `<size>  <YYYY-MM-DD HH:MM>` for a file path. Returns None on error.
+fn formatMetadata(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let size = formatSize(meta.len());
+    let mtime = meta.modified().ok().map(formatMtime).unwrap_or_default();
+    Some(format!("{size:>9}  {mtime}"))
+}
+
+fn formatSize(bytes: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[
+        (1024 * 1024 * 1024, "G"),
+        (1024 * 1024, "M"),
+        (1024, "K"),
+    ];
+    for (threshold, suffix) in UNITS {
+        if bytes >= *threshold {
+            let value = bytes as f64 / *threshold as f64;
+            return if value >= 10.0 {
+                format!("{value:.0}{suffix}")
+            } else {
+                format!("{value:.1}{suffix}")
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
+fn formatMtime(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Local-tz aware breakdown via chrono would be cleaner, but we don't have
+    // chrono. UTC is fine — the model just needs a stable ordering.
+    let (y, mo, d, h, mi) = epochToYMDHM(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}Z")
+}
+
+/// UTC epoch seconds → (year, month, day, hour, minute). Civil-time conversion
+/// from Howard Hinnant's date algorithms (no chrono dependency).
+fn epochToYMDHM(secs: u64) -> (u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let timeOfDay = (secs % 86400) as u32;
+    let h = timeOfDay / 3600;
+    let mi = (timeOfDay % 3600) / 60;
+
+    // Hinnant: civil_from_days
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let yy = (if mo <= 2 { y + 1 } else { y }) as u32;
+    (yy, mo, d, h, mi)
 }
 
 async fn executeStructSearch(pattern: &str, language: &str, path: Option<&str>) -> String {
@@ -2383,41 +2729,23 @@ async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
 
 async fn executeFileOutline(path: &str) -> String {
     let lang = detectLanguage(path);
-    let patterns = outlinePatterns(&lang);
+    let Some(rule) = outlineRule(&lang) else {
+        return format!("No outline support for language \"{lang}\". File: {path}");
+    };
 
-    if patterns.is_empty() {
-        return format!("No outline patterns for language \"{lang}\". File: {path}");
-    }
+    let args = vec!["scan", "--inline-rules", &rule, "--json=stream", path];
+    let stdout = match runSubprocess(
+        "sg", &args,
+        "ast-grep (sg) is required for fileOutline. Install: https://ast-grep.github.io",
+    ).await {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
-    let mut entries: Vec<(usize, String)> = Vec::new();
-
-    for pattern in &patterns {
-        let args = vec!["run", "-p", pattern, "-l", &lang, "--json=compact", path];
-        match runSubprocess("sg", &args, "ast-grep (sg) is required for fileOutline. Install: https://ast-grep.github.io").await {
-            Ok(stdout) => {
-                for line in stdout.lines() {
-                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-                        let lineNum = obj["range"]["start"]["line"]
-                            .as_u64()
-                            .map(|l| l + 1)
-                            .unwrap_or(0) as usize;
-                        let text = obj["text"].as_str().unwrap_or("");
-                        let firstLine = text.lines().next().unwrap_or("").trim().to_string();
-                        if !firstLine.is_empty() {
-                            entries.push((lineNum, firstLine));
-                        }
-                    }
-                }
-            }
-            Err(e) => return e,
-        }
-    }
-
+    let mut entries = parseSgEntries(&stdout);
     if entries.is_empty() {
         return format!("No symbols found in {path}.");
     }
-
-    // Deduplicate by line number and sort.
     entries.sort_by_key(|(line, _)| *line);
     entries.dedup_by_key(|(line, _)| *line);
 
@@ -2532,26 +2860,25 @@ async fn findSymbolRange(content: &str, name: &str, _lang: &str) -> Option<Symbo
 
 /// Simple single-name symbol lookup (original behavior).
 async fn viewSymbolSingle(file: &str, symbol: &str, lang: &str) -> String {
-    let patterns = symbolPatterns(lang, symbol);
+    let Some(rule) = symbolRule(lang, symbol) else {
+        return format!("Symbol lookup not supported for language \"{lang}\".");
+    };
+    let args = vec!["scan", "--inline-rules", &rule, "--json=stream", file];
+    let Ok(stdout) = runSubprocess("sg", &args, "").await else {
+        return format!("Symbol \"{symbol}\" not found in {file} via ast-grep.");
+    };
 
-    // Try ast-grep first.
-    for pattern in &patterns {
-        let args = vec!["run", "-p", pattern, "-l", lang, "--json=compact", file];
-        if let Ok(stdout) = runSubprocess("sg", &args, "").await {
-            let matches: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for obj in &matches {
-                let text = obj["text"].as_str().unwrap_or("");
-                let startLine = obj["range"]["start"]["line"]
-                    .as_u64()
-                    .map(|l| l + 1)
-                    .unwrap_or(0);
-                if !text.is_empty() {
-                    return format!("{file}:{startLine}\n\n{text}");
-                }
-            }
+    for line in stdout.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let text = obj["text"].as_str().unwrap_or("");
+        let startLine = obj["range"]["start"]["line"]
+            .as_u64()
+            .map(|l| l + 1)
+            .unwrap_or(0);
+        if !text.is_empty() {
+            return format!("{file}:{startLine}\n\n{text}");
         }
     }
 
@@ -2756,100 +3083,114 @@ fn detectLanguage(path: &str) -> String {
     }.into()
 }
 
-/// ast-grep patterns for file outline by language.
-fn outlinePatterns(lang: &str) -> Vec<&'static str> {
+/// Tree-sitter node kinds that appear in a file outline for `lang`.
+fn outlineKinds(lang: &str) -> Option<&'static [&'static str]> {
     match lang {
-        "rust" => vec![
-            "fn $NAME($$$) $BODY",
-            "pub fn $NAME($$$) $BODY",
-            "async fn $NAME($$$) $BODY",
-            "pub async fn $NAME($$$) $BODY",
-            "struct $NAME $BODY",
-            "pub struct $NAME $BODY",
-            "enum $NAME $BODY",
-            "pub enum $NAME $BODY",
-            "trait $NAME $BODY",
-            "pub trait $NAME $BODY",
-            "impl $TYPE $BODY",
-            "mod $NAME",
-            "pub mod $NAME",
-            "type $NAME = $TYPE;",
-            "pub type $NAME = $TYPE;",
-            "const $NAME: $TYPE = $EXPR;",
-            "pub const $NAME: $TYPE = $EXPR;",
-        ],
-        "python" => vec![
-            "def $NAME($$$): $BODY",
-            "async def $NAME($$$): $BODY",
-            "class $NAME: $BODY",
-            "class $NAME($$$): $BODY",
-        ],
-        "typescript" | "javascript" | "tsx" | "jsx" => vec![
-            "function $NAME($$$) $BODY",
-            "export function $NAME($$$) $BODY",
-            "export default function $NAME($$$) $BODY",
-            "class $NAME $BODY",
-            "export class $NAME $BODY",
-            "interface $NAME $BODY",
-            "export interface $NAME $BODY",
-            "type $NAME = $TYPE",
-            "export type $NAME = $TYPE",
-        ],
-        "go" => vec![
-            "func $NAME($$$) $BODY",
-            "func ($RECV) $NAME($$$) $BODY",
-            "type $NAME struct $BODY",
-            "type $NAME interface $BODY",
-        ],
-        _ => vec![],
+        "rust" => Some(&[
+            "function_item", "struct_item", "enum_item", "trait_item",
+            "impl_item", "mod_item", "type_item", "const_item",
+            "static_item", "macro_definition",
+        ]),
+        "python" => Some(&[
+            "function_definition", "class_definition",
+        ]),
+        "typescript" | "tsx" => Some(&[
+            "function_declaration", "class_declaration", "interface_declaration",
+            "type_alias_declaration", "enum_declaration", "method_definition",
+            "abstract_class_declaration",
+        ]),
+        "javascript" | "jsx" => Some(&[
+            "function_declaration", "class_declaration", "method_definition",
+        ]),
+        "go" => Some(&[
+            "function_declaration", "method_declaration", "type_declaration",
+        ]),
+        _ => None,
     }
 }
 
-/// ast-grep patterns to find a specific symbol by name.
-fn symbolPatterns(lang: &str, symbol: &str) -> Vec<String> {
+/// Tree-sitter kind of "function-like" nodes in this language. Items
+/// nested inside such a node are excluded from outlines (locals,
+/// nested consts inside fn bodies). Methods inside class/impl blocks
+/// stay because their containing kind isn't this one.
+fn fnKind(lang: &str) -> Option<&'static str> {
     match lang {
-        "rust" => vec![
-            format!("fn {symbol}($$$) $BODY"),
-            format!("pub fn {symbol}($$$) $BODY"),
-            format!("async fn {symbol}($$$) $BODY"),
-            format!("pub async fn {symbol}($$$) $BODY"),
-            format!("struct {symbol} $BODY"),
-            format!("pub struct {symbol} $BODY"),
-            format!("enum {symbol} $BODY"),
-            format!("pub enum {symbol} $BODY"),
-            format!("trait {symbol} $BODY"),
-            format!("pub trait {symbol} $BODY"),
-            format!("impl {symbol} $BODY"),
-            format!("mod {symbol}"),
-            format!("pub mod {symbol}"),
-            format!("type {symbol} = $TYPE;"),
-            format!("pub type {symbol} = $TYPE;"),
-            format!("const {symbol}: $TYPE = $EXPR;"),
-            format!("pub const {symbol}: $TYPE = $EXPR;"),
-        ],
-        "python" => vec![
-            format!("def {symbol}($$$): $BODY"),
-            format!("async def {symbol}($$$): $BODY"),
-            format!("class {symbol}: $BODY"),
-            format!("class {symbol}($$$): $BODY"),
-        ],
-        "typescript" | "javascript" | "tsx" | "jsx" => vec![
-            format!("function {symbol}($$$) $BODY"),
-            format!("export function {symbol}($$$) $BODY"),
-            format!("class {symbol} $BODY"),
-            format!("export class {symbol} $BODY"),
-            format!("interface {symbol} $BODY"),
-            format!("export interface {symbol} $BODY"),
-            format!("const {symbol} = $EXPR"),
-            format!("export const {symbol} = $EXPR"),
-        ],
-        "go" => vec![
-            format!("func {symbol}($$$) $BODY"),
-            format!("type {symbol} struct $BODY"),
-            format!("type {symbol} interface $BODY"),
-        ],
-        _ => vec![],
+        "rust" => Some("function_item"),
+        "python" => Some("function_definition"),
+        "typescript" | "tsx" | "javascript" | "jsx" | "go" => Some("function_declaration"),
+        _ => None,
     }
+}
+
+/// Build an ast-grep inline YAML rule matching outline items in `lang`.
+fn outlineRule(lang: &str) -> Option<String> {
+    let kinds = outlineKinds(lang)?;
+    let mut yaml = format!(
+        "id: outline\nlanguage: {lang}\nseverity: info\nmessage: outline\nrule:\n  any:\n"
+    );
+    for k in kinds {
+        yaml.push_str(&format!("    - kind: {k}\n"));
+    }
+    if let Some(fk) = fnKind(lang) {
+        yaml.push_str(&format!(
+            "  not:\n    inside:\n      kind: {fk}\n      stopBy: end\n"
+        ));
+    }
+    Some(yaml)
+}
+
+/// Build an ast-grep inline YAML rule matching a specific symbol by name.
+/// Rust impl blocks (which lack a `name` field) are matched via their
+/// `type` and `trait` fields.
+fn symbolRule(lang: &str, symbol: &str) -> Option<String> {
+    let kinds = outlineKinds(lang)?;
+    let escaped = regex::escape(symbol);
+    let mut yaml = format!(
+        "id: symbol\nlanguage: {lang}\nseverity: info\nmessage: symbol\nrule:\n  any:\n",
+    );
+
+    yaml.push_str("    - all:\n");
+    yaml.push_str("        - any:\n");
+    for k in kinds.iter().filter(|k| **k != "impl_item") {
+        yaml.push_str(&format!("            - kind: {k}\n"));
+    }
+    yaml.push_str("        - has:\n");
+    yaml.push_str("            field: name\n");
+    yaml.push_str(&format!("            regex: \"^{escaped}$\"\n"));
+
+    if lang == "rust" {
+        yaml.push_str("    - all:\n");
+        yaml.push_str("        - kind: impl_item\n");
+        yaml.push_str("        - any:\n");
+        yaml.push_str("            - has:\n");
+        yaml.push_str("                field: type\n");
+        yaml.push_str(&format!("                regex: \"^{escaped}$\"\n"));
+        yaml.push_str("            - has:\n");
+        yaml.push_str("                field: trait\n");
+        yaml.push_str(&format!("                regex: \"^{escaped}$\"\n"));
+    }
+    Some(yaml)
+}
+
+/// Parse JSONL output from `sg scan --json=stream` into (line, firstLine)
+/// pairs. Empty matches are skipped.
+fn parseSgEntries(stdout: &str) -> Vec<(usize, String)> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let lineNum = obj["range"]["start"]["line"]
+            .as_u64()
+            .map(|l| l + 1)
+            .unwrap_or(0) as usize;
+        let text = obj["text"].as_str().unwrap_or("");
+        let firstLine = text.lines().next().unwrap_or("").trim().to_string();
+        if !firstLine.is_empty() {
+            entries.push((lineNum, firstLine));
+        }
+    }
+    entries
 }
 
 /// Parse a tool call name + JSON arguments into a ToolAction.
@@ -2949,6 +3290,23 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         },
+        "copyFile" => ToolAction::CopyFile {
+            src: reqStr!("src"),
+            dest: reqStr!("dest"),
+            overwrite: optBool!("overwrite").unwrap_or(false),
+        },
+        "moveFile" => ToolAction::MoveFile {
+            src: reqStr!("src"),
+            dest: reqStr!("dest"),
+            overwrite: optBool!("overwrite").unwrap_or(false),
+        },
+        "deleteFile" => ToolAction::DeleteFile {
+            path: reqStr!("path"),
+            recursive: optBool!("recursive").unwrap_or(false),
+        },
+        "makeDirs" => ToolAction::MakeDirs {
+            path: reqStr!("path"),
+        },
         "shellHistory" => ToolAction::ShellHistory,
         "readOutput" => ToolAction::ReadOutput {
             index: optU64!("index").unwrap_or(0) as usize,
@@ -2966,6 +3324,7 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         "glob" => ToolAction::Glob {
             pattern: reqStr!("pattern"),
             path: optStr!("path"),
+            metadata: optBool!("metadata").unwrap_or(false),
         },
         "grep" => ToolAction::Grep {
             pattern: reqStr!("pattern"),
@@ -2982,6 +3341,7 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
             depth: optU64!("depth").unwrap_or(2).min(5).max(1) as usize,
             offset: optU64!("offset").unwrap_or(0) as usize,
             limit: optU64!("limit").unwrap_or(500) as usize,
+            metadata: optBool!("metadata").unwrap_or(false),
         },
         "structSearch" => ToolAction::StructSearch {
             pattern: reqStr!("pattern"),

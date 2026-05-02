@@ -403,6 +403,15 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::ToolStarted { name, summary } => serde_json::json!({
             "type": "toolStarted", "name": name, "summary": summary,
         }),
+        LogEvent::ToolCallPending { index, name } => serde_json::json!({
+            "type": "toolCallPending", "index": index, "name": name,
+        }),
+        LogEvent::ToolCallProgress { index, bytes } => serde_json::json!({
+            "type": "toolCallProgress", "index": index, "bytes": bytes,
+        }),
+        LogEvent::ToolCallPreview { index, preview } => serde_json::json!({
+            "type": "toolCallPreview", "index": index, "preview": preview,
+        }),
         LogEvent::ToolAutoApproved { name, summary } => serde_json::json!({
             "type": "toolAutoApproved", "name": name, "summary": summary,
         }),
@@ -489,6 +498,12 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         }),
         LogEvent::BudgetWarning { sessionCost, limit } => serde_json::json!({
             "type": "budgetWarning", "sessionCost": sessionCost, "limit": limit,
+        }),
+        LogEvent::ScratchpadRecovered { matchedTag, snippet, recoveredChars } => serde_json::json!({
+            "type": "scratchpadRecovered",
+            "matchedTag": matchedTag,
+            "snippet": snippet,
+            "recoveredChars": recoveredChars,
         }),
         LogEvent::Error(msg) => serde_json::json!({
             "type": "error", "message": msg,

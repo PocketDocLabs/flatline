@@ -37,6 +37,7 @@ pub mod shell;
 pub mod snapshot;
 pub mod text;
 pub mod tool;
+pub mod tool_preview;
 pub mod topic;
 pub mod transcript;
 pub mod web;

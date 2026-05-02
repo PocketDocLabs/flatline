@@ -13,17 +13,15 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal as RatatuiTerminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
-    Terminal as RatatuiTerminal,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -34,10 +32,10 @@ use construct::session::Session;
 use construct::shell::{ShellIo, spawnShell};
 
 use crate::agent_panel::AgentPanel;
+use crate::fork_picker::{ForkAction, ForkPicker};
 use crate::lsp_panel::{LspPanel, PanelAction as LspPanelAction};
 use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
-use crate::fork_picker::{ForkPicker, ForkAction};
-use crate::rewind_picker::{RewindPicker, RewindAction};
+use crate::rewind_picker::{RewindAction, RewindPicker};
 use crate::selection::{self, PanelId, SelectionState};
 use crate::session_picker::{PickerAction, SessionPicker};
 use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
@@ -47,7 +45,10 @@ use std::time::{Duration, Instant};
 
 /// Resolve main agent permissions from config, falling back to allowReadOnly.
 fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
-    config.permissions.clone().unwrap_or_else(Permissions::allowReadOnly)
+    config
+        .permissions
+        .clone()
+        .unwrap_or_else(Permissions::allowReadOnly)
 }
 
 /// Which panel has input focus.
@@ -103,8 +104,8 @@ impl ScrollAxisLock {
     /// Returns true if the given axis is allowed right now.
     fn allow(&mut self, incoming: ScrollAxis) -> bool {
         let now = Instant::now();
-        let expired = now.duration_since(self.lastEvent).as_millis()
-            > SCROLL_LOCK_TIMEOUT_MS as u128;
+        let expired =
+            now.duration_since(self.lastEvent).as_millis() > SCROLL_LOCK_TIMEOUT_MS as u128;
 
         if expired || self.axis.is_none() {
             self.axis = Some(incoming);
@@ -120,10 +121,15 @@ impl ScrollAxisLock {
     }
 }
 
+/// Static glyph shown in the title when a topic is set but the agent is idle.
+/// Ace of hearts — deliberately distinct from every animation frame so a
+/// still title reads as "idle" rather than "animation stuck on a card".
+const TITLE_IDLE_GLYPH: &str = "\u{1F0B1}";
+
 /// Set the host terminal's window title via OSC 2.
-fn setTerminalTitle(topic: Option<&str>) {
+fn writeTerminalTitle(glyph: &str, topic: Option<&str>) {
     let title = match topic {
-        Some(t) if !t.is_empty() => format!("\u{1f0a1} {t}"),
+        Some(t) if !t.is_empty() => format!("{glyph} {t}"),
         _ => "flatline".to_string(),
     };
     let _ = write!(io::stdout(), "\x1b]2;{title}\x07");
@@ -134,6 +140,71 @@ fn setTerminalTitle(topic: Option<&str>) {
 fn resetTerminalTitle() {
     let _ = write!(io::stdout(), "\x1b]2;\x07");
     let _ = io::stdout().flush();
+}
+
+/// Animated card-flip spinner for the terminal title. Cycles through a
+/// pre-built frame list with per-frame dwell times, advanced by a wall-clock
+/// tick on the main render loop.
+struct TitleSpinner {
+    frames: Vec<(&'static str, Duration)>,
+    idx: usize,
+    lastAdvance: Instant,
+}
+
+impl TitleSpinner {
+    fn new() -> Self {
+        const CARDS: &[&str] = &[
+            "\u{1F0A0}", // card back
+            "\u{1F0A1}", // ace of spades
+            "\u{1F0A0}", // card back
+            "\u{1F0DF}", // black joker
+        ];
+        // Trailing NBSP (not regular space) pads each 1-col bar to 2 cols.
+        // The title writer also injects a separator space between glyph and
+        // topic — using NBSP here prevents the terminal from collapsing
+        // those two consecutive whitespace chars and dropping the topic a
+        // column to the left on every non-card frame.
+        const BARS: &[&str] = &["\u{2337}", "|\u{00A0}"];
+        // Two NBSPs for the edge: leading one survives leading-whitespace
+        // stripping, trailing one survives the adjacent-space collapse.
+        const EDGE: &str = "\u{00A0}\u{00A0}";
+        let cardHold = Duration::from_millis(600);
+        let barHold = Duration::from_millis(80);
+        let edgeHold = Duration::from_millis(100);
+        let mut frames: Vec<(&'static str, Duration)> = Vec::new();
+        for card in CARDS {
+            frames.push((*card, cardHold));
+            for b in BARS {
+                frames.push((*b, barHold));
+            }
+            frames.push((EDGE, edgeHold));
+            for b in BARS.iter().rev() {
+                frames.push((*b, barHold));
+            }
+        }
+        Self {
+            frames,
+            idx: 0,
+            lastAdvance: Instant::now(),
+        }
+    }
+
+    fn current(&self) -> &'static str {
+        self.frames[self.idx].0
+    }
+
+    /// Advance by one frame if the current dwell has elapsed. Returns true
+    /// if the frame actually changed (caller should repaint the title).
+    fn tick(&mut self) -> bool {
+        let dwell = self.frames[self.idx].1;
+        if self.lastAdvance.elapsed() >= dwell {
+            self.idx = (self.idx + 1) % self.frames.len();
+            self.lastAdvance = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Run the deck TUI.
@@ -156,7 +227,7 @@ pub async fn run() -> Result<()> {
         ),
         crossterm::cursor::SetCursorStyle::SteadyBar,
     )?;
-    setTerminalTitle(None);
+    writeTerminalTitle(TITLE_IDLE_GLYPH, None);
 
     // From here until cleanup, any `?` bypasses terminal restore — wrap
     // fallible setup so errors get cleaned up before propagating.
@@ -172,23 +243,23 @@ pub async fn run() -> Result<()> {
         Ok((terminal, shell, shellIo, termState, termCols, termRows))
     })();
 
-    let (mut terminal, shell, mut shellIo, mut termState, _termCols, _termRows) =
-        match setupResult {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(
-                    io::stdout(),
-                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
-                    crossterm::event::PopKeyboardEnhancementFlags,
-                    crossterm::event::DisableMouseCapture,
-                    crossterm::event::DisableBracketedPaste,
-                    LeaveAlternateScreen,
-                );
-                resetTerminalTitle();
-                return Err(e);
-            }
-        };
+    let (mut terminal, shell, mut shellIo, mut termState, _termCols, _termRows) = match setupResult
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                crossterm::cursor::SetCursorStyle::DefaultUserShape,
+                crossterm::event::PopKeyboardEnhancementFlags,
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste,
+                LeaveAlternateScreen,
+            );
+            resetTerminalTitle();
+            return Err(e);
+        }
+    };
 
     let contextWindow = config.heavy.contextWindow;
     let cachingEnabled = config.heavy.cachingActive();
@@ -198,9 +269,8 @@ pub async fn run() -> Result<()> {
         supportsAnthropicCache = ?config.heavy.supportsAnthropicCache,
         "deck startup cache config"
     );
-    let rollingBaseline = construct::cost::rollingWindowCost(
-        config.projectRoot.as_deref().and_then(|p| p.to_str()),
-    );
+    let rollingBaseline =
+        construct::cost::rollingWindowCost(config.projectRoot.as_deref().and_then(|p| p.to_str()));
 
     let mut agentPanel = AgentPanel::new();
     let mut focus = Focus::Terminal;
@@ -592,12 +662,18 @@ async fn runLoop(
     // Stash for the oneshot reply to the currently-open permit prompt (either
     // top-level or subagent). Set when we receive a `SessionRequest::Permit`
     // and show the prompt; consumed when the user responds.
-    let mut pendingPermitReply: Option<oneshot::Sender<construct::permissions::PermitResponse>> = None;
+    let mut pendingPermitReply: Option<oneshot::Sender<construct::permissions::PermitResponse>> =
+        None;
     let projectDir = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let mut needsRedraw = true;
     let mut lastQuitPress: Option<Instant> = None;
+    // Title state: the current topic and the animated spinner that fronts it
+    // in the OS terminal title whenever the agent is actively working.
+    let mut currentTopic: Option<String> = None;
+    let mut titleSpinner = TitleSpinner::new();
+    let mut titleWasAnimating = false;
     // Cap draws at ~30fps. Prevents strobing when the PTY floods us with
     // updates (rich progress bars, keystroke echo) — ratatui's buffer diff
     // absorbs all the intermediate state into one frame.
@@ -613,279 +689,300 @@ async fn runLoop(
 
         // Draw only when state has changed and the throttle allows it.
         if needsRedraw && lastDraw.elapsed() >= DRAW_MIN_INTERVAL {
-        needsRedraw = false;
-        lastDraw = Instant::now();
-        terminal.draw(|frame| {
-            let area = frame.area();
+            needsRedraw = false;
+            lastDraw = Instant::now();
+            terminal.draw(|frame| {
+                let area = frame.area();
 
-            // Top area: terminal + agent panel. Bottom: status bar.
-            let vChunks = Layout::default()
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
+                // Top area: terminal + agent panel. Bottom: status bar.
+                let vChunks = Layout::default()
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(area);
 
-            // Horizontal split: terminal | agent panel.
-            let hChunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .split(vChunks[0]);
+                // Horizontal split: terminal | agent panel.
+                let hChunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .split(vChunks[0]);
 
-            // Terminal.
-            let termBorder = if *focus == Focus::Terminal {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let termTitle = if termState.displayOffset() > 0 {
-                format!(" terminal [\u{2191}{}\u{FE0E}] ", termState.displayOffset())
-            } else {
-                " terminal ".to_string()
-            };
-            let termBlock = Block::default()
-                .borders(Borders::ALL)
-                .border_style(termBorder)
-                .title(termTitle);
-            let termInner = termBlock.inner(hChunks[0]);
-
-            // Sync terminal grid size with render area — a mismatch causes
-            // content to overflow or underflow the panel borders.
-            let gridCols = termState.columns();
-            if gridCols != termInner.width as usize || termState.screenLines() != termInner.height as usize {
-                termState.resize(termInner.width, termInner.height);
-                let _ = shellIo.resizeTx.try_send((termInner.width, termInner.height));
-            }
-
-            frame.render_widget(termBlock, hChunks[0]);
-            frame.render_stateful_widget(EmbeddedTerminal, termInner, termState);
-
-            // Capture content rects for mouse hit-testing.
-            selState.termContentRect = termInner;
-
-            // Agent panel. When the popup is open showing a subagent permit,
-            // suppress the duplicate prompt in the main panel — they share
-            // permit state, so a visible duplicate would scroll/copy in
-            // lockstep with the popup version.
-            agentPanel.permitDisplaySuppressed = subagentPanel.is_some()
-                && agentPanel.pendingPermitIsSubagent();
-            let agentChatArea = agentPanel.render(hChunks[1], frame.buffer_mut(), *focus == Focus::Agent);
-            // Full chat area for hit-testing (includes prefix columns).
-            selState.agentPanelRect = agentChatArea;
-            // Content rect offset past the 2-column prefix for selection/highlight.
-            let agentContentArea = Rect {
-                x: agentChatArea.x + 2,
-                y: agentChatArea.y,
-                width: agentChatArea.width.saturating_sub(2),
-                height: agentChatArea.height,
-            };
-            selState.agentContentRect = agentContentArea;
-            selState.inputContentRect = agentPanel.lastInputRect;
-
-            // Expand selection for double/triple/quad click (needs Buffer).
-            let termOffset = termState.displayOffset() as u16;
-            let agentOffset = agentPanel.displayOffset();
-            if let Some((panel, clickCount)) = selState.pendingExpand.take() {
-                if panel == PanelId::Input {
-                    // Input selection expansion not supported.
+                // Terminal.
+                let termBorder = if *focus == Focus::Terminal {
+                    Style::default().fg(Color::Cyan)
                 } else {
-                let (sel, rect, offset) = match panel {
-                    PanelId::Terminal => (&mut selState.termSelection, termInner, termOffset),
-                    PanelId::Agent => (&mut selState.agentSelection, agentContentArea, agentOffset),
-                    PanelId::Input => unreachable!(),
+                    Style::default().fg(Color::DarkGray)
                 };
-                if let Some(sel) = sel {
-                    if clickCount == 4 {
-                        match panel {
+                let termTitle = if termState.displayOffset() > 0 {
+                    format!(" terminal [\u{2191}{}\u{FE0E}] ", termState.displayOffset())
+                } else {
+                    " terminal ".to_string()
+                };
+                let termBlock = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(termBorder)
+                    .title(termTitle);
+                let termInner = termBlock.inner(hChunks[0]);
+
+                // Sync terminal grid size with render area — a mismatch causes
+                // content to overflow or underflow the panel borders.
+                let gridCols = termState.columns();
+                if gridCols != termInner.width as usize
+                    || termState.screenLines() != termInner.height as usize
+                {
+                    termState.resize(termInner.width, termInner.height);
+                    let _ = shellIo
+                        .resizeTx
+                        .try_send((termInner.width, termInner.height));
+                }
+
+                frame.render_widget(termBlock, hChunks[0]);
+                frame.render_stateful_widget(EmbeddedTerminal, termInner, termState);
+
+                // Capture content rects for mouse hit-testing.
+                selState.termContentRect = termInner;
+
+                // Agent panel. When the popup is open showing a subagent permit,
+                // suppress the duplicate prompt in the main panel — they share
+                // permit state, so a visible duplicate would scroll/copy in
+                // lockstep with the popup version.
+                agentPanel.permitDisplaySuppressed =
+                    subagentPanel.is_some() && agentPanel.pendingPermitIsSubagent();
+                let agentChatArea =
+                    agentPanel.render(hChunks[1], frame.buffer_mut(), *focus == Focus::Agent);
+                // Full chat area for hit-testing (includes prefix columns).
+                selState.agentPanelRect = agentChatArea;
+                // Content rect offset past the 2-column prefix for selection/highlight.
+                let agentContentArea = Rect {
+                    x: agentChatArea.x + 2,
+                    y: agentChatArea.y,
+                    width: agentChatArea.width.saturating_sub(2),
+                    height: agentChatArea.height,
+                };
+                selState.agentContentRect = agentContentArea;
+                selState.inputContentRect = agentPanel.lastInputRect;
+
+                // Expand selection for double/triple/quad click (needs Buffer).
+                let termOffset = termState.displayOffset() as u16;
+                let agentOffset = agentPanel.displayOffset();
+                if let Some((panel, clickCount)) = selState.pendingExpand.take() {
+                    if panel == PanelId::Input {
+                        // Input selection expansion not supported.
+                    } else {
+                        let (sel, rect, offset) = match panel {
                             PanelId::Terminal => {
-                                // Select the command output region under the cursor.
-                                let clickGrid = sel.startGridLine();
-                                if let Some((startGrid, endGrid)) =
-                                    termState.commandRegionAt(clickGrid)
-                                {
-                                    sel.setBounds(0, startGrid, rect.width, endGrid);
-                                } else {
-                                    // No OSC 133 region — fall back to block selection.
-                                    selection::expandSelection(
-                                        sel,
-                                        clickCount,
-                                        frame.buffer_mut(),
-                                        rect,
-                                        offset,
-                                    );
-                                }
+                                (&mut selState.termSelection, termInner, termOffset)
                             }
                             PanelId::Agent => {
-                                // Select the logical entry under the cursor.
-                                let clickGrid = sel.startGridLine();
-                                if let Some((startGrid, endGrid)) =
-                                    agentPanel.entryBoundsAtGridLine(clickGrid)
-                                {
-                                    sel.setBounds(0, startGrid, rect.width, endGrid);
-                                }
+                                (&mut selState.agentSelection, agentContentArea, agentOffset)
                             }
                             PanelId::Input => unreachable!(),
+                        };
+                        if let Some(sel) = sel {
+                            if clickCount == 4 {
+                                match panel {
+                                    PanelId::Terminal => {
+                                        // Select the command output region under the cursor.
+                                        let clickGrid = sel.startGridLine();
+                                        if let Some((startGrid, endGrid)) =
+                                            termState.commandRegionAt(clickGrid)
+                                        {
+                                            sel.setBounds(0, startGrid, rect.width, endGrid);
+                                        } else {
+                                            // No OSC 133 region — fall back to block selection.
+                                            selection::expandSelection(
+                                                sel,
+                                                clickCount,
+                                                frame.buffer_mut(),
+                                                rect,
+                                                offset,
+                                            );
+                                        }
+                                    }
+                                    PanelId::Agent => {
+                                        // Select the logical entry under the cursor.
+                                        let clickGrid = sel.startGridLine();
+                                        if let Some((startGrid, endGrid)) =
+                                            agentPanel.entryBoundsAtGridLine(clickGrid)
+                                        {
+                                            sel.setBounds(0, startGrid, rect.width, endGrid);
+                                        }
+                                    }
+                                    PanelId::Input => unreachable!(),
+                                }
+                            } else {
+                                selection::expandSelection(
+                                    sel,
+                                    clickCount,
+                                    frame.buffer_mut(),
+                                    rect,
+                                    offset,
+                                );
+                            }
+                            sel.finalize();
+                            selState.pendingCopy = Some(panel);
+                            selState.selectingIn = None;
                         }
-                    } else {
-                        selection::expandSelection(
-                            sel,
-                            clickCount,
-                            frame.buffer_mut(),
-                            rect,
-                            offset,
-                        );
                     }
-                    sel.finalize();
-                    selState.pendingCopy = Some(panel);
-                    selState.selectingIn = None;
                 }
+
+                // Apply selection highlights after widgets have rendered.
+                if let Some(ref sel) = selState.termSelection {
+                    selection::applyHighlight(sel, termInner, frame.buffer_mut(), termOffset);
                 }
-            }
+                if let Some(ref sel) = selState.agentSelection {
+                    selection::applyHighlight(
+                        sel,
+                        agentContentArea,
+                        frame.buffer_mut(),
+                        agentOffset,
+                    );
+                }
 
-            // Apply selection highlights after widgets have rendered.
-            if let Some(ref sel) = selState.termSelection {
-                selection::applyHighlight(sel, termInner, frame.buffer_mut(), termOffset);
-            }
-            if let Some(ref sel) = selState.agentSelection {
-                selection::applyHighlight(sel, agentContentArea, frame.buffer_mut(), agentOffset);
-            }
-
-            // Deferred clipboard copy (Buffer only available during draw).
-            if let Some(panel) = selState.pendingCopy.take() {
-                match panel {
-                    PanelId::Terminal => {
-                        if let Some(sel) = &selState.termSelection {
-                            let text = extractTerminalUnwrapped(sel, termInner, frame.buffer_mut(), termOffset, termState);
-                            selection::copyToClipboard(&text);
+                // Deferred clipboard copy (Buffer only available during draw).
+                if let Some(panel) = selState.pendingCopy.take() {
+                    match panel {
+                        PanelId::Terminal => {
+                            if let Some(sel) = &selState.termSelection {
+                                let text = extractTerminalUnwrapped(
+                                    sel,
+                                    termInner,
+                                    frame.buffer_mut(),
+                                    termOffset,
+                                    termState,
+                                );
+                                selection::copyToClipboard(&text);
+                            }
                         }
-                    }
-                    PanelId::Agent => {
-                        if let Some(sel) = &selState.agentSelection {
-                            let text = agentPanel.extractUnwrappedText(sel, agentContentArea, frame.buffer_mut(), agentOffset);
-                            selection::copyToClipboard(&text);
+                        PanelId::Agent => {
+                            if let Some(sel) = &selState.agentSelection {
+                                let text = agentPanel.extractUnwrappedText(
+                                    sel,
+                                    agentContentArea,
+                                    frame.buffer_mut(),
+                                    agentOffset,
+                                );
+                                selection::copyToClipboard(&text);
+                            }
                         }
+                        PanelId::Input => {}
                     }
-                    PanelId::Input => {}
                 }
-            }
 
-            // Hardware cursor for agent text input (hidden during permission prompt).
-            if *focus == Focus::Agent && !agentPanel.pendingPermit {
-                if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
-                    frame.set_cursor_position(ratatui::layout::Position::new(col, row));
+                // Hardware cursor for agent text input (hidden during permission prompt).
+                if *focus == Focus::Agent && !agentPanel.pendingPermit {
+                    if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
+                        frame.set_cursor_position(ratatui::layout::Position::new(col, row));
+                    }
+                } else if *focus == Focus::Terminal {
+                    if let Some((col, row)) = termState.cursorViewportPos() {
+                        frame.set_cursor_position(ratatui::layout::Position::new(
+                            termInner.x + col,
+                            termInner.y + row,
+                        ));
+                    }
                 }
-            } else if *focus == Focus::Terminal {
-                if let Some((col, row)) = termState.cursorViewportPos() {
-                    frame.set_cursor_position(ratatui::layout::Position::new(
-                        termInner.x + col,
-                        termInner.y + row,
-                    ));
-                }
-            }
 
-            // Status bar. Minimal layout: right-aligned cost + ctx% + cache.
-            // The "press Ctrl+Q again to quit" hint still hijacks the bar
-            // briefly — it's a load-bearing safety affordance.
-            let quitHintActive = lastQuitPress
-                .map(|t| t.elapsed() < Duration::from_secs(1))
-                .unwrap_or(false);
+                // Status bar. Minimal layout: right-aligned cost + ctx% + cache.
+                // The "press Ctrl+Q again to quit" hint still hijacks the bar
+                // briefly — it's a load-bearing safety affordance.
+                let quitHintActive = lastQuitPress
+                    .map(|t| t.elapsed() < Duration::from_secs(1))
+                    .unwrap_or(false);
 
-            let (barBg, barFg) = if quitHintActive {
-                (Color::Yellow, Color::Black)
-            } else {
-                (Color::DarkGray, Color::White)
-            };
-
-            let barWidth = vChunks[1].width as usize;
-            let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
-
-            if quitHintActive {
-                let hint = " \u{25B8} press Ctrl+Q again to quit";
-                spans.push(Span::raw(hint.to_string()));
-                let pad = barWidth.saturating_sub(hint.chars().count());
-                spans.push(Span::raw(" ".repeat(pad)));
-            } else {
-                let costStr = if sessionCost > 0.0 {
-                    construct::cost::formatCost(sessionCost)
+                let (barBg, barFg) = if quitHintActive {
+                    (Color::Yellow, Color::Black)
                 } else {
-                    String::new()
+                    (Color::DarkGray, Color::White)
                 };
-                let ctxStr = formatContextPct(tokenCount, contextWindow);
-                let cacheSpans = cacheHeatSpans(
-                    cachingEnabled, lastCacheHitAt, barBg, barFg,
-                );
 
-                // Assemble right-aligned spans: cost  ctx  cache-glyph cache-word.
-                let mut rightSpans: Vec<Span<'static>> = Vec::with_capacity(6);
-                if !costStr.is_empty() {
-                    rightSpans.push(Span::raw(costStr));
-                }
-                if !ctxStr.is_empty() {
-                    if !rightSpans.is_empty() {
-                        rightSpans.push(Span::raw("  "));
+                let barWidth = vChunks[1].width as usize;
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+
+                if quitHintActive {
+                    let hint = " \u{25B8} press Ctrl+Q again to quit";
+                    spans.push(Span::raw(hint.to_string()));
+                    let pad = barWidth.saturating_sub(hint.chars().count());
+                    spans.push(Span::raw(" ".repeat(pad)));
+                } else {
+                    let costStr = if sessionCost > 0.0 {
+                        construct::cost::formatCost(sessionCost)
+                    } else {
+                        String::new()
+                    };
+                    let ctxStr = formatContextPct(tokenCount, contextWindow);
+                    let cacheSpans = cacheHeatSpans(cachingEnabled, lastCacheHitAt, barBg, barFg);
+
+                    // Assemble right-aligned spans: cost  ctx  cache-glyph cache-word.
+                    let mut rightSpans: Vec<Span<'static>> = Vec::with_capacity(6);
+                    if !costStr.is_empty() {
+                        rightSpans.push(Span::raw(costStr));
                     }
-                    rightSpans.push(Span::raw(ctxStr));
-                }
-                if !cacheSpans.is_empty() {
-                    if !rightSpans.is_empty() {
-                        rightSpans.push(Span::raw("  "));
+                    if !ctxStr.is_empty() {
+                        if !rightSpans.is_empty() {
+                            rightSpans.push(Span::raw("  "));
+                        }
+                        rightSpans.push(Span::raw(ctxStr));
                     }
-                    rightSpans.extend(cacheSpans);
-                    rightSpans.push(Span::raw(" cache"));
+                    if !cacheSpans.is_empty() {
+                        if !rightSpans.is_empty() {
+                            rightSpans.push(Span::raw("  "));
+                        }
+                        rightSpans.extend(cacheSpans);
+                        rightSpans.push(Span::raw(" cache"));
+                    }
+
+                    let rightWidth: usize =
+                        rightSpans.iter().map(|s| s.content.chars().count()).sum();
+                    // Trailing space + 1 char leading pad keeps the bar breathing.
+                    let pad = barWidth.saturating_sub(rightWidth + 1);
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.extend(rightSpans);
+                    spans.push(Span::raw(" "));
                 }
 
-                let rightWidth: usize = rightSpans
-                    .iter()
-                    .map(|s| s.content.chars().count())
-                    .sum();
-                // Trailing space + 1 char leading pad keeps the bar breathing.
-                let pad = barWidth.saturating_sub(rightWidth + 1);
-                spans.push(Span::raw(" ".repeat(pad)));
-                spans.extend(rightSpans);
-                spans.push(Span::raw(" "));
-            }
+                let statusBar =
+                    Paragraph::new(Line::from(spans)).style(Style::default().bg(barBg).fg(barFg));
+                frame.render_widget(statusBar, vChunks[1]);
 
-            let statusBar = Paragraph::new(Line::from(spans))
-                .style(Style::default().bg(barBg).fg(barFg));
-            frame.render_widget(statusBar, vChunks[1]);
+                // Session picker overlay.
+                if let Some(ref mut picker) = sessionPicker {
+                    picker.render(area, frame.buffer_mut());
+                }
 
-            // Session picker overlay.
-            if let Some(ref mut picker) = sessionPicker {
-                picker.render(area, frame.buffer_mut());
-            }
+                // Rewind picker overlay.
+                if let Some(ref mut picker) = rewindPicker {
+                    picker.render(area, frame.buffer_mut());
+                }
 
-            // Rewind picker overlay.
-            if let Some(ref mut picker) = rewindPicker {
-                picker.render(area, frame.buffer_mut());
-            }
+                // Fork picker overlay.
+                if let Some(ref mut picker) = forkPicker {
+                    picker.render(area, frame.buffer_mut());
+                }
 
-            // Fork picker overlay.
-            if let Some(ref mut picker) = forkPicker {
-                picker.render(area, frame.buffer_mut());
-            }
+                // MCP panel overlay.
+                if let Some(ref mut panel) = mcpPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
 
-            // MCP panel overlay.
-            if let Some(ref mut panel) = mcpPanel {
-                panel.render(area, frame.buffer_mut());
-            }
+                // LSP panel overlay.
+                if let Some(ref mut panel) = lspPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
 
-            // LSP panel overlay.
-            if let Some(ref mut panel) = lspPanel {
-                panel.render(area, frame.buffer_mut());
-            }
+                // Permissions panel overlay.
+                if let Some(ref mut panel) = permissionsPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
 
-            // Permissions panel overlay.
-            if let Some(ref mut panel) = permissionsPanel {
-                panel.render(area, frame.buffer_mut());
-            }
+                // Subagent panel overlay.
+                if let Some(ref mut panel) = subagentPanel {
+                    panel.render(area, frame.buffer_mut(), agentPanel);
+                }
 
-            // Subagent panel overlay.
-            if let Some(ref mut panel) = subagentPanel {
-                panel.render(area, frame.buffer_mut(), agentPanel);
-            }
-
-            // Help popup overlay.
-            if helpPopupOpen {
-                renderHelpPopup(area, frame.buffer_mut());
-            }
-        })?;
+                // Help popup overlay.
+                if helpPopupOpen {
+                    renderHelpPopup(area, frame.buffer_mut());
+                }
+            })?;
         }
 
         // Drain PTY output.
@@ -911,6 +1008,15 @@ async fn runLoop(
                         agentPanel.toolStarted(&name, &summary);
                     }
                 }
+                LogEvent::ToolCallPending { index, name } => {
+                    agentPanel.toolCallPending(index, &name);
+                }
+                LogEvent::ToolCallProgress { index, bytes } => {
+                    agentPanel.toolCallProgress(index, bytes);
+                }
+                LogEvent::ToolCallPreview { index, preview } => {
+                    agentPanel.toolCallPreview(index, &preview);
+                }
                 LogEvent::ToolAutoApproved { name, summary } => {
                     agentPanel.toolApproved(&format!("{name}: {summary}"));
                 }
@@ -933,9 +1039,18 @@ async fn runLoop(
                     agentPanel.promoteQueue(&texts);
                 }
                 LogEvent::TopicChanged { label } => {
-                    setTerminalTitle(Some(&label));
+                    currentTopic = Some(label);
+                    let glyph = if agentPanel.isActive() {
+                        titleSpinner.current()
+                    } else {
+                        TITLE_IDLE_GLYPH
+                    };
+                    writeTerminalTitle(glyph, currentTopic.as_deref());
                 }
-                LogEvent::LspHint { serverId, installHint } => {
+                LogEvent::LspHint {
+                    serverId,
+                    installHint,
+                } => {
                     let msg = format!(
                         "\u{2699}\u{FE0E} {} not found \u{2014} `{}`",
                         serverId, installHint,
@@ -954,7 +1069,10 @@ async fn runLoop(
                         lastCacheHitAt = Some(Instant::now());
                     }
                 }
-                LogEvent::Retrying { attempt, maxAttempts } => {
+                LogEvent::Retrying {
+                    attempt,
+                    maxAttempts,
+                } => {
                     agentPanel.showRetrying(attempt, maxAttempts);
                 }
                 LogEvent::Error(msg) => {
@@ -965,7 +1083,10 @@ async fn runLoop(
                     agentPanel.finishTurn();
                     agentPanel.errorHint = true;
                 }
-                LogEvent::BudgetWarning { sessionCost: sc, limit } => {
+                LogEvent::BudgetWarning {
+                    sessionCost: sc,
+                    limit,
+                } => {
                     let msg = format!(
                         "\u{26A0}\u{FE0E} Session cost ({}) exceeded limit ({})",
                         construct::cost::formatCost(sc),
@@ -976,7 +1097,11 @@ async fn runLoop(
                 LogEvent::CompactionStarted { stage } => {
                     tracing::info!(stage = %stage, "compaction started");
                 }
-                LogEvent::CompactionComplete { stage, reduction, markerBlock } => {
+                LogEvent::CompactionComplete {
+                    stage,
+                    reduction,
+                    markerBlock,
+                } => {
                     tracing::info!(stage = %stage, reduction = %reduction, "compaction complete");
                     if let Some(blockIdx) = markerBlock {
                         agentPanel.pushCompactionMarker(&stage, blockIdx);
@@ -985,7 +1110,8 @@ async fn runLoop(
                 LogEvent::Cleared => {
                     agentPanel.clearDisplay();
                     tokenCount = 0;
-                    setTerminalTitle(None);
+                    currentTopic = None;
+                    writeTerminalTitle(TITLE_IDLE_GLYPH, None);
                 }
                 LogEvent::Rewound { targetTurnId } => {
                     rewindPicker = None;
@@ -1020,19 +1146,35 @@ async fn runLoop(
                         agentPanel.pushCompactionMarker(stage, *blockIdx);
                     }
                 }
-                LogEvent::SubagentStarted { sessionId, agentType, prompt } => {
+                LogEvent::SubagentStarted {
+                    sessionId,
+                    agentType,
+                    prompt,
+                } => {
                     tracing::info!(agent = %agentType, "subagent started");
                     agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
                 }
-                LogEvent::SubagentEvent { sessionId: _, event } => {
+                LogEvent::SubagentEvent {
+                    sessionId: _,
+                    event,
+                } => {
                     match *event {
-                        LogEvent::ToolAutoApproved { ref name, ref summary } => {
+                        LogEvent::ToolAutoApproved {
+                            ref name,
+                            ref summary,
+                        } => {
                             agentPanel.subagentToolLine(name, summary);
                         }
-                        LogEvent::ToolStarted { ref name, ref summary } => {
+                        LogEvent::ToolStarted {
+                            ref name,
+                            ref summary,
+                        } => {
                             agentPanel.subagentToolLine(name, summary);
                         }
-                        LogEvent::ToolResult { ref name, ref output } => {
+                        LogEvent::ToolResult {
+                            ref name,
+                            ref output,
+                        } => {
                             // Brief one-liner for the inline block.
                             let brief = if output.len() > 60 {
                                 format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
@@ -1055,9 +1197,25 @@ async fn runLoop(
                 LogEvent::SubagentShellOutput { data, .. } => {
                     agentPanel.feedSubagentShell(&data);
                 }
-                LogEvent::SubagentComplete { agentType, turns, content, .. } => {
+                LogEvent::SubagentComplete {
+                    agentType,
+                    turns,
+                    content,
+                    ..
+                } => {
                     tracing::info!(agent = %agentType, turns = turns, "subagent completed");
                     agentPanel.subagentComplete(&agentType, turns, &content);
+                }
+                LogEvent::ScratchpadRecovered {
+                    matchedTag,
+                    snippet,
+                    recoveredChars,
+                } => {
+                    let msg = format!(
+                        "\u{26A0}\u{FE0E} scratchpad close recovered (`{}`, {} chars): \"{}\"",
+                        matchedTag, recoveredChars, snippet,
+                    );
+                    agentPanel.pushCommandResult(&msg);
                 }
             }
         }
@@ -1078,9 +1236,16 @@ async fn runLoop(
                     impact,
                     reply,
                 } => {
-                    let isSubagent = matches!(origin, construct::control::PermitOrigin::Subagent { .. });
+                    let isSubagent =
+                        matches!(origin, construct::control::PermitOrigin::Subagent { .. });
                     agentPanel.showToolRequest(
-                        &name, &summary, &args, diff, explanation, impact, origin,
+                        &name,
+                        &summary,
+                        &args,
+                        diff,
+                        explanation,
+                        impact,
+                        origin,
                     );
                     pendingPermitReply = Some(reply);
                     // Parent permits auto-close the popup so the main-panel
@@ -1140,9 +1305,9 @@ async fn runLoop(
                 DeckUpdate::ResumeResult(ack) => {
                     if ack.ok {
                         sessionPicker = None;
-                        agentPanel.entries.push(
-                            crate::agent_panel::PanelEntry::SessionNotice(ack.message),
-                        );
+                        agentPanel
+                            .entries
+                            .push(crate::agent_panel::PanelEntry::SessionNotice(ack.message));
                     } else if let Some(ref mut picker) = sessionPicker {
                         picker.resumeFailed(ack.message);
                     } else {
@@ -1156,6 +1321,18 @@ async fn runLoop(
         if agentPanel.tickThrobber() {
             needsRedraw = true;
         }
+
+        // Tick animated title spinner while a turn is active.
+        let nowAnimating = currentTopic.is_some() && agentPanel.isActive();
+        if nowAnimating {
+            if titleSpinner.tick() {
+                writeTerminalTitle(titleSpinner.current(), currentTopic.as_deref());
+            }
+        } else if titleWasAnimating {
+            // Agent just finished — drop back to the static idle glyph.
+            writeTerminalTitle(TITLE_IDLE_GLYPH, currentTopic.as_deref());
+        }
+        titleWasAnimating = nowAnimating;
 
         // Advance character reveal buffer.
         if agentPanel.tickReveal() {
@@ -1255,7 +1432,9 @@ async fn handleInput(
             Event::Key(key) => {
                 if key.kind == event::KeyEventKind::Release {
                     // Poll for more without blocking.
-                    if !event::poll(Duration::ZERO)? { break; }
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                     continue;
                 }
 
@@ -1271,9 +1450,7 @@ async fn handleInput(
 
                 // Global keybindings.
                 // Double-tap Ctrl+Q to quit — prevents accidental exits.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('q')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                     const DOUBLE_TAP_WINDOW: Duration = Duration::from_secs(1);
                     if let Some(prev) = *lastQuitPress {
                         if prev.elapsed() < DOUBLE_TAP_WINDOW {
@@ -1285,17 +1462,13 @@ async fn handleInput(
                 }
 
                 // Ctrl+L: force full terminal redraw to fix rendering artifacts.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('l')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
                     resized = true;
                     break;
                 }
 
                 // Ctrl+H: toggle the hotkey-tips popup.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('h')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
                     *helpPopupOpen = !*helpPopupOpen;
                     break;
                 }
@@ -1309,28 +1482,22 @@ async fn handleInput(
                 // Error-mode recovery bindings. Only active when the last
                 // turn fatally errored (hint is showing). Both discard the
                 // error state before dispatching the command.
-                if agentPanel.errorHint
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if agentPanel.errorHint && key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('r') => {
                             agentPanel.errorHint = false;
                             let _ = cancelTx.send(false);
-                            spawnAckRequest(
-                                requestTx.clone(),
-                                deckUpdateTx.clone(),
-                                |reply| TuiRequest::RetryLastTurn { reply },
-                            );
+                            spawnAckRequest(requestTx.clone(), deckUpdateTx.clone(), |reply| {
+                                TuiRequest::RetryLastTurn { reply }
+                            });
                             break;
                         }
                         KeyCode::Char(' ') => {
                             agentPanel.errorHint = false;
                             let _ = cancelTx.send(false);
-                            spawnAckRequest(
-                                requestTx.clone(),
-                                deckUpdateTx.clone(),
-                                |reply| TuiRequest::ContinueLastTurn { reply },
-                            );
+                            spawnAckRequest(requestTx.clone(), deckUpdateTx.clone(), |reply| {
+                                TuiRequest::ContinueLastTurn { reply }
+                            });
                             break;
                         }
                         _ => {}
@@ -1362,7 +1529,13 @@ async fn handleInput(
 
                 if key.code == KeyCode::Tab {
                     // Don't switch focus when an overlay is active or completion menu is open.
-                    if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() || permissionsPanel.is_some() {
+                    if sessionPicker.is_some()
+                        || rewindPicker.is_some()
+                        || forkPicker.is_some()
+                        || mcpPanel.is_some()
+                        || lspPanel.is_some()
+                        || permissionsPanel.is_some()
+                    {
                         // Let the overlay handle Tab (falls through to overlay dispatch below).
                     } else if !(*focus == Focus::Agent && agentPanel.completionActive()) {
                         *focus = match focus {
@@ -1374,9 +1547,7 @@ async fn handleInput(
                 }
 
                 // Cmd+C: copy active selection to clipboard.
-                if key.modifiers.contains(KeyModifiers::SUPER)
-                    && key.code == KeyCode::Char('c')
-                {
+                if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('c') {
                     if let Some(text) = agentPanel.textArea.selectedText() {
                         selection::copyToClipboard(&text);
                     } else if selState.agentSelection.is_some() {
@@ -1386,7 +1557,6 @@ async fn handleInput(
                     }
                     break;
                 }
-
 
                 // Permission prompt takes priority regardless of focus.
                 if agentPanel.pendingPermit {
@@ -1442,9 +1612,7 @@ async fn handleInput(
                             // Open the subagent panel — Live mode reads
                             // transcript + shell from agentPanel.activeSubagent.
                             if agentPanel.activeSubagent.is_some() {
-                                *subagentPanel = Some(
-                                    crate::subagent_panel::SubagentPanel::live(),
-                                );
+                                *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                             }
                         }
                         _ => {}
@@ -1465,7 +1633,10 @@ async fn handleInput(
                             tokio::spawn(async move {
                                 let (rTx, rRx) = oneshot::channel();
                                 let _ = requestTxC
-                                    .send(TuiRequest::ResumeSession { sessionId: id, reply: rTx })
+                                    .send(TuiRequest::ResumeSession {
+                                        sessionId: id,
+                                        reply: rTx,
+                                    })
                                     .await;
                                 if let Ok(ack) = rRx.await {
                                     let _ = deckTx.send(DeckUpdate::ResumeResult(ack)).await;
@@ -1483,22 +1654,38 @@ async fn handleInput(
                         RewindAction::Close => {
                             *rewindPicker = None;
                         }
-                        RewindAction::Rewind { target, userMessage, attachments } => {
+                        RewindAction::Rewind {
+                            target,
+                            userMessage,
+                            attachments,
+                        } => {
                             *pendingRewindMessage = Some(userMessage);
                             *pendingRewindAttachments = attachments;
                             spawnAckRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
-                                move |reply| TuiRequest::Rewind { target, saveFork: false, reply },
+                                move |reply| TuiRequest::Rewind {
+                                    target,
+                                    saveFork: false,
+                                    reply,
+                                },
                             );
                         }
-                        RewindAction::ForkAndRewind { target, userMessage, attachments } => {
+                        RewindAction::ForkAndRewind {
+                            target,
+                            userMessage,
+                            attachments,
+                        } => {
                             *pendingRewindMessage = Some(userMessage);
                             *pendingRewindAttachments = attachments;
                             spawnAckRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
-                                move |reply| TuiRequest::Rewind { target, saveFork: true, reply },
+                                move |reply| TuiRequest::Rewind {
+                                    target,
+                                    saveFork: true,
+                                    reply,
+                                },
                             );
                         }
                         RewindAction::None => {}
@@ -1567,7 +1754,11 @@ async fn handleInput(
                             spawnAckRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
-                                move |reply| TuiRequest::SavePermissions { defaultMode, rules, reply },
+                                move |reply| TuiRequest::SavePermissions {
+                                    defaultMode,
+                                    rules,
+                                    reply,
+                                },
                             );
                         }
                         PermPanelAction::None => {}
@@ -1578,7 +1769,9 @@ async fn handleInput(
                 match focus {
                     Focus::Terminal => {
                         if key.modifiers.contains(KeyModifiers::SUPER) {
-                            if !event::poll(Duration::ZERO)? { break; }
+                            if !event::poll(Duration::ZERO)? {
+                                break;
+                            }
                             continue;
                         }
                         // Ctrl+C triggers the killchain for captured commands.
@@ -1627,7 +1820,10 @@ async fn handleInput(
                         let mut navigatingHistory = false;
                         if !completionHandled {
                             // Handle attachment-related keys before borrowing textArea.
-                            if ctrl && key.code == KeyCode::Char('d') && agentPanel.attachmentCount() > 0 {
+                            if ctrl
+                                && key.code == KeyCode::Char('d')
+                                && agentPanel.attachmentCount() > 0
+                            {
                                 agentPanel.removeLastAttachment();
                                 break;
                             }
@@ -1642,10 +1838,14 @@ async fn handleInput(
                                                 "pasted image ({}x{})",
                                                 imgData.width, imgData.height,
                                             ),
-                                            rgbaDimensions: Some((imgData.width as u32, imgData.height as u32)),
+                                            rgbaDimensions: Some((
+                                                imgData.width as u32,
+                                                imgData.height as u32,
+                                            )),
                                         });
                                     } else if let Ok(text) = cb.get_text() {
-                                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                                        let normalized =
+                                            text.replace("\r\n", "\n").replace('\r', "\n");
                                         agentPanel.textArea.insertStr(&normalized);
                                     }
                                 }
@@ -1678,10 +1878,13 @@ async fn handleInput(
                                                     agentPanel.pushCommandResult(&text);
                                                 }
                                                 crate::command::CommandOutput::Action(
-                                                    crate::command::CommandAction::Resume { sessionId: None },
+                                                    crate::command::CommandAction::Resume {
+                                                        sessionId: None,
+                                                    },
                                                 ) => {
                                                     // Open the interactive picker.
-                                                    *sessionPicker = Some(SessionPicker::new(projectDir));
+                                                    *sessionPicker =
+                                                        Some(SessionPicker::new(projectDir));
                                                 }
                                                 crate::command::CommandOutput::Action(action) => {
                                                     dispatchSlashCommand(
@@ -1796,10 +1999,25 @@ async fn handleInput(
                     break;
                 }
                 // Other overlay panels consume all mouse events to prevent click-through.
-                if sessionPicker.is_some() || rewindPicker.is_some() || forkPicker.is_some() || mcpPanel.is_some() || lspPanel.is_some() || permissionsPanel.is_some() {
+                if sessionPicker.is_some()
+                    || rewindPicker.is_some()
+                    || forkPicker.is_some()
+                    || mcpPanel.is_some()
+                    || lspPanel.is_some()
+                    || permissionsPanel.is_some()
+                {
                     break;
                 }
-                if handleMouse(mouse, focus, agentPanel, termState, selState, shellIo, scrollLock, subagentPanel) {
+                if handleMouse(
+                    mouse,
+                    focus,
+                    agentPanel,
+                    termState,
+                    selState,
+                    shellIo,
+                    scrollLock,
+                    subagentPanel,
+                ) {
                     hadInput = true;
                 }
             }
@@ -1884,7 +2102,10 @@ fn handleMouse(
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Check input area first (not part of panel hit-testing).
-            if selState.inputContentRect.contains((mouse.column, mouse.row).into()) {
+            if selState
+                .inputContentRect
+                .contains((mouse.column, mouse.row).into())
+            {
                 // Permission prompt: check for copy button click on code block top border.
                 if agentPanel.pendingPermit {
                     let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
@@ -1903,7 +2124,9 @@ fn handleMouse(
                 let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
                 let contentWidth = selState.inputContentRect.width.saturating_sub(2);
                 let contentCol = localCol.saturating_sub(2);
-                agentPanel.textArea.mouseDown(contentCol, localRow, contentWidth);
+                agentPanel
+                    .textArea
+                    .mouseDown(contentCol, localRow, contentWidth);
                 selState.selectingIn = Some(PanelId::Input);
                 selState.termSelection = None;
                 selState.agentSelection = None;
@@ -1921,33 +2144,26 @@ fn handleMouse(
                 };
 
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
-                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                let gridLine =
+                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
 
                 // Single click on a reasoning header toggles it.
-                if panel == PanelId::Agent
-                    && agentPanel.toggleReasoningAtGridLine(gridLine)
-                {
+                if panel == PanelId::Agent && agentPanel.toggleReasoningAtGridLine(gridLine) {
                     return true;
                 }
 
                 // Click on code block "copy" label copies the block content.
-                if panel == PanelId::Agent
-                    && agentPanel.tryCopyCodeBlock(gridLine, col)
-                {
+                if panel == PanelId::Agent && agentPanel.tryCopyCodeBlock(gridLine, col) {
                     return true;
                 }
 
                 // Click on code block top/bottom border toggles expand/collapse.
-                if panel == PanelId::Agent
-                    && agentPanel.tryToggleCodeBlock(gridLine)
-                {
+                if panel == PanelId::Agent && agentPanel.tryToggleCodeBlock(gridLine) {
                     return true;
                 }
 
                 // Click on subagent header [view] opens the overlay panel.
-                if panel == PanelId::Agent
-                    && agentPanel.isSubagentHeaderLine(gridLine)
-                {
+                if panel == PanelId::Agent && agentPanel.isSubagentHeaderLine(gridLine) {
                     if agentPanel.activeSubagent.is_some() {
                         // Live subagent — popup reads from agentPanel each frame.
                         *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
@@ -1963,11 +2179,10 @@ fn handleMouse(
                                 let mut tmp = crate::agent_panel::AgentPanel::new();
                                 replayTranscript(&mut tmp, &turns);
                                 let entries = tmp.entries;
-                                *subagentPanel = Some(
-                                    crate::subagent_panel::SubagentPanel::frozen(
+                                *subagentPanel =
+                                    Some(crate::subagent_panel::SubagentPanel::frozen(
                                         &agentType, entries,
-                                    ),
-                                );
+                                    ));
                                 return true;
                             }
                         }
@@ -1975,9 +2190,7 @@ fn handleMouse(
                 }
 
                 // Click on subagent content toggle (expand/collapse).
-                if panel == PanelId::Agent
-                    && agentPanel.tryToggleSubagentContent(gridLine)
-                {
+                if panel == PanelId::Agent && agentPanel.tryToggleSubagentContent(gridLine) {
                     return true;
                 }
 
@@ -2012,19 +2225,26 @@ fn handleMouse(
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if selState.selectingIn == Some(PanelId::Input) {
-                let localCol = mouse.column.saturating_sub(selState.inputContentRect.x)
+                let localCol = mouse
+                    .column
+                    .saturating_sub(selState.inputContentRect.x)
                     .min(selState.inputContentRect.width.saturating_sub(1));
-                let localRow = mouse.row.saturating_sub(selState.inputContentRect.y)
+                let localRow = mouse
+                    .row
+                    .saturating_sub(selState.inputContentRect.y)
                     .min(selState.inputContentRect.height.saturating_sub(1));
                 let contentWidth = selState.inputContentRect.width.saturating_sub(2);
                 let contentCol = localCol.saturating_sub(2);
-                agentPanel.textArea.mouseDrag(contentCol, localRow, contentWidth);
+                agentPanel
+                    .textArea
+                    .mouseDrag(contentCol, localRow, contentWidth);
                 return true;
             }
             if let Some(panel) = selState.selectingIn {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
-                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                let gridLine =
+                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
                 }
@@ -2041,7 +2261,8 @@ fn handleMouse(
             if let Some(panel) = selState.selectingIn.take() {
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
-                let gridLine = selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                let gridLine =
+                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
 
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
@@ -2056,12 +2277,15 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollUp => {
-            if !scrollLock.allow(ScrollAxis::Vertical) { return false; }
+            if !scrollLock.allow(ScrollAxis::Vertical) {
+                return false;
+            }
             match selState.hitTest(mouse.column, mouse.row) {
                 Some(PanelId::Agent) => {
                     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         // Shift+ScrollUp = scroll code block left.
-                        let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                        let (_, screenRow) =
+                            selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
                         let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                         if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                             agentPanel.scrollCodeBlockH(blockId, -3);
@@ -2088,12 +2312,15 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollDown => {
-            if !scrollLock.allow(ScrollAxis::Vertical) { return false; }
+            if !scrollLock.allow(ScrollAxis::Vertical) {
+                return false;
+            }
             match selState.hitTest(mouse.column, mouse.row) {
                 Some(PanelId::Agent) => {
                     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         // Shift+ScrollDown = scroll code block right.
-                        let (_, screenRow) = selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
+                        let (_, screenRow) =
+                            selState.toLocal(PanelId::Agent, mouse.column, mouse.row);
                         let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                         if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                             agentPanel.scrollCodeBlockH(blockId, 3);
@@ -2119,10 +2346,14 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollLeft => {
-            if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
+            if !scrollLock.allow(ScrollAxis::Horizontal) {
+                return false;
+            }
             // Permission code block scroll (in input area).
             if agentPanel.pendingPermit
-                && selState.inputContentRect.contains((mouse.column, mouse.row).into())
+                && selState
+                    .inputContentRect
+                    .contains((mouse.column, mouse.row).into())
             {
                 agentPanel.scrollPermitCode(-3);
             } else if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
@@ -2134,9 +2365,13 @@ fn handleMouse(
             }
         }
         MouseEventKind::ScrollRight => {
-            if !scrollLock.allow(ScrollAxis::Horizontal) { return false; }
+            if !scrollLock.allow(ScrollAxis::Horizontal) {
+                return false;
+            }
             if agentPanel.pendingPermit
-                && selState.inputContentRect.contains((mouse.column, mouse.row).into())
+                && selState
+                    .inputContentRect
+                    .contains((mouse.column, mouse.row).into())
             {
                 agentPanel.scrollPermitCode(3);
             } else if let Some(PanelId::Agent) = selState.hitTest(mouse.column, mouse.row) {
@@ -2147,7 +2382,9 @@ fn handleMouse(
                 }
             }
         }
-        _ => { return false; }
+        _ => {
+            return false;
+        }
     }
     true
 }
@@ -2236,12 +2473,15 @@ fn formatContextPct(tokens: usize, window: usize) -> String {
 /// shortcut. Dismisses on any keypress (handled in input loop).
 fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     const ROWS: &[(&str, &str)] = &[
-        ("Tab",         "Switch focus between terminal and agent"),
-        ("Esc",         "Cancel running turn / close overlay"),
+        ("Tab", "Switch focus between terminal and agent"),
+        ("Esc", "Cancel running turn / close overlay"),
         ("Ctrl+Q \u{00d7}2", "Quit flatline (double-tap)"),
-        ("Ctrl+L",      "Force terminal redraw"),
-        ("Ctrl+H",      "Toggle this help"),
-        ("\u{2191} / \u{2193}", "Scroll / history navigation in agent panel"),
+        ("Ctrl+L", "Force terminal redraw"),
+        ("Ctrl+H", "Toggle this help"),
+        (
+            "\u{2191} / \u{2193}",
+            "Scroll / history navigation in agent panel",
+        ),
     ];
 
     // Center a 56x(rows+4) box inside the given area.
@@ -2251,7 +2491,12 @@ fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     let h = innerH.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     // Clear underlying cells so the popup reads cleanly.
     Clear.render(popup, buf);
@@ -2270,7 +2515,9 @@ fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
                 Span::raw("  "),
                 Span::styled(
                     format!("{:<10}", key),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::raw(*desc),
@@ -2360,24 +2607,36 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                 let display = match &turn.attachments {
                     Some(atts) if !atts.is_empty() => {
                         let n = atts.len();
-                        let suffix = if n == 1 { "1 image".to_string() } else { format!("{n} images") };
+                        let suffix = if n == 1 {
+                            "1 image".to_string()
+                        } else {
+                            format!("{n} images")
+                        };
                         format!("{}\n[+{suffix} attached]", turn.content)
                     }
                     _ => turn.content.clone(),
                 };
-                panel.entries.push(crate::agent_panel::PanelEntry::User(display));
+                panel
+                    .entries
+                    .push(crate::agent_panel::PanelEntry::User(display));
             }
             TurnRole::Assistant => {
                 if let Some(ref reasoning) = turn.reasoning {
                     if !reasoning.is_empty() {
-                        panel.entries.push(crate::agent_panel::PanelEntry::Reasoning {
-                            text: reasoning.clone(),
-                            expanded: false,
-                        });
+                        panel
+                            .entries
+                            .push(crate::agent_panel::PanelEntry::Reasoning {
+                                text: reasoning.clone(),
+                                expanded: false,
+                            });
                     }
                 }
                 if !turn.content.is_empty() {
-                    panel.entries.push(crate::agent_panel::PanelEntry::Assistant(turn.content.clone()));
+                    panel
+                        .entries
+                        .push(crate::agent_panel::PanelEntry::Assistant(
+                            turn.content.clone(),
+                        ));
                 }
             }
             TurnRole::ToolCall => {
@@ -2385,26 +2644,32 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
 
                 if name == "task" {
                     // Reconstruct SubagentBlock from the task tool call.
-                    let prompt = turn.args.as_ref()
+                    let prompt = turn
+                        .args
+                        .as_ref()
                         .and_then(|a| a["prompt"].as_str())
                         .unwrap_or("")
                         .to_string();
-                    let agentType = turn.args.as_ref()
+                    let agentType = turn
+                        .args
+                        .as_ref()
                         .and_then(|a| a["agent"].as_str())
                         .unwrap_or("general")
                         .to_string();
 
                     let entryIdx = panel.entries.len();
-                    panel.entries.push(crate::agent_panel::PanelEntry::SubagentBlock {
-                        agentType,
-                        prompt,
-                        toolLines: Vec::new(),
-                        done: true,
-                        turns: 0,
-                        content: None,
-                        contentExpanded: false,
-                        sessionId: None, // Filled when ToolResult arrives.
-                    });
+                    panel
+                        .entries
+                        .push(crate::agent_panel::PanelEntry::SubagentBlock {
+                            agentType,
+                            prompt,
+                            toolLines: Vec::new(),
+                            done: true,
+                            turns: 0,
+                            content: None,
+                            contentExpanded: false,
+                            sessionId: None, // Filled when ToolResult arrives.
+                        });
 
                     if let Some(ref callId) = turn.toolCallId {
                         pendingTasks.insert(callId.clone(), entryIdx);
@@ -2422,9 +2687,11 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                             }
                         })
                         .unwrap_or_default();
-                    panel.entries.push(crate::agent_panel::PanelEntry::ToolApproved {
-                        name: format!("{name}: {summary}"),
-                    });
+                    panel
+                        .entries
+                        .push(crate::agent_panel::PanelEntry::ToolApproved {
+                            name: format!("{name}: {summary}"),
+                        });
                 }
             }
             TurnRole::ToolResult => {
@@ -2434,23 +2701,24 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                         // Extract child session ID and content from
                         // "[subagent session: {id}]\n\n{content}".
                         let raw = &turn.content;
-                        let (childSessionId, content) = if let Some(start) = raw.find("[subagent session: ") {
-                            let idStart = start + "[subagent session: ".len();
-                            if let Some(end) = raw[idStart..].find(']') {
-                                let sid = raw[idStart..idStart + end].to_string();
-                                let bodyStart = idStart + end + 1;
-                                let body = if raw[bodyStart..].starts_with("\n\n") {
-                                    raw[bodyStart + 2..].to_string()
+                        let (childSessionId, content) =
+                            if let Some(start) = raw.find("[subagent session: ") {
+                                let idStart = start + "[subagent session: ".len();
+                                if let Some(end) = raw[idStart..].find(']') {
+                                    let sid = raw[idStart..idStart + end].to_string();
+                                    let bodyStart = idStart + end + 1;
+                                    let body = if raw[bodyStart..].starts_with("\n\n") {
+                                        raw[bodyStart + 2..].to_string()
+                                    } else {
+                                        raw[bodyStart..].to_string()
+                                    };
+                                    (Some(sid), body)
                                 } else {
-                                    raw[bodyStart..].to_string()
-                                };
-                                (Some(sid), body)
+                                    (None, raw.clone())
+                                }
                             } else {
                                 (None, raw.clone())
-                            }
-                        } else {
-                            (None, raw.clone())
-                        };
+                            };
 
                         // Load the child transcript to reconstruct tool lines and turn count.
                         let (childToolLines, childTurns) = if let Some(ref csid) = childSessionId {
@@ -2460,13 +2728,17 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                         };
 
                         if let Some(crate::agent_panel::PanelEntry::SubagentBlock {
-                            content: c, sessionId: sid, toolLines: tl, turns: t, ..
-                        }) = panel.entries.get_mut(entryIdx) {
+                            content: c,
+                            sessionId: sid,
+                            toolLines: tl,
+                            turns: t,
+                            ..
+                        }) = panel.entries.get_mut(entryIdx)
+                        {
                             *sid = childSessionId;
                             *tl = childToolLines;
                             *t = childTurns;
-                            if !content.is_empty()
-                                && content != "Task completed (no text output)."
+                            if !content.is_empty() && content != "Task completed (no text output)."
                             {
                                 *c = Some(content);
                             }
@@ -2477,10 +2749,12 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                 }
 
                 let name = turn.tool.as_deref().unwrap_or("tool");
-                panel.entries.push(crate::agent_panel::PanelEntry::ToolResult {
-                    name: name.to_string(),
-                    output: turn.content.clone(),
-                });
+                panel
+                    .entries
+                    .push(crate::agent_panel::PanelEntry::ToolResult {
+                        name: name.to_string(),
+                        output: turn.content.clone(),
+                    });
             }
             // System turns are ephemeral — never appear in transcript chains.
             TurnRole::System => {}
@@ -2511,7 +2785,9 @@ fn loadChildToolLines(sessionId: &str) -> (Vec<(String, String)>, usize) {
             }
             TurnRole::ToolCall => {
                 let name = turn.tool.as_deref().unwrap_or("tool");
-                let argsJson = turn.args.as_ref()
+                let argsJson = turn
+                    .args
+                    .as_ref()
                     .map(|a| a.to_string())
                     .unwrap_or_default();
                 let summary = match construct::tool::parse(name, &argsJson) {
@@ -2543,8 +2819,7 @@ fn spawnAckRequest<F>(
     requestTx: mpsc::Sender<TuiRequest>,
     deckUpdateTx: mpsc::Sender<DeckUpdate>,
     build: F,
-)
-where
+) where
     F: FnOnce(oneshot::Sender<construct::control::CommandAck>) -> TuiRequest + Send + 'static,
 {
     tokio::spawn(async move {
@@ -2604,11 +2879,16 @@ fn dispatchSlashCommand(
                 TuiRequest::SwitchFork { forkId: id, reply }
             });
         }
-        crate::command::CommandAction::Resume { sessionId: Some(id) } => {
+        crate::command::CommandAction::Resume {
+            sessionId: Some(id),
+        } => {
             tokio::spawn(async move {
                 let (rTx, rRx) = oneshot::channel();
                 let _ = requestTx
-                    .send(TuiRequest::ResumeSession { sessionId: id, reply: rTx })
+                    .send(TuiRequest::ResumeSession {
+                        sessionId: id,
+                        reply: rTx,
+                    })
                     .await;
                 if let Ok(ack) = rRx.await {
                     let _ = deckUpdateTx.send(DeckUpdate::ResumeResult(ack)).await;
@@ -2620,7 +2900,9 @@ fn dispatchSlashCommand(
             // is unreachable but handled defensively with a list fallback.
             tokio::spawn(async move {
                 let (rTx, rRx) = oneshot::channel();
-                let _ = requestTx.send(TuiRequest::ListSessions { reply: rTx }).await;
+                let _ = requestTx
+                    .send(TuiRequest::ListSessions { reply: rTx })
+                    .await;
                 if let Ok(text) = rRx.await {
                     let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
                 }
@@ -2654,7 +2936,9 @@ fn dispatchSlashCommand(
                     .send(TuiRequest::GetPermissions { reply: rTx })
                     .await;
                 if let Ok(status) = rRx.await {
-                    let _ = deckUpdateTx.send(DeckUpdate::PermissionsStatus(status)).await;
+                    let _ = deckUpdateTx
+                        .send(DeckUpdate::PermissionsStatus(status))
+                        .await;
                 }
             });
         }

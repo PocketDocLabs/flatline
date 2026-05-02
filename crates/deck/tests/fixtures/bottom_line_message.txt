@@ -1,0 +1,288 @@
+Okay here's how it actually works in practice:
+
+---
+
+## The Practical Implementation
+
+### APFS (macOS)
+
+```bash
+# Create snapshot (any user can do this)
+$ tmutil snapshot /
+Created local snapshot with date: 2025-01-22-143052
+
+# List snapshots
+$ tmutil listlocalsnapshots /
+com.apple.TimeMachine.2025-01-22-143052
+
+# Access snapshot files (read-only, via .snapshot directory)
+$ ls /.snapshot/com.apple.TimeMachine.2025-01-22-143052/Users/me/project/
+src/  Cargo.toml  ...
+
+# Restore specific file
+$ cp /.snapshot/com.apple.TimeMachine.2025-01-22-143052/Users/me/project/src/main.rs .
+```
+
+**For Flatline's use case:**
+```rust
+pub async fn bash_pre_exec(&self) -> Result<ApfsSnapshot> {
+    // Create APFS snapshot of entire volume
+    let output = tokio::process::Command::new("tmutil")
+        .args(&["snapshot", "/"])
+        .output()
+        .await?;
+    
+    // Parse snapshot name from output
+    let snapshot_name = parse_snapshot_name(&output)?;
+    
+    Ok(ApfsSnapshot { 
+        name: snapshot_name,
+        mount_point: None, // On-demand mount later
+    })
+}
+
+pub async fn restore_file_from_snapshot(
+    &self,
+    snapshot: &ApfsSnapshot,
+    file_path: &Path,
+    restore_to: &Path,
+) -> Result<()> {
+    // Build path to file inside snapshot
+    let snapshot_path = format!(
+        "/.snapshot/{}/{}",
+        snapshot.name,
+        strip_root(file_path) // /Users/me/project/src/main.rs → Users/me/project/src/main.rs
+    );
+    
+    // Copy file from snapshot to restore location
+    tokio::fs::copy(&snapshot_path, restore_to).await?;
+    
+    Ok(())
+}
+```
+
+**The catch:** `.snapshot` directory is only accessible as root on newer macOS versions (Catalina+). So we'd need to:
+
+1. Mount the snapshot to a temporary directory (requires root OR use `mount_apfs -s` with `-o nobrowse,ro`)
+2. Copy what we need
+3. Unmount
+
+Or use a privileged helper / ask for user permission when needed.
+
+---
+
+### Btrfs (Linux)
+
+Much cleaner:
+
+```bash
+# Create snapshot of working directory subvolume
+$ btrfs subvolume snapshot -r /home/me/project /home/me/.flatline/snapshots/project-2025-01-22-143052
+
+# Snapshot is now a directory we can access directly
+$ ls /home/me/.flatline/snapshots/project-2025-01-22-143052/
+src/  Cargo.toml  ...
+
+# Restore file
+$ cp /home/me/.flatline/snapshots/project-2025-01-22-143052/src/main.rs .
+
+# Cleanup when done
+$ btrfs subvolume delete /home/me/.flatline/snapshots/project-2025-01-22-143052
+```
+
+**Flatline implementation:**
+```rust
+pub async fn bash_pre_exec(&self) -> Result<BtrfsSnapshot> {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let snapshot_name = format!("flatline-bash-{}-{}", self.session_id, timestamp);
+    let snapshot_path = self.snapshots_dir.join(&snapshot_name);
+    
+    // Create read-only snapshot of working directory
+    tokio::process::Command::new("btrfs")
+        .args(&[
+            "subvolume", 
+            "snapshot", 
+            "-r",  // read-only
+            self.working_dir.to_str().unwrap(),
+            snapshot_path.to_str().unwrap(),
+        ])
+        .output()
+        .await?;
+    
+    Ok(BtrfsSnapshot { path: snapshot_path })
+}
+
+pub async fn restore_file_from_snapshot(
+    &self,
+    snapshot: &BtrfsSnapshot,
+    relative_path: &Path,
+    restore_to: &Path,
+) -> Result<()> {
+    let source = snapshot.path.join(relative_path);
+    tokio::fs::copy(&source, restore_to).await?;
+    Ok(())
+}
+
+pub async fn cleanup_snapshot(&self, snapshot: BtrfsSnapshot) -> Result<()> {
+    tokio::process::Command::new("btrfs")
+        .args(&["subvolume", "delete", snapshot.path.to_str().unwrap()])
+        .output()
+        .await?;
+    Ok(())
+}
+```
+
+---
+
+## The Full Flow
+
+```rust
+pub enum OsSnapshot {
+    /// APFS snapshot (macOS)
+    Apfs { name: String },
+    /// Btrfs subvolume snapshot (Linux)
+    Btrfs { path: PathBuf },
+    /// ZFS snapshot (BSD/Linux)
+    Zfs { name: String },
+    /// No OS support, fallback to pessimistic file copy
+    None,
+}
+
+impl FileHistory {
+    pub async fn bash_will_run(&self, cmd: &str) -> Result<BashCheckpoint> {
+        // First, detect what OS/filesystem we're on
+        let snapshot = match self.detect_filesystem().await? {
+            Filesystem::Apfs => {
+                let name = create_apfs_snapshot("/").await?;
+                OsSnapshot::Apfs { name }
+            }
+            Filesystem::Btrfs => {
+                let path = create_btrfs_snapshot(&self.working_dir).await?;
+                OsSnapshot::Btrfs { path }
+            }
+            _ => OsSnapshot::None,
+        };
+        
+        // Record what we expect this bash to touch (best effort)
+        let likely_targets = parse_bash_for_paths(cmd);
+        
+        Ok(BashCheckpoint {
+            snapshot,
+            command: cmd.to_string(),
+            expected_targets: likely_targets,
+        })
+    }
+    
+    pub async fn bash_did_run(&self, checkpoint: BashCheckpoint) -> Result<()> {
+        // Detect what actually changed
+        let changed_files = self.detect_changes().await?;
+        
+        match &checkpoint.snapshot {
+            OsSnapshot::Apfs { name } | OsSnapshot::Btrfs { .. } => {
+                // Store checkpoint referencing the OS snapshot
+                // We don't need to copy files - the snapshot has everything
+                self.create_checkpoint(BashOsCheckpoint {
+                    snapshot: checkpoint.snapshot,
+                    files_changed: changed_files.keys().cloned().collect(),
+                    has_full_backup: true,
+                }).await?;
+            }
+            
+            OsSnapshot::None => {
+                // No OS support - we can only record what changed, not restore
+                self.create_checkpoint(BashNoRewindCheckpoint {
+                    command: checkpoint.command,
+                    files_changed: changed_files.keys().cloned().collect(),
+                    warning: "Bash changes not rewindable (no OS snapshot support)",
+                }).await?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    pub async fn rewind_past_bash(
+        &self,
+        checkpoint: &BashOsCheckpoint,
+        file_path: &Path,
+    ) -> Result<()> {
+        // Restore specific file from OS snapshot
+        match &checkpoint.snapshot {
+            OsSnapshot::Apfs { name } => {
+                restore_from_apfs(name, file_path).await
+            }
+            OsSnapshot::Btrfs { path } => {
+                let source = path.join(relative_to_working_dir(file_path));
+                tokio::fs::copy(&source, file_path).await?;
+                Ok(())
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+```
+
+---
+
+## Timeline UI with OS Snapshots
+
+```
+◉ "add user auth" ────────────────────────── 3 files    2:41 PM
+│  └─ src/auth.rs (+45/-3)
+│
+├─○ ! bash ───────────────────────────────── 12 files 📸  2:45 PM  ← OS snapshot
+│  │  cargo build --release
+│  │  └─ target/release/app (binary)
+│  │     target/release/*.rlib
+│  │     src/main.rs (timestamp changed)
+│  │
+│  └─ 📸 APFS snapshot: com.apple.TimeMachine.2025-01-22-143052
+│      Rewindable: restore individual files or full state
+│
+◉ "fix warnings" ──────────────────────────── 2 files    2:48 PM
+```
+
+The 📸 icon tells the user: "This checkpoint uses an OS-level snapshot. You can restore any file from this point."
+
+---
+
+## The Tradeoffs
+
+| Aspect | APFS | Btrfs | Fallback (copy) |
+|--------|------|-------|-----------------|
+| **Creation speed** | ~50ms | ~10ms | O(n) file copies |
+| **Space cost** | Zero (COW) | Zero (COW) | 2× changed files |
+| **Restore speed** | Copy from snapshot | Copy from subvolume | Already have copy |
+| **Requires root** | Sometimes* | No | No |
+| **Cleanup** | Auto (7 days) | Manual | Manual |
+| **Granularity** | Whole volume | Per-directory | Per-file |
+
+*APFS: `.snapshot` access requires root on Catalina+ in protected directories (Desktop, Documents, Downloads). Can work around with temporary mount.
+
+---
+
+## Fallback Strategy
+
+When no OS support:
+```rust
+// Before bash: snapshot all currently-tracked files (slow but safe)
+let backup_dir = self.create_eager_backup().await?;
+
+// After bash: record checkpoint with backup location
+self.create_checkpoint(BashPessimisticCheckpoint {
+    backup_dir,
+    // ...
+});
+```
+
+This is what Claude does always. We only do it when we have to.
+
+---
+
+## Bottom Line
+
+- **macOS**: `tmutil snapshot` + mount + copy from `/.snapshot/`. Sometimes needs privilege escalation for protected directories.
+- **Linux (Btrfs)**: `btrfs subvolume snapshot -r` → direct access → `btrfs subvolume delete`. Clean and fast.
+- **Neither**: Fall back to pessimistic copy of tracked files, or honest "not rewindable" warning.
+
+The magic is: **we don't revert the entire volume**, we just use the snapshot as a read-only source to copy specific files from during rewind.

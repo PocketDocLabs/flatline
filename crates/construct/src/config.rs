@@ -31,7 +31,7 @@
 //! - `FLATLINE_HEAVY_PROFILE` — override `heavyProfile` selection
 //! - `FLATLINE_LIGHT_PROFILE` — override `lightProfile` selection
 //! - `FLATLINE_UTILITY_PROFILE` — override `utilityProfile` selection
-//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `EXA_API_KEY` — API keys
+//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`, `EXA_API_KEY` — API keys
 //!
 //! # Dependencies
 //! `serde`, `toml`, `dirs`
@@ -116,7 +116,7 @@ pub struct WebConfig {
 /// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// API provider: "openrouter" or "fireworks".
+    /// API provider: "openrouter", "fireworks", or "deepseek".
     pub provider: String,
 
     /// API key.
@@ -216,6 +216,18 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             contextWindow: 256_000,
             supportsAnthropicCache: None,
         },
+        "deepseek" => ModelConfig {
+            provider: "deepseek".into(),
+            key: String::new(),
+            model: "deepseek-v4-pro".into(),
+            baseUrl: "https://api.deepseek.com".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(8_000),
+            contextWindow: 128_000,
+            supportsAnthropicCache: None,
+        },
         // Default to OpenRouter for anything unrecognized.
         _ => ModelConfig {
             provider: "openrouter".into(),
@@ -296,7 +308,7 @@ pub fn configDir() -> PathBuf {
 /// 4. Local (`.flatline/config.local.toml`, gitignored)
 /// 5. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
 ///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`,
-///    `EXA_API_KEY`)
+///    `DEEPSEEK_API_KEY`, `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
     // Explicit-path override: FLATLINE_CONFIG=/path/to/config.toml bypasses
     // user/project/local discovery and loads exactly that file.
@@ -426,6 +438,7 @@ fn applyEnvKey(config: &mut ModelConfig) {
 
     let envVar = match config.provider.as_str() {
         "fireworks" => "FIREWORKS_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
         _ => "OPENROUTER_API_KEY",
     };
 
@@ -745,10 +758,14 @@ fn resolveWeb(partial: Option<PartialWebConfig>) -> WebConfig {
 /// TOML text written when no user config exists yet.
 ///
 /// Three-tier starter config: Opus (heavy), Sonnet (light), Kimi K2.5 via
-/// OpenRouter (utility). All three profiles share the OpenRouter provider
-/// so a user with only `OPENROUTER_API_KEY` gets a working setup out of
-/// the box. Swap the utility profile to Fireworks direct if you have a
-/// Firepass account.
+/// OpenRouter (utility). All three active profiles share the OpenRouter
+/// provider so a user with only `OPENROUTER_API_KEY` gets a working setup
+/// out of the box.
+///
+/// DeepSeek V4 Pro/Flash profiles are also defined but not selected by
+/// default — switch `heavyProfile` / `lightProfile` / `utilityProfile` to
+/// `deepseekPro` / `deepseekFlash` / `deepseekUtility` and set
+/// `DEEPSEEK_API_KEY` to use the official DeepSeek API instead.
 fn defaultConfigToml() -> String {
     format!(
         "heavyProfile   = \"opus\"\n\
@@ -770,7 +787,22 @@ fn defaultConfigToml() -> String {
          [profile.kimi]\n\
          provider       = \"openrouter\"\n\
          model          = \"moonshotai/kimi-k2.5\"\n\
-         contextWindow  = 256000\n",
+         contextWindow  = 256000\n\n\
+         [profile.deepseekPro]\n\
+         provider       = \"deepseek\"\n\
+         model          = \"deepseek-v4-pro\"\n\
+         contextWindow  = 128000\n\
+         reasoning      = {{ effort = \"max\" }}\n\n\
+         [profile.deepseekFlash]\n\
+         provider       = \"deepseek\"\n\
+         model          = \"deepseek-v4-flash\"\n\
+         contextWindow  = 128000\n\
+         reasoning      = {{ effort = \"high\" }}\n\n\
+         [profile.deepseekUtility]\n\
+         provider       = \"deepseek\"\n\
+         model          = \"deepseek-v4-flash\"\n\
+         contextWindow  = 128000\n\
+         reasoning      = {{ effort = \"disabled\" }}\n",
         compact = defaultCompactRatio(),
     )
 }
@@ -1097,5 +1129,32 @@ mod tests {
         assert!(cfg.light.promptThinking);
         assert!(cfg.utility.model.contains("kimi"));
         assert!(!cfg.utility.promptThinking);
+    }
+
+    #[test]
+    fn starterTomlParsesAndExposesDeepseekProfiles() {
+        // Guard against escape-brace mistakes in the format! template and
+        // confirm the three DeepSeek profiles land in the profile map with
+        // their configured reasoning effort.
+        let toml = defaultConfigToml();
+        let partial: PartialConfig = ::toml::from_str(&toml).expect("parse starter toml");
+
+        for name in ["opus", "sonnet", "kimi", "deepseekPro", "deepseekFlash", "deepseekUtility"] {
+            assert!(
+                partial.profile.contains_key(name),
+                "starter toml missing profile {name}"
+            );
+        }
+
+        let pro = partial.profile.get("deepseekPro").unwrap();
+        assert_eq!(pro.provider.as_deref(), Some("deepseek"));
+        assert_eq!(pro.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(pro.reasoning.as_ref().unwrap().effort.as_deref(), Some("max"));
+
+        let flash = partial.profile.get("deepseekFlash").unwrap();
+        assert_eq!(flash.reasoning.as_ref().unwrap().effort.as_deref(), Some("high"));
+
+        let util = partial.profile.get("deepseekUtility").unwrap();
+        assert_eq!(util.reasoning.as_ref().unwrap().effort.as_deref(), Some("disabled"));
     }
 }

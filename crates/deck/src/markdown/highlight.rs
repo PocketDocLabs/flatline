@@ -20,7 +20,17 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+/// Iterate (grapheme, display_width) pairs for a string.
+///
+/// Uses grapheme clusters with str-level width so emoji sequences like
+/// `⚠\u{FE0F}` render as one atomic 2-col unit, matching what ratatui
+/// and the terminal actually draw.
+fn graphemeWidths(s: &str) -> impl Iterator<Item = (&str, usize)> {
+    s.graphemes(true).map(|g| (g, UnicodeWidthStr::width(g)))
+}
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Theme> = OnceLock::new();
@@ -86,16 +96,17 @@ fn truncateLabelToWidth(s: &str, maxWidth: usize) -> String {
         return s.to_string();
     }
     let mut width = 0;
-    for (i, ch) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    let mut end = 0;
+    for (g, cw) in graphemeWidths(s) {
         // Reserve 1 column for the ellipsis.
         if width + cw > maxWidth.saturating_sub(1) {
             if width == 0 {
                 return s.to_string();
             }
-            return format!("{}\u{2026}", &s[..i]);
+            return format!("{}\u{2026}", &s[..end]);
         }
         width += cw;
+        end += g.len();
     }
     s.to_string()
 }
@@ -224,9 +235,9 @@ pub fn renderCodeBlock(
 
         for span in &scrolled {
             let start = buf.len();
-            for ch in span.content.chars() {
+            for (g, cw) in graphemeWidths(&span.content) {
                 // Expand tabs to spaces (terminals interpret raw \t as tab stops).
-                if ch == '\t' {
+                if g == "\t" {
                     let tabW = 4usize.saturating_sub(bufWidth % 4);
                     for _ in 0..tabW {
                         if bufWidth >= innerWidth { break; }
@@ -235,15 +246,14 @@ pub fn renderCodeBlock(
                     }
                     continue;
                 }
-                // Skip other control characters entirely.
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if cw == 0 && ch.is_control() {
+                // Skip control-only clusters (e.g. \0, \r).
+                if cw == 0 && g.chars().all(|c| c.is_control()) {
                     continue;
                 }
                 if bufWidth + cw > innerWidth {
                     break;
                 }
-                buf.push(ch);
+                buf.push_str(g);
                 bufWidth += cw;
             }
             let end = buf.len();
@@ -617,9 +627,7 @@ fn scrollAndTruncateSpans(
 
     for span in spans {
         let mut text = String::new();
-        for ch in span.content.chars() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-
+        for (g, w) in graphemeWidths(&span.content) {
             // Still skipping.
             if skipped < skipCols {
                 skipped += w;
@@ -630,7 +638,7 @@ fn scrollAndTruncateSpans(
             if taken + w > maxCols {
                 break;
             }
-            text.push(ch);
+            text.push_str(g);
             taken += w;
         }
         if !text.is_empty() {
@@ -661,4 +669,55 @@ fn syntectToRatatui(s: SyntectStyle) -> Style {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lineText(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn emojiSequenceWidthMatchesRender() {
+        let code = "\u{2514}\u{2500} \u{26A0}\u{FE0F} Cannot automatically restore";
+        let lines = highlightLines(code, None);
+        let mcw = maxContentWidth(&lines);
+        assert_eq!(mcw, UnicodeWidthStr::width(code));
+
+        for width in [20u16, 30u16, 40u16, 50u16, 60u16] {
+            let rendered = renderCodeBlock(&lines, None, width, 0, mcw, false, None, None);
+            for (i, ln) in rendered.iter().enumerate() {
+                let text = lineText(ln);
+                let w = UnicodeWidthStr::width(text.as_str());
+                assert_eq!(
+                    w, width as usize,
+                    "width={} line{}: rendered width {} mismatch for text={:?}",
+                    width, i, w, text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emojiInScrolledContent() {
+        let code = "\u{251C}\u{2500}\u{25CB} ! bash \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} 3 files \u{26A0}\u{FE0F}    2:45 PM";
+        let lines = highlightLines(code, None);
+        let mcw = maxContentWidth(&lines);
+        for width in [30u16, 40u16, 50u16, 60u16, 70u16] {
+            for scroll in [0u16, 5u16, 20u16] {
+                let rendered = renderCodeBlock(&lines, None, width, scroll, mcw, false, None, None);
+                for (i, ln) in rendered.iter().enumerate() {
+                    let text = lineText(ln);
+                    let w = UnicodeWidthStr::width(text.as_str());
+                    assert_eq!(
+                        w, width as usize,
+                        "w={} scroll={} line{}: rendered width {} mismatch for text={:?}",
+                        width, scroll, i, w, text
+                    );
+                }
+            }
+        }
+    }
 }

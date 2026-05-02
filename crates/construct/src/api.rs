@@ -1,7 +1,7 @@
-//! OpenRouter API client with streaming and non-streaming support.
+//! Multi-provider chat completion client (OpenRouter, Fireworks, DeepSeek).
 //!
-//! Speaks the OpenAI-compatible chat completions format
-//! with OpenRouter's reasoning extensions.
+//! Speaks the OpenAI-compatible chat completions format with provider-
+//! specific extensions for reasoning, caching, and routing.
 //!
 //! # Public API
 //! - [`Client`] — HTTP client for the LLM API
@@ -41,7 +41,8 @@ impl std::fmt::Display for PermanentApiError {
 
 impl std::error::Error for PermanentApiError {}
 
-/// LLM API client. Supports OpenRouter and Fireworks (any OpenAI-compatible endpoint).
+/// LLM API client. Supports OpenRouter, Fireworks, and the official DeepSeek API
+/// (any OpenAI-compatible endpoint).
 ///
 /// Holds only heavy (streaming, main session) and utility (non-streaming,
 /// compaction + topic tracking). The light tier is reached by subagents
@@ -60,7 +61,7 @@ impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
         if config.heavy.key.is_empty() {
-            bail!("API key not set. Set the heavy profile's key in config.toml, or OPENROUTER_API_KEY / FIREWORKS_API_KEY");
+            bail!("API key not set. Set the heavy profile's key in config.toml, or OPENROUTER_API_KEY / FIREWORKS_API_KEY / DEEPSEEK_API_KEY");
         }
 
         let heavyHttp = buildHttpClient(&config.heavy)
@@ -114,14 +115,27 @@ impl Client {
         }
 
         if let Some(r) = reasoning {
-            if self.heavy.provider == "fireworks" {
-                // Fireworks uses a top-level `reasoning_effort` string.
-                if let Some(ref effort) = r.effort {
-                    body["reasoning_effort"] = serde_json::json!(effort);
+            match self.heavy.provider.as_str() {
+                "fireworks" => {
+                    // Fireworks uses a top-level `reasoning_effort` string.
+                    if let Some(ref effort) = r.effort {
+                        body["reasoning_effort"] = serde_json::json!(effort);
+                    }
                 }
-            } else {
-                // OpenRouter uses a nested `reasoning` object.
-                body["reasoning"] = serde_json::to_value(r)?;
+                "deepseek" => {
+                    // DeepSeek wraps reasoning in a `thinking` object with
+                    // `type` ("enabled" | "disabled") and `reasoning_effort`
+                    // ("high" | "max"). The effort string "disabled" / "off"
+                    // turns thinking off entirely; anything else passes
+                    // through as the effort level.
+                    if let Some(ref effort) = r.effort {
+                        body["thinking"] = deepseekThinking(effort);
+                    }
+                }
+                _ => {
+                    // OpenRouter uses a nested `reasoning` object.
+                    body["reasoning"] = serde_json::to_value(r)?;
+                }
             }
         }
 
@@ -220,6 +234,18 @@ impl Client {
                 "order": self.utility.providerOrder,
                 "allow_fallbacks": false,
             });
+        }
+
+        // DeepSeek defaults reasoning to `high` server-side, which wastes
+        // tokens on mechanical utility calls (topic naming, compaction).
+        // Honour the utility profile's reasoning.effort — including
+        // "disabled" — so the operator can opt out.
+        if self.utility.provider == "deepseek" {
+            if let Some(ref settings) = self.utility.reasoning {
+                if let Some(ref effort) = settings.effort {
+                    body["thinking"] = deepseekThinking(effort);
+                }
+            }
         }
 
         tracing::debug!(
@@ -450,12 +476,12 @@ fn warnIfProviderNotPinned(cfg: &ModelConfig) {
 
 /// Serialize messages with provider-specific field names.
 ///
-/// Fireworks uses `reasoning_content` where OpenRouter uses `reasoning`
-/// on assistant messages. This translates at the JSON boundary so the
-/// internal Message type stays provider-agnostic.
+/// Fireworks and DeepSeek use `reasoning_content` where OpenRouter uses
+/// `reasoning` on assistant messages. This translates at the JSON boundary
+/// so the internal Message type stays provider-agnostic.
 fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
     let mut value = serde_json::to_value(messages).unwrap_or_default();
-    if provider == "fireworks" {
+    if provider == "fireworks" || provider == "deepseek" {
         if let serde_json::Value::Array(ref mut arr) = value {
             for msg in arr.iter_mut() {
                 if let serde_json::Value::Object(map) = msg {
@@ -469,6 +495,21 @@ fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
         }
     }
     value
+}
+
+/// Build the DeepSeek `thinking` request object. Effort strings `"disabled"`
+/// or `"off"` produce `{"type":"disabled"}`; anything else maps to
+/// `{"type":"enabled","reasoning_effort":<effort>}`. DeepSeek itself
+/// silently maps `low`/`medium` → `high`, so callers can stay loose.
+fn deepseekThinking(effort: &str) -> serde_json::Value {
+    if effort.eq_ignore_ascii_case("disabled") || effort.eq_ignore_ascii_case("off") {
+        serde_json::json!({ "type": "disabled" })
+    } else {
+        serde_json::json!({
+            "type": "enabled",
+            "reasoning_effort": effort,
+        })
+    }
 }
 
 /// Build an HTTP client for a specific model config, with provider-appropriate headers.
@@ -840,6 +881,46 @@ mod tests {
 
     fn serializedMessages(msgs: &[Message]) -> serde_json::Value {
         adaptMessages(msgs, "openrouter")
+    }
+
+    #[test]
+    fn deepseekThinkingShapes() {
+        assert_eq!(
+            deepseekThinking("max"),
+            serde_json::json!({ "type": "enabled", "reasoning_effort": "max" }),
+        );
+        assert_eq!(
+            deepseekThinking("high"),
+            serde_json::json!({ "type": "enabled", "reasoning_effort": "high" }),
+        );
+        assert_eq!(
+            deepseekThinking("disabled"),
+            serde_json::json!({ "type": "disabled" }),
+        );
+        assert_eq!(
+            deepseekThinking("off"),
+            serde_json::json!({ "type": "disabled" }),
+        );
+        assert_eq!(
+            deepseekThinking("DISABLED"),
+            serde_json::json!({ "type": "disabled" }),
+        );
+    }
+
+    #[test]
+    fn deepseekRenamesAssistantReasoning() {
+        let msgs = vec![
+            Message::Assistant {
+                content: Some("answer".into()),
+                tool_calls: None,
+                reasoning: Some("ponder".into()),
+            },
+        ];
+        let value = adaptMessages(&msgs, "deepseek");
+        let arr = value.as_array().unwrap();
+        let assistant = arr[0].as_object().unwrap();
+        assert!(!assistant.contains_key("reasoning"));
+        assert_eq!(assistant.get("reasoning_content").unwrap(), "ponder");
     }
 
     #[test]

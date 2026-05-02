@@ -68,6 +68,19 @@ pub enum PanelEntry {
     Cancelled,
 }
 
+/// A tool call that is still streaming from the model. Populated as
+/// ToolCallPending/Progress/Preview events arrive and cleared once the
+/// full tool call reaches approval or the turn ends.
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub name: String,
+    pub bytes: usize,
+    /// Human-readable summary of the key arg (file path, command, pattern,
+    /// etc.) once its value has finished streaming. `None` until at least
+    /// one recognized field closes.
+    pub preview: Option<String>,
+}
+
 /// Tracked state for a running subagent (for the overlay panel).
 pub struct ActiveSubagent {
     /// Child session id — used for matching incoming subagent permits.
@@ -198,12 +211,22 @@ pub struct AgentPanel {
     toolActive: bool,
     /// When the current tool started executing (for elapsed time display).
     toolStartTime: Option<Instant>,
+    /// Tool calls currently being assembled in the stream, indexed by the
+    /// model's tool_call index. Populated on ToolCallPending/Progress and
+    /// cleared when approval or cancellation transitions fire.
+    pendingToolCalls: Vec<PendingToolCall>,
+    /// When the first pending tool call appeared (shared elapsed clock).
+    pendingToolCallStartTime: Option<Instant>,
     /// Active subagent state (for the overlay panel).
     pub activeSubagent: Option<ActiveSubagent>,
     /// Last wall-clock time the throbber was ticked.
     lastThrobberTick: Instant,
     /// Scroll offset from the bottom (in visual lines).
     pub scrollOffset: u16,
+    /// New content arrived while scrolled up (for border indicator).
+    newContentWhileScrolled: bool,
+    /// Agent became idle while user scrolled up (for border indicator).
+    idleWhileScrolled: bool,
     /// ScrollY value from the last render (for visual-line lookups).
     lastScrollY: u16,
     /// Chat area width from the last render (for wrap estimation).
@@ -278,9 +301,13 @@ impl AgentPanel {
             reasoningActive: false,
             toolActive: false,
             toolStartTime: None,
+            pendingToolCalls: Vec::new(),
+            pendingToolCallStartTime: None,
             activeSubagent: None,
             lastThrobberTick: Instant::now(),
             scrollOffset: 0,
+            newContentWhileScrolled: false,
+            idleWhileScrolled: false,
             lastScrollY: 0,
             lastChatWidth: 0,
             lastMaxScroll: 0,
@@ -318,10 +345,14 @@ impl AgentPanel {
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
+        self.pendingToolCalls.clear();
+        self.pendingToolCallStartTime = None;
         self.thinkingStartTime = None;
         self.thinkingExpanded = false;
         self.reasoningActive = false;
         self.scrollOffset = 0;
+        self.newContentWhileScrolled = false;
+        self.idleWhileScrolled = false;
         self.lastScrollY = 0;
         self.lastMaxScroll = 0;
         self.lastContinuationMap.clear();
@@ -383,7 +414,10 @@ impl AgentPanel {
         }
         // Discard the deck-side queue — construct has consumed them.
         self.queuedMessages.clear();
+        // User explicitly promoted queue — snap to bottom
         self.scrollOffset = 0;
+        self.newContentWhileScrolled = false;
+        self.idleWhileScrolled = false;
     }
 
     pub fn pushUser(&mut self, text: &str) {
@@ -395,7 +429,10 @@ impl AgentPanel {
             format!("{text}\n[+{suffix} attached]")
         };
         self.entries.push(PanelEntry::User(display));
+        // User sent message — snap to bottom to see their own message
         self.scrollOffset = 0;
+        self.newContentWhileScrolled = false;
+        self.idleWhileScrolled = false;
         self.turnActive = true;
         self.textArea.placeholder = "Queue a message...";
         // Start thinking indicator immediately for responsiveness.
@@ -406,7 +443,10 @@ impl AgentPanel {
     /// Display a slash command without activating the turn or throbber.
     pub fn pushCommand(&mut self, text: &str) {
         self.entries.push(PanelEntry::User(text.into()));
+        // Slash command — snap to bottom
         self.scrollOffset = 0;
+        self.newContentWhileScrolled = false;
+        self.idleWhileScrolled = false;
     }
 
     pub fn appendContent(&mut self, text: &str) {
@@ -496,17 +536,24 @@ impl AgentPanel {
     pub fn finishTurn(&mut self) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
+        self.clearPendingToolCalls();
         self.turnActive = false;
         self.toolActive = false;
         self.toolStartTime = None;
         self.retryStatus = None;
         self.textArea.placeholder = "Type a message...";
+        // Turn complete — agent is now idle
+        if self.scrollOffset > 0 {
+            self.idleWhileScrolled = true;
+        }
+        self.newContentWhileScrolled = false;
     }
 
     /// Finalize streaming state after a cancellation.
     pub fn finalizeCancelled(&mut self) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
+        self.clearPendingToolCalls();
         self.turnActive = false;
         self.toolActive = false;
         self.toolStartTime = None;
@@ -570,7 +617,15 @@ impl AgentPanel {
         self.permitEditingCustom = false;
         self.permitCodeScrollX = 0;
 
-        self.scrollOffset = 0;
+        // Tool request arrived — DO NOT snap scroll, user may be reading
+        if self.scrollOffset == 0 {
+            // At bottom, stay at bottom (will show new content)
+            self.newContentWhileScrolled = false;
+        } else {
+            // Scrolled up — flag new content arrived
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
     }
 
     pub fn approvePending(&mut self) {
@@ -707,7 +762,13 @@ impl AgentPanel {
             contentExpanded: false,
             sessionId: Some(sessionId.into()),
         });
-        self.scrollOffset = 0;
+        // Subagent started — DO NOT snap scroll
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+        } else {
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
     }
 
     pub fn subagentToolLine(&mut self, name: &str, summary: &str) {
@@ -723,7 +784,13 @@ impl AgentPanel {
                 name: format!("{name}: {summary}"),
             });
         }
-        self.scrollOffset = 0;
+        // Subagent tool activity — DO NOT snap scroll
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+        } else {
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
     }
 
     /// Push a full tool result to the subagent's transcript (for the overlay).
@@ -807,19 +874,65 @@ impl AgentPanel {
     pub fn toolApproved(&mut self, name: &str) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
+        self.clearPendingToolCalls();
         self.entries
             .push(PanelEntry::ToolApproved { name: name.into() });
+    }
+
+    /// A tool call's name was just revealed in the stream. Register it so the
+    /// "preparing" indicator can render while arguments continue to arrive.
+    pub fn toolCallPending(&mut self, index: usize, name: &str) {
+        if !self.turnActive { return; }
+        while self.pendingToolCalls.len() <= index {
+            self.pendingToolCalls.push(PendingToolCall {
+                name: String::new(),
+                bytes: 0,
+                preview: None,
+            });
+        }
+        self.pendingToolCalls[index].name = name.into();
+        if self.pendingToolCallStartTime.is_none() {
+            self.pendingToolCallStartTime = Some(Instant::now());
+        }
+    }
+
+    /// A tool call's arguments have grown — update the byte counter.
+    pub fn toolCallProgress(&mut self, index: usize, bytes: usize) {
+        if !self.turnActive { return; }
+        if let Some(slot) = self.pendingToolCalls.get_mut(index) {
+            slot.bytes = bytes;
+        }
+    }
+
+    /// A tool call's key-arg preview just resolved (or refined).
+    pub fn toolCallPreview(&mut self, index: usize, preview: &str) {
+        if !self.turnActive { return; }
+        if let Some(slot) = self.pendingToolCalls.get_mut(index) {
+            slot.preview = Some(preview.into());
+        }
+    }
+
+    fn clearPendingToolCalls(&mut self) {
+        self.pendingToolCalls.clear();
+        self.pendingToolCallStartTime = None;
     }
 
     pub fn toolStarted(&mut self, _name: &str, summary: &str) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
+        self.clearPendingToolCalls();
         self.toolActive = true;
         self.toolStartTime = Some(Instant::now());
         self.entries.push(PanelEntry::ToolActive {
             summary: summary.into(),
         });
-        self.scrollOffset = 0;
+        // Tool started — DO NOT snap scroll
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+        } else {
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
     }
 
     pub fn toolDenied(&mut self, name: &str) {
@@ -854,7 +967,13 @@ impl AgentPanel {
             name: name.into(),
             output: output.into(),
         });
-        self.scrollOffset = 0;
+        // Tool result — DO NOT snap scroll
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+        } else {
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
         // Restart thinking indicator — model will be called again after tool results.
         self.isStreaming = true;
         self.thinkingStartTime = Some(Instant::now());
@@ -981,6 +1100,25 @@ impl AgentPanel {
         self.completion.is_some()
     }
 
+    /// Build the agent panel title string with scroll indicators.
+    fn agent_title(&self) -> String {
+        if self.scrollOffset == 0 {
+            // At bottom — clean title
+            " agent ".to_string()
+        } else if self.newContentWhileScrolled {
+            // Scrolled up with new content below
+            " agent [↓ new] ".to_string()
+        } else if self.idleWhileScrolled && !self.turnActive {
+            // Scrolled up, agent done, waiting for user
+            " agent [⋯ waiting] ".to_string()
+        } else if self.scrollOffset > 0 {
+            // Just scrolled up (no new content since scroll)
+            format!(" agent [↑{}] ", self.scrollOffset)
+        } else {
+            " agent ".to_string()
+        }
+    }
+
     pub fn scrollUp(&mut self, amount: u16) {
         self.scrollOffset = self.scrollOffset.saturating_add(amount);
     }
@@ -1098,7 +1236,13 @@ impl AgentPanel {
             && self.streamingReasoning.is_empty();
         let subagentRunning = self.activeSubagent.is_some()
             && !self.entries.iter().rev().any(|e| matches!(e, PanelEntry::SubagentBlock { done: true, .. }));
-        if !(waiting || self.reasoningActive || self.toolActive || subagentRunning) {
+        let pendingToolCall = !self.pendingToolCalls.is_empty();
+        if !(waiting
+            || self.reasoningActive
+            || self.toolActive
+            || subagentRunning
+            || pendingToolCall)
+        {
             return false;
         }
         let now = Instant::now();
@@ -1379,7 +1523,7 @@ impl AgentPanel {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(borderStyle)
-            .title(" agent ");
+            .title(self.agent_title());
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -1504,29 +1648,60 @@ impl AgentPanel {
             .collect();
         self.nonCopyableLines = nonCopyable;
 
-        // buildLines already wraps text to fit paddedChat.width — don't let
-        // Paragraph re-wrap, as that shifts visual line indices and breaks
-        // click targets (code block scroll/copy, subagent toggle, etc.).
+        // buildLines already wraps text to fit paddedChat.width.
         let totalLines = lines.len() as u16;
-        let paragraph = Paragraph::new(lines);
-        let totalWrapped = totalLines;
         let visible = paddedChat.height;
-        let maxScroll = totalWrapped.saturating_sub(visible);
-        // Keep view pinned when scrolled up and new content arrives.
-        if self.scrollOffset > 0 && maxScroll > self.lastMaxScroll {
-            self.scrollOffset = self.scrollOffset.saturating_add(maxScroll - self.lastMaxScroll);
-        }
+        let maxScroll = totalLines.saturating_sub(visible);
+        // REMOVED: No longer auto-scroll when content arrives — respect user's scroll position
+        // Previously: if self.scrollOffset > 0 && maxScroll > self.lastMaxScroll { ... }
         self.lastMaxScroll = maxScroll;
         // Clamp to prevent scroll accumulation past content top.
         self.scrollOffset = self.scrollOffset.min(maxScroll);
+        // Clear indicator flags when user reaches bottom
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+            self.idleWhileScrolled = false;
+        }
         let scrollY = maxScroll.saturating_sub(self.scrollOffset);
 
         self.lastScrollY = scrollY;
         self.lastChatWidth = paddedChat.width;
 
-        paragraph
-            .scroll((scrollY, 0))
-            .render(paddedChat, buf);
+        // Render each visible line via buf.set_line rather than
+        // Paragraph::render. set_line → set_stringn explicitly resets the
+        // trailing cells of wide graphemes, and we explicitly space-fill
+        // every remaining cell so fast scrolling can't leave stale glyphs
+        // in the gutter (ratatui's own buffer diff compares None symbol
+        // cells as equal to Some(" "), so "empty" cells with leftover
+        // terminal-side content never get an update).
+        let visibleLines: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(scrollY as usize)
+            .take(paddedChat.height as usize)
+            .collect();
+        // Always fill the full chatArea (not just paddedChat). The 2-col
+        // gutter on the right of paddedChat is where stale glyphs accumulate
+        // during fast scrolling — filling it explicitly here forces ratatui
+        // to diff those cells every frame.
+        let visibleRows = visibleLines.len();
+        for (i, line) in visibleLines.into_iter().enumerate() {
+            let y = chatArea.y + i as u16;
+            let (endX, _) = buf.set_line(paddedChat.x, y, &line, paddedChat.width);
+            for x in endX..chatArea.x + chatArea.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default());
+                }
+            }
+        }
+        for y in chatArea.y + visibleRows as u16..chatArea.y + chatArea.height {
+            for x in chatArea.x..chatArea.x + chatArea.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default());
+                }
+            }
+        }
 
         // Completion dropdown overlays the chat area above the input.
         self.renderCompletionDropdown(paddedInput, buf);
@@ -1556,18 +1731,37 @@ impl AgentPanel {
         self.nonCopyableLines = nonCopyable;
 
         let totalLines = chatLines.len() as u16;
-        let paragraph = Paragraph::new(chatLines);
-        let totalWrapped = totalLines;
         let visible = padded.height;
-        let maxScroll = totalWrapped.saturating_sub(visible);
+        let maxScroll = totalLines.saturating_sub(visible);
         self.scrollOffset = self.scrollOffset.min(maxScroll);
         let scrollY = maxScroll.saturating_sub(self.scrollOffset);
         self.lastScrollY = scrollY;
         self.lastChatWidth = padded.width;
 
-        paragraph
-            .scroll((scrollY, 0))
-            .render(padded, buf);
+        let visibleLines: Vec<Line<'static>> = chatLines
+            .into_iter()
+            .skip(scrollY as usize)
+            .take(padded.height as usize)
+            .collect();
+        let visibleRows = visibleLines.len();
+        for (i, line) in visibleLines.into_iter().enumerate() {
+            let y = area.y + i as u16;
+            let (endX, _) = buf.set_line(padded.x, y, &line, padded.width);
+            for x in endX..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default());
+                }
+            }
+        }
+        for y in area.y + visibleRows as u16..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default());
+                }
+            }
+        }
     }
 
     /// Render just the permit prompt UI (header + code block + key grid +
@@ -2240,6 +2434,12 @@ impl AgentPanel {
             let showThrobber = waiting || self.reasoningActive;
             let hasReasoning = !self.streamingReasoning.is_empty();
 
+            let namedPending: Vec<&PendingToolCall> = self
+                .pendingToolCalls
+                .iter()
+                .filter(|c| !c.name.is_empty())
+                .collect();
+
             if showThrobber {
                 // Record header position for click-to-toggle.
                 if hasReasoning {
@@ -2250,8 +2450,32 @@ impl AgentPanel {
                 let elapsed = self.thinkingStartTime
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
+                // While reasoning is still actively producing characters, the
+                // model isn't really "preparing" a tool call yet — keep the
+                // throbber's "thinking" label until reasoning settles.
+                let preparingFirst = if self.reasoningActive {
+                    None
+                } else {
+                    namedPending.first().copied()
+                };
                 let suffix = if let Some(ref status) = self.retryStatus {
                     format!(" {status}")
+                } else if let Some(first) = preparingFirst {
+                    let tcElapsed = self
+                        .pendingToolCallStartTime
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    let mut s = format!(
+                        " preparing {}  ({} \u{00B7} {}s)",
+                        first.name,
+                        formatBytes(first.bytes),
+                        tcElapsed,
+                    );
+                    if let Some(ref preview) = first.preview {
+                        s.push_str("  \u{2192} ");
+                        s.push_str(preview);
+                    }
+                    s
                 } else if hasReasoning {
                     let icon = if self.thinkingExpanded { "\u{25BE}" } else { "\u{25B8}" };
                     format!(" thinking ({elapsed}s)  {icon}")
@@ -2264,7 +2488,31 @@ impl AgentPanel {
                     Span::styled(suffix, Style::default().fg(Color::DarkGray)),
                 ]));
                 cont.push(false);
-                lines.push(blobLines[1].clone());
+
+                // Row 2 of the throbber — tack on sibling calls when >1 are
+                // streaming in parallel. Suppressed while reasoning is still
+                // active so the throbber stays as a pure "thinking" indicator
+                // until the model commits to its tool plan.
+                let mut row2 = blobLines[1].clone();
+                if preparingFirst.is_some() && namedPending.len() > 1 {
+                    let names = namedPending[1..]
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let otherBytes: usize =
+                        namedPending[1..].iter().map(|c| c.bytes).sum();
+                    row2.spans.push(Span::styled(
+                        format!(
+                            "  +{} more: {}  ({})",
+                            namedPending.len() - 1,
+                            names,
+                            formatBytes(otherBytes),
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                lines.push(row2);
                 cont.push(false);
             } else if hasReasoning {
                 // Record header position for click-to-toggle.
@@ -2314,6 +2562,42 @@ impl AgentPanel {
                 // Apply fade to the last character if one is mid-reveal.
                 if hasFadingChar {
                     applyFadeToLastChar(&mut lines[linesBeforeMd..], self.fadeProgress);
+                }
+            }
+
+            // Tool calls still streaming from the model — rendered under
+            // content when the throbber isn't occupying that slot. When the
+            // throbber is up, its suffix already names the first call and
+            // row 2 lists the siblings. Held back while content is still
+            // mid-reveal so the preparing line doesn't pop in under text
+            // the user hasn't seen yet.
+            let revealComplete =
+                self.pendingContent.is_empty() && self.fadeProgress >= 1.0;
+            if !showThrobber && !namedPending.is_empty() && revealComplete {
+                let tcElapsed = self
+                    .pendingToolCallStartTime
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let style = Style::default().fg(Color::DarkGray);
+                let previewStyle = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                for call in &namedPending {
+                    let text = format!(
+                        "\u{25C6} preparing {}  ({} \u{00B7} {}s)",
+                        call.name,
+                        formatBytes(call.bytes),
+                        tcElapsed,
+                    );
+                    lines.push(Line::from(Span::styled(text, style)));
+                    cont.push(false);
+                    if let Some(ref preview) = call.preview {
+                        lines.push(Line::from(Span::styled(
+                            format!("    \u{2192} {preview}"),
+                            previewStyle,
+                        )));
+                        cont.push(false);
+                    }
                 }
             }
         }
@@ -3289,8 +3573,10 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
         let content = span.content.to_string();
         let style = span.style;
 
-        // Find the byte offset of the last char.
-        if let Some((byteIdx, _)) = content.char_indices().last() {
+        // Find the byte offset of the last grapheme so we don't split
+        // emoji sequences like ⚠\u{FE0F} across spans.
+        use unicode_segmentation::UnicodeSegmentation;
+        if let Some((byteIdx, _)) = content.grapheme_indices(true).last() {
             let prefix = content[..byteIdx].to_string();
             let lastCharStr = content[byteIdx..].to_string();
 
@@ -3317,19 +3603,28 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
 /// splitting when a word exceeds the available width.
 /// Truncate a string to fit within `maxWidth` display columns, appending `…` if truncated.
 fn truncateToWidth(s: &str, maxWidth: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    // Control chars (tab, \r, etc.) report width 1 via UnicodeWidthStr but
+    // are filtered by ratatui's set_stringn — replace with a space so the
+    // padding math matches what the terminal actually draws.
+    let sanitized: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let mut width = 0;
-    for (i, ch) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    let mut out = String::with_capacity(sanitized.len());
+    for g in sanitized.graphemes(true) {
+        let cw = UnicodeWidthStr::width(g);
         // Reserve 1 column for the ellipsis.
         if width + cw > maxWidth.saturating_sub(1) {
-            let end = if width == 0 { s.len() } else { i };
-            return format!("{}\u{2026}", &s[..end]);
+            let tail: &str = if width == 0 { &sanitized } else { &out };
+            return format!("{}\u{2026}", tail);
         }
         width += cw;
+        out.push_str(g);
     }
-    // Didn't need truncation.
-    s.to_string()
+    out
 }
 
 /// Strip leading blockquote bar spans (`│ `) from a line.
@@ -3358,23 +3653,30 @@ fn stripBlockquoteBars(line: Line<'static>) -> (Vec<Span<'static>>, Line<'static
 }
 
 fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     if maxWidth == 0 {
         return vec![line];
     }
 
-    // Flatten spans into (char, Style) pairs.
-    let chars: Vec<(char, Style)> = line
+    // Flatten spans into (grapheme, Style) atoms so emoji sequences stay
+    // atomic and their str-level width (e.g. ⚠\u{FE0F} = 2 cols) matches
+    // what ratatui and the terminal actually render.
+    let atoms: Vec<(String, Style)> = line
         .spans
         .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .flat_map(|span| {
+            let style = span.style;
+            span.content
+                .graphemes(true)
+                .map(move |g| (g.to_string(), style))
+        })
         .collect();
 
-    // NOTE: Use UnicodeWidthChar (crate) not unicode_display_width (custom) so
-    // measurements match UnicodeWidthStr used by bordered line padding and ratatui.
-    let totalWidth: usize = chars.iter()
-        .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0))
+    let totalWidth: usize = atoms
+        .iter()
+        .map(|(g, _)| UnicodeWidthStr::width(g.as_str()))
         .sum();
     if totalWidth <= maxWidth {
         return vec![line];
@@ -3385,12 +3687,12 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
     let mut currentWidth: usize = 0;
     let mut lastSpace: Option<usize> = None;
 
-    for i in 0..chars.len() {
-        if chars[i].0 == ' ' {
+    for i in 0..atoms.len() {
+        if atoms[i].0 == " " {
             lastSpace = Some(i);
         }
 
-        let charW = UnicodeWidthChar::width(chars[i].0).unwrap_or(0);
+        let charW = UnicodeWidthStr::width(atoms[i].0.as_str());
 
         if currentWidth + charW > maxWidth && i > lineStart {
             // Break at the last space: exclude the trailing space from output
@@ -3401,13 +3703,13 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
                 (i, i)
             };
 
-            result.push(styledCharsToLine(&chars[lineStart..sliceEnd]));
+            result.push(styledGraphemesToLine(&atoms[lineStart..sliceEnd]));
             lineStart = nextStart;
-            // Recount width from the new start through the current character.
+            // Recount width from the new start through the current atom.
             if lineStart <= i {
-                currentWidth = chars[lineStart..=i]
+                currentWidth = atoms[lineStart..=i]
                     .iter()
-                    .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0))
+                    .map(|(g, _)| UnicodeWidthStr::width(g.as_str()))
                     .sum();
             } else {
                 currentWidth = 0;
@@ -3418,26 +3720,26 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
         }
     }
 
-    if lineStart < chars.len() {
-        result.push(styledCharsToLine(&chars[lineStart..]));
+    if lineStart < atoms.len() {
+        result.push(styledGraphemesToLine(&atoms[lineStart..]));
     }
 
     result
 }
 
-/// Reconstruct a Line from styled character pairs, merging adjacent same-style runs.
-fn styledCharsToLine(chars: &[(char, Style)]) -> Line<'static> {
-    if chars.is_empty() {
+/// Reconstruct a Line from styled grapheme atoms, merging adjacent same-style runs.
+fn styledGraphemesToLine(atoms: &[(String, Style)]) -> Line<'static> {
+    if atoms.is_empty() {
         return Line::from("");
     }
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut currentStr = String::new();
-    let mut currentStyle = chars[0].1;
+    let mut currentStyle = atoms[0].1;
 
-    for &(ch, style) in chars {
-        if style == currentStyle {
-            currentStr.push(ch);
+    for (g, style) in atoms {
+        if *style == currentStyle {
+            currentStr.push_str(g);
         } else {
             if !currentStr.is_empty() {
                 spans.push(Span::styled(
@@ -3445,8 +3747,8 @@ fn styledCharsToLine(chars: &[(char, Style)]) -> Line<'static> {
                     currentStyle,
                 ));
             }
-            currentStr.push(ch);
-            currentStyle = style;
+            currentStr.push_str(g);
+            currentStyle = *style;
         }
     }
 
@@ -3455,5 +3757,329 @@ fn styledCharsToLine(chars: &[(char, Style)]) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod wrapTests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    fn lineText(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrapsEmojiParagraphCorrectly() {
+        let text = "The \u{26A0}\u{FE0F} tells user: \"If you rewind past here, those .bak files stay deleted. We can't bring them back.\"";
+        for w in [30usize, 40, 44, 50, 60] {
+            let line = Line::from(Span::raw(text));
+            let wrapped = wrapSpannedLine(line, w);
+            for (i, wl) in wrapped.iter().enumerate() {
+                let t = lineText(wl);
+                let width = UnicodeWidthStr::width(t.as_str());
+                assert!(
+                    width <= w,
+                    "maxW={} line{}: wrapped width {} exceeds limit for text={:?}",
+                    w, i, width, t
+                );
+            }
+            let joined: String = wrapped.iter().map(lineText).collect::<Vec<_>>().join(" ");
+            assert!(
+                joined.replace("  ", " ").contains("those"),
+                "maxW={}: expected 'those' intact in wrapped output, got joined={:?}",
+                w, joined
+            );
+            assert!(
+                !joined.contains("thosee"),
+                "maxW={}: unexpected 'thosee' in joined={:?}",
+                w, joined
+            );
+        }
+    }
+
+    #[test]
+    fn truncateWithEmojiRespectsLimit() {
+        let text = "The \u{26A0}\u{FE0F} warning text";
+        for w in [5usize, 6, 7, 10, 20] {
+            let t = truncateToWidth(text, w);
+            let width = UnicodeWidthStr::width(t.as_str());
+            assert!(
+                width <= w,
+                "maxW={}: truncated width {} > limit, got {:?}",
+                w, width, t
+            );
+        }
+    }
+
+    fn snapshotBuffer(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        let a = buf.area();
+        (a.y..a.y + a.height)
+            .map(|y| {
+                (a.x..a.x + a.width)
+                    .map(|x| {
+                        let s = buf[(x, y)].symbol();
+                        if s.is_empty() { " ".to_string() } else { s.to_string() }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Drive a Terminal<TestBackend> through the full ratatui draw cycle
+    /// (buffer reset + diff + backend.draw), scroll up and down rapidly
+    /// between frames, and return the terminal's actual screen buffer plus
+    /// the chat rect so the caller can inspect cells in the right gutter.
+    ///
+    /// TestBackend's internal buffer is only updated via the diff stream
+    /// ratatui sends per frame — same protocol as a real terminal. Any
+    /// stale glyph visible on-screen during fast scrolling will appear as
+    /// a non-space Cell here.
+    fn driveScrollStress() -> (ratatui::Terminal<ratatui::backend::TestBackend>, Rect) {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Size taken from the user's screenshot: narrow agent panel, lots
+        // of vertical room to require scrolling.
+        let backend = TestBackend::new(48, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut panel = AgentPanel::new();
+
+        // Use the exact assistant message from the session where the user
+        // saw the ghost glyph bug (ses_19d924d4df7_7f98). The fixture is
+        // entry 71 from that transcript — the one visible in screenshot 6.
+        let msg = include_str!("../tests/fixtures/bottom_line_message.txt");
+        for i in 0..4 {
+            panel.entries.push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
+        }
+
+        // Initial render.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                panel.render(area, frame.buffer_mut(), true);
+            })
+            .unwrap();
+
+        // "Whip" the scroll view around: large, uneven jumps both
+        // directions across many frames. This replicates fast mouse-wheel
+        // flicks where the user scrolls through dozens of lines per frame
+        // before the render catches up.
+        let pattern: &[i32] = &[
+            20, -15, 25, -30, 40, -10, -35, 50, -45, 15, -25, 35, -50, 28, -18, 42, -38,
+        ];
+        for _ in 0..10 {
+            for &step in pattern {
+                if step > 0 {
+                    panel.scrollUp(step as u16);
+                } else {
+                    panel.scrollDown((-step) as u16);
+                }
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        panel.render(area, frame.buffer_mut(), true);
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Settle on a known state.
+        panel.scrollOffset = 0;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                panel.render(area, frame.buffer_mut(), true);
+            })
+            .unwrap();
+
+        // Inspect the inner area of the outer agent panel (one row of
+        // border on each side). Conservatively drop the last 5 rows since
+        // those belong to the separator + input + queue zones.
+        let bufArea = *terminal.backend().buffer().area();
+        let inner = Rect::new(
+            bufArea.x + 1,
+            bufArea.y + 1,
+            bufArea.width.saturating_sub(2),
+            bufArea.height.saturating_sub(2),
+        );
+        let chatRect = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(5));
+        (terminal, chatRect)
+    }
+
+    fn strayCellsInGutter(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        chatRect: Rect,
+    ) -> Vec<(u16, u16, String)> {
+        let buf = terminal.backend().buffer();
+        let mut stray = Vec::new();
+        // Clamp to the buffer's valid area in case the caller passes a
+        // chatRect that overlaps the edges of the terminal.
+        let bufArea = buf.area();
+        let x0 = chatRect.x.max(bufArea.x);
+        let y0 = chatRect.y.max(bufArea.y);
+        let x1 = (chatRect.x + chatRect.width).min(bufArea.x + bufArea.width);
+        let y1 = (chatRect.y + chatRect.height).min(bufArea.y + bufArea.height);
+        for y in y0..y1 {
+            // Walk the row and record the last column at which a
+            // recognizable content glyph was written.
+            let mut lastContentCol: i32 = -1;
+            for x in x0..x1 {
+                let sym = buf[(x, y)].symbol();
+                if !sym.trim().is_empty() {
+                    lastContentCol = x as i32;
+                }
+            }
+            let scanStart = (lastContentCol + 1).max(x0 as i32) as u16;
+            for x in scanStart..x1 {
+                let sym = buf[(x, y)].symbol();
+                if !sym.chars().all(|c| c == ' ') {
+                    stray.push((x, y, sym.to_string()));
+                }
+            }
+        }
+        stray
+    }
+
+    /// Render a known scroll position, whip the scroll around, then
+    /// render the same scroll position again. The buffer after the
+    /// whipping should match the buffer from the initial render exactly.
+    /// Any divergence is a ghost glyph that the render pipeline failed to
+    /// clear between frames.
+    #[test]
+    fn returningToInitialScrollProducesIdenticalBuffer() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let backend = TestBackend::new(48, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut panel = AgentPanel::new();
+        let msg = include_str!("../tests/fixtures/bottom_line_message.txt");
+        for i in 0..4 {
+            panel.entries.push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
+        }
+
+        // Initial render at offset 0.
+        panel.scrollOffset = 0;
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                panel.render(area, f.buffer_mut(), true);
+            })
+            .unwrap();
+        let baseline = snapshotBuffer(&terminal);
+
+        // Whip the scroll around.
+        let pattern: &[i32] = &[
+            20, -15, 25, -30, 40, -10, -35, 50, -45, 15, -25, 35, -50, 28, -18, 42, -38,
+        ];
+        for _ in 0..10 {
+            for &step in pattern {
+                if step > 0 {
+                    panel.scrollUp(step as u16);
+                } else {
+                    panel.scrollDown((-step) as u16);
+                }
+                terminal
+                    .draw(|f| {
+                        let area = f.area();
+                        panel.render(area, f.buffer_mut(), true);
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Return to initial offset and render.
+        panel.scrollOffset = 0;
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                panel.render(area, f.buffer_mut(), true);
+            })
+            .unwrap();
+        let after = snapshotBuffer(&terminal);
+
+        if baseline != after {
+            let mut msg = String::from(
+                "buffer after whipping scroll back to offset 0 differs from baseline (ghost glyphs)\n\n",
+            );
+            msg.push_str("baseline:\n");
+            for (i, row) in baseline.iter().enumerate() {
+                msg.push_str(&format!("{:>3}: [{}]\n", i, row));
+            }
+            msg.push_str("\nafter:\n");
+            for (i, row) in after.iter().enumerate() {
+                msg.push_str(&format!("{:>3}: [{}]\n", i, row));
+            }
+            msg.push_str("\ndiff (row: col: baseline -> after):\n");
+            for (y, (b, a)) in baseline.iter().zip(after.iter()).enumerate() {
+                if b == a { continue; }
+                use unicode_segmentation::UnicodeSegmentation as _;
+                let bc: Vec<&str> = b.graphemes(true).collect();
+                let ac: Vec<&str> = a.graphemes(true).collect();
+                let n = bc.len().max(ac.len());
+                for x in 0..n {
+                    let bx = bc.get(x).copied().unwrap_or(" ");
+                    let ax = ac.get(x).copied().unwrap_or(" ");
+                    if bx != ax {
+                        msg.push_str(&format!("  y={:>2} x={:>2}: {:?} -> {:?}\n", y, x, bx, ax));
+                    }
+                }
+            }
+            panic!("{}", msg);
+        }
+    }
+
+    #[test]
+    fn fastScrollLeavesNoGhostGlyphsInGutter() {
+        let (terminal, chatRect) = driveScrollStress();
+        let stray = strayCellsInGutter(&terminal, chatRect);
+        if !stray.is_empty() {
+            let buf = terminal.backend().buffer();
+            let bufArea = buf.area();
+            let x0 = chatRect.x.max(bufArea.x);
+            let y0 = chatRect.y.max(bufArea.y);
+            let x1 = (chatRect.x + chatRect.width).min(bufArea.x + bufArea.width);
+            let y1 = (chatRect.y + chatRect.height).min(bufArea.y + bufArea.height);
+            let mut render = String::new();
+            for y in y0..y1 {
+                render.push_str(&format!("{:>3}: [", y));
+                for x in x0..x1 {
+                    let sym = buf[(x, y)].symbol();
+                    render.push_str(if sym.is_empty() { " " } else { sym });
+                }
+                render.push_str("]\n");
+            }
+            panic!(
+                "{} stray glyph(s) in the gutter after fast scroll:\n{:?}\n\nchat rect ({}, {}) {}x{}:\n{}",
+                stray.len(),
+                stray,
+                chatRect.x, chatRect.y, chatRect.width, chatRect.height,
+                render,
+            );
+        }
+    }
+
+    #[test]
+    fn truncateStripsControlCharsMatchingRatatuiRender() {
+        // ratatui's set_stringn filters graphemes containing any control
+        // character, so a line like "     1\tcontent" would drop the tab
+        // and render 1 col short of what UnicodeWidthStr claims. Our
+        // truncateToWidth must produce output whose width matches what
+        // ratatui will actually draw.
+        let text = "     1\thulls/flareCartridge.lua: local M = {}";
+        for w in [10usize, 20, 30, 40, 60] {
+            let t = truncateToWidth(text, w);
+            assert!(
+                !t.chars().any(|c| c.is_control()),
+                "maxW={}: truncated contained control chars, got {:?}",
+                w, t
+            );
+            let width = UnicodeWidthStr::width(t.as_str());
+            assert!(
+                width <= w,
+                "maxW={}: truncated width {} > limit, got {:?}",
+                w, width, t
+            );
+        }
+    }
 }
 

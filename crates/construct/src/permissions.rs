@@ -45,9 +45,14 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
         | ToolAction::WriteFile { path, .. }
         | ToolAction::EditFile { path, .. }
         | ToolAction::MultiEdit { path, .. }
+        | ToolAction::DeleteFile { path, .. }
+        | ToolAction::MakeDirs { path }
         | ToolAction::FileOutline { path }
         | ToolAction::ViewSymbol { file: path, .. }
         | ToolAction::RelatedFiles { path } => pathPatterns(path),
+
+        ToolAction::CopyFile { dest, .. }
+        | ToolAction::MoveFile { dest, .. } => pathPatterns(dest),
 
         ToolAction::Glob { path, .. } => {
             if let Some(p) = path {
@@ -100,7 +105,11 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
         ToolAction::Shell { impact, .. } => impact.clone(),
         ToolAction::WriteFile { .. }
         | ToolAction::EditFile { .. }
-        | ToolAction::MultiEdit { .. } => ShellImpact::MinorMod,
+        | ToolAction::MultiEdit { .. }
+        | ToolAction::CopyFile { .. }
+        | ToolAction::MoveFile { .. }
+        | ToolAction::MakeDirs { .. } => ShellImpact::MinorMod,
+        ToolAction::DeleteFile { .. } => ShellImpact::Delete,
         ToolAction::Mcp { .. } => ShellImpact::MinorMod,
         ToolAction::Task { .. } => ShellImpact::MinorMod,
         _ => ShellImpact::Read,
@@ -379,6 +388,10 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::WriteFile { path, .. } => ("writeFile", path),
         ToolAction::EditFile { path, .. } => ("editFile", path),
         ToolAction::MultiEdit { path, .. } => ("multiEdit", path),
+        ToolAction::CopyFile { dest, .. } => ("copyFile", dest),
+        ToolAction::MoveFile { dest, .. } => ("moveFile", dest),
+        ToolAction::DeleteFile { path, .. } => ("deleteFile", path),
+        ToolAction::MakeDirs { path } => ("makeDirs", path),
         ToolAction::ShellHistory => ("shellHistory", ""),
         ToolAction::ReadOutput { .. } => ("readOutput", ""),
         ToolAction::SearchOutput { pattern, .. } => ("searchOutput", pattern),

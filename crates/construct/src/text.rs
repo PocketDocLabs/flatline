@@ -6,6 +6,7 @@
 //!
 //! # Public API
 //! - [`sanitizeVariationSelectors`] — strip U+FE0E from emoji-only codepoints
+//! - [`recoverScratchpadClose`] — retroactively split a malformed `</scratchpad>`
 
 /// Strip U+FE0E (text variation selector) when it follows a character
 /// that has `Emoji_Presentation=Yes` — meaning it has no text glyph
@@ -99,6 +100,67 @@ fn isEmojiPresentation(ch: char) -> bool {
     )
 }
 
+/// Result of a successful retroactive scratchpad-close recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchpadRecovery {
+    /// The reasoning buffer with the malformed close and trailing content removed.
+    pub reasoning: String,
+    /// The content that was originally misclassified as reasoning.
+    pub content: String,
+    /// The literal matched tag (e.g. `</scratch>`, `</scratchpa>`, `</scratchpad`).
+    pub matchedTag: String,
+}
+
+/// Find a malformed `</scratchpad>` close near the end of `reasoning` and
+/// split the trailing visible content out of the reasoning buffer.
+///
+/// Used when the streaming extractor never matched a proper `</scratchpad>`
+/// — typically because the model dropped a letter (`</scratch>`,
+/// `</scratchpa>`), forgot the `>` (`</scratchpad`), or wrote the bare
+/// prefix (`</scratch`). In all those cases the entire turn collapses
+/// into reasoning and the visible answer is lost to the user.
+///
+/// Heuristic: take the LAST `</scratch[A-Za-z]*\s*>?` in the buffer. Earlier
+/// occurrences may be the model legitimately quoting the tag while thinking,
+/// so we leave them alone. Returns `None` if no candidate exists or if the
+/// candidate has nothing after it (a trailing typo with no recoverable
+/// content isn't worth touching).
+pub fn recoverScratchpadClose(reasoning: &str) -> Option<ScratchpadRecovery> {
+    const NEEDLE: &str = "</scratch";
+
+    let start = reasoning.rfind(NEEDLE)?;
+    let bytes = reasoning.as_bytes();
+
+    // Consume the alphabetic suffix after `</scratch` (e.g. `pad`, `pads`).
+    let mut end = start + NEEDLE.len();
+    while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+        end += 1;
+    }
+
+    // Optionally consume `\s*>`. If neither shows up, the tag is bare —
+    // keep `end` at the last alphabetic char so we don't eat real content.
+    let mut probe = end;
+    while probe < bytes.len() && (bytes[probe] == b' ' || bytes[probe] == b'\t') {
+        probe += 1;
+    }
+    if probe < bytes.len() && bytes[probe] == b'>' {
+        end = probe + 1;
+    }
+
+    let matched = &reasoning[start..end];
+    let before = &reasoning[..start];
+    let after = reasoning[end..].trim_start();
+    if after.is_empty() {
+        return None;
+    }
+
+    Some(ScratchpadRecovery {
+        reasoning: before.to_string(),
+        content: after.to_string(),
+        matchedTag: matched.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +200,87 @@ mod tests {
         let input = "\u{2614}\u{FE0E}";
         let expected = "\u{2614}";
         assert_eq!(sanitizeVariationSelectors(input), expected);
+    }
+
+    #[test]
+    fn recoverDroppedPad() {
+        let input = "thinking out loud</scratch>final answer";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "thinking out loud");
+        assert_eq!(r.content, "final answer");
+        assert_eq!(r.matchedTag, "</scratch>");
+    }
+
+    #[test]
+    fn recoverPartialPad() {
+        let input = "thoughts</scratchpa>visible";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "thoughts");
+        assert_eq!(r.content, "visible");
+        assert_eq!(r.matchedTag, "</scratchpa>");
+    }
+
+    #[test]
+    fn recoverMissingAngleBracket() {
+        let input = "thoughts</scratchpad\nvisible answer";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "thoughts");
+        assert_eq!(r.content, "visible answer");
+        assert_eq!(r.matchedTag, "</scratchpad");
+    }
+
+    #[test]
+    fn recoverBarePrefix() {
+        let input = "thinking</scratch the answer is 42";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "thinking");
+        assert_eq!(r.content, "the answer is 42");
+        assert_eq!(r.matchedTag, "</scratch");
+    }
+
+    #[test]
+    fn recoverProperTag() {
+        // Defensive: if a proper tag somehow leaks through, recovery still works.
+        let input = "thoughts</scratchpad>\n\nanswer";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "thoughts");
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.matchedTag, "</scratchpad>");
+    }
+
+    #[test]
+    fn recoverPicksLastOccurrence() {
+        // Earlier `</scratch` mention is the model quoting itself; only the
+        // last one should be treated as the close.
+        let input = "I should remember to write </scratchpad> at the end</scratch>final";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.reasoning, "I should remember to write </scratchpad> at the end");
+        assert_eq!(r.content, "final");
+        assert_eq!(r.matchedTag, "</scratch>");
+    }
+
+    #[test]
+    fn recoverNothingAfterTag() {
+        // Trailing malformed tag with no content — nothing to recover.
+        let input = "just thoughts</scratch";
+        assert!(recoverScratchpadClose(input).is_none());
+    }
+
+    #[test]
+    fn recoverNoMatch() {
+        let input = "no scratch tag here at all";
+        assert!(recoverScratchpadClose(input).is_none());
+    }
+
+    #[test]
+    fn recoverEmptyInput() {
+        assert!(recoverScratchpadClose("").is_none());
+    }
+
+    #[test]
+    fn recoverStripsLeadingWhitespace() {
+        let input = "thoughts</scratch>\n\n  final answer";
+        let r = recoverScratchpadClose(input).unwrap();
+        assert_eq!(r.content, "final answer");
     }
 }

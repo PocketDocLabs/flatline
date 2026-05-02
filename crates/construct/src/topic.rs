@@ -166,13 +166,24 @@ impl TopicTracker {
     }
 
     /// Restore state from saved topic infos (for session resume).
+    ///
+    /// When `topics` is empty the tracker is reset to a clean-slate state —
+    /// `currentTopicId`/`currentLabel` are cleared so the transcript is not
+    /// left stamping turns with a ghost `topicId`. `nextTopicNum` is derived
+    /// from the max existing `topic-NN` number rather than list length so
+    /// rewinds that drop entries can't recycle a still-referenced ID.
     pub fn restoreState(&mut self, topics: Vec<TopicInfo>) {
-        if let Some(last) = topics.last() {
-            self.currentTopicId = last.topicId.clone();
-            self.currentLabel = last.label.clone();
+        match topics.last() {
+            Some(last) => {
+                self.currentTopicId = last.topicId.clone();
+                self.currentLabel = last.label.clone();
+            }
+            None => {
+                self.currentTopicId.clear();
+                self.currentLabel.clear();
+            }
         }
-        // Restore nextTopicNum to be past any existing topic.
-        self.nextTopicNum = topics.len() + 1;
+        self.nextTopicNum = nextTopicNumFromTopics(&topics);
         self.topics = topics;
     }
 
@@ -337,6 +348,20 @@ fn parseTopicResponse(response: &str) -> TopicDecision {
     TopicDecision::Same
 }
 
+/// Next `topic-NN` number to assign, derived from the max existing number.
+///
+/// Using max-plus-one instead of list-length prevents ID reuse after a rewind
+/// that truncated the topics list. Older transcript turns referencing a
+/// higher-numbered topic would otherwise collide with a freshly-minted topic
+/// that reused their ID.
+fn nextTopicNumFromTopics(topics: &[TopicInfo]) -> usize {
+    topics
+        .iter()
+        .filter_map(|t| t.topicId.strip_prefix("topic-").and_then(|n| n.parse::<usize>().ok()))
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
 /// Clean up a label: trim whitespace, quotes, trailing punctuation.
 fn sanitizeLabel(raw: &str) -> String {
     raw.trim()
@@ -350,12 +375,17 @@ fn sanitizeLabel(raw: &str) -> String {
 /// Rebuild TopicInfo entries from a chain of transcript turns.
 ///
 /// Groups turns by topicId, derives startBlock (first blockId per topic)
-/// and blockCount (distinct blockId count per topic). Labels are looked up
-/// from `existingTopics`; unknown topicIds get fallback "Unknown".
+/// and blockCount (distinct blockId count per topic). Labels come from
+/// `existingTopics`; topics whose labels can't be recovered are dropped
+/// from the output rather than resurrected with a placeholder. A silent
+/// `"Unknown"` stand-in used to mask upstream corruption (empty tracker +
+/// rewind) by baking a meaningless label into persisted metadata.
 ///
 /// Args:
 ///     turns: Turns on the active branch, in chronological order.
-///     existingTopics: Previous TopicInfo list (for label lookup).
+///     existingTopics: Previous TopicInfo list (for label lookup). Callers
+///         that have multiple label sources (e.g. live tracker + on-disk
+///         meta) should merge them before passing the union here.
 pub fn rebuildTopicInfos(turns: &[Turn], existingTopics: &[TopicInfo]) -> Vec<TopicInfo> {
     let labelMap: HashMap<&str, &str> = existingTopics
         .iter()
@@ -386,24 +416,141 @@ pub fn rebuildTopicInfos(turns: &[Turn], existingTopics: &[TopicInfo]) -> Vec<To
 
     order
         .into_iter()
-        .map(|tid| {
-            let label = labelMap
-                .get(tid.as_str())
-                .copied()
-                .unwrap_or("Unknown");
-            let startBlock = firstBlock
-                .get(&tid)
-                .cloned()
-                .unwrap_or_default();
-            let blockCount = blockSets
-                .get(&tid)
-                .map_or(0, |s| s.len());
-            TopicInfo {
+        .filter_map(|tid| {
+            let label = match labelMap.get(tid.as_str()).copied() {
+                Some(l) => l.to_string(),
+                None => {
+                    tracing::warn!(
+                        topicId = %tid,
+                        "dropping topic with unrecoverable label during rebuild"
+                    );
+                    return None;
+                }
+            };
+            let startBlock = firstBlock.get(&tid).cloned().unwrap_or_default();
+            let blockCount = blockSets.get(&tid).map_or(0, |s| s.len());
+            Some(TopicInfo {
                 topicId: tid,
-                label: label.to_string(),
+                label,
                 startBlock,
                 blockCount,
-            }
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::{TurnRole, TurnStatus};
+
+    fn topic(id: &str, label: &str) -> TopicInfo {
+        TopicInfo {
+            topicId: id.to_string(),
+            label: label.to_string(),
+            startBlock: String::new(),
+            blockCount: 0,
+        }
+    }
+
+    fn turn(id: &str, blockId: &str, topicId: &str) -> Turn {
+        Turn {
+            id: id.to_string(),
+            blockId: blockId.to_string(),
+            topicId: topicId.to_string(),
+            role: TurnRole::User,
+            content: String::new(),
+            ts: 0,
+            parentId: None,
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
+            cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
+        }
+    }
+
+    #[test]
+    fn restoreState_with_empty_clears_current_label() {
+        let mut tracker = TopicTracker::new();
+        tracker.restoreState(vec![topic("topic-01", "Real Label")]);
+        assert_eq!(tracker.currentTopicId(), "topic-01");
+        assert_eq!(tracker.currentLabel(), "Real Label");
+
+        tracker.restoreState(Vec::new());
+        assert_eq!(tracker.currentTopicId(), "", "ghost topicId must clear");
+        assert_eq!(tracker.currentLabel(), "", "ghost label must clear");
+        assert_eq!(tracker.nextTopicNum, 1);
+    }
+
+    #[test]
+    fn restoreState_nextTopicNum_uses_max_id_not_length() {
+        let mut tracker = TopicTracker::new();
+        tracker.restoreState(vec![
+            topic("topic-01", "A"),
+            topic("topic-05", "E"),
+        ]);
+        assert_eq!(
+            tracker.nextTopicNum, 6,
+            "next must exceed max existing ID so a rewind can't recycle topic-02..topic-05"
+        );
+    }
+
+    #[test]
+    fn rebuildTopicInfos_drops_unknown_instead_of_labeling_unknown() {
+        let turns = vec![
+            turn("t1", "b_aaa", "topic-01"),
+            turn("t2", "b_bbb", "topic-07"),
+        ];
+        let known = vec![topic("topic-01", "Known Label")];
+
+        let rebuilt = rebuildTopicInfos(&turns, &known);
+        assert_eq!(rebuilt.len(), 1, "orphaned topic-07 must be dropped");
+        assert_eq!(rebuilt[0].topicId, "topic-01");
+        assert_eq!(rebuilt[0].label, "Known Label");
+        assert!(
+            !rebuilt.iter().any(|t| t.label == "Unknown"),
+            "literal 'Unknown' must never appear"
+        );
+    }
+
+    #[test]
+    fn rebuildTopicInfos_preserves_labels_across_rewind() {
+        let turns = vec![
+            turn("t1", "b_aaa", "topic-01"),
+            turn("t2", "b_bbb", "topic-01"),
+            turn("t3", "b_ccc", "topic-02"),
+        ];
+        let known = vec![
+            topic("topic-01", "Research"),
+            topic("topic-02", "Implementation"),
+        ];
+
+        let rebuilt = rebuildTopicInfos(&turns, &known);
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt[0].label, "Research");
+        assert_eq!(rebuilt[0].startBlock, "b_aaa");
+        assert_eq!(rebuilt[0].blockCount, 2);
+        assert_eq!(rebuilt[1].label, "Implementation");
+        assert_eq!(rebuilt[1].startBlock, "b_ccc");
+    }
+
+    #[test]
+    fn rebuildTopicInfos_skips_empty_topicId_turns() {
+        // Pre-classification turns (first send) have empty topicId and
+        // must not end up in the rebuilt list at all.
+        let turns = vec![
+            turn("t1", "b_aaa", ""),
+            turn("t2", "b_aaa", ""),
+        ];
+        let rebuilt = rebuildTopicInfos(&turns, &[]);
+        assert!(rebuilt.is_empty());
+    }
 }

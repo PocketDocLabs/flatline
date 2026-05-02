@@ -88,6 +88,49 @@ pub struct Rider {
     pub content: String,
 }
 
+/// Build child (subagent) permissions by inheriting from the parent and
+/// layering the preset as a floor.
+///
+/// Rule order in the result (first-match-wins):
+///   1. Preset floor (explicit denies for mutation tools, if `ReadOnly` toolSet)
+///   2. Preset's own rules
+///   3. Parent's rules
+///
+/// `defaultMode` is taken from the preset. This ensures a read-only preset
+/// can't be widened by a permissive parent, while still inheriting the
+/// parent's narrower allows (e.g. `readFile` patterns the user has already
+/// approved in the top-level session).
+fn buildChildPermissions(
+    parent: &crate::permissions::Permissions,
+    preset: &crate::runner::AgentPreset,
+) -> crate::permissions::Permissions {
+    use crate::permissions::{Permissions, Rule};
+    use crate::tool::ToolSet;
+
+    let mut rules: Vec<Rule> = Vec::new();
+
+    // Preset floor: explicit denies for mutation tools when the preset is
+    // read-only. This prevents an inherited "allow *" from the parent from
+    // widening a read-only subagent's scope.
+    if matches!(preset.toolSet, ToolSet::ReadOnly) {
+        for tool in ["writeFile", "editFile", "multiEdit"] {
+            rules.push(Rule { tool: tool.into(), pattern: None, allow: false });
+        }
+    }
+
+    // Preset rules next (e.g. allowReadOnly's readFile/grep/... allows).
+    rules.extend(preset.permissions.rules.iter().cloned());
+
+    // Parent rules last — matched only when no preset rule applies.
+    rules.extend(parent.rules.iter().cloned());
+
+    Permissions {
+        defaultMode: preset.permissions.defaultMode.clone(),
+        rules,
+        source: parent.source,
+    }
+}
+
 /// Build the active rider list for a session from its config.
 fn buildRiders(config: &Config) -> Vec<Rider> {
     let mut riders = Vec::new();
@@ -611,19 +654,30 @@ impl Session {
 
     /// Rebuild the topic tracker from the active branch turns.
     ///
-    /// Must be called after rewind or fork-switch so topic state reflects
-    /// only the active branch.
+    /// Called after rewind or fork-switch so topic state reflects only the
+    /// active branch. Labels are sourced from the union of the live tracker
+    /// and the on-disk `meta.topics`. The disk fallback matters when a
+    /// prior rewind landed on a pre-classification point and transiently
+    /// emptied the tracker — without it, any subsequent rebuild would lose
+    /// every label and bake `"Unknown"` into persisted meta. `setTopicId` is
+    /// called unconditionally so the transcript's stamp-on-write state
+    /// cannot drift from the tracker's `currentTopicId`.
     fn rebuildTopicTracker(&mut self) {
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
-        let rebuilt = crate::topic::rebuildTopicInfos(
-            &branchTurns,
-            self.topicTracker.topics(),
-        );
-        self.topicTracker.restoreState(rebuilt);
-        let currentId = self.topicTracker.currentTopicId().to_string();
-        if !currentId.is_empty() {
-            self.transcript.setTopicId(&currentId);
+
+        let mut labelSources: Vec<crate::topic::TopicInfo> =
+            self.topicTracker.topics().to_vec();
+        if let Ok(meta) = Transcript::loadMeta(self.transcript.sessionDir()) {
+            for t in meta.topics {
+                if !labelSources.iter().any(|x| x.topicId == t.topicId) {
+                    labelSources.push(t);
+                }
+            }
         }
+
+        let rebuilt = crate::topic::rebuildTopicInfos(&branchTurns, &labelSources);
+        self.topicTracker.restoreState(rebuilt);
+        self.transcript.setTopicId(self.topicTracker.currentTopicId());
     }
 
     /// Load turns for display — extends past the current head through any
@@ -1401,6 +1455,12 @@ impl Session {
         // at the start of sendInner.
         self.updateMeta();
 
+        // Fire compaction on every exit path, not just Done. Cancelled,
+        // Error, BudgetHit, MaxRetries, and tool-permission-denied otherwise
+        // leave the session parked at high context until the next message.
+        // Idempotent when Done already ran it during the loop.
+        self.checkCompactionTrigger(logTx).await;
+
         result
     }
 
@@ -1497,6 +1557,8 @@ impl Session {
         let mut contentBuf = String::new();
         let mut reasoningBuf = String::new();
         let mut toolAccum = ToolCallAccumulator::new();
+        let mut toolCallPreviews: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
         let mut lastUsage: Option<TokenUsage> = None;
         let mut lastFinishReason: Option<String> = None;
 
@@ -1535,7 +1597,41 @@ impl Session {
                             name,
                             arguments,
                         }) => {
-                            toolAccum.accumulate(index, id, name, arguments);
+                            let (newName, totalBytes) =
+                                toolAccum.accumulate(index, id, name, arguments);
+                            if let Some(n) = newName {
+                                let _ = tx
+                                    .send(LogEvent::ToolCallPending {
+                                        index,
+                                        name: n,
+                                    })
+                                    .await;
+                            }
+                            if let Some(bytes) = totalBytes {
+                                let _ = tx
+                                    .send(LogEvent::ToolCallProgress { index, bytes })
+                                    .await;
+                            }
+                            if let Some((toolName, argsStr)) =
+                                toolAccum.pendingCall(index)
+                            {
+                                if let Some(preview) =
+                                    crate::tool_preview::previewForTool(
+                                        toolName, argsStr,
+                                    )
+                                {
+                                    let slot = toolCallPreviews.entry(index).or_default();
+                                    if *slot != preview {
+                                        *slot = preview.clone();
+                                        let _ = tx
+                                            .send(LogEvent::ToolCallPreview {
+                                                index,
+                                                preview,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                         Some(StreamEvent::Done { usage, finishReason }) => {
                             if let Some(u) = usage {
@@ -1661,6 +1757,41 @@ impl Session {
         // Strip variation selectors from emoji-only codepoints.
         contentBuf = crate::text::sanitizeVariationSelectors(&contentBuf);
         reasoningBuf = crate::text::sanitizeVariationSelectors(&reasoningBuf);
+
+        // Retroactive scratchpad-close recovery. When promptThinking is on
+        // and the model botches the close (`</scratch>`, `</scratchpa>`,
+        // `</scratchpad` w/ no `>`), the streaming extractor flushes the
+        // entire buffer as reasoning and the visible answer is lost. Scan
+        // the reasoning tail for a malformed close and split it back out.
+        if self.config.heavy.promptThinking
+            && contentBuf.is_empty()
+            && !reasoningBuf.is_empty()
+        {
+            if let Some(recovery) = crate::text::recoverScratchpadClose(&reasoningBuf) {
+                let recoveredChars = recovery.content.chars().count();
+                let snippet: String =
+                    recovery.content.chars().take(80).collect::<String>();
+                let snippet = if recoveredChars > 80 {
+                    format!("{snippet}…")
+                } else {
+                    snippet
+                };
+                tracing::info!(
+                    matchedTag = %recovery.matchedTag,
+                    recoveredChars,
+                    "recovered malformed scratchpad close"
+                );
+                contentBuf = recovery.content;
+                reasoningBuf = recovery.reasoning;
+                let _ = tx
+                    .send(LogEvent::ScratchpadRecovered {
+                        matchedTag: recovery.matchedTag,
+                        snippet,
+                        recoveredChars,
+                    })
+                    .await;
+            }
+        }
 
         let calls = toolAccum.finish();
 
@@ -2420,10 +2551,16 @@ impl Session {
             Err(e) => return format!("Failed to spawn subagent shell: {e}"),
         };
 
-        // Create child session with restricted tools.
+        // Inherit parent permissions, with the preset's rules layered on top
+        // as a floor. Rule order is: [preset floor (read-only denies)] →
+        // [preset rules] → [parent rules]. First-match-wins ensures the
+        // preset's restrictions hold even when the parent is broadly permissive.
+        let childPermissions = buildChildPermissions(&self.permissions, &preset);
+
+        // Create child session with inherited+floored permissions.
         let mut child = match Session::new(
             &childConfig,
-            preset.permissions,
+            childPermissions,
             childShell,
             preset.interface,
             &[crate::prompt::DomainModule::Swe],
@@ -3383,13 +3520,26 @@ impl ToolCallAccumulator {
         !self.pending.is_empty()
     }
 
+    /// Peek at the current (name, arguments) for an index. Used to refresh
+    /// tool-call previews after each arg delta.
+    fn pendingCall(&self, index: usize) -> Option<(&str, &str)> {
+        self.pending
+            .get(index)
+            .map(|p| (p.name.as_str(), p.arguments.as_str()))
+    }
+
+    /// Returns `(newName, totalArgBytes)`:
+    /// - `newName` is `Some(name)` only on the delta that first sets the name
+    ///   for this index (used to emit ToolCallPending exactly once).
+    /// - `totalArgBytes` is the running total of accumulated argument bytes
+    ///   for this index, or `None` if this delta didn't carry any args.
     fn accumulate(
         &mut self,
         index: usize,
         id: Option<String>,
         name: Option<String>,
         arguments: Option<String>,
-    ) {
+    ) -> (Option<String>, Option<usize>) {
         while self.pending.len() <= index {
             self.pending.push(PendingCall {
                 id: String::new(),
@@ -3402,12 +3552,20 @@ impl ToolCallAccumulator {
         if let Some(id) = id {
             entry.id = id;
         }
+        let mut firstName = None;
         if let Some(name) = name {
+            if !name.is_empty() && entry.name.is_empty() {
+                firstName = Some(name.clone());
+            }
             entry.name = name;
         }
-        if let Some(args) = arguments {
+        let bytes = if let Some(args) = arguments {
             entry.arguments.push_str(&args);
-        }
+            Some(entry.arguments.len())
+        } else {
+            None
+        };
+        (firstName, bytes)
     }
 
     fn finish(self) -> Vec<ToolCall> {
@@ -3549,5 +3707,90 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn accumulatorReportsFirstNameOnce() {
+        let mut acc = ToolCallAccumulator::new();
+        // Name first arrives alongside an id and empty args.
+        let (firstName, bytes) = acc.accumulate(
+            0,
+            Some("call_1".into()),
+            Some("editFile".into()),
+            Some(String::new()),
+        );
+        assert_eq!(firstName.as_deref(), Some("editFile"));
+        assert_eq!(bytes, Some(0));
+
+        // Same name echoed in a later chunk must NOT fire firstName again.
+        let (firstName, _) = acc.accumulate(
+            0,
+            None,
+            Some("editFile".into()),
+            None,
+        );
+        assert!(firstName.is_none());
+    }
+
+    #[test]
+    fn accumulatorReportsRunningByteTotal() {
+        let mut acc = ToolCallAccumulator::new();
+        let c1 = r#"{"path""#;
+        let c2 = r#": "crates/deck/src/app.rs""#;
+        acc.accumulate(0, None, Some("editFile".into()), Some(c1.into()));
+        let (_, bytes) = acc.accumulate(0, None, None, Some(c2.into()));
+        assert_eq!(bytes, Some(c1.len() + c2.len()));
+        let (_, bytes) = acc.accumulate(0, None, None, Some("}".into()));
+        assert_eq!(bytes, Some(c1.len() + c2.len() + 1));
+    }
+
+    #[test]
+    fn accumulatorTracksParallelCallsIndependently() {
+        let mut acc = ToolCallAccumulator::new();
+        let (n0, _) = acc.accumulate(0, None, Some("editFile".into()), Some("{".into()));
+        let (n1, _) = acc.accumulate(1, None, Some("grep".into()), Some("{".into()));
+        assert_eq!(n0.as_deref(), Some("editFile"));
+        assert_eq!(n1.as_deref(), Some("grep"));
+
+        let (n0, bytes0) = acc.accumulate(0, None, None, Some("}".into()));
+        assert!(n0.is_none());
+        assert_eq!(bytes0, Some(2));
+        assert_eq!(acc.pendingCall(0), Some(("editFile", "{}")));
+        assert_eq!(acc.pendingCall(1), Some(("grep", "{")));
+    }
+
+    #[test]
+    fn previewResolvesOncePathValueCloses() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.accumulate(0, None, Some("editFile".into()), Some(r#"{"path": "crates"#.into()));
+        // Value still open — preview should be None.
+        let (name, args) = acc.pendingCall(0).unwrap();
+        assert_eq!(crate::tool_preview::previewForTool(name, args), None);
+
+        // Closing quote arrives — preview resolves.
+        acc.accumulate(0, None, None, Some(r#"/deck/src/app.rs""#.into()));
+        let (name, args) = acc.pendingCall(0).unwrap();
+        assert_eq!(
+            crate::tool_preview::previewForTool(name, args).as_deref(),
+            Some("crates/deck/src/app.rs"),
+        );
+    }
+
+    #[test]
+    fn previewGrepRefinesWhenPathArrivesAfterPattern() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.accumulate(0, None, Some("grep".into()), Some(r#"{"pattern": "ToolCall""#.into()));
+        let (name, args) = acc.pendingCall(0).unwrap();
+        assert_eq!(
+            crate::tool_preview::previewForTool(name, args).as_deref(),
+            Some("\"ToolCall\""),
+        );
+
+        acc.accumulate(0, None, None, Some(r#", "path": "crates/""#.into()));
+        let (name, args) = acc.pendingCall(0).unwrap();
+        assert_eq!(
+            crate::tool_preview::previewForTool(name, args).as_deref(),
+            Some("\"ToolCall\" in crates/"),
+        );
     }
 }
