@@ -8,3 +8,4 @@
 __pycache__/
 *.pyc
 /.flatline/
+config.template.toml

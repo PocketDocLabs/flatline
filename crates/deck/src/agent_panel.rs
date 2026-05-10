@@ -1652,8 +1652,12 @@ impl AgentPanel {
         let totalLines = lines.len() as u16;
         let visible = paddedChat.height;
         let maxScroll = totalLines.saturating_sub(visible);
-        // REMOVED: No longer auto-scroll when content arrives — respect user's scroll position
-        // Previously: if self.scrollOffset > 0 && maxScroll > self.lastMaxScroll { ... }
+        // Keep view stable when scrolled up and content grows below.
+        // scrollOffset is "lines from bottom", so when content grows (maxScroll increases),
+        // we need to increase scrollOffset by the same amount to stay looking at same content.
+        if self.scrollOffset > 0 && maxScroll > self.lastMaxScroll {
+            self.scrollOffset = self.scrollOffset.saturating_add(maxScroll - self.lastMaxScroll);
+        }
         self.lastMaxScroll = maxScroll;
         // Clamp to prevent scroll accumulation past content top.
         self.scrollOffset = self.scrollOffset.min(maxScroll);

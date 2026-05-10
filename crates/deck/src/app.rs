@@ -124,7 +124,14 @@ impl ScrollAxisLock {
 /// Static glyph shown in the title when a topic is set but the agent is idle.
 /// Ace of hearts — deliberately distinct from every animation frame so a
 /// still title reads as "idle" rather than "animation stuck on a card".
-const TITLE_IDLE_GLYPH: &str = "\u{1F0B1}";
+const TITLE_IDLE_GLYPH: &str = "\u{1F0B1}"; // Ace of Hearts
+
+/// Glyph shown when agent completed work while window was not focused.
+/// U+FE0E forces text presentation so the title shows a glyph, not an emoji.
+const TITLE_UNSEEN_GLYPH: &str = "\u{2709}\u{FE0E}"; // Envelope
+
+/// Glyph shown when a permission prompt is waiting while window was not focused.
+const TITLE_PERMIT_GLYPH: &str = "\u{26A0}\u{FE0E}"; // Warning
 
 /// Set the host terminal's window title via OSC 2.
 fn writeTerminalTitle(glyph: &str, topic: Option<&str>) {
@@ -226,6 +233,7 @@ pub async fn run() -> Result<()> {
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
         ),
         crossterm::cursor::SetCursorStyle::SteadyBar,
+        crossterm::event::EnableFocusChange,
     )?;
     writeTerminalTitle(TITLE_IDLE_GLYPH, None);
 
@@ -253,6 +261,7 @@ pub async fn run() -> Result<()> {
                 crossterm::cursor::SetCursorStyle::DefaultUserShape,
                 crossterm::event::PopKeyboardEnhancementFlags,
                 crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableFocusChange,
                 crossterm::event::DisableBracketedPaste,
                 LeaveAlternateScreen,
             );
@@ -615,6 +624,7 @@ pub async fn run() -> Result<()> {
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
         crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableFocusChange,
         crossterm::event::DisableBracketedPaste,
         LeaveAlternateScreen,
     )?;
@@ -674,6 +684,12 @@ async fn runLoop(
     let mut currentTopic: Option<String> = None;
     let mut titleSpinner = TitleSpinner::new();
     let mut titleWasAnimating = false;
+    // Window focus tracking — enabled via EnableFocusChange.
+    let mut windowFocused = true;
+    // True when agent completed work while window was not focused.
+    let mut unseenWorkPending = false;
+    // True when a permission prompt arrived while window was not focused.
+    let mut unseenPermitPending = false;
     // Cap draws at ~30fps. Prevents strobing when the PTY floods us with
     // updates (rich progress bars, keystroke echo) — ratatui's buffer diff
     // absorbs all the intermediate state into one frame.
@@ -1031,6 +1047,11 @@ async fn runLoop(
                 }
                 LogEvent::TurnComplete => {
                     agentPanel.finishTurn();
+                    // If completed while window not focused, show envelope indicator.
+                    if !windowFocused {
+                        unseenWorkPending = true;
+                        writeTerminalTitle(TITLE_UNSEEN_GLYPH, currentTopic.as_deref());
+                    }
                 }
                 LogEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
@@ -1040,7 +1061,13 @@ async fn runLoop(
                 }
                 LogEvent::TopicChanged { label } => {
                     currentTopic = Some(label);
-                    let glyph = if agentPanel.isActive() {
+                    // Preserve unseen indicators across topic changes so the user
+                    // still sees the envelope/warning when they refocus.
+                    let glyph = if unseenPermitPending {
+                        TITLE_PERMIT_GLYPH
+                    } else if unseenWorkPending {
+                        TITLE_UNSEEN_GLYPH
+                    } else if agentPanel.isActive() {
                         titleSpinner.current()
                     } else {
                         TITLE_IDLE_GLYPH
@@ -1248,6 +1275,11 @@ async fn runLoop(
                         origin,
                     );
                     pendingPermitReply = Some(reply);
+                    // If permit arrived while window not focused, show warning indicator.
+                    if !windowFocused {
+                        unseenPermitPending = true;
+                        writeTerminalTitle(TITLE_PERMIT_GLYPH, currentTopic.as_deref());
+                    }
                     // Parent permits auto-close the popup so the main-panel
                     // prompt becomes visible. Subagent permits stay routed
                     // through the popup (which renders them inline).
@@ -1322,13 +1354,17 @@ async fn runLoop(
             needsRedraw = true;
         }
 
-        // Tick animated title spinner while a turn is active.
+        // Tick animated title spinner while a turn is active. While an unseen
+        // indicator is showing (envelope/warning for off-focus events), suppress
+        // both the spinner tick and the spinner-end fallback so the indicator
+        // survives until the user refocuses the window.
         let nowAnimating = currentTopic.is_some() && agentPanel.isActive();
+        let unseenIndicatorActive = unseenWorkPending || unseenPermitPending;
         if nowAnimating {
-            if titleSpinner.tick() {
+            if titleSpinner.tick() && !unseenIndicatorActive {
                 writeTerminalTitle(titleSpinner.current(), currentTopic.as_deref());
             }
-        } else if titleWasAnimating {
+        } else if titleWasAnimating && !unseenIndicatorActive {
             // Agent just finished — drop back to the static idle glyph.
             writeTerminalTitle(TITLE_IDLE_GLYPH, currentTopic.as_deref());
         }
@@ -1373,6 +1409,11 @@ async fn runLoop(
             &projectDir,
             &mut lastQuitPress,
             &mut helpPopupOpen,
+            &mut windowFocused,
+            &mut unseenWorkPending,
+            &mut unseenPermitPending,
+            &currentTopic,
+            &titleSpinner,
         )
         .await?;
         if quit {
@@ -1418,6 +1459,11 @@ async fn handleInput(
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
     helpPopupOpen: &mut bool,
+    windowFocused: &mut bool,
+    unseenWorkPending: &mut bool,
+    unseenPermitPending: &mut bool,
+    currentTopic: &Option<String>,
+    titleSpinner: &TitleSpinner,
 ) -> Result<(bool, bool, bool)> {
     // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
@@ -1429,6 +1475,37 @@ async fn handleInput(
     let mut resized = false;
     loop {
         match event::read()? {
+            Event::FocusGained => {
+                *windowFocused = true;
+                // Completed-work indicator can always clear — the user is now
+                // looking. The permit indicator only clears if the permit is
+                // actually resolved; an unanswered permit should stay flagged.
+                let permitStillPending = pendingPermitReply.is_some();
+                let cleared = if *unseenWorkPending || (*unseenPermitPending && !permitStillPending) {
+                    *unseenWorkPending = false;
+                    if !permitStillPending {
+                        *unseenPermitPending = false;
+                    }
+                    true
+                } else {
+                    false
+                };
+                if cleared {
+                    // Pick the glyph the spinner section would draw next iteration,
+                    // so refocus doesn't flash IDLE while the agent is working.
+                    let glyph = if *unseenPermitPending {
+                        TITLE_PERMIT_GLYPH
+                    } else if agentPanel.isActive() && currentTopic.is_some() {
+                        titleSpinner.current()
+                    } else {
+                        TITLE_IDLE_GLYPH
+                    };
+                    writeTerminalTitle(glyph, currentTopic.as_deref());
+                }
+            }
+            Event::FocusLost => {
+                *windowFocused = false;
+            }
             Event::Key(key) => {
                 if key.kind == event::KeyEventKind::Release {
                     // Poll for more without blocking.
