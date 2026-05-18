@@ -27,6 +27,7 @@ two-face.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 dirs.workspace = true
+toml.workspace = true
 ascii-dag.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

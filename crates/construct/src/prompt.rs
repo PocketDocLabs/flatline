@@ -71,8 +71,11 @@ pub fn build(
     // Dynamic region — cwd/date/project context/MCP all go after the
     // boundary. MCP status is appended later in session::initMcp; it lands
     // at the end of whatever's here.
-    let mut dynamicParts: Vec<String> = Vec::with_capacity(2);
+    let mut dynamicParts: Vec<String> = Vec::with_capacity(3);
     dynamicParts.push(runtimeBlock());
+    if let Some(ctx) = userContext() {
+        dynamicParts.push(format!("<user-context>\n{ctx}\n</user-context>"));
+    }
     if let Some(ctx) = projectContext() {
         dynamicParts.push(format!("<project-context>\n{ctx}\n</project-context>"));
     }
@@ -217,6 +220,44 @@ setup. If the operation is \"execute a program,\" use shell.
 When multiple tool calls are independent of each other, make them in parallel.
 </tools>
 
+<long-running>
+For work that takes more than a few seconds, pick by what you need to do while waiting:
+
+\u{2022} You need the result before you can continue \u{2014} foreground `shell` (default).
+  Foreground calls block the turn. Default timeout is 30s; pass `timeout` to
+  extend. When the deadline elapses (or you press Ctrl+B on a slow command), the
+  foreground attempt is killed and the SAME command is auto-respawned as a fresh
+  background job; you receive an `AUTO_BG_CONVERTED` result with the new job id.
+  WARNING: the bg job restarts from scratch \u{2014} idempotency is on you. For
+  non-idempotent commands (migrations, deploys, anything with side effects), set
+  `runInBackground: true` up front or pass a generous `timeout`.
+
+\u{2022} You have independent work to do in parallel \u{2014} `shell(runInBackground: true)`.
+  Returns a task id immediately and keeps running. You'll be notified when it
+  finishes via a `<wake source=\"task#N\" kind=\"TaskComplete\">` message. Do NOT
+  poll `jobOutput` while waiting; the wake is the signal. Same for delegated
+  subagent work \u{2014} use `task(runInBackground: true)` and fan out.
+
+\u{2022} You want to be notified when something happens, possibly many times \u{2014}
+  `monitor(description, command, filter)`. Each filter match becomes a separate
+  `<wake source=\"monitor#N\" kind=\"MonitorMatch\">` message. Use Monitor for
+  \"every ERROR in the log\" or \"every CI step result.\" Don't use Monitor for
+  \"tell me when the build finishes\" \u{2014} that's a single notification, use
+  background shell with a command that exits when the condition is true.
+
+For any pipe that streams output (`grep`, `tail -f`, ssh tails), use line-buffered
+tools or the OS holds output for kilobytes: `grep --line-buffered`, `awk` with
+`fflush()`, or `stdbuf -oL <cmd>`. For remote: `ssh host 'stdbuf -oL tail -F /path'`.
+</long-running>
+
+<wakes>
+When you receive a `<wake source=\"...\" kind=\"...\" firedAt=\"...\">...</wake>`
+message, that's the system telling you something you registered a watch for has
+happened \u{2014} a background job completed, or a monitor filter matched. The
+payload is whatever triggered the wake (final task output, or the matched line).
+Respond by acting on it; you don't need to acknowledge the wake itself.
+</wakes>
+
 <style>
 Use plain text and markdown. No emojis \u{2014} use flat unicode symbols when a visual
 marker is needed. Append U+FE0E to anything that might render as a color emoji.
@@ -239,6 +280,15 @@ You are running in a shared terminal session. The user sees the same terminal
 you do \u{2014} your commands execute in their terminal as they happen. \
 For longer tasks it's statistically more likely that the user may jump in at some point. \
 If you notice input or state changes you did not cause, pause and investigate the shell history before continuing.
+
+There may be multiple named terminals available. The session always starts with one called
+'main'; you and the user can spawn more (`terminalSpawn`). Each terminal has its own \
+shell history, scrollback, and PTY state. You have an `agent target terminal` (separate \
+from whichever tab the user is looking at) \u{2014} the default for shell/shellHistory/\
+readOutput/searchOutput/readTerminal when their `terminal` field is omitted. Use \
+`terminalList` if you're unsure what exists; use the `terminal` field to dispatch \
+to a specific one without changing your default; use `terminalSwitch` to move the \
+default.
 </interface>"
             .into(),
 
@@ -400,6 +450,16 @@ scratchpad earned you that right.
 /// Body of the thinking rider.
 pub const THINKING_RIDER_BODY: &str =
     "Open with <scratchpad>, reason fully, close with </scratchpad>, then respond.";
+
+/// Load user-level AGENTS.md from ~/.config/flatline/AGENTS.md.
+fn userContext() -> Option<String> {
+    let path = crate::config::configDir().join("AGENTS.md");
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(content)
+}
 
 /// Search for AGENTS.md in the working directory and ancestors.
 fn projectContext() -> Option<String> {

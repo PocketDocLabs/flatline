@@ -37,9 +37,39 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "shell".into(),
-                description: "Execute a shell command and return its output. \
-                    Output is truncated at 2000 lines / 100KB. \
-                    Use readOutput to access full output of past commands.".into(),
+                description: "Execute a shell command. By default BLOCKS the \
+                    turn until the command completes or the timeout elapses; \
+                    output is truncated at 2000 lines / 100KB (full output \
+                    in shellHistory + readOutput). Runs in the agent's \
+                    target terminal \u{2014} pass `terminal` to dispatch \
+                    elsewhere.\n\n\
+                    AUTO-BG: a foreground call that hits its timeout is \
+                    AUTOMATICALLY converted to a background job. You will \
+                    receive an AUTO_BG_CONVERTED result with the new job id \
+                    and any partial output captured before conversion. The \
+                    bg job is a FRESH run of the same command \u{2014} the \
+                    foreground attempt was killed and not migrated. If the \
+                    command is non-idempotent (writes files, sends network \
+                    requests, mutates shared state), prefer setting \
+                    `runInBackground: true` up front or a generous `timeout` \
+                    so it never trips auto-bg.\n\n\
+                    Set `runInBackground: true` for long builds, dev \
+                    servers, log tails, or any command whose result you \
+                    don't need before continuing. Background calls return \
+                    a job id immediately; you'll be notified when the \
+                    job completes \u{2014} do NOT poll `jobOutput` while \
+                    waiting. Use foreground (default) when you need the \
+                    result before you can proceed; background when you \
+                    have genuinely independent work to do in parallel.\n\n\
+                    LINE BUFFERING: long-running pipes (`cmd | grep ...`, \
+                    `ssh host 'tail -F ...'`) block-buffer stdout until \
+                    kilobytes accumulate, hiding output for minutes. Use \
+                    `grep --line-buffered`, `awk 'BEGIN {{...}}'` with \
+                    `fflush()`, `stdbuf -oL <cmd>`, or `ssh host 'stdbuf \
+                    -oL tail -F /path'` to keep output flowing.\n\n\
+                    Background jobs bypass the named terminal (output \
+                    buffered in a 5000-line ring; retrieve via jobOutput, \
+                    stop via jobStop).".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -62,7 +92,15 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds. Default 30. The command is interrupted if it exceeds this."
+                            "description": "Timeout in seconds. Default 30. When exceeded, the command is auto-converted to a background job (you receive the new job id; the fg attempt is killed and the bg job is a fresh re-run). Ignored when runInBackground is true."
+                        },
+                        "terminal": {
+                            "type": "string",
+                            "description": "Name of the terminal to run in. Omit to use the agent's target terminal. Ignored when runInBackground is true."
+                        },
+                        "runInBackground": {
+                            "type": "boolean",
+                            "description": "Spawn non-blocking. Returns a task id immediately; the command keeps running while you work. You'll be notified when it completes — do not poll. Defaults to false."
                         }
                     },
                     "required": ["command", "explanation", "impact"]
@@ -280,11 +318,18 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "shellHistory".into(),
-                description: "List recent shell commands with their index, exit code, \
-                    and output size. Use readOutput to read a specific command's full output.".into(),
+                description: "List recent shell commands for a terminal with their index, \
+                    exit code, and output size. Use readOutput to read a specific \
+                    command's full output. History is per-terminal — pass `terminal` \
+                    to inspect a specific terminal, otherwise the agent's target terminal is used.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "terminal": {
+                            "type": "string",
+                            "description": "Name of the terminal to inspect. Omit to use the agent's target terminal."
+                        }
+                    },
                     "required": []
                 }),
             },
@@ -294,8 +339,9 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "readOutput".into(),
                 description: "Read the output of a previous shell command by index. \
-                    Use shellHistory to see available commands. \
-                    Supports offset/limit like readFile for navigating large output.".into(),
+                    Indices are per-terminal — pair this with `terminal` if you ran \
+                    the command in a non-default terminal. Use shellHistory to see \
+                    available commands. Supports offset/limit for navigating large output.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -310,6 +356,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of lines to read. Defaults to 2000."
+                        },
+                        "terminal": {
+                            "type": "string",
+                            "description": "Name of the terminal whose history to read from. Omit to use the agent's target terminal."
                         }
                     },
                     "required": ["index"]
@@ -321,8 +371,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "searchOutput".into(),
                 description: "Search a previous command's output for a pattern (regex or substring). \
-                    Returns matching lines with surrounding context. \
-                    Use shellHistory to see available commands.".into(),
+                    Returns matching lines with surrounding context. Indices are per-terminal — \
+                    pair with `terminal` to search a specific terminal's history.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -337,6 +387,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         "context": {
                             "type": "integer",
                             "description": "Number of lines of context around each match. Defaults to 3."
+                        },
+                        "terminal": {
+                            "type": "string",
+                            "description": "Name of the terminal whose history to search. Omit to use the agent's target terminal."
                         }
                     },
                     "required": ["index", "pattern"]
@@ -347,15 +401,19 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "readTerminal".into(),
-                description: "Read recent terminal scrollback — everything visible in \
-                    the shared terminal including user commands and their output. \
-                    Use this to see what the user has been doing.".into(),
+                description: "Read recent terminal scrollback for a terminal — everything \
+                    visible there including user commands and their output. Pair with \
+                    `terminal` to read a specific one.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "lines": {
                             "type": "integer",
                             "description": "Number of recent lines to read. Defaults to 50."
+                        },
+                        "terminal": {
+                            "type": "string",
+                            "description": "Name of the terminal to read from. Omit to use the agent's target terminal."
                         }
                     },
                     "required": []
@@ -767,12 +825,24 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "task".into(),
-                description: "Spawn a subtask agent to handle a focused piece of work. \
-                    The agent runs with its own context and shell, then returns a result. \
-                    Use 'explore' for read-only codebase research (cheap, fast model). \
-                    Use 'general' for tasks that may modify files (full tools, same model). \
-                    Prefer delegating bounded, well-defined work — don't use task for \
-                    simple operations you can do directly.".into(),
+                description: "Spawn a subtask agent to handle a focused piece \
+                    of work. The agent runs with its own context and shell, \
+                    then returns a result. Use 'explore' for read-only \
+                    codebase research (cheap, fast model). Use 'general' for \
+                    tasks that may modify files (full tools, same model). \
+                    Prefer delegating bounded, well-defined work \u{2014} \
+                    don't use task for simple operations you can do directly.\n\n\
+                    **Foreground vs background**: Use foreground (default) \
+                    when you need the agent's results before you can \
+                    proceed \u{2014} e.g. research whose findings inform \
+                    your next step. Use background when you have genuinely \
+                    independent work to do in parallel (fan out 3 explores \
+                    for unrelated topics, then continue working).\n\n\
+                    When `runInBackground: true`, the call returns \
+                    immediately with a task id and you'll be notified when \
+                    the subagent completes \u{2014} do NOT poll \
+                    `jobOutput` while waiting. Use `jobList` to see \
+                    what's still running.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -787,6 +857,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                             "description": "Agent type. 'explore' = read-only research with a cheap \
                                 model. 'general' = full tools with the same model as the parent. \
                                 Default: 'general'."
+                        },
+                        "runInBackground": {
+                            "type": "boolean",
+                            "description": "Spawn non-blocking and return a task id immediately. You'll be notified on completion — do not poll. Default: false (blocking)."
                         }
                     },
                     "required": ["prompt"]
@@ -818,6 +892,378 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 }),
             },
         },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "terminalSpawn".into(),
+                description: "Spawn a new terminal (PTY) and add it as a tab the user can see. \
+                    Returns the resolved name. Useful when you need an isolated shell — \
+                    e.g. to run a TUI tool that would interfere with the main shell, \
+                    or to give the user a tab while you work in another. \
+                    Foreground `shell` calls block the turn; use \
+                    `shell(runInBackground: true)` for non-blocking commands.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name for the new terminal. Must be unique. \
+                                Letters, digits, dashes, underscores only. \
+                                If omitted, a name like 'term2' is auto-generated."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "terminalSwitch".into(),
+                description: "Set the agent's target terminal — the default for subsequent \
+                    shell, shellHistory, readOutput, searchOutput, and readTerminal calls \
+                    when they omit the `terminal` field. Independent from the user's \
+                    focused tab in the deck; switching the agent's target does NOT switch \
+                    the user's view.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the terminal to make active."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "terminalKill".into(),
+                description: "Kill a named terminal. Refused if it is the last live \
+                    terminal in the session \u{2014} the session must have at least one \
+                    PTY. `main` is killable when at least one other terminal exists; \
+                    in that case future calls with `terminal: \"main\"` will return \
+                    a 'closed' error, so check `terminalList` if you're unsure. Any \
+                    in-flight commands targeting the killed terminal will also return \
+                    a 'closed' error.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the terminal to kill."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "terminalList".into(),
+                description: "List all live terminals with their names, age, and \
+                    which one is currently active.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "jobOutput".into(),
+                description: "Read buffered output from a background job \
+                    spawned by `shell(runInBackground: true)`. Returns the \
+                    latest output lines plus the job's current state \
+                    (running, completed, killed, errored). \n\n\
+                    You generally don't need to call this proactively \u{2014} \
+                    you'll receive a completion notification with the final \
+                    output. Use it when you want a mid-flight peek or to \
+                    page through historical output via `sinceLine`. Omit \
+                    `sinceLine` for the most recent tail; `maxLines` caps \
+                    the response (default 200, max 500).".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "jobId": {
+                            "type": "integer",
+                            "description": "Job id returned by shell(runInBackground: true)."
+                        },
+                        "sinceLine": {
+                            "type": "integer",
+                            "description": "Line index to resume from. Each line of output has a \
+                                stable 0-indexed line number; the response tells you the next \
+                                line index to resume at."
+                        },
+                        "maxLines": {
+                            "type": "integer",
+                            "description": "Cap on lines returned. Default 200, max 500."
+                        }
+                    },
+                    "required": ["jobId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "jobStop".into(),
+                description: "Kill a running background job by id. Sends SIGTERM to \
+                    the job's process group (so the shell wrapper and any child \
+                    processes it spawned), waits briefly, then SIGKILLs anything \
+                    still alive. No-op if the job is already terminal.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "jobId": {
+                            "type": "integer",
+                            "description": "Job id from shell(runInBackground: true)."
+                        }
+                    },
+                    "required": ["jobId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "jobList".into(),
+                description: "List all background jobs (running, completed, killed, errored) \
+                    with their command, age, total lines emitted, and state. Use to \
+                    rediscover job ids if you've lost track.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "monitor".into(),
+                description: "Register a line-streamed watcher backed by a \
+                    long-running bash command. Each matching line is a \
+                    notification — the model is woken with the matched \
+                    line as payload (once the wake plane lands; today \
+                    matches are counted and visible via monitorList).\n\n\
+                    Pick by how many notifications you need:\n\
+                    \u{2022} One (\"tell me when the build finishes\") \u{2192} \
+                    use `shell(runInBackground: true)` with a command that \
+                    exits when the condition is true. Don't use Monitor.\n\
+                    \u{2022} One per occurrence, indefinitely (\"every ERROR \
+                    in the log\") \u{2192} Monitor with an unbounded command \
+                    like `tail -F` or `inotifywait -m`.\n\
+                    \u{2022} One per occurrence with a known end (\"each CI \
+                    step result, stop at run end\") \u{2192} Monitor with a \
+                    command that emits lines and then exits.\n\n\
+                    LINE BUFFERING: pipe-buffered output delays notifications \
+                    by kilobytes. Always pass through `grep --line-buffered`, \
+                    `awk` with `fflush()`, or wrap with `stdbuf -oL <cmd>`. \
+                    For remote ssh: `ssh host 'stdbuf -oL tail -F /path'`. \
+                    Use `tail -F` (capital F) for log rotation; `-f` silently \
+                    stops on rotation.\n\n\
+                    COVERAGE: filter must match every terminal state, not \
+                    just the happy path. Before arming, ask: if this process \
+                    crashed right now, would my filter emit anything? If not, \
+                    widen it. Use alternation to cover progress + failure \
+                    signatures (`elapsed_steps=|Traceback|Error|Killed|OOM`).\n\n\
+                    OUTPUT VOLUME: every match becomes a notification, so \
+                    keep the filter selective \u{2014} but selective means \
+                    \"lines you'd act on,\" not just success. Monitors \
+                    sustaining >500 matches/sec for 5s auto-stop; tighten \
+                    the filter and re-register.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "Short label shown in every notification and in F2 control panel. Be specific: \"errors in deploy.log\", not \"watching logs\"."
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Bash command to run (via `bash -c`). Should produce \
+                                line-by-line output. Examples: `tail -F /var/log/app.log`, \
+                                `inotifywait -m --format '%e %f' /watched`, \
+                                `while sleep 30; do curl -s http://x/health || true; done`."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "REQUIRED regex applied to each output line. Lines \
+                                that don't match are still kept in the backing job's ring \
+                                buffer (visible via jobOutput) but do NOT count as events \
+                                or trigger wakes. Use alternation to cover failure modes."
+                        }
+                    },
+                    "required": ["description", "command", "filter"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "monitorStop".into(),
+                description: "Stop a monitor by id. Also kills the backing bash task so \
+                    the watched process exits cleanly. No-op on already-terminal \
+                    monitors.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "monitorId": {
+                            "type": "integer",
+                            "description": "Monitor id returned by `monitor`."
+                        }
+                    },
+                    "required": ["monitorId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "monitorList".into(),
+                description: "Snapshot of every monitor (running, stopped, auto-stopped) \
+                    with command, filter, event count, last-event age, and state.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "scheduleWakeup".into(),
+                description: "Arm a one-shot delay wake. After `delaySeconds`, \
+                    you'll receive a `<wake source=\"delay#N\" kind=\"Delay\">` \
+                    user-shaped message carrying `prompt` as its payload. \
+                    Use for \"remind me to check X in 5 minutes\" without \
+                    blocking the conversation. The minimum granularity is \
+                    ~1s (scheduler tick). Cancellable via cronDelete(wakeId).".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "delaySeconds": {
+                            "type": "integer",
+                            "description": "Seconds from now. Minimum 1."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Text passed back as the wake payload \u{2014} the model sees it as the new \"user\" turn."
+                        }
+                    },
+                    "required": ["delaySeconds", "prompt"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "cronCreate".into(),
+                description: "Arm a cron-scheduled wake. `spec` is a standard \
+                    5-field cron string in local time (`minute hour day-of-month \
+                    month day-of-week`). On each fire you'll receive a \
+                    `<wake source=\"cron#N\" kind=\"Cron\">` message carrying \
+                    `prompt`.\n\n\
+                    `recurring` defaults to true (loops). Set false for a \
+                    single-shot fire (functionally similar to scheduleWakeup \
+                    but with a calendar-aware specification).\n\n\
+                    Cron evaluation uses wall-clock so machine sleep doesn't \
+                    permanently shift the schedule. Cancel via \
+                    `cronDelete(wakeId)`.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "spec": {
+                            "type": "string",
+                            "description": "5-field cron in local time. Examples: `0 9 * * 1-5` (weekdays at 09:00), `*/15 * * * *` (every 15 min), `30 8 1 * *` (1st of each month at 08:30)."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Payload passed to the model on each fire."
+                        },
+                        "recurring": {
+                            "type": "boolean",
+                            "description": "Default true. False = single-shot fire then auto-disarm."
+                        }
+                    },
+                    "required": ["spec", "prompt"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "cronList".into(),
+                description: "Snapshot every active wake source (delay, cron, \
+                    file-watch, plus passive monitor/task sources) with id, \
+                    kind, summary, prompt, and fire count. Use to rediscover \
+                    wake ids you've lost track of.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "cronDelete".into(),
+                description: "Disarm any wake source by id. Works for delay, \
+                    cron, and file-watch sources. Named `cronDelete` for \
+                    convenience but accepts any wake id from cronList.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "wakeId": {
+                            "type": "integer",
+                            "description": "Wake source id (from cronList or the return value of scheduleWakeup/cronCreate/fileWatch)."
+                        }
+                    },
+                    "required": ["wakeId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "fileWatch".into(),
+                description: "Watch a filesystem path for events. Each created, \
+                    modified, or removed file under `path` (recursive) fires a \
+                    `<wake source=\"fileWatch#N\" kind=\"FileWatch\">` message \
+                    with the event kind + affected paths appended to your \
+                    `prompt`.\n\n\
+                    Suitable for \"resume when the config file is saved\" or \
+                    \"react to new files in this directory.\" Returns a wake id \
+                    — cancel via cronDelete.\n\n\
+                    macOS uses FSEvents (coalesces rapid bursts into single \
+                    notifications). Linux uses inotify. Watching a noisy \
+                    directory (e.g. node_modules during a build) will fire \
+                    many wakes \u{2014} narrow the path or use a Monitor with \
+                    a filter instead.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to watch. Must exist. Directories are watched recursively."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Text prepended to the wake payload on each event."
+                        }
+                    },
+                    "required": ["path", "prompt"]
+                }),
+            },
+        },
     ]
 }
 
@@ -846,7 +1292,20 @@ pub enum ShellImpact {
 /// A parsed tool invocation from the LLM.
 #[derive(Debug)]
 pub enum ToolAction {
-    Shell { command: String, explanation: String, impact: ShellImpact, timeout: Option<u64> },
+    Shell {
+        command: String,
+        explanation: String,
+        impact: ShellImpact,
+        timeout: Option<u64>,
+        /// Target terminal by name. None resolves to the active terminal.
+        /// Ignored when `runInBackground` is true (background jobs bypass
+        /// the shared PTY).
+        terminal: Option<String>,
+        /// Spawn non-blocking in the background. When true, returns a
+        /// task id immediately and the command continues running under
+        /// the JobPlane; retrieve output via `jobOutput`.
+        runInBackground: bool,
+    },
     ReadFile { path: String, offset: Option<usize>, limit: Option<usize>, anchor: Option<usize> },
     WriteFile { path: String, content: String },
     EditFile { path: String, oldString: String, newString: String, replaceAll: bool },
@@ -855,10 +1314,52 @@ pub enum ToolAction {
     MoveFile { src: String, dest: String, overwrite: bool },
     DeleteFile { path: String, recursive: bool },
     MakeDirs { path: String },
-    ShellHistory,
-    ReadOutput { index: usize, offset: Option<usize>, limit: Option<usize> },
-    SearchOutput { index: usize, pattern: String, context: usize },
-    ReadTerminal { lines: usize },
+    ShellHistory { terminal: Option<String> },
+    ReadOutput { index: usize, offset: Option<usize>, limit: Option<usize>, terminal: Option<String> },
+    SearchOutput { index: usize, pattern: String, context: usize, terminal: Option<String> },
+    ReadTerminal { lines: usize, terminal: Option<String> },
+    /// Spawn a new terminal. Name auto-generated when None.
+    TerminalSpawn { name: Option<String> },
+    /// Set the active default target for shell-using tool calls.
+    TerminalSwitch { name: String },
+    /// Kill a named terminal.
+    TerminalKill { name: String },
+    /// Snapshot of all terminals.
+    TerminalList,
+    /// Retrieve buffered output for a task.
+    JobOutput { jobId: u64, sinceLine: Option<u64>, maxLines: Option<usize> },
+    /// Kill a running job.
+    JobStop { jobId: u64 },
+    /// Snapshot of all tasks.
+    JobList,
+    /// Register a line-streamed monitor backed by a bash task. Lines
+    /// matching the regex `filter` emit `MonitorEvent`s, bump the
+    /// monitor's counter, and (once the wake plane lands) wake the
+    /// agent with a synthetic `<wake>` message. Floods auto-stop the
+    /// task.
+    Monitor {
+        description: String,
+        command: String,
+        filter: String,
+    },
+    /// Stop a monitor (and its backing bash task).
+    MonitorStop { monitorId: u64 },
+    /// Snapshot of all monitors.
+    MonitorList,
+    /// Arm a one-shot delay wake. Fires after `delaySeconds` with the
+    /// model-supplied `prompt` as the wake payload.
+    ScheduleWakeup { delaySeconds: u64, prompt: String },
+    /// Arm a cron-scheduled wake. 5-field cron in local time.
+    CronCreate { spec: String, prompt: String, recurring: bool },
+    /// Snapshot all wake sources (delay, cron, file-watch).
+    CronList,
+    /// Disarm a wake source by id. Works for any wake kind, named
+    /// `cronDelete` because cron is the most common case the model
+    /// will want to cancel.
+    CronDelete { wakeId: u64 },
+    /// Arm a filesystem watch. Each fs event under `path` (created,
+    /// modified, removed) fires a wake with the `prompt` payload.
+    FileWatch { path: String, prompt: String },
     Glob { pattern: String, path: Option<String>, metadata: bool },
     Grep {
         pattern: String, path: Option<String>, include: Option<String>,
@@ -894,7 +1395,15 @@ pub enum ToolAction {
     },
     HistoryFetch { blockId: String },
     HistorySearch { query: String, mediaType: Option<String> },
-    Task { prompt: String, agent: Option<String> },
+    Task {
+        prompt: String,
+        agent: Option<String>,
+        /// When true, the child session is registered as a background
+        /// task in the JobPlane and the call returns immediately with a
+        /// task id. The parent polls `jobOutput` / `jobList` and
+        /// retrieves the final content from the task's ring buffer.
+        runInBackground: bool,
+    },
     Diagnostics { path: String, severity: String },
     Mcp { qualifiedName: String, args: String },
     Unknown { name: String, args: String },
@@ -911,18 +1420,39 @@ pub enum ToolSet {
 
 /// Filter tool definitions by a ToolSet.
 pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
+    // Terminal-management tools are excluded from subagent toolsets in
+    // phase 1 — child sessions stay single-shell.
+    const SUBAGENT_DENIED: &[&str] = &[
+        "task",
+        "terminalSpawn",
+        "terminalSwitch",
+        "terminalKill",
+        "terminalList",        "monitor",
+        "monitorStop",
+        "monitorList",
+        "scheduleWakeup",
+        "cronCreate",
+        "cronList",
+        "cronDelete",
+        "fileWatch",
+    ];
     match set {
         ToolSet::All => defs
             .iter()
-            .filter(|d| d.function.name != "task")
+            .filter(|d| !SUBAGENT_DENIED.contains(&d.function.name.as_str()))
             .cloned()
             .collect(),
         ToolSet::ReadOnly => {
+            // Read-only toolset for explore subagents. Deliberately omits
+            // `shell` — the model self-classifies impact and we don't trust
+            // that classification for explore agents. Read-only inspection
+            // of prior shell output is available via `shellHistory` +
+            // `readOutput` + `searchOutput`.
             const ALLOWED: &[&str] = &[
                 "readFile", "glob", "grep", "listDir", "structSearch", "diff",
                 "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
                 "shellHistory", "readOutput", "searchOutput", "readTerminal",
-                "shell",
+                "terminalList",
             ];
             defs.iter()
                 .filter(|d| ALLOWED.contains(&d.function.name.as_str()))
@@ -937,13 +1467,83 @@ pub fn needsTask(action: &ToolAction) -> bool {
     matches!(action, ToolAction::Task { .. })
 }
 
+/// Whether this action mutates the shell registry (handled by Session,
+/// not `execute()`). Includes terminal management tools.
+pub fn needsRegistry(action: &ToolAction) -> bool {
+    matches!(
+        action,
+        ToolAction::TerminalSpawn { .. }
+            | ToolAction::TerminalSwitch { .. }
+            | ToolAction::TerminalKill { .. }
+            | ToolAction::TerminalList,
+    )
+}
+
+/// Whether this action touches the background-job plane (handled by
+/// Session, not `execute()`). `Shell { runInBackground: true, .. }` also
+/// belongs here — backgrounded shell calls route through JobPlane.
+pub fn needsJobPlane(action: &ToolAction) -> bool {
+    matches!(
+        action,
+        ToolAction::Shell { runInBackground: true, .. }
+            | ToolAction::JobOutput { .. }
+            | ToolAction::JobStop { .. }
+            | ToolAction::JobList,
+    )
+}
+
+/// True for actions that the MonitorPlane handles. Routed separately
+/// from the JobPlane handler because monitor lifecycle is decoupled
+/// from the backing bash task's lifecycle (a stopped monitor can have
+/// a still-completing task and vice-versa).
+pub fn needsMonitor(action: &ToolAction) -> bool {
+    matches!(
+        action,
+        ToolAction::Monitor { .. }
+            | ToolAction::MonitorStop { .. }
+            | ToolAction::MonitorList,
+    )
+}
+
+/// True for actions that the WakeRegistry handles (schedule/cron/fs).
+pub fn needsWakes(action: &ToolAction) -> bool {
+    matches!(
+        action,
+        ToolAction::ScheduleWakeup { .. }
+            | ToolAction::CronCreate { .. }
+            | ToolAction::CronList
+            | ToolAction::CronDelete { .. }
+            | ToolAction::FileWatch { .. },
+    )
+}
+
+impl ToolAction {
+    /// Optional target terminal for shell-using actions.
+    /// Returns `None` for all non-shell actions and for shell actions
+    /// without an explicit `terminal` field (which resolves to active).
+    pub fn terminal(&self) -> Option<&str> {
+        match self {
+            ToolAction::Shell { terminal, .. }
+            | ToolAction::ShellHistory { terminal }
+            | ToolAction::ReadOutput { terminal, .. }
+            | ToolAction::SearchOutput { terminal, .. }
+            | ToolAction::ReadTerminal { terminal, .. } => terminal.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// Human-readable summary of what a tool action will do.
 pub fn summarize(action: &ToolAction) -> String {
     match action {
-        ToolAction::Shell { command, explanation, timeout, .. } => {
-            let prefix = match timeout {
-                Some(t) => format!("Run ({t}s)"),
-                None => "Run".into(),
+        ToolAction::Shell { command, explanation, timeout, runInBackground, .. } => {
+            let prefix = if *runInBackground {
+                "Spawn bg".to_string()
+            } else {
+                match timeout {
+                    Some(t) => format!("Run ({t}s)"),
+                    None => "Run".into(),
+                }
             };
             if explanation.is_empty() {
                 format!("{prefix}: {command}")
@@ -997,18 +1597,76 @@ pub fn summarize(action: &ToolAction) -> String {
             }
         }
         ToolAction::MakeDirs { path } => format!("Create directory {path}"),
-        ToolAction::ShellHistory => "List shell command history".into(),
-        ToolAction::ReadOutput { index, offset, limit } => {
+        ToolAction::ShellHistory { terminal } => match terminal {
+            Some(t) => format!("List shell history [{t}]"),
+            None => "List shell command history".into(),
+        },
+        ToolAction::ReadOutput { index, offset, limit, terminal } => {
+            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
             match (offset, limit) {
-                (Some(o), Some(l)) => format!("Read output #{index} (lines {o}..{})", o + l - 1),
-                (Some(o), None) => format!("Read output #{index} (from line {o})"),
-                _ => format!("Read output #{index}"),
+                (Some(o), Some(l)) => format!("Read output #{index} (lines {o}..{}){suffix}", o + l - 1),
+                (Some(o), None) => format!("Read output #{index} (from line {o}){suffix}"),
+                _ => format!("Read output #{index}{suffix}"),
             }
         }
-        ToolAction::SearchOutput { index, pattern, .. } => {
-            format!("Search output #{index} for \"{pattern}\"")
+        ToolAction::SearchOutput { index, pattern, terminal, .. } => {
+            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
+            format!("Search output #{index} for \"{pattern}\"{suffix}")
         }
-        ToolAction::ReadTerminal { lines } => format!("Read last {lines} terminal lines"),
+        ToolAction::ReadTerminal { lines, terminal } => {
+            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
+            format!("Read last {lines} terminal lines{suffix}")
+        }
+        ToolAction::TerminalSpawn { name } => match name {
+            Some(n) => format!("Spawn terminal '{n}'"),
+            None => "Spawn terminal".into(),
+        },
+        ToolAction::TerminalSwitch { name } => format!("Switch active terminal to '{name}'"),
+        ToolAction::TerminalKill { name } => format!("Kill terminal '{name}'"),
+        ToolAction::TerminalList => "List terminals".into(),
+        ToolAction::JobOutput { jobId, sinceLine, .. } => match sinceLine {
+            Some(n) => format!("jobOutput #{jobId} (since line {n})"),
+            None => format!("jobOutput #{jobId}"),
+        },
+        ToolAction::JobStop { jobId } => format!("jobStop #{jobId}"),
+        ToolAction::JobList => "jobList".into(),
+        ToolAction::Monitor { description, command, filter } => {
+            let preview = if command.len() > 50 {
+                format!("{}\u{2026}", &command[..command.floor_char_boundary(50)])
+            } else {
+                command.clone()
+            };
+            format!("monitor \"{description}\": {preview}  | /{filter}/")
+        }
+        ToolAction::MonitorStop { monitorId } => format!("monitorStop #{monitorId}"),
+        ToolAction::MonitorList => "monitorList".into(),
+        ToolAction::ScheduleWakeup { delaySeconds, prompt } => {
+            let preview = if prompt.len() > 40 {
+                format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(40)])
+            } else {
+                prompt.clone()
+            };
+            format!("scheduleWakeup {delaySeconds}s: {preview}")
+        }
+        ToolAction::CronCreate { spec, prompt, recurring } => {
+            let preview = if prompt.len() > 40 {
+                format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(40)])
+            } else {
+                prompt.clone()
+            };
+            let suffix = if *recurring { "" } else { " (once)" };
+            format!("cronCreate `{spec}`{suffix}: {preview}")
+        }
+        ToolAction::CronList => "cronList".into(),
+        ToolAction::CronDelete { wakeId } => format!("cronDelete #{wakeId}"),
+        ToolAction::FileWatch { path, prompt } => {
+            let preview = if prompt.len() > 40 {
+                format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(40)])
+            } else {
+                prompt.clone()
+            };
+            format!("fileWatch {path}: {preview}")
+        }
         ToolAction::Glob { pattern, path, metadata } => {
             let dir = path.as_deref().unwrap_or(".");
             let suffix = if *metadata { " +meta" } else { "" };
@@ -1057,14 +1715,15 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::HistoryFetch { blockId } => format!("Fetch block: {blockId}"),
         ToolAction::HistorySearch { query, .. } => format!("Search history: {query}"),
         ToolAction::Diagnostics { path, .. } => format!("Check diagnostics: {path}"),
-        ToolAction::Task { prompt, agent } => {
+        ToolAction::Task { prompt, agent, runInBackground } => {
             let agentName = agent.as_deref().unwrap_or("general");
             let preview = if prompt.len() > 60 {
                 format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(60)])
             } else {
                 prompt.clone()
             };
-            format!("task [{agentName}]: {preview}")
+            let modeLabel = if *runInBackground { " (bg)" } else { "" };
+            format!("task [{agentName}]{modeLabel}: {preview}")
         }
         ToolAction::Mcp { qualifiedName, .. } => {
             match crate::mcp::schema::splitQualifiedName(qualifiedName) {
@@ -1217,14 +1876,29 @@ pub fn needsWeb(action: &ToolAction) -> bool {
 }
 
 /// Execute a tool action and return the content (text or multimodal).
-pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Content {
+///
+/// `terminalName` is the resolved display name of the shell (e.g. "main",
+/// "build") so per-terminal tools can label their output. Caller passes
+/// `action.terminal().unwrap_or(active_name)`.
+pub async fn execute(
+    action: &ToolAction,
+    shell: &Shell,
+    terminalName: &str,
+) -> crate::message::Content {
     match action {
-        ToolAction::Shell { command, timeout, .. } => {
+        ToolAction::Shell { command, timeout, runInBackground, .. } => {
+            // Background shell calls are routed by the Session via the
+            // JobPlane handler. If we got one here, it's a bug.
+            if *runInBackground {
+                return crate::message::Content::text(
+                    "Error: background shell calls must be executed through the session.",
+                );
+            }
             let dur = timeout.map(|s| std::time::Duration::from_secs(s));
             let raw = shell.execute(command, dur).await;
             // Apply same size guard as readFile. Full output is in shell history.
             let index = shell.historyLen().saturating_sub(1);
-            crate::message::Content::text(truncateOutput(&raw, index))
+            crate::message::Content::text(truncateOutput(&raw, index, terminalName))
         }
         ToolAction::ReadFile { path, offset, limit, anchor } => {
             executeReadFile(path, *offset, *limit, *anchor)
@@ -1244,14 +1918,46 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
             executeDeleteFile(path, *recursive).into()
         }
         ToolAction::MakeDirs { path } => executeMakeDirs(path).into(),
-        ToolAction::ShellHistory => executeShellHistory(shell).into(),
-        ToolAction::ReadOutput { index, offset, limit } => {
-            executeReadOutput(shell, *index, *offset, *limit).into()
+        ToolAction::ShellHistory { .. } => executeShellHistory(shell, terminalName).into(),
+        ToolAction::ReadOutput { index, offset, limit, .. } => {
+            executeReadOutput(shell, *index, *offset, *limit, terminalName).into()
         }
-        ToolAction::SearchOutput { index, pattern, context } => {
-            executeSearchOutput(shell, *index, pattern, *context).into()
+        ToolAction::SearchOutput { index, pattern, context, .. } => {
+            executeSearchOutput(shell, *index, pattern, *context, terminalName).into()
         }
-        ToolAction::ReadTerminal { lines } => shell.readTerminal(*lines).into(),
+        ToolAction::ReadTerminal { lines, .. } => shell.readTerminal(*lines).into(),
+        // Terminal management is handled by Session (needs ShellRegistry).
+        ToolAction::TerminalSpawn { .. }
+        | ToolAction::TerminalSwitch { .. }
+        | ToolAction::TerminalKill { .. }
+        | ToolAction::TerminalList => {
+            crate::message::Content::text(
+                "Error: terminal tools must be executed through the session.",
+            )
+        }
+        // Job plane and monitor tools are handled by Session (need
+        // direct access to JobPlane / MonitorPlane and logTx).
+        ToolAction::JobOutput { .. }
+        | ToolAction::JobStop { .. }
+        | ToolAction::JobList
+        | ToolAction::Monitor { .. }
+        | ToolAction::MonitorStop { .. }
+        | ToolAction::MonitorList => {
+            crate::message::Content::text(
+                "Error: job plane tools must be executed through the session.",
+            )
+        }
+        // Wake registry tools are handled by Session (need direct
+        // access to WakeRegistry).
+        ToolAction::ScheduleWakeup { .. }
+        | ToolAction::CronCreate { .. }
+        | ToolAction::CronList
+        | ToolAction::CronDelete { .. }
+        | ToolAction::FileWatch { .. } => {
+            crate::message::Content::text(
+                "Error: wake tools must be executed through the session.",
+            )
+        }
         ToolAction::Glob { pattern, path, metadata } => executeGlob(pattern, path.as_deref(), *metadata).await.into(),
         ToolAction::Grep {
             pattern, path, include, fileType, outputMode,
@@ -1306,7 +2012,7 @@ pub async fn execute(action: &ToolAction, shell: &Shell) -> crate::message::Cont
 /// where the signal lives — exit codes, error summaries, final state.
 /// Head gives setup context; a middle sample helps the model tell
 /// whether something interesting sits in the elided range.
-fn truncateOutput(raw: &str, historyIndex: usize) -> String {
+fn truncateOutput(raw: &str, historyIndex: usize, terminalName: &str) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     let totalLines = lines.len();
 
@@ -1391,7 +2097,7 @@ fn truncateOutput(raw: &str, historyIndex: usize) -> String {
 
     let hint = format!(
         "\n[truncated \u{2014} {totalLines} total lines; \
-         use readOutput(index: {historyIndex}) for full output]"
+         use readOutput(index: {historyIndex}, terminal: \"{terminalName}\") for full output]"
     );
 
     format!("{head}{headMarker}{middle}{midMarker}{tail}{hint}")
@@ -1779,13 +2485,13 @@ fn executeMakeDirs(path: &str) -> String {
     }
 }
 
-fn executeShellHistory(shell: &Shell) -> String {
+fn executeShellHistory(shell: &Shell, terminalName: &str) -> String {
     let entries = shell.listHistory();
     if entries.is_empty() {
-        return "No commands in history.".into();
+        return format!("No commands in history for terminal '{terminalName}'.");
     }
 
-    let mut output = String::new();
+    let mut output = format!("History for terminal '{terminalName}':\n");
     for (i, cmd, exitCode, lineCount) in &entries {
         let codeStr = match exitCode {
             Some(0) => String::new(),
@@ -1809,11 +2515,13 @@ fn executeReadOutput(
     index: usize,
     offset: Option<usize>,
     limit: Option<usize>,
+    terminalName: &str,
 ) -> String {
     match shell.getRecord(index) {
         Some(record) => {
             let header = format!(
-                "Command [{}]: {}\n\n",
+                "Terminal '{}', command [{}]: {}\n\n",
+                terminalName,
                 index,
                 if record.command.len() > 100 {
                     format!("{}\u{2026}", &record.command[..100])
@@ -1828,7 +2536,13 @@ fn executeReadOutput(
     }
 }
 
-fn executeSearchOutput(shell: &Shell, index: usize, pattern: &str, context: usize) -> String {
+fn executeSearchOutput(
+    shell: &Shell,
+    index: usize,
+    pattern: &str,
+    context: usize,
+    _terminalName: &str,
+) -> String {
     match shell.searchOutput(index, pattern, context) {
         Some(result) => result,
         None => format!("No command at index {index}. Use shellHistory to see available commands."),
@@ -3256,6 +3970,8 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
                 explanation: reqStr!("explanation"),
                 impact,
                 timeout: optU64!("timeout"),
+                terminal: optStr!("terminal"),
+                runInBackground: optBool!("runInBackground").unwrap_or(false),
             }
         }
         "readFile" => ToolAction::ReadFile {
@@ -3307,19 +4023,74 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         "makeDirs" => ToolAction::MakeDirs {
             path: reqStr!("path"),
         },
-        "shellHistory" => ToolAction::ShellHistory,
+        "shellHistory" => ToolAction::ShellHistory {
+            terminal: optStr!("terminal"),
+        },
         "readOutput" => ToolAction::ReadOutput {
             index: optU64!("index").unwrap_or(0) as usize,
             offset: optU64!("offset").map(|v| v as usize),
             limit: optU64!("limit").map(|v| v as usize),
+            terminal: optStr!("terminal"),
         },
         "searchOutput" => ToolAction::SearchOutput {
             index: optU64!("index").unwrap_or(0) as usize,
             pattern: reqStr!("pattern"),
             context: optU64!("context").unwrap_or(3) as usize,
+            terminal: optStr!("terminal"),
         },
         "readTerminal" => ToolAction::ReadTerminal {
             lines: optU64!("lines").unwrap_or(50) as usize,
+            terminal: optStr!("terminal"),
+        },
+        "terminalSpawn" => ToolAction::TerminalSpawn {
+            name: optStr!("name"),
+        },
+        "terminalSwitch" => ToolAction::TerminalSwitch {
+            name: reqStr!("name"),
+        },
+        "terminalKill" => ToolAction::TerminalKill {
+            name: reqStr!("name"),
+        },
+        "terminalList" => ToolAction::TerminalList,
+        "jobOutput" => ToolAction::JobOutput {
+            jobId: optU64!("jobId")
+                .ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
+            sinceLine: optU64!("sinceLine"),
+            maxLines: optU64!("maxLines").map(|v| v as usize),
+        },
+        "jobStop" => ToolAction::JobStop {
+            jobId: optU64!("jobId")
+                .ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
+        },
+        "jobList" => ToolAction::JobList,
+        "monitor" => ToolAction::Monitor {
+            description: reqStr!("description"),
+            command: reqStr!("command"),
+            filter: reqStr!("filter"),
+        },
+        "monitorStop" => ToolAction::MonitorStop {
+            monitorId: optU64!("monitorId")
+                .ok_or_else(|| "Missing required field 'monitorId'.".to_string())?,
+        },
+        "monitorList" => ToolAction::MonitorList,
+        "scheduleWakeup" => ToolAction::ScheduleWakeup {
+            delaySeconds: optU64!("delaySeconds")
+                .ok_or_else(|| "Missing required field 'delaySeconds'.".to_string())?,
+            prompt: reqStr!("prompt"),
+        },
+        "cronCreate" => ToolAction::CronCreate {
+            spec: reqStr!("spec"),
+            prompt: reqStr!("prompt"),
+            recurring: optBool!("recurring").unwrap_or(true),
+        },
+        "cronList" => ToolAction::CronList,
+        "cronDelete" => ToolAction::CronDelete {
+            wakeId: optU64!("wakeId")
+                .ok_or_else(|| "Missing required field 'wakeId'.".to_string())?,
+        },
+        "fileWatch" => ToolAction::FileWatch {
+            path: reqStr!("path"),
+            prompt: reqStr!("prompt"),
         },
         "glob" => ToolAction::Glob {
             pattern: reqStr!("pattern"),
@@ -3403,6 +4174,7 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         "task" => ToolAction::Task {
             prompt: reqStr!("prompt"),
             agent: optStr!("agent"),
+            runInBackground: optBool!("runInBackground").unwrap_or(false),
         },
         "diagnostics" => ToolAction::Diagnostics {
             path: reqStr!("path"),

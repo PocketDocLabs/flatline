@@ -20,8 +20,55 @@ use tokio::sync::oneshot;
 use crate::context::ContextState;
 use crate::lsp;
 use crate::permissions::{PermissionsSource, PermitMode, PermitResponse, Rule};
+use crate::shells::TerminalInfo;
 use crate::tool::ShellImpact;
 use crate::transcript::{Fork, Turn};
+
+/// Origin tag mirroring [`crate::shells::SpawnedBy`] but `Clone + Debug`
+/// for use inside `LogEvent`s.
+/// Why a wake fired. Used in `<wake kind="...">` so the model knows
+/// what kind of event woke it without parsing the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeKind {
+    /// A monitor's filter matched a stdout line.
+    MonitorMatch,
+    /// A backgrounded task finished — either a `shell(runInBackground: true)`
+    /// bash job or a `task(runInBackground: true)` subagent.
+    TaskComplete,
+    /// A one-shot delay timer (`scheduleWakeup`) elapsed.
+    Delay,
+    /// A cron schedule (`cronCreate`) fired.
+    Cron,
+    /// A filesystem watch (`fileWatch`) reported an event.
+    FileWatch,
+}
+
+impl WakeKind {
+    pub fn asStr(self) -> &'static str {
+        match self {
+            WakeKind::MonitorMatch => "MonitorMatch",
+            WakeKind::TaskComplete => "TaskComplete",
+            WakeKind::Delay => "Delay",
+            WakeKind::Cron => "Cron",
+            WakeKind::FileWatch => "FileWatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSpawnedBy {
+    User,
+    Agent,
+}
+
+impl From<crate::shells::SpawnedBy> for TerminalSpawnedBy {
+    fn from(b: crate::shells::SpawnedBy) -> Self {
+        match b {
+            crate::shells::SpawnedBy::User => Self::User,
+            crate::shells::SpawnedBy::Agent => Self::Agent,
+        }
+    }
+}
 
 /// Monotone log events emitted by the session during a turn.
 ///
@@ -142,6 +189,114 @@ pub enum LogEvent {
         content: String,
         turns: usize,
     },
+
+    /// A new background job was spawned (phase 2 only fires for `bashSpawn`;
+    /// future phases add Subagent and Monitor variants).
+    JobSpawned { id: u64, kind: String, command: String },
+
+    /// A line of output arrived on a task's stdout/stderr. Lines arrive
+    /// in stream order; deck buffers per-task to drive F2 control panel inspect.
+    JobOutput { id: u64, line: String },
+
+    /// A task finished on its own. `exitCode` is None if the wait
+    /// itself failed (rare — the OS would have to be unhealthy).
+    JobComplete { id: u64, exitCode: Option<i32> },
+
+    /// A task was stopped — by `jobStop`, kill from F2 control panel, or an
+    /// internal error. `reason` is "killed", a spawn error, etc.
+    JobStopped { id: u64, reason: String },
+
+    /// A foreground `shell` call was interrupted because either the
+    /// auto-bg timer fired or the user pressed Ctrl+B. Deck uses this
+    /// to render a notice; the model receives an `AUTO_BG_INTERRUPT`
+    /// tool result describing what happened and asking it to decide.
+    AutoBgWarning {
+        command: String,
+        elapsedSecs: u64,
+        /// `true` if user-triggered (Ctrl+B), `false` if timer-triggered.
+        userTriggered: bool,
+    },
+
+    /// A monitor was registered via `monitor(...)`. Carries the
+    /// backing `taskId` so consumers can correlate monitor lifecycle
+    /// with the underlying bash task.
+    MonitorRegistered {
+        id: u64,
+        taskId: u64,
+        description: String,
+        command: String,
+        filter: String,
+    },
+
+    /// A monitor line passed its filter. `eventCount` is the
+    /// post-increment running total for the monitor.
+    MonitorEvent {
+        id: u64,
+        line: String,
+        eventCount: u64,
+    },
+
+    /// The monitor's rolling events/sec exceeded its threshold for the
+    /// flood-guard window; the backing task is killed and the monitor
+    /// transitions to `AutoStopped`.
+    MonitorAutoStopped {
+        id: u64,
+        reason: String,
+    },
+
+    /// The monitor was stopped by the agent or user (clean exit).
+    MonitorStopped {
+        id: u64,
+    },
+
+    /// A coalesced wake batch was injected into the session as a single
+    /// synthetic `<wakes count="N">…</wakes>` user-shaped message. One
+    /// event per batch — the deck renders a single notice chip, never
+    /// per-fire. The session task drives this from the wake batcher; no
+    /// other path emits it. (Replaces the old per-fire `WakeFired` that
+    /// raced through `userInputTx` and produced one model turn per
+    /// matching log line.)
+    WakeBatchInjected {
+        count: usize,
+        summary: String,
+    },
+
+    /// A scheduled wake source (Delay, Cron, FileWatch) was registered
+    /// via `scheduleWakeup`/`cronCreate`/`fileWatch`. The deck uses
+    /// this to populate the F2 control panel schedules section. Passive
+    /// sources (MonitorMatch, TaskComplete) also emit this when
+    /// their underlying monitor/task is registered.
+    WakeRegistered {
+        id: u64,
+        kind: WakeKind,
+        summary: String,
+    },
+
+    /// A wake source was disarmed — either explicitly (`cronDelete`,
+    /// `scheduleWakeup` one-shot fire, `monitorStop`) or its scheduler
+    /// task exited. After this event, no further `WakeFired` events
+    /// will arrive from this id.
+    WakeDisarmed {
+        id: u64,
+    },
+
+    /// A new terminal was spawned in the session's shell registry.
+    /// `name` is the resolved unique name. `spawnedBy` is User (Ctrl+T,
+    /// Ctrl+T) or Agent (`terminalSpawn` tool call).
+    TerminalSpawned {
+        name: String,
+        spawnedBy: TerminalSpawnedBy,
+    },
+
+    /// A terminal was killed.
+    TerminalClosed { name: String },
+
+    /// The agent's default target terminal changed (via `terminalSwitch`
+    /// tool, agent-side only — user focus is handled in deck).
+    TerminalActiveForAgent { name: String },
+
+    /// A terminal was renamed (future).
+    TerminalRenamed { from: String, to: String },
 
     /// A transient API error is being retried silently.
     Retrying { attempt: u32, maxAttempts: u32 },
@@ -267,6 +422,51 @@ pub enum TuiRequest {
 
     /// Re-run the last user turn from scratch. Drives the turn loop.
     RetryLastTurn { reply: oneshot::Sender<CommandAck> },
+
+    /// User spawned a new terminal (Ctrl+T / Ctrl+T).
+    /// Reply carries the resolved name (registry may auto-generate).
+    SpawnTerminal {
+        name: Option<String>,
+        reply: oneshot::Sender<std::result::Result<String, String>>,
+    },
+
+    /// User killed a terminal (the tab strip kill button).
+    KillTerminal {
+        name: String,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Snapshot of the shell registry for the tab strip.
+    ListTerminals {
+        reply: oneshot::Sender<Vec<TerminalInfo>>,
+    },
+
+    /// Snapshot of every background job for `/jobs`.
+    ListJobs {
+        reply: oneshot::Sender<Vec<crate::jobs::JobInfo>>,
+    },
+
+    /// Snapshot of every scheduled wake source (delay, cron, file-watch).
+    /// Drives the schedules section of the `/jobs` panel.
+    ListWakes {
+        reply: oneshot::Sender<Vec<crate::wakes::WakeSourceInfo>>,
+    },
+
+    /// Kill a background job from the F2 control panel panel.
+    KillTask {
+        id: u64,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Fetch the buffered output of a task for the inspect popup. When
+    /// `sinceLine` is `None` the response carries the latest tail
+    /// (matches `taskOutput(None)`); `Some(N)` pages from that line so
+    /// the user can scroll back through still-buffered earlier output.
+    GetTaskOutput {
+        id: u64,
+        sinceLine: Option<u64>,
+        reply: oneshot::Sender<Option<crate::jobs::JobOutputSnapshot>>,
+    },
 
     /// Resume streaming from where the last turn was cut off.
     ContinueLastTurn { reply: oneshot::Sender<CommandAck> },

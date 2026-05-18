@@ -102,6 +102,31 @@ pub async fn run(
                 if let Some(c) = topicCost {
                     totalCost += c;
                 }
+                // Reduction gate: a "summary" no shorter than the
+                // total S2 content it replaces is not a compaction.
+                // Drop it so the stage marks itself exhausted instead
+                // of repeating a no-op.
+                let originalChars: usize = topic
+                    .blockIds
+                    .iter()
+                    .filter_map(|bid| blockContent.get(bid))
+                    .map(|b| {
+                        b.agentTurns
+                            .iter()
+                            .map(|t| t.content.len())
+                            .sum::<usize>()
+                            + b.userMessage.len()
+                    })
+                    .sum();
+                if summary.len() >= originalChars {
+                    tracing::warn!(
+                        topicId = %topic.topicId,
+                        originalChars,
+                        summaryChars = summary.len(),
+                        "S3: topic summary did not reduce — discarding"
+                    );
+                    continue;
+                }
                 compacted.push(CompactedTopic {
                     topicId: topic.topicId.clone(),
                     topicLabel: topic.label.clone(),
@@ -132,29 +157,37 @@ pub async fn run(
 /// >= 2 S2'd blocks in the zone. This is the complete eligibility
 /// pipeline that `run` uses — extracted so tests can verify it without
 /// needing an API client.
+///
+/// Topic membership is derived from `topics[i].startBlock` walking the
+/// active branch in chronological order, not from `turn.topicId`. The
+/// user turn that initiates a new topic is recorded before the
+/// classifier runs, so its on-disk topicId can lag the authoritative
+/// segmentation tracked by [`crate::topic::TopicTracker`].
 fn resolveEligible(
     turns: &[Turn],
     ops: &[CompactionOp],
     headTurnId: &str,
     topics: &[TopicInfo],
 ) -> Vec<EligibleTopic> {
+    // Every block id covered by a prior S3 op — not just the first
+    // one of each topic. Partial topic compactions must continue from
+    // where they left off, not skip the remainder of the topic.
     let alreadyCompacted: HashSet<String> = ops
         .iter()
-        .filter_map(|op| match op {
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                sourceBlockIds.first().cloned()
-            }
-            _ => None,
+        .flat_map(|op| match op {
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds.clone(),
+            _ => Vec::new(),
         })
         .collect();
 
     let compactedSizes = crate::compaction::compactedBlockSizes(ops);
-    let topicBlockMap = buildTopicBlockMap(turns);
 
     let activeTurns = crate::transcript::walkBranchTurns(turns, headTurnId);
     if activeTurns.is_empty() {
         return Vec::new();
     }
+
+    let topicBlockMap = buildTopicBlockMap(&activeTurns, topics);
 
     let superseded = crate::compaction::supersededBlocks(ops);
     let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, &superseded, 0.30);
@@ -201,7 +234,7 @@ fn groupTurnsByBlock(turns: &[Turn]) -> HashMap<String, BlockTurns> {
         let block = map.get_mut(&turn.blockId).unwrap();
 
         match turn.role {
-            TurnRole::User => {
+            TurnRole::User | TurnRole::Wake => {
                 block.userMessage = turn.content.clone();
             }
             TurnRole::Assistant => {
@@ -240,11 +273,12 @@ fn groupTurnsByBlock(turns: &[Turn]) -> HashMap<String, BlockTurns> {
 
 /// Find topics eligible for S3 compaction within the 30% zone.
 ///
-/// A topic is eligible if:
-/// - It has more than one block (single-block topics are already S2's domain)
-/// - All its blocks are S2-compacted
-/// - It hasn't been S3-compacted yet
-/// - It starts within the 30% zone (or straddles the boundary)
+/// A topic is eligible if it has at least two blocks that are all of:
+/// - In the 30% zone (or straddling its boundary)
+/// - S2-compacted
+/// - Not already covered by a prior S3 op (partial topic compactions
+///   continue from where they left off — the remaining tail of a
+///   long topic stays eligible)
 fn findEligibleTopics(
     topics: &[TopicInfo],
     topicBlockMap: &HashMap<String, Vec<String>>,
@@ -266,22 +300,24 @@ fn findEligibleTopics(
             continue;
         }
 
-        // Skip if already S3-compacted (idempotency check on first block).
-        if alreadyCompacted.contains(&blockIds[0]) {
-            tracing::debug!(topicId = %topic.topicId, "S3 skip: already compacted");
-            continue;
-        }
-
-        // Narrow to blocks that are both in the zone and S2-compacted.
-        // Partial topic compaction is OK — the rest gets picked up on future passes.
+        // Narrow to blocks that are in the zone, S2-compacted, and not
+        // already covered by a prior S3 op. Filtering per-block here
+        // (rather than rejecting the entire topic when any block is
+        // covered) is what lets partial topic compactions continue —
+        // a 6-block topic compacted in halves stays eligible for the
+        // second half after the first pass.
         let zonedBlocks: Vec<String> = blockIds
             .iter()
-            .filter(|bid| zone.contains(*bid) && compactedSizes.contains_key(*bid))
+            .filter(|bid| {
+                zone.contains(*bid)
+                    && compactedSizes.contains_key(*bid)
+                    && !alreadyCompacted.contains(*bid)
+            })
             .cloned()
             .collect();
 
         if zonedBlocks.is_empty() {
-            tracing::debug!(topicId = %topic.topicId, "S3 skip: no in-zone S2'd blocks");
+            tracing::debug!(topicId = %topic.topicId, "S3 skip: no in-zone S2'd uncompacted blocks");
             continue;
         }
 
@@ -301,20 +337,44 @@ fn findEligibleTopics(
     eligible
 }
 
-/// Build a map of topicId → ordered distinct block IDs from transcript turns.
-fn buildTopicBlockMap(turns: &[Turn]) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for turn in turns {
-        if turn.topicId.is_empty() {
-            continue;
+/// Build a map of topicId → ordered distinct block IDs.
+///
+/// Topic membership is computed by walking the active branch and
+/// switching topics each time a `topics[i].startBlock` is seen. The
+/// `turn.topicId` field on the transcript is *not* used: the user turn
+/// that initiates a new topic is recorded before the classifier
+/// returns, so its on-disk stamp is the prior topic's id. The topic
+/// tracker's `startBlock` records are the authoritative segmentation.
+///
+/// Blocks that precede any known topic (e.g. early turns before the
+/// first classification completed, or sessions where topic restoration
+/// dropped a label) are dropped from the map — S3 has no labelled
+/// topic to assign them to.
+fn buildTopicBlockMap(activeTurns: &[Turn], topics: &[TopicInfo]) -> HashMap<String, Vec<String>> {
+    // blockId → first occurrence index, preserving chronological order.
+    let mut blockOrder: Vec<String> = Vec::new();
+    let mut seenBlocks: HashSet<String> = HashSet::new();
+    for turn in activeTurns {
+        if seenBlocks.insert(turn.blockId.clone()) {
+            blockOrder.push(turn.blockId.clone());
         }
-        let set = seen.entry(turn.topicId.clone()).or_default();
-        if set.insert(turn.blockId.clone()) {
-            map.entry(turn.topicId.clone())
+    }
+
+    let startToTopic: HashMap<&str, &TopicInfo> = topics
+        .iter()
+        .map(|t| (t.startBlock.as_str(), t))
+        .collect();
+
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut currentTopic: Option<&TopicInfo> = None;
+    for blockId in &blockOrder {
+        if let Some(t) = startToTopic.get(blockId.as_str()) {
+            currentTopic = Some(*t);
+        }
+        if let Some(t) = currentTopic {
+            map.entry(t.topicId.clone())
                 .or_default()
-                .push(turn.blockId.clone());
+                .push(blockId.clone());
         }
     }
 
@@ -529,17 +589,36 @@ mod tests {
     }
 
     #[test]
-    fn buildTopicBlockMap_groups_by_topicId() {
+    fn buildTopicBlockMap_uses_topic_startBlock_not_turn_topicId() {
+        // The user turn that opens a new topic is recorded BEFORE the
+        // classifier finishes, so its on-disk topicId is the previous
+        // topic's id. Topic membership must come from TopicInfo.startBlock,
+        // not from turn.topicId.
         let turns = vec![
-            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, "a", None),
+            // b_aaa: classifier hadn't run yet → stamped with previous
+            // (empty) id, but topics[] says topic-01 starts here.
+            makeTurn("t1", "b_aaa", "", TurnRole::User, "a", None),
             makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, "b", Some("t1")),
+            // b_bbb: still topic-01.
             makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, "c", Some("t2")),
-            makeTurn("t4", "b_ccc", "topic-02", TurnRole::User, "d", Some("t3")),
+            // b_ccc: user turn carries the STALE topic-01 id; classifier
+            // determined topic-02 only after the turn was written.
+            makeTurn("t4", "b_ccc", "topic-01", TurnRole::User, "d", Some("t3")),
             makeTurn("t5", "b_ddd", "topic-02", TurnRole::User, "e", Some("t4")),
         ];
-        let map = buildTopicBlockMap(&turns);
-        assert_eq!(map["topic-01"], vec!["b_aaa", "b_bbb"]);
-        assert_eq!(map["topic-02"], vec!["b_ccc", "b_ddd"]);
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "First".into(), startBlock: "b_aaa".into(), blockCount: 2 },
+            TopicInfo { topicId: "topic-02".into(), label: "Second".into(), startBlock: "b_ccc".into(), blockCount: 2 },
+        ];
+        let map = buildTopicBlockMap(&turns, &topics);
+        assert_eq!(
+            map["topic-01"], vec!["b_aaa", "b_bbb"],
+            "topic-01 should NOT include b_ccc despite its stale stamp"
+        );
+        assert_eq!(
+            map["topic-02"], vec!["b_ccc", "b_ddd"],
+            "topic-02 owns b_ccc because topics[].startBlock says so"
+        );
     }
 
     #[test]
@@ -610,7 +689,7 @@ mod tests {
             TopicInfo { topicId: "topic-02".into(), label: "Second".into(), startBlock: "b_ccc".into(), blockCount: 2 },
         ];
 
-        let topicBlockMap = buildTopicBlockMap(&turns);
+        let topicBlockMap = buildTopicBlockMap(&turns, &topics);
         let mut compactedSizes = HashMap::new();
         for id in &["b_aaa", "b_bbb", "b_ccc", "b_ddd"] {
             compactedSizes.insert(id.to_string(), 50_usize);
@@ -643,7 +722,7 @@ mod tests {
             TopicInfo { topicId: "topic-01".into(), label: "Big Topic".into(), startBlock: "b_aaa".into(), blockCount: 4 },
         ];
 
-        let topicBlockMap = buildTopicBlockMap(&turns);
+        let topicBlockMap = buildTopicBlockMap(&turns, &topics);
         // Only first 2 blocks S2'd.
         let mut compactedSizes = HashMap::new();
         compactedSizes.insert("b_aaa".to_string(), 50_usize);
@@ -658,6 +737,73 @@ mod tests {
         assert_eq!(eligible.len(), 1, "topic-01 should be eligible (partial)");
         assert_eq!(eligible[0].blockIds.len(), 2, "only the 2 in-zone S2'd blocks");
         assert_eq!(eligible[0].blockIds, vec!["b_aaa", "b_bbb"]);
+    }
+
+    /// Partial topic compaction must continue from where it left off.
+    /// First pass S3'd b_aaa+b_bbb; later the conversation grew and the
+    /// 30% zone advanced to include b_ccc+b_ddd. Those remaining blocks
+    /// must still be eligible — not skipped because the topic's first
+    /// block is already covered.
+    #[test]
+    fn findEligibleTopics_continues_partial_topic() {
+        let mut turns = vec![
+            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
+            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
+            makeTurn("t5", "b_ccc", "topic-01", TurnRole::User, &"x".repeat(100), Some("t4")),
+            makeTurn("t6", "b_ccc", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
+            makeTurn("t7", "b_ddd", "topic-01", TurnRole::User, &"x".repeat(100), Some("t6")),
+            makeTurn("t8", "b_ddd", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+        ];
+        // Fresh tail to push the zone past b_ddd.
+        let mut nextId = 9;
+        let mut prev = "t8".to_string();
+        for i in 0..8 {
+            let bid = format!("b_fresh_{i:02}");
+            let uid = format!("t{nextId}"); nextId += 1;
+            let aid = format!("t{nextId}"); nextId += 1;
+            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(100), Some(&prev)));
+            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(100), Some(&uid)));
+            prev = aid;
+        }
+
+        let topics = vec![
+            TopicInfo { topicId: "topic-01".into(), label: "Big Topic".into(), startBlock: "b_aaa".into(), blockCount: 4 },
+            TopicInfo { topicId: "topic-02".into(), label: "Fresh".into(), startBlock: "b_fresh_00".into(), blockCount: 8 },
+        ];
+
+        let topicBlockMap = buildTopicBlockMap(&turns, &topics);
+        // Only topic-01 blocks were S2'd in the earlier pass; tail
+        // hasn't reached S2 yet.
+        let mut compactedSizes = HashMap::new();
+        for id in &["b_aaa", "b_bbb", "b_ccc", "b_ddd"] {
+            compactedSizes.insert(id.to_string(), 50_usize);
+        }
+        let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &HashSet::new(), 0.30);
+        // Prior pass only compacted the first half of topic-01.
+        let mut alreadyCompacted: HashSet<String> = HashSet::new();
+        alreadyCompacted.insert("b_aaa".into());
+        alreadyCompacted.insert("b_bbb".into());
+
+        let eligible = findEligibleTopics(
+            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+        );
+
+        assert_eq!(
+            eligible.len(), 1,
+            "topic-01 remains eligible for the uncompacted tail"
+        );
+        assert!(
+            !eligible[0].blockIds.contains(&"b_aaa".to_string())
+                && !eligible[0].blockIds.contains(&"b_bbb".to_string()),
+            "already-compacted blocks must be excluded from the next pass"
+        );
+        assert!(
+            eligible[0].blockIds.contains(&"b_ccc".to_string())
+                && eligible[0].blockIds.contains(&"b_ddd".to_string()),
+            "tail blocks must be eligible"
+        );
     }
 
     /// Helper: build compaction ops for a set of S2'd blocks, an S3 topic,

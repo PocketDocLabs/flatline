@@ -35,6 +35,8 @@ use crate::message::{
 use crate::permissions::{PermitMode, Permissions, Verdict};
 use crate::prompt::{self, DomainModule, InterfaceMode};
 use crate::shell::Shell;
+use crate::shells::{ShellRegistry, SpawnedBy};
+use crate::jobs::JobPlane;
 use crate::tool;
 use crate::topic::{TopicDecision, TopicTracker};
 use crate::transcript::{self, Transcript, SessionMeta};
@@ -72,6 +74,7 @@ impl From<String> for UserInput {
 // Session events and control requests live in `crate::control` — this module
 // only holds the `Session` struct and turn-loop logic.
 
+/// Seconds a foreground `shell` call can run before the session
 /// A scaffolding instruction prepended to the latest User message at API
 /// call time. Riders never appear in `self.history`, the transcript, or
 /// snapshots — they're ephemeral nudges to reinforce system-prompt behavior.
@@ -100,6 +103,281 @@ pub struct Rider {
 /// can't be widened by a permissive parent, while still inheriting the
 /// parent's narrower allows (e.g. `readFile` patterns the user has already
 /// approved in the top-level session).
+/// Background subagent runner — owns the child session and all its
+/// forwarders. Lives on its own `tokio::spawn` so the parent's tool
+/// dispatch returns immediately.
+///
+/// Mirrors the structure of [`Session::executeTask`] but with three
+/// extra wrinkles:
+/// 1. Streamed content deltas are pushed into the [`SubagentJobHandle`]'s
+///    ring buffer so `jobOutput` returns real-time progress.
+/// 2. The child's `send` future races the handle's `cancelRx` so
+///    `jobStop` aborts the run cooperatively.
+/// 3. Completion calls `handle.complete(...)` / `handle.killed()` /
+///    `handle.errored(...)` so the JobPlane's state machine and the
+///    F2 control panel panel both reflect the outcome.
+async fn runSubagentTaskInBackground(
+    mut child: Session,
+    childMainIo: crate::shell::ShellIo,
+    mut childIoRx: mpsc::Receiver<(
+        String,
+        crate::shell::ShellIo,
+        crate::shells::SpawnedBy,
+    )>,
+    handle: crate::jobs::SubagentJobHandle,
+    prompt: String,
+    agentType: String,
+    childSessionId: String,
+    parentLogTx: mpsc::Sender<LogEvent>,
+    parentSessionRequestTx: mpsc::Sender<SessionRequest>,
+) {
+    // Shell-output forwarder — same as foreground subagents.
+    let shellForwardTx = parentLogTx.clone();
+    let shellForwardId = childSessionId.clone();
+    tokio::spawn(async move {
+        let mut mainRx = childMainIo.outputRx;
+        loop {
+            tokio::select! {
+                Some(data) = mainRx.recv() => {
+                    let _ = shellForwardTx
+                        .send(LogEvent::SubagentShellOutput {
+                            sessionId: shellForwardId.clone(),
+                            data,
+                        })
+                        .await;
+                }
+                Some((_n, _io, _by)) = childIoRx.recv() => {
+                    // Subagents don't currently spawn extra shells. Drop io.
+                }
+                else => break,
+            }
+        }
+    });
+
+    // Notify parent that subagent has started — same event the foreground
+    // path emits, so the deck's existing SubagentStarted handler renders it.
+    let _ = parentLogTx
+        .send(LogEvent::SubagentStarted {
+            sessionId: childSessionId.clone(),
+            agentType: agentType.clone(),
+            prompt: prompt.clone(),
+        })
+        .await;
+
+    tracing::info!(
+        agent = %agentType,
+        childSession = %childSessionId,
+        taskId = handle.id,
+        "background subagent spawned"
+    );
+
+    // Channels for the child session.
+    let (childLogTx, mut childLogRx) = mpsc::channel::<LogEvent>(256);
+    let (childRequestTx, mut childRequestRx) = mpsc::channel::<SessionRequest>(16);
+
+    // Child cancel is driven by the task handle's watch — flipping the
+    // cancel flag cancels both the child's tool-execution races and the
+    // child.send future below.
+    let (childCancelTx, mut childCancelRx) = watch::channel(false);
+    let mut handleCancelRx = handle.cancelRx.clone();
+    let cancelBridge = tokio::spawn(async move {
+        loop {
+            if handleCancelRx.changed().await.is_err() {
+                break;
+            }
+            if *handleCancelRx.borrow() {
+                let _ = childCancelTx.send(true);
+                break;
+            }
+        }
+    });
+
+    // Log forwarder — push ContentDeltas into the BgJob ring buffer line
+    // by line, and rewrap visible events as SubagentEvent for the parent.
+    let logSessionId = childSessionId.clone();
+    let logParentTx = parentLogTx.clone();
+    let logHandleId = handle.id;
+    let lineSender = handle.lineSender();
+    let logHandle = tokio::spawn(async move {
+        let mut content = String::new();
+        let mut turns: usize = 0;
+        // Buffer partial lines from streamed deltas so the ring stores
+        // whole lines (matches bash semantics).
+        let mut deltaCarry = String::new();
+        while let Some(event) = childLogRx.recv().await {
+            match &event {
+                LogEvent::ContentDelta(text) => {
+                    content.push_str(text);
+                    deltaCarry.push_str(text);
+                    while let Some(pos) = deltaCarry.find('\n') {
+                        let line = deltaCarry[..pos].to_string();
+                        deltaCarry.drain(..=pos);
+                        lineSender.push(line);
+                    }
+                }
+                LogEvent::TurnComplete => turns += 1,
+                _ => {}
+            }
+            match &event {
+                LogEvent::ContentDelta(_)
+                | LogEvent::ReasoningDelta(_)
+                | LogEvent::ToolStarted { .. }
+                | LogEvent::ToolAutoApproved { .. }
+                | LogEvent::ToolResult { .. }
+                | LogEvent::ToolDenied { .. }
+                | LogEvent::ToolAutoDenied { .. }
+                | LogEvent::TurnAborted { .. }
+                | LogEvent::TurnComplete
+                | LogEvent::TurnCancelled
+                | LogEvent::Error(_) => {
+                    let _ = logParentTx
+                        .send(LogEvent::SubagentEvent {
+                            sessionId: logSessionId.clone(),
+                            event: Box::new(event),
+                        })
+                        .await;
+                }
+                _ => {}
+            }
+        }
+        // Flush any trailing partial line so the final assistant message
+        // shows up in the ring buffer.
+        if !deltaCarry.is_empty() {
+            lineSender.push(deltaCarry);
+        }
+        let _ = logHandleId; // silence unused if logging gets stripped
+        (content, turns)
+    });
+
+    // Permit forwarder — identical to executeTask.
+    let permitSessionId = childSessionId.clone();
+    let permitParentTx = parentSessionRequestTx.clone();
+    let permitHandle = tokio::spawn(async move {
+        while let Some(req) = childRequestRx.recv().await {
+            match req {
+                SessionRequest::Permit {
+                    origin: _,
+                    name,
+                    summary,
+                    args,
+                    diff,
+                    explanation,
+                    impact,
+                    reply: childReply,
+                } => {
+                    let (parentReplyTx, parentReplyRx) = oneshot::channel();
+                    if permitParentTx
+                        .send(SessionRequest::Permit {
+                            origin: PermitOrigin::Subagent {
+                                sessionId: permitSessionId.clone(),
+                            },
+                            name,
+                            summary,
+                            args,
+                            diff,
+                            explanation,
+                            impact,
+                            reply: parentReplyTx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        let _ = childReply.send(crate::permissions::PermitResponse::Deny);
+                        continue;
+                    }
+                    match parentReplyRx.await {
+                        Ok(response) => {
+                            let _ = childReply.send(response);
+                        }
+                        Err(_) => {
+                            let _ = childReply.send(crate::permissions::PermitResponse::Deny);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let childInput = UserInput::from(prompt.clone());
+    let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
+    // Subagents have no user keybind — give them a closed channel.
+    let (_childUserBgTx, mut childUserBgRx) = mpsc::channel::<()>(1);
+
+    let sendResult = child
+        .send(
+            &childInput,
+            &childLogTx,
+            &childRequestTx,
+            &mut childCancelRx,
+            &mut childSteerRx,
+            &mut childUserBgRx,
+        )
+        .await;
+
+    drop(childLogTx);
+    drop(childRequestTx);
+
+    let (rawContent, turns) = match logHandle.await {
+        Ok(r) => r,
+        Err(_) => (String::new(), 0),
+    };
+    let _ = permitHandle.await;
+    cancelBridge.abort();
+
+    // Determine outcome BEFORE notifying the parent so the conversation
+    // block shows the right status. Decorate the content with a
+    // visible marker so existing SubagentComplete handlers (which just
+    // store `content` on the block) display the right outcome inline.
+    enum Outcome {
+        Completed,
+        Killed,
+        Errored(String),
+    }
+    let outcome = if handle.cancelRequested() {
+        Outcome::Killed
+    } else if let Err(e) = &sendResult {
+        Outcome::Errored(e.to_string())
+    } else {
+        Outcome::Completed
+    };
+    let displayContent = match &outcome {
+        Outcome::Completed => rawContent.clone(),
+        Outcome::Killed => {
+            if rawContent.is_empty() {
+                "[subagent cancelled by user]".into()
+            } else {
+                format!("[subagent cancelled by user]\n\n{rawContent}")
+            }
+        }
+        Outcome::Errored(e) => {
+            if rawContent.is_empty() {
+                format!("[subagent errored: {e}]")
+            } else {
+                format!("[subagent errored: {e}]\n\n{rawContent}")
+            }
+        }
+    };
+
+    // Notify parent — same SubagentComplete event the foreground path
+    // emits so existing UI handlers fire. Content already carries the
+    // outcome marker.
+    let _ = parentLogTx
+        .send(LogEvent::SubagentComplete {
+            sessionId: childSessionId.clone(),
+            agentType: agentType.clone(),
+            content: displayContent,
+            turns,
+        })
+        .await;
+
+    // Final state on the task: kill > error > complete.
+    match outcome {
+        Outcome::Killed => handle.killed().await,
+        Outcome::Errored(e) => handle.errored(format!("subagent failed: {e}")).await,
+        Outcome::Completed => handle.complete(0).await,
+    }
+}
+
 fn buildChildPermissions(
     parent: &crate::permissions::Permissions,
     preset: &crate::runner::AgentPreset,
@@ -109,11 +387,38 @@ fn buildChildPermissions(
 
     let mut rules: Vec<Rule> = Vec::new();
 
-    // Preset floor: explicit denies for mutation tools when the preset is
-    // read-only. This prevents an inherited "allow *" from the parent from
-    // widening a read-only subagent's scope.
+    // Preset floor: explicit denies for every state-mutating tool when
+    // the preset is read-only. These rules come BEFORE the parent's
+    // rules so a parent `allow *` or broad `allow shell *` cannot widen
+    // a read-only subagent's scope. `shell` is the key entry because
+    // the model self-classifies impact and we don't want a parent
+    // allow-all to let an "impact: read" claim through — and the same
+    // denial covers `runInBackground: true` since both shapes use the
+    // same tool name.
     if matches!(preset.toolSet, ToolSet::ReadOnly) {
-        for tool in ["writeFile", "editFile", "multiEdit"] {
+        for tool in [
+            "shell",
+            "writeFile",
+            "editFile",
+            "multiEdit",
+            "copyFile",
+            "moveFile",
+            "deleteFile",
+            "makeDirs",
+            "terminalSpawn",
+            "terminalSwitch",
+            "terminalKill",
+            "monitor",
+            "monitorStop",
+            // Wake-scheduling tools schedule autonomous future LLM
+            // calls — never auto-approve for a read-only explore
+            // subagent. The parent agent can still call them in its
+            // own context.
+            "scheduleWakeup",
+            "cronCreate",
+            "cronDelete",
+            "fileWatch",
+        ] {
             rules.push(Rule { tool: tool.into(), pattern: None, allow: false });
         }
     }
@@ -239,7 +544,24 @@ pub struct Session {
     tools: Vec<ToolDef>,
     reasoning: Option<ReasoningConfig>,
     permissions: Permissions,
-    shell: Shell,
+    /// Shared via `Arc<tokio::sync::Mutex<>>` so the deck's terminal-
+    /// management requests can run concurrently with `session.send`.
+    /// `tokio::sync::Mutex` (not std) because `ShellRegistry::spawn` is
+    /// async — holding a std Mutex guard across the spawn await would
+    /// break Send.
+    pub shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
+    /// Background-job registry. Shared via `Arc<Mutex<>>` so the deck's
+    /// F2 control panel request handler can run concurrently with `session.send`
+    /// (the latter holds `&mut self` for the whole turn). Use
+    /// `jobPlaneHandle()` to clone the handle.
+    pub jobs: std::sync::Arc<std::sync::Mutex<JobPlane>>,
+    /// Monitor registry. Same Arc<Mutex> pattern as `tasks` so the deck
+    /// can list/inspect monitors concurrently with a turn.
+    pub monitors: std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>>,
+    /// Wake-source registry — schedule/cron/file-watch sources. Uses
+    /// tokio::sync::Mutex because the wake schedulers run as tokio
+    /// tasks that need to lock across .await points.
+    pub wakes: std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
     transcript: Transcript,
     snapshots: crate::snapshot::SnapshotStore,
     compactionLog: CompactionLog,
@@ -274,13 +596,59 @@ pub struct Session {
     /// the first turn (expected cache miss) from later turns (expected hit)
     /// in the cache-watchdog trace.
     turnsWithUsage: usize,
+    /// Receiver for coalesced `WakeBatch` values. The session task takes
+    /// this once at startup and selects on it alongside user input; each
+    /// batch becomes one synthetic user-shaped turn driving the model.
+    /// `Option` so the host can pull it out via `takeWakeBatchRx()`.
+    wakeBatchRx: Option<mpsc::Receiver<crate::wakes::WakeBatch>>,
 }
 
 impl Session {
-    /// Consume this session and return its shell.
-    /// Used when switching to a resumed session — the shell persists.
-    pub fn intoShell(self) -> Shell {
-        self.shell
+    /// Clone of the task-plane handle for callers that need to query or
+    /// mutate it independently of the session's `&mut self` borrow
+    /// (e.g. a dedicated F2 control panel request handler running concurrently
+    /// with `session.send`).
+    pub fn jobPlaneHandle(&self) -> std::sync::Arc<std::sync::Mutex<JobPlane>> {
+        self.jobs.clone()
+    }
+
+    /// Clone of the monitor-plane handle. Same rationale as
+    /// `jobPlaneHandle()` — for off-thread queries during a turn.
+    pub fn monitorPlaneHandle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>> {
+        self.monitors.clone()
+    }
+
+    /// Clone of the wake-registry handle.
+    pub fn wakeRegistryHandle(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>> {
+        self.wakes.clone()
+    }
+
+    /// Take ownership of the wake-batch receiver. Called once by the
+    /// session host (e.g. the deck) so it can select on coalesced
+    /// `WakeBatch` values alongside user input. Subsequent calls return
+    /// `None`.
+    pub fn takeWakeBatchRx(&mut self) -> Option<mpsc::Receiver<crate::wakes::WakeBatch>> {
+        self.wakeBatchRx.take()
+    }
+
+    /// Consume this session and return its shell registry handle. The
+    /// caller hands this to `Session::new` / `Session::resume` so the
+    /// resumed session shares the same live PTYs and the deck's
+    /// dedicated terminal-request handler stays pointed at a valid
+    /// registry without needing a hot-swap.
+    pub fn intoShells(self) -> std::sync::Arc<tokio::sync::Mutex<ShellRegistry>> {
+        self.shells
+    }
+
+    /// Clone of the shell-registry handle. Used by the deck's dedicated
+    /// terminal-request handler so spawn/kill/list operations don't
+    /// have to wait for `session.send` to release `&mut session`.
+    pub fn shellsHandle(&self) -> std::sync::Arc<tokio::sync::Mutex<ShellRegistry>> {
+        self.shells.clone()
     }
 
     /// Create a new session.
@@ -288,13 +656,13 @@ impl Session {
     /// Args:
     ///     config: Application config (API settings, etc).
     ///     permissions: Permission rules for tool execution.
-    ///     shell: Stateful shell session for command execution.
+    ///     shells: Named registry of PTYs for command execution.
     ///     interface: How the agent is being driven.
     ///     domains: Task-specific skill modules to include.
     pub fn new(
         config: &Config,
         permissions: Permissions,
-        shell: Shell,
+        shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
         interface: InterfaceMode,
         domains: &[DomainModule],
     ) -> Result<Self> {
@@ -330,6 +698,8 @@ impl Session {
         ).unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
+        let (wakeArc, wakeBatchRx) = crate::wakes::WakeRegistry::new();
+
         Ok(Self {
             client,
             config: config.clone(),
@@ -337,7 +707,14 @@ impl Session {
             tools,
             reasoning,
             permissions,
-            shell,
+            shells,
+            jobs: std::sync::Arc::new(std::sync::Mutex::new(JobPlane::new(
+                config.projectRoot.clone(),
+            ))),
+            monitors: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::monitors::MonitorPlane::new(),
+            )),
+            wakes: wakeArc,
             transcript,
             snapshots,
             compactionLog,
@@ -360,6 +737,7 @@ impl Session {
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
             turnsWithUsage: 0,
+            wakeBatchRx: Some(wakeBatchRx),
         })
     }
 
@@ -395,25 +773,25 @@ impl Session {
     pub async fn resume(
         config: &Config,
         permissions: Permissions,
-        shell: Shell,
+        shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
         interface: InterfaceMode,
         domains: &[DomainModule],
         sessionId: &str,
-    ) -> std::result::Result<Self, (anyhow::Error, Shell)> {
-        Self::resumeInner(config, permissions, shell, interface, domains, sessionId).await
+    ) -> std::result::Result<Self, (anyhow::Error, std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>)> {
+        Self::resumeInner(config, permissions, shells, interface, domains, sessionId).await
     }
 
     async fn resumeInner(
         config: &Config,
         permissions: Permissions,
-        shell: Shell,
+        shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
         interface: InterfaceMode,
         domains: &[DomainModule],
         sessionId: &str,
-    ) -> std::result::Result<Self, (anyhow::Error, Shell)> {
+    ) -> std::result::Result<Self, (anyhow::Error, std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>)> {
         let client = match api::Client::new(&config) {
             Ok(c) => c,
-            Err(e) => return Err((e, shell)),
+            Err(e) => return Err((e, shells)),
         };
         let tools = tool::builtinDefs();
 
@@ -427,15 +805,15 @@ impl Session {
 
         let mut transcript = match Transcript::open(sessionId) {
             Ok(t) => t,
-            Err(e) => return Err((e, shell)),
+            Err(e) => return Err((e, shells)),
         };
         let compactionLog = match CompactionLog::open(transcript.sessionDir()) {
             Ok(c) => c,
-            Err(e) => return Err((e, shell)),
+            Err(e) => return Err((e, shells)),
         };
         let snapshots = match crate::snapshot::SnapshotStore::open(transcript.sessionDir()) {
             Ok(s) => s,
-            Err(e) => return Err((e, shell)),
+            Err(e) => return Err((e, shells)),
         };
 
         // Load headTurn from meta to determine active branch.
@@ -458,7 +836,7 @@ impl Session {
         let reconstructed = match &headTurnId {
             Some(head) => match context::reconstruct(&transcript, &compactionLog, head) {
                 Ok(h) => h,
-                Err(e) => return Err((e, shell)),
+                Err(e) => return Err((e, shells)),
             },
             None => Vec::new(),
         };
@@ -533,6 +911,8 @@ impl Session {
         ).unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
+        let (wakeArc, wakeBatchRx) = crate::wakes::WakeRegistry::new();
+
         Ok(Self {
             client,
             config: config.clone(),
@@ -540,7 +920,14 @@ impl Session {
             tools,
             reasoning,
             permissions,
-            shell,
+            shells,
+            jobs: std::sync::Arc::new(std::sync::Mutex::new(JobPlane::new(
+                config.projectRoot.clone(),
+            ))),
+            monitors: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::monitors::MonitorPlane::new(),
+            )),
+            wakes: wakeArc,
             transcript,
             snapshots,
             compactionLog,
@@ -569,6 +956,7 @@ impl Session {
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
             turnsWithUsage: 0,
+            wakeBatchRx: Some(wakeBatchRx),
         })
     }
 
@@ -793,10 +1181,13 @@ impl Session {
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
+        userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
         // Drain stale steer messages from a previous cancelled turn.
         while steerRx.try_recv().is_ok() {}
+        // Drain stale user-bg requests from a previous turn.
+        while userBgRx.try_recv().is_ok() {}
 
         let userMessage = &input.text;
         tracing::info!(len = userMessage.len(), attachments = input.attachments.len(), "user message received");
@@ -818,7 +1209,86 @@ impl Session {
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
 
-        self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
+        self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
+        })
+    }
+
+    /// Inject a coalesced `WakeBatch` and run one turn. Formats the
+    /// batch as a single `<wakes count="N">…</wakes>` envelope, pushes
+    /// it as user-shaped content to the model, and records it as a
+    /// `TurnRole::Wake` transcript entry so resume can render the turn
+    /// as a notice rather than a real user bubble.
+    ///
+    /// Wakes that arrive while a turn is running are queued in the
+    /// batcher's receiver — the deck's session task selects on that
+    /// receiver alongside `userInputRx`, so this only runs while idle.
+    pub fn injectWakeBatch<'a>(
+        &'a mut self,
+        batch: crate::wakes::WakeBatch,
+        logTx: &'a mpsc::Sender<LogEvent>,
+        sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
+        cancelRx: &'a mut watch::Receiver<bool>,
+        steerRx: &'a mut mpsc::Receiver<UserInput>,
+        userBgRx: &'a mut mpsc::Receiver<()>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // User input that landed since the last in-turn drain beats
+            // the wake. If anything is queued in steerRx, requeue the
+            // batch's fires (they re-batch on the next idle tick) and
+            // process the queued input as a real user turn instead.
+            let mut queued: Vec<UserInput> = Vec::new();
+            while let Ok(input) = steerRx.try_recv() {
+                queued.push(input);
+            }
+            if !queued.is_empty() {
+                let fireTx = self.wakes.lock().await.fireSender();
+                for fire in batch.fires {
+                    let _ = fireTx.send(fire);
+                }
+                while userBgRx.try_recv().is_ok() {}
+                let combined = UserInput {
+                    text: queued.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n\n"),
+                    attachments: queued.into_iter().flat_map(|i| i.attachments).collect(),
+                };
+                return self.send(&combined, logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await;
+            }
+            while userBgRx.try_recv().is_ok() {}
+
+            if batch.fires.is_empty() {
+                return Ok(());
+            }
+
+            let envelope = formatWakeBatch(&batch);
+            tracing::info!(
+                count = batch.fires.len(),
+                "injecting coalesced wake batch",
+            );
+
+            // Warm up LSP servers on first send.
+            if !self.lspWarmedUp {
+                self.lspWarmedUp = true;
+                let projectDir = std::env::current_dir().unwrap_or_default();
+                self.lspManager.warmUp(&projectDir).await;
+            }
+
+            // The model sees user-shaped content; the transcript stores
+            // it under TurnRole::Wake so resume can render it as a
+            // notice instead of a real user bubble.
+            let (content, _atts) = buildUserContent(&envelope, &[]);
+            self.history.push(Message::User { content });
+            match self.transcript.recordWake(&envelope, self.headTurnId.as_deref()) {
+                Ok(turnId) => self.headTurnId = Some(turnId),
+                Err(e) => tracing::warn!("wake transcript write failed: {e}"),
+            }
+
+            // Surface the batch to the deck for UI rendering. One
+            // WakeBatchInjected per batch — no per-fire chips.
+            let _ = logTx.send(LogEvent::WakeBatchInjected {
+                count: batch.fires.len(),
+                summary: wakeBatchSummary(&batch),
+            }).await;
+
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
         })
     }
 
@@ -837,9 +1307,11 @@ impl Session {
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
+        userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             while steerRx.try_recv().is_ok() {}
+            while userBgRx.try_recv().is_ok() {}
 
             // Pop the trailing partial assistant, if any.
             if matches!(self.history.last(), Some(Message::Assistant { .. })) {
@@ -871,7 +1343,7 @@ impl Session {
             }
 
             tracing::info!("retrying last turn");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
         })
     }
 
@@ -887,9 +1359,11 @@ impl Session {
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
         steerRx: &'a mut mpsc::Receiver<UserInput>,
+        userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             while steerRx.try_recv().is_ok() {}
+            while userBgRx.try_recv().is_ok() {}
 
             // For continue we need a trailing assistant (the prefill).
             if !matches!(self.history.last(), Some(Message::Assistant { .. })) {
@@ -898,7 +1372,7 @@ impl Session {
             }
 
             tracing::info!("continuing from partial assistant response");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
         })
     }
 
@@ -909,6 +1383,7 @@ impl Session {
         sessionRequestTx: &mpsc::Sender<SessionRequest>,
         cancelRx: &mut watch::Receiver<bool>,
         steerRx: &mut mpsc::Receiver<UserInput>,
+        userBgRx: &mut mpsc::Receiver<()>,
     ) -> Result<()> {
         let blockId = self.transcript.currentBlock().to_string();
 
@@ -1143,9 +1618,15 @@ impl Session {
                                                     Ok(PermitResponse::Allow) => true,
                                                     Ok(PermitResponse::AlwaysAllow { pattern }) => {
                                                         let (toolName, _) = crate::permissions::actionKey(&action);
+                                                        let rulePattern = crate::permissions::normalizeRulePattern(
+                                                            &action, &pattern,
+                                                        );
+                                                        let persistPattern = rulePattern
+                                                            .clone()
+                                                            .unwrap_or_default();
                                                         self.permissions.addRule(crate::permissions::Rule {
                                                             tool: toolName.into(),
-                                                            pattern: Some(pattern.clone()),
+                                                            pattern: rulePattern,
                                                             allow: true,
                                                         });
                                                         // Persist to .flatline/config.toml if we have a project root.
@@ -1154,7 +1635,7 @@ impl Session {
                                                                 root,
                                                                 &self.permissions,
                                                                 toolName,
-                                                                &pattern,
+                                                                &persistPattern,
                                                                 true,
                                                             ) {
                                                                 tracing::warn!("failed to persist permission rule: {e}");
@@ -1164,9 +1645,15 @@ impl Session {
                                                     }
                                                     Ok(PermitResponse::AlwaysDeny { pattern }) => {
                                                         let (toolName, _) = crate::permissions::actionKey(&action);
+                                                        let rulePattern = crate::permissions::normalizeRulePattern(
+                                                            &action, &pattern,
+                                                        );
+                                                        let persistPattern = rulePattern
+                                                            .clone()
+                                                            .unwrap_or_default();
                                                         self.permissions.addRule(crate::permissions::Rule {
                                                             tool: toolName.into(),
-                                                            pattern: Some(pattern.clone()),
+                                                            pattern: rulePattern,
                                                             allow: false,
                                                         });
                                                         if let Some(ref root) = self.config.projectRoot {
@@ -1174,7 +1661,7 @@ impl Session {
                                                                 root,
                                                                 &self.permissions,
                                                                 toolName,
-                                                                &pattern,
+                                                                &persistPattern,
                                                                 false,
                                                             ) {
                                                                 tracing::warn!("failed to persist deny rule: {e}");
@@ -1257,13 +1744,23 @@ impl Session {
 
                             if tool::needsTask(&action) {
                                 // Subagent events handle all TUI rendering — no ToolStarted needed.
-                                let (taskPrompt, taskAgent) = match &action {
-                                    tool::ToolAction::Task { prompt, agent } => {
-                                        (prompt.clone(), agent.as_deref().unwrap_or("general").to_string())
-                                    }
+                                let (taskPrompt, taskAgent, runInBackground) = match &action {
+                                    tool::ToolAction::Task { prompt, agent, runInBackground } => (
+                                        prompt.clone(),
+                                        agent.as_deref().unwrap_or("general").to_string(),
+                                        *runInBackground,
+                                    ),
                                     _ => unreachable!(),
                                 };
-                                let result = self.executeTask(&taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx).await;
+                                let result = if runInBackground {
+                                    self.executeTaskBackground(
+                                        &taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx,
+                                    ).await
+                                } else {
+                                    self.executeTask(
+                                        &taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx,
+                                    ).await
+                                };
                                 // NOTE: No ToolResult event — SubagentComplete already notified the TUI.
                                 crate::message::Content::text(result)
                             } else {
@@ -1284,43 +1781,207 @@ impl Session {
                             } else if tool::needsLsp(&action) {
                                 crate::message::Content::text(self.executeLspTool(&action).await)
                             }
-                            // Race tool execution against cancellation for shell commands.
-                            else if matches!(action, tool::ToolAction::Shell { .. }) {
-                                loop {
-                                tokio::select! {
-                                    result = tool::execute(&action, &self.shell) => {
-                                        tracing::debug!(
-                                            tool = %call.function.name,
-                                            outputLen = result.charCount(),
-                                            "tool execution complete"
-                                        );
-                                        break result;
-                                    }
-                                    _ = cancelRx.changed() => {
-                                        if !*cancelRx.borrow() {
-                                            // Spurious wakeup — retry select.
-                                            continue;
+                            else if tool::needsRegistry(&action) {
+                                crate::message::Content::text(self.executeTerminalTool(&action, logTx).await)
+                            }
+                            else if tool::needsJobPlane(&action) {
+                                crate::message::Content::text(self.executeJobTool(&action, logTx).await)
+                            }
+                            else if tool::needsMonitor(&action) {
+                                crate::message::Content::text(self.executeMonitorTool(&action, logTx).await)
+                            }
+                            else if tool::needsWakes(&action) {
+                                crate::message::Content::text(self.executeWakeTool(&action, logTx).await)
+                            }
+                            // Resolve target shell for shell-using tools. The
+                            // shell handle is also used for cancel-side
+                            // interrupt() if a Shell call is racing cancel.
+                            else {
+                                let resolvedShell = self.resolveShell(&action).await;
+                                // Display name for output labeling — what the
+                                // model called the terminal, or the agent's
+                                // current target if it omitted the field.
+                                let targetName = match action.terminal() {
+                                    Some(s) => s.to_string(),
+                                    None => self.shells.lock().await.activeForAgent().to_string(),
+                                };
+                                match resolvedShell {
+                                    Err(e) => crate::message::Content::text(e),
+                                    Ok(shell) => {
+                                        // Race tool execution against cancel + user-triggered
+                                        // bg (Ctrl+B) for shell commands. Auto-bg on a long
+                                        // run is not a separate timer — the shell's own
+                                        // timeout (default + model override) does the work;
+                                        // when it fires the result carries a sentinel suffix
+                                        // and we wrap with structured guidance below.
+                                        if matches!(action, tool::ToolAction::Shell { .. }) {
+                                            let (shellCommand, modelTimeout) = match &action {
+                                                tool::ToolAction::Shell { command, timeout, .. } => {
+                                                    (command.clone(), *timeout)
+                                                }
+                                                _ => (String::new(), None),
+                                            };
+                                            let effectiveTimeout = modelTimeout
+                                                .unwrap_or(crate::shell::SHELL_DEFAULT_TIMEOUT_SECS);
+                                            let execFut = tool::execute(&action, &shell, &targetName);
+                                            tokio::pin!(execFut);
+                                            // Build a "converted to bg" result. When the shell's
+                                            // timeout elapses or the user presses Ctrl+B we don't
+                                            // hand the model a "decide what to do" prompt — we
+                                            // auto-respawn the same command as a real JobPlane
+                                            // bg job and tell the model the new job id.
+                                            // NOTE: the bg job restarts from scratch — the
+                                            // foreground attempt was already killed by the
+                                            // shell driver. Idempotency is the caller's problem.
+                                            let buildConverted = |jobId: u64, elapsed: u64, userBg: bool, partial: &str| {
+                                                let trigger = if userBg {
+                                                    format!("you pressed Ctrl+B")
+                                                } else {
+                                                    format!("the shell exceeded its {elapsed}s timeout")
+                                                };
+                                                format!(
+                                                    "AUTO_BG_CONVERTED: {trigger}, so the command was auto-converted to background job #{jobId}.\n\n\
+                                                     Partial output captured from the foreground attempt before conversion:\n{partial}\n\n\
+                                                     NOTE: job #{jobId} is a FRESH run of the same command \u{2014} the foreground attempt was killed and not migrated. You will be notified when job #{jobId} completes (do not poll). Use jobOutput(jobId: {jobId}) for a mid-flight peek; jobStop(jobId: {jobId}) to cancel."
+                                                )
+                                            };
+                                            loop {
+                                            tokio::select! {
+                                                result = &mut execFut => {
+                                                    tracing::debug!(
+                                                        tool = %call.function.name,
+                                                        outputLen = result.charCount(),
+                                                        "tool execution complete"
+                                                    );
+                                                    // Shell appends this suffix when its
+                                                    // deadline elapsed without an exit code.
+                                                    // Auto-convert to a bg job and return the
+                                                    // new job id to the model.
+                                                    let text = match &result {
+                                                        crate::message::Content::Text(s) => s.clone(),
+                                                        _ => String::new(),
+                                                    };
+                                                    let marker = "\n(command timed out and was interrupted)";
+                                                    if text.contains(marker) {
+                                                        let stripped = text.replace(marker, "");
+                                                        let id = self.jobs.lock().unwrap().reserveJobId();
+                                                        let (wakeId, fireTx) = {
+                                                            let mut g = self.wakes.lock().await;
+                                                            let wid = g.registerTaskComplete(id, logTx);
+                                                            (wid, g.fireSender())
+                                                        };
+                                                        let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
+                                                            id,
+                                                            shellCommand.clone(),
+                                                            logTx.clone(),
+                                                            Some(crate::jobs::TaskWakeCtx {
+                                                                wakeId,
+                                                                registry: self.wakes.clone(),
+                                                                fireTx,
+                                                            }),
+                                                        );
+                                                        match spawnResult {
+                                                            Ok(_) => {
+                                                                let _ = logTx
+                                                                    .send(LogEvent::AutoBgWarning {
+                                                                        command: shellCommand.clone(),
+                                                                        elapsedSecs: effectiveTimeout,
+                                                                        userTriggered: false,
+                                                                    })
+                                                                    .await;
+                                                                break crate::message::Content::text(
+                                                                    buildConverted(id, effectiveTimeout, false, &stripped)
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                                                                break crate::message::Content::text(format!(
+                                                                    "Command exceeded its {effectiveTimeout}s timeout. Auto-bg conversion FAILED: {e}\n\nPartial output:\n{stripped}"
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    break result;
+                                                }
+                                                _ = userBgRx.recv() => {
+                                                    // User pressed Ctrl+B — interrupt the
+                                                    // foreground attempt and respawn as a
+                                                    // tracked bg job.
+                                                    shell.interrupt();
+                                                    let partial = (&mut execFut).await;
+                                                    let partialText = match &partial {
+                                                        crate::message::Content::Text(s) => s.clone(),
+                                                        _ => String::new(),
+                                                    };
+                                                    // Strip the shell's timeout suffix if it
+                                                    // landed (Ctrl+B may race with deadline).
+                                                    let cleaned = partialText
+                                                        .replace("\n(command timed out and was interrupted)", "");
+                                                    let id = self.jobs.lock().unwrap().reserveJobId();
+                                                    let (wakeId, fireTx) = {
+                                                        let mut g = self.wakes.lock().await;
+                                                        let wid = g.registerTaskComplete(id, logTx);
+                                                        (wid, g.fireSender())
+                                                    };
+                                                    let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
+                                                        id,
+                                                        shellCommand.clone(),
+                                                        logTx.clone(),
+                                                        Some(crate::jobs::TaskWakeCtx {
+                                                            wakeId,
+                                                            registry: self.wakes.clone(),
+                                                            fireTx,
+                                                        }),
+                                                    );
+                                                    match spawnResult {
+                                                        Ok(_) => {
+                                                            let _ = logTx
+                                                                .send(LogEvent::AutoBgWarning {
+                                                                    command: shellCommand.clone(),
+                                                                    elapsedSecs: 0,
+                                                                    userTriggered: true,
+                                                                })
+                                                                .await;
+                                                            break crate::message::Content::text(
+                                                                buildConverted(id, 0, true, &cleaned)
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                                                            break crate::message::Content::text(format!(
+                                                                "User-triggered bg conversion FAILED: {e}\n\nPartial output:\n{cleaned}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                _ = cancelRx.changed() => {
+                                                    if !*cancelRx.borrow() {
+                                                        // Spurious wakeup — retry select.
+                                                        continue;
+                                                    }
+                                                    tracing::info!(tool = %call.function.name, "cancelled during shell execution");
+                                                    shell.interrupt();
+                                                    self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
+                                                    for remaining in &calls[callIdx + 1..] {
+                                                        self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                                    }
+                                                    let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                                    break 'turns Ok(());
+                                                }
+                                            }
+                                            }
+                                        } else {
+                                            // File operations are fast — no cancel race needed.
+                                            let result = tool::execute(&action, &shell, &targetName).await;
+                                            tracing::debug!(
+                                                tool = %call.function.name,
+                                                outputLen = result.charCount(),
+                                                "tool execution complete"
+                                            );
+                                            result
                                         }
-                                        tracing::info!(tool = %call.function.name, "cancelled during shell execution");
-                                        self.shell.interrupt();
-                                        self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
-                                        for remaining in &calls[callIdx + 1..] {
-                                            self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
-                                        }
-                                        let _ = logTx.send(LogEvent::TurnCancelled).await;
-                                        break 'turns Ok(());
                                     }
                                 }
-                                }
-                            } else {
-                                // File operations are fast — no cancel race needed.
-                                let result = tool::execute(&action, &self.shell).await;
-                                tracing::debug!(
-                                    tool = %call.function.name,
-                                    outputLen = result.charCount(),
-                                    "tool execution complete"
-                                );
-                                result
                             }
                             } // Close the else block for non-task tools.
                         } else {
@@ -1704,7 +2365,7 @@ impl Session {
                 _ = cancelRx.changed() => {
                     if *cancelRx.borrow() {
                         tracing::info!("stream cancelled, committing partial content");
-                        // Drop rx — kills the SSE background task.
+                        // Drop rx — kills the SSE background job.
                         drop(rx);
                         // Commit partial content to history (skip if nothing was streamed).
                         if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
@@ -2030,7 +2691,7 @@ impl Session {
             &alreadyProcessed,
         );
         if s1Result.didWork {
-            let afterTurn = self.transcript.currentBlock().to_string();
+            let afterTurn = self.headTurnId.clone().unwrap_or_default();
             if !s1Result.dedupedCallIds.is_empty() {
                 if let Err(e) = self.compactionLog.recordFileDedup(
                     s1Result.dedupedCallIds.clone(),
@@ -2104,7 +2765,7 @@ impl Session {
             tracing::debug!("S2 exhausted \u{2014} no blocks to compact");
             return false;
         }
-        let afterTurn = self.transcript.currentBlock().to_string();
+        let afterTurn = self.headTurnId.clone().unwrap_or_default();
         let blockCount = s2Result.compacted.len();
         for block in &s2Result.compacted {
             if let Err(e) = self.compactionLog.recordBlockCompact(
@@ -2172,7 +2833,7 @@ impl Session {
             tracing::debug!("S3 exhausted \u{2014} no topics to compact");
             return false;
         }
-        let afterTurn = self.transcript.currentBlock().to_string();
+        let afterTurn = self.headTurnId.clone().unwrap_or_default();
         let topicCount = s3Result.compacted.len();
         for topic in &s3Result.compacted {
             if let Err(e) = self.compactionLog.recordTopicCompact(
@@ -2205,16 +2866,20 @@ impl Session {
         true
     }
 
-    /// Run S4 full compaction. Merges S3 topic summaries and any prior
-    /// S4 briefings into a single handoff briefing. Returns true if
+    /// Run S4 deep recompaction. Merges S3 topic summaries, prior S4
+    /// briefings, and orphan S2 summaries from outside the protected
+    /// recent band into a single handoff briefing. Returns true if
     /// context was reduced.
     async fn runS4Trigger(
         &mut self,
         stageStr: &str,
         logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
+        let headId = self.headTurnId.as_deref().unwrap_or("");
         let s4Result = match crate::s4::run(
+            &self.transcript,
             &self.compactionLog,
+            headId,
             &self.client,
             &self.config.utility.model,
         )
@@ -2240,7 +2905,7 @@ impl Session {
             return false;
         }
 
-        let afterTurn = self.transcript.currentBlock().to_string();
+        let afterTurn = self.headTurnId.clone().unwrap_or_default();
         let blockCount = s4Result.sourceBlockIds.len();
         let summaryLen = s4Result.summary.len();
         if let Err(e) = self.compactionLog.recordFullCompact(
@@ -2276,6 +2941,384 @@ impl Session {
     }
 
     /// Execute a transcript-dependent tool (historyFetch, historySearch).
+    /// Resolve the target shell for a shell-using action. Returns an
+    /// error message — including the agent's current target and the
+    /// list of available terminals — if the named terminal doesn't
+    /// exist. The verbose error is the model's recovery path; without
+    /// it, a single typo can derail several turns.
+    async fn resolveShell(&self, action: &tool::ToolAction) -> std::result::Result<Shell, String> {
+        let guard = self.shells.lock().await;
+        match action.terminal() {
+            Some(name) => guard.shellFor(Some(name)).ok_or_else(|| {
+                let available = guard.names().join(", ");
+                let target = guard.activeForAgent();
+                format!(
+                    "No terminal named '{name}'. \
+                     Available terminals: [{available}]. \
+                     Agent's current target: '{target}'. \
+                     Call terminalList to inspect, or terminalSpawn to create."
+                )
+            }),
+            None => guard
+                .shellFor(None)
+                .ok_or_else(|| "No agent target terminal available.".into()),
+        }
+    }
+
+    /// Handle the terminal-management tools (Spawn/Switch/Kill/List).
+    /// These mutate `self.shells` and emit terminal lifecycle events on
+    /// the log channel so the deck can update its tab strip.
+    async fn executeTerminalTool(
+        &mut self,
+        action: &tool::ToolAction,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> String {
+        match action {
+            tool::ToolAction::TerminalSpawn { name } => {
+                // NOTE: agent-spawned terminals do NOT emit TerminalSpawned
+                // log events — the surrounding ToolStarted/ToolResult pair
+                // already represents the action in the panel. Emitting a
+                // separate notice between Started and Result causes the
+                // panel to fail to pop the ToolActive entry (it pops only
+                // when the trailing entry is still ToolActive), leaving
+                // an orphan throbber. User-initiated spawns DO emit the
+                // event (they have no surrounding tool lifecycle).
+                // Hold the lock across `spawn`'s await — fine with
+                // tokio::sync::Mutex; the user-side terminal handler
+                // simply waits for this to finish.
+                let spawnResult = {
+                    let mut guard = self.shells.lock().await;
+                    guard.spawn(name.clone(), SpawnedBy::Agent).await
+                };
+                match spawnResult {
+                    Ok(resolved) => format!(
+                        "Spawned terminal '{resolved}'. Use shell with \
+                         terminal:'{resolved}' to run commands there."
+                    ),
+                    Err(e) => format!("Failed to spawn terminal: {e}"),
+                }
+            }
+            tool::ToolAction::TerminalSwitch { name } => {
+                // Same reasoning as TerminalSpawn — no separate notice.
+                let switchResult = {
+                    let mut guard = self.shells.lock().await;
+                    guard.setActiveForAgent(name)
+                };
+                match switchResult {
+                    Ok(()) => format!("Agent target terminal is now '{name}'."),
+                    Err(e) => format!("Failed to switch terminal: {e}"),
+                }
+            }
+            tool::ToolAction::TerminalKill { name } => {
+                let killResult = {
+                    let mut guard = self.shells.lock().await;
+                    guard.kill(name)
+                };
+                match killResult {
+                    Ok(()) => {
+                        // TerminalClosed is needed regardless — the deck must
+                        // know to drop the tab.
+                        let _ = logTx
+                            .send(LogEvent::TerminalClosed { name: name.clone() })
+                            .await;
+                        format!("Terminal '{name}' killed.")
+                    }
+                    Err(e) => format!("Failed to kill terminal: {e}"),
+                }
+            }
+            tool::ToolAction::TerminalList => {
+                let infos = self.shells.lock().await.list();
+                if infos.is_empty() {
+                    return "No terminals.".into();
+                }
+                let mut out = String::from("Terminals:\n");
+                for info in infos {
+                    let active = if info.activeForAgent { " (active)" } else { "" };
+                    let by = match info.spawnedBy {
+                        SpawnedBy::User => "user",
+                        SpawnedBy::Agent => "agent",
+                    };
+                    out.push_str(&format!(
+                        "  {} — by {}, age {}s{}\n",
+                        info.name, by, info.ageSecs, active
+                    ));
+                }
+                out
+            }
+            _ => unreachable!("non-registry action passed to executeTerminalTool"),
+        }
+    }
+
+    /// Handle the task-plane tools: backgrounded `shell` calls
+    /// (`runInBackground: true`) and the lifecycle tools TaskOutput /
+    /// TaskStop / TaskList. These mutate or query `self.jobs`; output
+    /// for the agent is text suitable for an LLM tool result.
+    async fn executeJobTool(
+        &mut self,
+        action: &tool::ToolAction,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> String {
+        match action {
+            tool::ToolAction::Shell { command, runInBackground: true, .. } => {
+                // Reserve the job id, register the wake against it,
+                // THEN spawn the drainer with wakeCtx already set.
+                // This closes the attach-after-spawn race: a fast
+                // command can't complete before its wake context is
+                // installed.
+                let id = self.jobs.lock().unwrap().reserveJobId();
+                let (wakeId, fireTx) = {
+                    let mut g = self.wakes.lock().await;
+                    let wid = g.registerTaskComplete(id, logTx);
+                    (wid, g.fireSender())
+                };
+                let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
+                    id,
+                    command.clone(),
+                    logTx.clone(),
+                    Some(crate::jobs::TaskWakeCtx {
+                        wakeId,
+                        registry: self.wakes.clone(),
+                        fireTx,
+                    }),
+                );
+                match spawnResult {
+                    Ok(_) => format!(
+                        "Spawned job #{id}: {command}\n\nThe command is running \
+                         in the background. You'll be notified when it completes; \
+                         do not poll. Call jobOutput(jobId: {id}) only if you \
+                         want a mid-flight peek."
+                    ),
+                    Err(e) => {
+                        // Spawn failed — roll back the wake registration
+                        // so /jobs schedules doesn't show a phantom row.
+                        self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                        format!("Failed to spawn job: {e}")
+                    }
+                }
+            }
+            tool::ToolAction::JobOutput { jobId, sinceLine, maxLines } => {
+                let cap = maxLines.unwrap_or(200);
+                match self.jobs.lock().unwrap().output(*jobId, *sinceLine, cap) {
+                    Ok(snap) => formatJobOutput(*jobId, &snap, *sinceLine),
+                    Err(e) => format!("{e}. Use jobList to see available job ids."),
+                }
+            }
+            tool::ToolAction::JobStop { jobId } => {
+                // Distinguish the no-op case ("already terminal") from
+                // an active kill so the agent doesn't think both
+                // statuses mean "the kill signal was just delivered".
+                let preState = self
+                    .jobs
+                    .lock()
+                    .unwrap()
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == *jobId)
+                    .map(|t| t.state);
+                match self.jobs.lock().unwrap().stop(*jobId) {
+                    Ok(()) => match preState {
+                        Some(s) if s.isTerminal() => format!(
+                            "Job #{jobId} was already {:?} \u{2014} no signal sent.",
+                            s,
+                        ),
+                        _ => format!("Sent kill signal to job #{jobId}."),
+                    },
+                    Err(e) => format!("Failed to stop job: {e}"),
+                }
+            }
+            tool::ToolAction::JobList => formatJobList(&self.jobs.lock().unwrap().list()),
+            _ => unreachable!("non-job action passed to executeJobTool"),
+        }
+    }
+
+    /// Handle the monitor-plane tools (Monitor / MonitorStop /
+    /// MonitorList). Routes through `self.monitors` (and `self.jobs`
+    /// for the backing bash drainer).
+    async fn executeMonitorTool(
+        &mut self,
+        action: &tool::ToolAction,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> String {
+        match action {
+            tool::ToolAction::Monitor {
+                description,
+                command,
+                filter,
+            } => {
+                // Reserve monitor id, register the passive wake
+                // against it, THEN call registerWithId so the per-line
+                // callback sees wakeCtx from match #1. Eliminates the
+                // attach-after-spawn race for monitor fires.
+                let id = self.monitors.lock().unwrap().reserveMonitorId();
+                let (wakeId, fireTx) = {
+                    let mut g = self.wakes.lock().await;
+                    let wid = g.registerMonitor(id, logTx);
+                    (wid, g.fireSender())
+                };
+                let result = {
+                    let mut plane = self.monitors.lock().unwrap();
+                    plane.registerWithId(
+                        id,
+                        description.clone(),
+                        command.clone(),
+                        filter.clone(),
+                        crate::monitors::DEFAULT_AUTOSTOP_EPS,
+                        &self.jobs,
+                        logTx.clone(),
+                        Some(crate::monitors::MonitorWakeCtx {
+                            wakeId,
+                            registry: self.wakes.clone(),
+                            fireTx,
+                        }),
+                    )
+                };
+                match result {
+                    Ok(_) => format!(
+                        "Registered monitor #{id} \"{description}\" with filter /{filter}/.\n\n\
+                         Watching: {command}\n\n\
+                         You'll be notified when matches arrive (do not poll). \
+                         Use monitorList to check event counts, monitorStop({id}) to \
+                         stop. The underlying bash job is also tracked in jobList."
+                    ),
+                    Err(e) => {
+                        // Register failed — roll back the passive wake.
+                        self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                        format!("Failed to register monitor: {e}")
+                    }
+                }
+            }
+            tool::ToolAction::MonitorStop { monitorId } => {
+                // Take the wake id BEFORE stopping so we can unregister
+                // the passive source — otherwise it would linger in
+                // /jobs schedules after the monitor is dead.
+                let wakeId = self.monitors.lock().unwrap().takeWakeId(*monitorId);
+                let stopResult = {
+                    let plane = self.monitors.lock().unwrap();
+                    plane.stop(*monitorId, &self.jobs)
+                };
+                match stopResult {
+                    Ok(()) => {
+                        if let Some(wid) = wakeId {
+                            self.wakes.lock().await.unregisterPassive(wid, logTx);
+                        }
+                        let _ = logTx
+                            .send(LogEvent::MonitorStopped { id: *monitorId })
+                            .await;
+                        format!("Stopped monitor #{monitorId}.")
+                    }
+                    Err(e) => format!("Failed to stop monitor: {e}"),
+                }
+            }
+            tool::ToolAction::MonitorList => {
+                let snapshot = self.monitors.lock().unwrap().list();
+                formatMonitorList(&snapshot)
+            }
+            _ => unreachable!("non-monitor action passed to executeMonitorTool"),
+        }
+    }
+
+    /// Handle the wake-registry tools: scheduleWakeup, cronCreate,
+    /// cronList, cronDelete, fileWatch. These mutate `self.wakes`;
+    /// schedulers are spawned as tokio tasks and outlive the turn.
+    async fn executeWakeTool(
+        &mut self,
+        action: &tool::ToolAction,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> String {
+        match action {
+            tool::ToolAction::ScheduleWakeup { delaySeconds, prompt } => {
+                if *delaySeconds == 0 {
+                    return "delaySeconds must be at least 1".into();
+                }
+                // armDelay locks the registry with blocking_lock — call
+                // it from spawn_blocking so we don't block the runtime.
+                let regArc = self.wakes.clone();
+                let promptOwned = prompt.clone();
+                let logTxClone = logTx.clone();
+                let secs = *delaySeconds;
+                let id = tokio::task::spawn_blocking(move || {
+                    crate::wakes::WakeRegistry::armDelay(
+                        &regArc,
+                        std::time::Duration::from_secs(secs),
+                        promptOwned,
+                        logTxClone,
+                    )
+                })
+                .await
+                .unwrap_or(0);
+                format!(
+                    "Armed wake #{id} \u{2014} will fire in {secs}s with prompt: {prompt}.\n\
+                     You'll receive a <wake source=\"delay#{id}\" kind=\"Delay\"> message at that time. \
+                     Cancel with cronDelete({id})."
+                )
+            }
+            tool::ToolAction::CronCreate { spec, prompt, recurring } => {
+                let regArc = self.wakes.clone();
+                let specOwned = spec.clone();
+                let promptOwned = prompt.clone();
+                let logTxClone = logTx.clone();
+                let recurringFlag = *recurring;
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::wakes::WakeRegistry::armCron(
+                        &regArc,
+                        specOwned,
+                        recurringFlag,
+                        promptOwned,
+                        logTxClone,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+                match result {
+                    Ok(id) => format!(
+                        "Armed wake #{id} \u{2014} cron `{spec}`{}.\n\
+                         You'll receive a <wake source=\"cron#{id}\" kind=\"Cron\"> message on each fire. \
+                         Cancel with cronDelete({id}).",
+                        if *recurring { " (recurring)" } else { " (one-shot)" },
+                    ),
+                    Err(e) => format!("Failed to arm cron: {e}"),
+                }
+            }
+            tool::ToolAction::CronList => {
+                let sources = self.wakes.lock().await.list();
+                formatWakeList(&sources)
+            }
+            tool::ToolAction::CronDelete { wakeId } => {
+                let removed = self.wakes.lock().await.disarm(*wakeId, logTx);
+                if removed {
+                    format!("Disarmed wake #{wakeId}.")
+                } else {
+                    format!("No wake source #{wakeId} (use cronList to see active ids).")
+                }
+            }
+            tool::ToolAction::FileWatch { path, prompt } => {
+                let regArc = self.wakes.clone();
+                let pathBuf = std::path::PathBuf::from(path);
+                let promptOwned = prompt.clone();
+                let logTxClone = logTx.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::wakes::WakeRegistry::armFileWatch(
+                        &regArc,
+                        pathBuf,
+                        promptOwned,
+                        logTxClone,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+                match result {
+                    Ok(id) => format!(
+                        "Armed wake #{id} \u{2014} watching {path}.\n\
+                         Each fs event under that path fires a <wake source=\"fileWatch#{id}\"> message. \
+                         Cancel with cronDelete({id})."
+                    ),
+                    Err(e) => format!("Failed to arm fileWatch: {e}"),
+                }
+            }
+            _ => unreachable!("non-wake action passed to executeWakeTool"),
+        }
+    }
+
     fn executeTranscriptTool(&self, action: &tool::ToolAction) -> String {
         match action {
             tool::ToolAction::HistoryFetch { blockId } => {
@@ -2298,6 +3341,7 @@ impl Session {
                                 crate::transcript::TurnRole::ToolCall => "Tool Call",
                                 crate::transcript::TurnRole::ToolResult => "Tool Result",
                                 crate::transcript::TurnRole::System => "System",
+                                crate::transcript::TurnRole::Wake => "Wake",
                             };
 
                             output.push_str(&format!("### [{roleLabel}] {}\n", turn.id));
@@ -2352,6 +3396,7 @@ impl Session {
                                     crate::transcript::TurnRole::ToolCall => "tool_call",
                                     crate::transcript::TurnRole::ToolResult => "tool_result",
                                     crate::transcript::TurnRole::System => "system",
+                                    crate::transcript::TurnRole::Wake => "wake",
                                 };
                                 // Annotate if turn has attachments.
                                 let imageNote = turn.attachments.as_ref()
@@ -2545,11 +3590,19 @@ impl Session {
             runner::AgentTier::Utility => childConfig.utility.clone(),
         };
 
-        // Spawn an isolated shell for the subagent.
-        let (childShell, childIo) = match crate::shell::spawnShell(120, 40) {
-            Ok(s) => s,
-            Err(e) => return format!("Failed to spawn subagent shell: {e}"),
-        };
+        // Spawn an isolated shell registry for the subagent. Phase 1
+        // child sessions only ever have a `main` shell — terminal-mgmt
+        // tools are filtered out of subagent toolsets in `filterDefs`.
+        let (childIoTx, mut childIoRx) = mpsc::channel::<(
+            String,
+            crate::shell::ShellIo,
+            crate::shells::SpawnedBy,
+        )>(8);
+        let (childRegistry, childMainIo) =
+            match crate::shells::ShellRegistry::newWithMain(120, 40, childIoTx) {
+                Ok(r) => r,
+                Err(e) => return format!("Failed to spawn subagent shell: {e}"),
+            };
 
         // Inherit parent permissions, with the preset's rules layered on top
         // as a floor. Rule order is: [preset floor (read-only denies)] →
@@ -2558,10 +3611,11 @@ impl Session {
         let childPermissions = buildChildPermissions(&self.permissions, &preset);
 
         // Create child session with inherited+floored permissions.
+        let childRegistryArc = std::sync::Arc::new(tokio::sync::Mutex::new(childRegistry));
         let mut child = match Session::new(
             &childConfig,
             childPermissions,
-            childShell,
+            childRegistryArc,
             preset.interface,
             &[crate::prompt::DomainModule::Swe],
         ) {
@@ -2575,17 +3629,29 @@ impl Session {
         let childSessionId = child.sessionId().to_string();
 
         // Forward child shell output to parent as SubagentShellOutput events.
+        // Drain main shell's output and any future per-child spawn ioRx
+        // deliveries (phase 1: only main, but the structure is in place).
         let shellForwardTx = parentLogTx.clone();
         let shellForwardId = childSessionId.clone();
         tokio::spawn(async move {
-            let mut rx: tokio::sync::mpsc::Receiver<Vec<u8>> = childIo.outputRx;
-            while let Some(data) = rx.recv().await {
-                let _ = shellForwardTx
-                    .send(LogEvent::SubagentShellOutput {
-                        sessionId: shellForwardId.clone(),
-                        data,
-                    })
-                    .await;
+            let mut mainRx = childMainIo.outputRx;
+            loop {
+                tokio::select! {
+                    Some(data) = mainRx.recv() => {
+                        let _ = shellForwardTx
+                            .send(LogEvent::SubagentShellOutput {
+                                sessionId: shellForwardId.clone(),
+                                data,
+                            })
+                            .await;
+                    }
+                    Some((_name, _io, _by)) = childIoRx.recv() => {
+                        // Phase 1: subagents don't spawn additional shells.
+                        // Drop the io to avoid leaking the channel; phase 2+
+                        // will multiplex these into shellForwardTx by name.
+                    }
+                    else => break,
+                }
             }
         });
 
@@ -2706,8 +3772,9 @@ impl Session {
         // Run the child session. Subagents don't support mid-turn steering.
         let childInput = UserInput::from(prompt.to_string());
         let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
+        let (_childUserBgTx, mut childUserBgRx) = mpsc::channel::<()>(1);
         let sendResult = child
-            .send(&childInput, &childLogTx, &childRequestTx, &mut childCancelRx, &mut childSteerRx)
+            .send(&childInput, &childLogTx, &childRequestTx, &mut childCancelRx, &mut childSteerRx, &mut childUserBgRx)
             .await;
 
         // Drop senders so forwarding tasks exit.
@@ -2757,6 +3824,115 @@ impl Session {
         } else {
             format!("[subagent session: {childSessionId}]\n\n{content}")
         }
+    }
+
+    /// Background variant of [`Self::executeTask`]. Registers a subagent
+    /// task in [`JobPlane`] and `tokio::spawn`s the entire child-session
+    /// runner so the parent's tool-call returns immediately with the new
+    /// task id. The parent retrieves streaming progress via
+    /// `jobOutput(jobId)` and the final content from the ring buffer.
+    ///
+    /// Cancellation is cooperative: `jobStop` flips the handle's
+    /// `cancelRx` watch, which races the child's `send` future inside the
+    /// runner.
+    async fn executeTaskBackground(
+        &mut self,
+        prompt: &str,
+        agentType: &str,
+        parentLogTx: &mpsc::Sender<LogEvent>,
+        parentSessionRequestTx: &mpsc::Sender<SessionRequest>,
+        _parentCancelRx: &mut watch::Receiver<bool>,
+    ) -> String {
+        use crate::runner;
+
+        let preset = runner::agentPreset(agentType);
+        let mut childConfig = self.config.clone();
+        childConfig.heavy = match preset.tier {
+            runner::AgentTier::Heavy => childConfig.heavy.clone(),
+            runner::AgentTier::Light => childConfig.light.clone(),
+            runner::AgentTier::Utility => childConfig.utility.clone(),
+        };
+
+        let (childIoTx, childIoRx) = mpsc::channel::<(
+            String,
+            crate::shell::ShellIo,
+            crate::shells::SpawnedBy,
+        )>(8);
+        let (childRegistry, childMainIo) =
+            match crate::shells::ShellRegistry::newWithMain(120, 40, childIoTx) {
+                Ok(r) => r,
+                Err(e) => return format!("Failed to spawn subagent shell: {e}"),
+            };
+
+        let childPermissions = buildChildPermissions(&self.permissions, &preset);
+
+        let childRegistryArc = std::sync::Arc::new(tokio::sync::Mutex::new(childRegistry));
+        let mut child = match Session::new(
+            &childConfig,
+            childPermissions,
+            childRegistryArc,
+            preset.interface,
+            &[crate::prompt::DomainModule::Swe],
+        ) {
+            Ok(s) => s,
+            Err(e) => return format!("Failed to create subagent session: {e}"),
+        };
+
+        let filtered = tool::filterDefs(&tool::builtinDefs(), &preset.toolSet);
+        child.setTools(filtered);
+
+        // Register the task BEFORE spawning the runner so the caller's
+        // return string can quote the real task id. Reserve the job id
+        // first so the TaskComplete wake source can be registered against
+        // it before the runner starts feeding output.
+        let taskId = self.jobs.lock().unwrap().reserveJobId();
+        let (wakeId, fireTx) = {
+            let mut g = self.wakes.lock().await;
+            let wid = g.registerTaskComplete(taskId, parentLogTx);
+            (wid, g.fireSender())
+        };
+        let wakeCtx = crate::jobs::TaskWakeCtx {
+            wakeId,
+            registry: self.wakes.clone(),
+            fireTx,
+        };
+        let handle = self.jobs.lock().unwrap().spawnSubagentWithId(
+            taskId,
+            agentType.to_string(),
+            prompt.to_string(),
+            parentLogTx.clone(),
+            Some(wakeCtx),
+        );
+
+        let childSessionId = child.sessionId().to_string();
+        let promptOwned = prompt.to_string();
+        let agentTypeOwned = agentType.to_string();
+        let parentLogTxOwned = parentLogTx.clone();
+        let parentRequestTxOwned = parentSessionRequestTx.clone();
+
+        // Move everything into the runner task. From here on the parent's
+        // tool-call thread is free.
+        tokio::spawn(async move {
+            runSubagentTaskInBackground(
+                child,
+                childMainIo,
+                childIoRx,
+                handle,
+                promptOwned,
+                agentTypeOwned,
+                childSessionId.clone(),
+                parentLogTxOwned,
+                parentRequestTxOwned,
+            )
+            .await;
+        });
+
+        format!(
+            "Spawned subagent #{taskId} ({agentType}). The agent is running in the \
+             background \u{2014} call jobOutput(jobId: {taskId}) for streaming \
+             progress or to read its final answer, jobList to see status, and \
+             jobStop(jobId: {taskId}) to cancel."
+        )
     }
 
     /// Execute an MCP tool action.
@@ -3433,6 +4609,54 @@ fn isTransientError(msg: &str) -> bool {
 
 /// Encode attachments and build multimodal user content for the conversation history.
 ///
+/// Format a coalesced `WakeBatch` as a single user-shaped envelope. The
+/// model sees one user message containing N nested `<wake>` elements,
+/// one per fire, in arrival order. Single-fire batches still go through
+/// this path so the on-the-wire shape is uniform.
+fn formatWakeBatch(batch: &crate::wakes::WakeBatch) -> String {
+    use std::fmt::Write;
+    let count = batch.fires.len();
+    let mut buf = String::with_capacity(64 + count * 96);
+    let _ = write!(buf, "<wakes count=\"{count}\">");
+    for fire in &batch.fires {
+        let firedAtSecs = fire.firedAt.elapsed().as_secs();
+        let kindStr = fire.kind.asStr();
+        let _ = write!(
+            buf,
+            "\n<wake source=\"{}\" kind=\"{kindStr}\" ageSecs=\"{firedAtSecs}\">\n{}\n</wake>",
+            fire.source, fire.payload,
+        );
+    }
+    buf.push_str("\n</wakes>");
+    buf
+}
+
+/// One-line summary for `LogEvent::WakeBatchInjected` — drives the deck
+/// notice chip without exposing the full envelope text.
+fn wakeBatchSummary(batch: &crate::wakes::WakeBatch) -> String {
+    let count = batch.fires.len();
+    let first = batch.fires.first();
+    match (count, first) {
+        (1, Some(f)) => format!("{} \u{00B7} {}", f.source, snippet(&f.payload, 80)),
+        (n, Some(f)) => format!("{n} wakes (first: {})", f.source),
+        _ => "wake".to_string(),
+    }
+}
+
+fn snippet(s: &str, n: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    if first.len() <= n {
+        first.to_string()
+    } else {
+        // Find a char-boundary <= n so we don't slice a multi-byte char.
+        let mut cut = n;
+        while cut > 0 && !first.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\u{2026}", &first[..cut])
+    }
+}
+
 /// Returns the `Content` for `Message::User` and optional `TurnAttachment` list for transcript.
 fn buildUserContent(
     text: &str,
@@ -3582,6 +4806,165 @@ impl ToolCallAccumulator {
             })
             .collect()
     }
+}
+
+/// Format a JobOutputSnapshot for the agent. Includes the command,
+/// state, line range, and the buffered lines themselves with a hint
+/// about how to page if `totalLines` exceeds what we returned.
+fn formatJobOutput(
+    taskId: u64,
+    snap: &crate::jobs::JobOutputSnapshot,
+    sinceLine: Option<u64>,
+) -> String {
+    use crate::jobs::JobState;
+    let stateLabel = match &snap.state {
+        JobState::Running => "running".to_string(),
+        JobState::Completed { exitCode } => format!("completed exit {exitCode}"),
+        JobState::Killed => "killed".into(),
+        JobState::Errored(msg) => format!("errored: {msg}"),
+    };
+    let returned = snap.lines.len() as u64;
+    let nextLine = snap.firstLine + returned;
+    let header = format!(
+        "Task #{} \u{2014} {}\nState: {} \u{00B7} {} total lines \u{00B7} \
+         showing lines {}..{}\n\n",
+        taskId,
+        snap.command,
+        stateLabel,
+        snap.totalLines,
+        snap.firstLine,
+        snap.firstLine + returned.saturating_sub(1),
+    );
+    let mut body = String::new();
+    // Two cases for "you're missing earlier lines":
+    //
+    // 1. The caller asked for `sinceLine = N` but the ring evicted past
+    //    that point. firstLine > N AND firstLine > earliestBuffered →
+    //    those lines are gone for good.
+    //
+    // 2. The caller passed `sinceLine = None` (default tail) and there
+    //    are buffered lines older than what we returned. firstLine >
+    //    earliestBuffered → the lines are still recoverable via an
+    //    explicit `sinceLine`. We must NOT say they "fell off the ring
+    //    buffer" — they're still there. Just hint at how to fetch them.
+    let askedFor = sinceLine.unwrap_or(0);
+    if snap.firstLine > askedFor && askedFor < snap.earliestBuffered {
+        let lost = snap.earliestBuffered - askedFor;
+        body.push_str(&format!(
+            "[earlier {lost} lines fell off the ring buffer; oldest buffered is line {}]\n",
+            snap.earliestBuffered,
+        ));
+    } else if sinceLine.is_none() && snap.firstLine > snap.earliestBuffered {
+        let recoverable = snap.firstLine - snap.earliestBuffered;
+        body.push_str(&format!(
+            "[{recoverable} earlier lines still buffered \u{2014} call \
+             jobOutput(jobId: {taskId}, sinceLine: {}) to read from the start]\n",
+            snap.earliestBuffered,
+        ));
+    }
+    for line in &snap.lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    if nextLine < snap.totalLines {
+        body.push_str(&format!(
+            "\n[{} more lines \u{2014} call jobOutput(jobId: {}, sinceLine: {}) to continue]",
+            snap.totalLines - nextLine,
+            taskId,
+            nextLine,
+        ));
+    } else if matches!(snap.state, JobState::Running) {
+        body.push_str(&format!(
+            "\n[task is still running \u{2014} next sinceLine: {}]",
+            nextLine,
+        ));
+    }
+    format!("{header}{body}")
+}
+
+/// Format a TaskList snapshot.
+fn formatJobList(tasks: &[crate::jobs::JobInfo]) -> String {
+    use crate::jobs::JobState;
+    if tasks.is_empty() {
+        return "No background jobs.".into();
+    }
+    let mut out = String::from("Background tasks:\n");
+    for info in tasks {
+        let stateLabel = match &info.state {
+            JobState::Running => "running".to_string(),
+            JobState::Completed { exitCode } => format!("completed exit {exitCode}"),
+            JobState::Killed => "killed".into(),
+            JobState::Errored(msg) => format!("errored: {msg}"),
+        };
+        let age = info.spawnedAt.elapsed().as_secs();
+        let cmdPreview = if info.command.len() > 80 {
+            format!("{}\u{2026}", &info.command[..info.command.floor_char_boundary(80)])
+        } else {
+            info.command.clone()
+        };
+        out.push_str(&format!(
+            "  #{} {} \u{2014} {} \u{00B7} {}s \u{00B7} {} lines\n",
+            info.id, cmdPreview, stateLabel, age, info.totalLines,
+        ));
+    }
+    out
+}
+
+fn formatMonitorList(monitors: &[crate::monitors::MonitorInfo]) -> String {
+    use crate::monitors::MonitorState;
+    if monitors.is_empty() {
+        return "No monitors.".into();
+    }
+    let mut out = String::from("Monitors:\n");
+    for info in monitors {
+        let stateLabel = match &info.state {
+            MonitorState::Running => "running".to_string(),
+            MonitorState::Stopped => "stopped".into(),
+            MonitorState::AutoStopped(reason) => format!("auto-stopped ({reason})"),
+        };
+        let lastEvent = match info.lastEventAt {
+            Some(t) => format!("{}s ago", t.elapsed().as_secs()),
+            None => "never".into(),
+        };
+        let cmdPreview = if info.command.len() > 60 {
+            format!("{}\u{2026}", &info.command[..info.command.floor_char_boundary(60)])
+        } else {
+            info.command.clone()
+        };
+        out.push_str(&format!(
+            "  #{} \"{}\" {} | /{}/ \u{2014} {} \u{00B7} {} events \u{00B7} last {}\n",
+            info.id, info.description, cmdPreview, info.filter,
+            stateLabel, info.eventCount, lastEvent,
+        ));
+    }
+    out
+}
+
+fn formatWakeList(sources: &[crate::wakes::WakeSourceInfo]) -> String {
+    if sources.is_empty() {
+        return "No wake sources.".into();
+    }
+    let mut out = String::from("Wake sources:\n");
+    for info in sources {
+        let promptPreview = info
+            .prompt
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                if p.len() > 40 {
+                    format!(" \u{2014} {}\u{2026}", &p[..p.floor_char_boundary(40)])
+                } else {
+                    format!(" \u{2014} {p}")
+                }
+            })
+            .unwrap_or_default();
+        let age = info.createdAt.elapsed().as_secs();
+        out.push_str(&format!(
+            "  #{} [{}] {} \u{00B7} {} fires \u{00B7} {age}s ago{promptPreview}\n",
+            info.id, info.kind.asStr(), info.summary, info.firesSoFar,
+        ));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -35,6 +35,11 @@ pub enum TurnRole {
     ToolCall,
     ToolResult,
     System,
+    /// A wake-injected synthetic user message. Stored separately from
+    /// `User` so resume can render it as a notice instead of a real user
+    /// turn. The model still receives it as user-shaped content via
+    /// `context::reconstruct`.
+    Wake,
 }
 
 /// Outcome state for an assistant turn. Other roles always use `Completed`.
@@ -330,6 +335,41 @@ impl Transcript {
             toolCallId: None,
             reasoning: None,
             attachments,
+            cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
+        };
+        self.writeTurn(&turn)
+    }
+
+    /// Record a wake-injected synthetic user message. Starts a new block
+    /// (wakes are conversational boundaries — they begin a fresh turn).
+    /// The content is the formatted `<wakes>…</wakes>` envelope; the model
+    /// sees it as user-shaped via `context::reconstruct`.
+    pub fn recordWake(
+        &mut self,
+        content: &str,
+        parentId: Option<&str>,
+    ) -> Result<String> {
+        let blockId = randomHexId("b");
+        self.currentBlockId = blockId.clone();
+        let turn = Turn {
+            id: randomHexId("t"),
+            blockId,
+            topicId: self.currentTopicId.clone(),
+            role: TurnRole::Wake,
+            content: content.to_string(),
+            ts: Self::now(),
+            parentId: parentId.map(|s| s.to_string()),
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,

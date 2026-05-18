@@ -277,6 +277,11 @@ async fn test_s3_finds_and_compacts_topics() {
 async fn test_s4_merges_topic_summaries() {
     let dir = tempfile::TempDir::new().unwrap();
 
+    // Minimal transcript so s4 can compute the protected band.
+    let mut transcript = Transcript::createAt(dir.path(), "test_s4").unwrap();
+    let _ = transcript.recordUser("kickoff", None, None).unwrap();
+    let head = transcript.recordAssistant("ack", Default::default()).unwrap();
+
     // Pre-populate compaction log with TopicCompact ops (simulating S3 output).
     let mut compactionLog = CompactionLog::open(dir.path()).unwrap();
     compactionLog
@@ -298,7 +303,7 @@ async fn test_s4_merges_topic_summaries() {
 
     let client = dummyClient();
 
-    let result = s4::run(&compactionLog, &client, "test-model").await;
+    let result = s4::run(&transcript, &compactionLog, &head, &client, "test-model").await;
 
     // S4 finds the topic summaries and attempts the LLM call, which fails
     // with a bogus API key (401). This proves the logic works — it got past

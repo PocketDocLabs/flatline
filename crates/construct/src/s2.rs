@@ -127,6 +127,21 @@ pub async fn run(
                 if let Some(c) = blockCost {
                     totalCost += c;
                 }
+                // Reduction gate: a "summary" longer than the agent
+                // content it replaces is not a compaction. Drop it so
+                // the stage trips its exhaustion check instead of
+                // growing context and re-firing.
+                let originalAgentChars: usize =
+                    block.agentTurns.iter().map(|t| t.content.len()).sum();
+                if summary.len() >= originalAgentChars {
+                    tracing::warn!(
+                        blockId = %block.blockId,
+                        originalChars = originalAgentChars,
+                        summaryChars = summary.len(),
+                        "S2: summary did not reduce — discarding"
+                    );
+                    continue;
+                }
                 compacted.push(CompactedBlock {
                     blockId: block.blockId.clone(),
                     summary,
@@ -218,7 +233,9 @@ fn groupByBlock(turns: &[Turn]) -> Vec<Block> {
         block.charCount += turn.content.len();
 
         match turn.role {
-            TurnRole::User => {
+            TurnRole::User | TurnRole::Wake => {
+                // Wake turns are the user-shaped opener of their block —
+                // they participate in compaction identically.
                 block.userMessage = turn.content.clone();
             }
             TurnRole::System => {

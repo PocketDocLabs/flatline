@@ -94,6 +94,10 @@ pub struct SubagentPanel {
     pub lastSelectionRect: Rect,
     /// Tab bar row from the last render (for tab clicks).
     pub lastTabBarRect: Rect,
+    /// Per-row click hitboxes for the parallel-subagent tab strip. One
+    /// rect per entry in `agentPanel.activeSubagents`, in matching order.
+    /// Cleared (length 0) whenever fewer than 2 subagents are alive.
+    subagentTabRects: Vec<(Rect, String)>,
     /// Per-tab click rects: (transcriptRect, shellRect). Set during render.
     pub tabRects: [Rect; 2],
     /// Permit overlay rect from the last render (when subagent permit pending).
@@ -130,42 +134,51 @@ impl SubagentPanel {
             lastSelectionRect: Rect::default(),
             lastTabBarRect: Rect::default(),
             tabRects: [Rect::default(); 2],
+            subagentTabRects: Vec::new(),
             lastPermitRect: Rect::default(),
         }
     }
 
     /// Display name of the subagent (live or frozen).
     fn agentTypeFor<'a>(&'a self, agentPanel: &'a AgentPanel) -> &'a str {
-        match (&self.source, agentPanel.activeSubagent.as_ref()) {
+        match (&self.source, agentPanel.currentSubagent()) {
             (SubagentSource::Live, Some(sub)) => &sub.agentType,
             (SubagentSource::Frozen { agentType, .. }, _) => agentType,
             _ => "subagent",
         }
     }
 
-    /// True when the subagent is still running (live, latest block not done).
+    /// True when the subagent is still running (live + has a currently
+    /// selected subagent whose SubagentBlock is still unfinished).
     fn isRunning(&self, agentPanel: &AgentPanel) -> bool {
         if !matches!(self.source, SubagentSource::Live) {
             return false;
         }
-        if agentPanel.activeSubagent.is_none() {
+        let Some(sub) = agentPanel.currentSubagent() else {
             return false;
-        }
-        // The most recent SubagentBlock entry tells us done/running.
+        };
+        // Match the SubagentBlock by sessionId — looking for "the most
+        // recent unfinished block" is wrong with parallel subagents.
         for entry in agentPanel.entries.iter().rev() {
-            if let PanelEntry::SubagentBlock { done, .. } = entry {
-                return !*done;
+            if let PanelEntry::SubagentBlock {
+                sessionId: Some(sid),
+                done,
+                ..
+            } = entry
+            {
+                if sid == &sub.sessionId {
+                    return !*done;
+                }
             }
         }
         true
     }
 
-    /// Elapsed runtime for live subagents; None for frozen.
+    /// Elapsed runtime for the currently-selected live subagent.
     fn elapsedSecs(&self, agentPanel: &AgentPanel) -> Option<u64> {
         match &self.source {
             SubagentSource::Live => agentPanel
-                .activeSubagent
-                .as_ref()
+                .currentSubagent()
                 .map(|s| s.startTime.elapsed().as_secs()),
             SubagentSource::Frozen { .. } => None,
         }
@@ -191,7 +204,9 @@ impl SubagentPanel {
     /// Promotes Live → Frozen with an empty terminal if the live subagent
     /// disappeared (graceful degradation; should not happen in practice).
     fn shellMut<'a>(&'a mut self, agentPanel: &'a mut AgentPanel) -> &'a mut TerminalState {
-        if matches!(self.source, SubagentSource::Live) && agentPanel.activeSubagent.is_none() {
+        if matches!(self.source, SubagentSource::Live)
+            && agentPanel.currentSubagent().is_none()
+        {
             self.source = SubagentSource::Frozen {
                 agentType: "subagent".into(),
                 transcript: Vec::new(),
@@ -201,8 +216,7 @@ impl SubagentPanel {
         match &mut self.source {
             SubagentSource::Frozen { shellTerm, .. } => shellTerm,
             SubagentSource::Live => &mut agentPanel
-                .activeSubagent
-                .as_mut()
+                .currentSubagentMut()
                 .expect("checked above")
                 .shellTerm,
         }
@@ -237,6 +251,10 @@ impl SubagentPanel {
                     SubagentTab::Shell => SubagentTab::Transcript,
                 };
             }
+            // Cycle parallel subagents. `]` / `[` mirrors `Cmd+Shift+]`
+            // tab-cycle conventions; no-ops when only one is live.
+            KeyCode::Char(']') => agentPanel.cycleSubagent(1),
+            KeyCode::Char('[') => agentPanel.cycleSubagent(-1),
             KeyCode::Up | KeyCode::Char('k') => self.scrollUp(agentPanel, 3),
             KeyCode::Down | KeyCode::Char('j') => self.scrollDown(agentPanel, 3),
             KeyCode::PageUp => self.scrollUp(agentPanel, 20),
@@ -262,6 +280,8 @@ impl SubagentPanel {
                 | KeyCode::PageDown
                 | KeyCode::Char('k')
                 | KeyCode::Char('j')
+                | KeyCode::Char('[')
+                | KeyCode::Char(']')
         );
         if isNav {
             return true;
@@ -384,6 +404,15 @@ impl SubagentPanel {
                 if self.lastTabBarRect.contains((ev.column, ev.row).into()) {
                     self.handleTabBarClick(ev.column);
                     return SubagentMouseAction::Handled;
+                }
+
+                // Parallel-subagent tab strip click — switch to that subagent.
+                for (rect, sessionId) in &self.subagentTabRects {
+                    if rect.contains((ev.column, ev.row).into()) {
+                        let sid = sessionId.clone();
+                        agentPanel.selectSubagentBySessionId(&sid);
+                        return SubagentMouseAction::Handled;
+                    }
                 }
 
                 // Content click in the active tab.
@@ -533,8 +562,7 @@ impl SubagentPanel {
             let off = match &self.source {
                 SubagentSource::Frozen { shellTerm, .. } => shellTerm.displayOffset(),
                 SubagentSource::Live => agentPanel
-                    .activeSubagent
-                    .as_ref()
+                    .currentSubagent()
                     .map(|s| s.shellTerm.displayOffset())
                     .unwrap_or(0),
             };
@@ -655,19 +683,42 @@ impl SubagentPanel {
             (inner, None)
         };
 
-        self.lastContentRect = contentArea;
+        // When the parent has fanned out multiple parallel subagents, draw
+        // a secondary tab strip just below the title row listing each one.
+        // Empty otherwise so the body has the full pane.
+        let multiTabHeight: u16 = if agentPanel.activeSubagents.len() > 1 { 1 } else { 0 };
+        let bodyArea = if multiTabHeight > 0 && contentArea.height > multiTabHeight {
+            let strip = Rect {
+                x: contentArea.x,
+                y: contentArea.y,
+                width: contentArea.width,
+                height: multiTabHeight,
+            };
+            self.renderSubagentTabStrip(strip, buf, agentPanel);
+            Rect {
+                x: contentArea.x,
+                y: contentArea.y + multiTabHeight,
+                width: contentArea.width,
+                height: contentArea.height - multiTabHeight,
+            }
+        } else {
+            self.subagentTabRects.clear();
+            contentArea
+        };
+
+        self.lastContentRect = bodyArea;
         // Selection rect is content rect shifted +2 cols (after-prefix), so
         // selection coords match the convention used by extractUnwrappedText.
         self.lastSelectionRect = Rect {
-            x: contentArea.x + 2,
-            y: contentArea.y,
-            width: contentArea.width.saturating_sub(2),
-            height: contentArea.height,
+            x: bodyArea.x + 2,
+            y: bodyArea.y,
+            width: bodyArea.width.saturating_sub(2),
+            height: bodyArea.height,
         };
 
         match self.tab {
-            SubagentTab::Transcript => self.renderTranscript(contentArea, buf, agentPanel),
-            SubagentTab::Shell => self.renderShell(contentArea, buf, agentPanel),
+            SubagentTab::Transcript => self.renderTranscript(bodyArea, buf, agentPanel),
+            SubagentTab::Shell => self.renderShell(bodyArea, buf, agentPanel),
         }
 
         if let Some(rect) = permitArea {
@@ -698,10 +749,107 @@ impl SubagentPanel {
         }
     }
 
+    /// Render the parallel-subagent tab strip — one labelled chip per
+    /// live subagent. Highlights the currently selected one and records
+    /// per-chip click rects.
+    fn renderSubagentTabStrip(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        agentPanel: &AgentPanel,
+    ) {
+        use unicode_width::UnicodeWidthStr as UWS;
+
+        // Background fill so cell colors don't bleed.
+        for col in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((col, area.y)) {
+                cell.reset();
+                cell.set_char(' ');
+                cell.set_bg(Color::Rgb(20, 20, 30));
+                cell.set_fg(Color::Gray);
+            }
+        }
+
+        let active = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::Gray).bg(Color::Rgb(20, 20, 30));
+        let pendingPermit = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let mut x = area.x;
+        let mut rects: Vec<(Rect, String)> = Vec::with_capacity(agentPanel.activeSubagents.len());
+        let isSubagentPermit =
+            agentPanel.pendingPermit && agentPanel.pendingPermitIsSubagent();
+        let permitSessionId = if isSubagentPermit {
+            agentPanel.pendingPermitSubagentSessionId()
+        } else {
+            None
+        };
+
+        for (idx, sub) in agentPanel.activeSubagents.iter().enumerate() {
+            let label = format!(" #{} {} ", idx + 1, sub.agentType);
+            let labelW = UWS::width(label.as_str()) as u16;
+            if x + labelW > area.x + area.width {
+                break;
+            }
+
+            let isSelected = agentPanel.selectedSubagent == Some(idx);
+            let hasPermit = permitSessionId
+                .as_deref()
+                .map(|sid| sid == sub.sessionId)
+                .unwrap_or(false);
+            let style = if hasPermit {
+                pendingPermit
+            } else if isSelected {
+                active
+            } else {
+                inactive
+            };
+
+            let chipRect = Rect { x, y: area.y, width: labelW, height: 1 };
+            buf.set_span(x, area.y, &Span::styled(label, style), labelW);
+            rects.push((chipRect, sub.sessionId.clone()));
+            x += labelW;
+
+            // Thin divider between chips (except after last).
+            if idx + 1 < agentPanel.activeSubagents.len() && x < area.x + area.width {
+                buf.set_span(
+                    x,
+                    area.y,
+                    &Span::styled(
+                        "\u{2502}",
+                        Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30)),
+                    ),
+                    1,
+                );
+                x += 1;
+            }
+        }
+
+        // Cycle hint pinned to the right of the strip when there's room.
+        let hint = " [/] cycle ";
+        let hintW = UWS::width(hint) as u16;
+        if x + hintW + 1 < area.x + area.width {
+            let hintX = area.x + area.width - hintW;
+            buf.set_span(
+                hintX,
+                area.y,
+                &Span::styled(hint, Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30))),
+                hintW,
+            );
+        }
+
+        self.subagentTabRects = rects;
+    }
+
     fn renderTranscript(&mut self, area: Rect, buf: &mut Buffer, agentPanel: &mut AgentPanel) {
         // Pull live transcript from activeSubagent each frame; fall back to
         // frozen snapshot otherwise.
-        let entries: Vec<PanelEntry> = match (&self.source, agentPanel.activeSubagent.as_ref()) {
+        let entries: Vec<PanelEntry> = match (&self.source, agentPanel.currentSubagent()) {
             (SubagentSource::Live, Some(sub)) => sub.transcript.clone(),
             (SubagentSource::Frozen { transcript, .. }, _) => transcript.clone(),
             (SubagentSource::Live, None) => Vec::new(),
@@ -766,7 +914,7 @@ impl SubagentPanel {
         // Resolve the shell TerminalState (live or frozen).
         let term: &mut TerminalState = match &mut self.source {
             SubagentSource::Frozen { shellTerm, .. } => shellTerm,
-            SubagentSource::Live => match agentPanel.activeSubagent.as_mut() {
+            SubagentSource::Live => match agentPanel.currentSubagentMut() {
                 Some(sub) => &mut sub.shellTerm,
                 None => {
                     let lines = vec![Line::from(Span::styled(

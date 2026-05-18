@@ -17,6 +17,8 @@ mod command;
 mod export;
 mod fork_picker;
 mod history;
+#[allow(dead_code)]
+mod layout;
 mod markdown;
 mod lsp_panel;
 mod mcp_panel;
@@ -25,7 +27,9 @@ mod rewind_picker;
 mod selection;
 mod session_picker;
 mod subagent_panel;
+mod jobs_panel;
 mod terminal;
+mod terminal_pane;
 mod text_area;
 mod throbber;
 
@@ -504,6 +508,62 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
             "matchedTag": matchedTag,
             "snippet": snippet,
             "recoveredChars": recoveredChars,
+        }),
+        LogEvent::JobSpawned { id, kind, command } => serde_json::json!({
+            "type": "taskSpawned", "id": id, "kind": kind, "command": command,
+        }),
+        LogEvent::JobOutput { id, line } => serde_json::json!({
+            "type": "taskOutput", "id": id, "line": line,
+        }),
+        LogEvent::JobComplete { id, exitCode } => serde_json::json!({
+            "type": "taskComplete", "id": id, "exitCode": exitCode,
+        }),
+        LogEvent::JobStopped { id, reason } => serde_json::json!({
+            "type": "taskStopped", "id": id, "reason": reason,
+        }),
+        LogEvent::MonitorRegistered {
+            id, taskId, description, command, filter,
+        } => serde_json::json!({
+            "type": "monitorRegistered",
+            "id": id, "taskId": taskId,
+            "description": description, "command": command, "filter": filter,
+        }),
+        LogEvent::MonitorEvent { id, line, eventCount } => serde_json::json!({
+            "type": "monitorEvent", "id": id, "line": line, "eventCount": eventCount,
+        }),
+        LogEvent::MonitorAutoStopped { id, reason } => serde_json::json!({
+            "type": "monitorAutoStopped", "id": id, "reason": reason,
+        }),
+        LogEvent::MonitorStopped { id } => serde_json::json!({
+            "type": "monitorStopped", "id": id,
+        }),
+        LogEvent::TerminalSpawned { name, spawnedBy } => serde_json::json!({
+            "type": "terminalSpawned", "name": name,
+            "spawnedBy": format!("{:?}", spawnedBy),
+        }),
+        LogEvent::TerminalClosed { name } => serde_json::json!({
+            "type": "terminalClosed", "name": name,
+        }),
+        LogEvent::TerminalActiveForAgent { name } => serde_json::json!({
+            "type": "terminalActiveForAgent", "name": name,
+        }),
+        LogEvent::TerminalRenamed { from, to } => serde_json::json!({
+            "type": "terminalRenamed", "from": from, "to": to,
+        }),
+        LogEvent::WakeBatchInjected { count, summary } => serde_json::json!({
+            "type": "wakeBatchInjected", "count": count, "summary": summary,
+        }),
+        LogEvent::WakeRegistered { id, kind, summary } => serde_json::json!({
+            "type": "wakeRegistered", "id": id, "kind": kind.asStr(), "summary": summary,
+        }),
+        LogEvent::WakeDisarmed { id } => serde_json::json!({
+            "type": "wakeDisarmed", "id": id,
+        }),
+        LogEvent::AutoBgWarning { command, elapsedSecs, userTriggered } => serde_json::json!({
+            "type": "autoBgWarning",
+            "command": command,
+            "elapsedSecs": elapsedSecs,
+            "userTriggered": userTriggered,
         }),
         LogEvent::Error(msg) => serde_json::json!({
             "type": "error", "message": msg,

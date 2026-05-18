@@ -21,6 +21,20 @@
 use crate::tool::ToolAction;
 use serde::{Deserialize, Serialize};
 
+/// Tools that are considered read-only by [`Permissions::allowReadOnly`].
+/// Each gets an explicit `allow` rule so the model never hits an
+/// approval prompt for inspecting state. Shell is NOT in this set —
+/// the model's `impact: read` self-classification is not trusted.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "readFile", "glob", "grep", "listDir", "structSearch", "diff",
+    "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
+    "shellHistory", "readOutput", "searchOutput", "readTerminal",
+    "terminalList",
+    "jobOutput", "jobList",
+    "monitorList",
+    "webSearch", "webFetch", "webSimilar", "diagnostics",
+];
+
 /// Response from the supervisor (TUI or parent agent) to a permission prompt.
 #[derive(Debug, Clone)]
 pub enum PermitResponse {
@@ -70,8 +84,67 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
         }
         ToolAction::ListDir { path, .. } => pathPatterns(path),
 
-        // Shell: progressively shorter token prefixes.
+        // Shell: progressively shorter token prefixes. Same pattern shape
+        // for foreground and background — `runInBackground` only changes
+        // where the result goes, not what's executed.
         ToolAction::Shell { command, .. } => shellPatterns(command),
+
+        // Read-only / management tools — exact tool name only. No
+        // user-typed pattern can broaden these incorrectly.
+        ToolAction::JobList => vec!["jobList".into()],
+        ToolAction::JobOutput { .. } => vec!["jobOutput".into()],
+        ToolAction::JobStop { .. } => vec!["jobStop".into()],
+        ToolAction::MonitorList => vec!["monitorList".into()],
+        ToolAction::MonitorStop { .. } => vec!["monitorStop".into()],
+
+        // Monitors run arbitrary bash commands — same pattern shape as
+        // shell so users can scope rules to specific watches.
+        ToolAction::Monitor { command, .. } => shellPatterns(command),
+
+        // Wake registry tools. Each creation tool's keyArg is the most
+        // identifying scope: cron spec, delay duration, watched path.
+        ToolAction::ScheduleWakeup { .. } => vec!["scheduleWakeup".into()],
+        ToolAction::CronCreate { spec, .. } => {
+            vec![spec.clone(), "cronCreate".into()]
+        }
+        ToolAction::CronList => vec!["cronList".into()],
+        ToolAction::CronDelete { .. } => vec!["cronDelete".into()],
+        ToolAction::FileWatch { path, .. } => {
+            let mut patterns = pathPatterns(path);
+            patterns.push("fileWatch".into());
+            patterns
+        }
+
+        // Terminal mutators. Suggest the specific terminal name first
+        // (so a click-through is the narrower rule) then the tool-wide
+        // fallback. Without these, the permit prompt would have no
+        // suggestions, hide the custom field by default, and trap the
+        // user in a state where Shift+A says "type one in the custom
+        // field" but no keystrokes are accepted.
+        ToolAction::TerminalSpawn { name } => {
+            let mut patterns = Vec::new();
+            if let Some(n) = name.as_deref().filter(|s| !s.is_empty()) {
+                patterns.push(n.to_string());
+            }
+            patterns.push("terminalSpawn".into());
+            patterns
+        }
+        ToolAction::TerminalSwitch { name } => {
+            let mut patterns = Vec::new();
+            if !name.is_empty() {
+                patterns.push(name.clone());
+            }
+            patterns.push("terminalSwitch".into());
+            patterns
+        }
+        ToolAction::TerminalKill { name } => {
+            let mut patterns = Vec::new();
+            if !name.is_empty() {
+                patterns.push(name.clone());
+            }
+            patterns.push("terminalKill".into());
+            patterns
+        }
 
         // Web: subdomain → domain → any.
         ToolAction::WebFetch { url, .. } | ToolAction::WebSimilar { url, .. } => urlPatterns(url),
@@ -103,6 +176,18 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
     use crate::tool::ShellImpact;
     match action {
         ToolAction::Shell { impact, .. } => impact.clone(),
+        // Wake registry tools schedule autonomous future LLM calls —
+        // conservatively MinorMod so the confirm UI surfaces them
+        // above read-tier (file reads/grep/etc.).
+        ToolAction::ScheduleWakeup { .. }
+        | ToolAction::CronCreate { .. }
+        | ToolAction::CronDelete { .. }
+        | ToolAction::FileWatch { .. } => ShellImpact::MinorMod,
+        // cronList is read-only; let it fall through to the bottom.
+        // Monitors run arbitrary commands too — treat conservatively
+        // as MinorMod even though most are reads (`tail -f` etc).
+        ToolAction::Monitor { .. } => ShellImpact::MinorMod,
+        ToolAction::MonitorStop { .. } => ShellImpact::MinorMod,
         ToolAction::WriteFile { .. }
         | ToolAction::EditFile { .. }
         | ToolAction::MultiEdit { .. }
@@ -112,11 +197,25 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
         ToolAction::DeleteFile { .. } => ShellImpact::Delete,
         ToolAction::Mcp { .. } => ShellImpact::MinorMod,
         ToolAction::Task { .. } => ShellImpact::MinorMod,
+        // jobStop kills a process group — surface as MinorMod so the
+        // confirm UI doesn't downgrade the prompt.
+        ToolAction::JobStop { .. } => ShellImpact::MinorMod,
+        // terminalSpawn allocates a real PTY — session-visible state
+        // change beyond what Read covers. MinorMod tier.
+        ToolAction::TerminalSpawn { .. } => ShellImpact::MinorMod,
+        // terminalSwitch changes the agent's default routing for
+        // subsequent shell calls — also session-visible state. MinorMod.
+        ToolAction::TerminalSwitch { .. } => ShellImpact::MinorMod,
+        // terminalKill destroys a visible PTY and any process tree
+        // running in it — closer to a delete than an edit.
+        ToolAction::TerminalKill { .. } => ShellImpact::Delete,
         _ => ShellImpact::Read,
     }
 }
 
-/// Get the shell explanation from a tool action (only present for shell commands).
+/// Get the user-facing explanation from a tool action. Present for any
+/// tool whose schema requires an `explanation` field — currently just
+/// `shell` (foreground and background share the same shape).
 pub fn toolExplanation(action: &ToolAction) -> Option<&str> {
     match action {
         ToolAction::Shell { explanation, .. } if !explanation.is_empty() => Some(explanation),
@@ -329,15 +428,9 @@ impl Permissions {
 
     /// Create permissions that auto-approve read-only tools.
     pub fn allowReadOnly() -> Self {
-        let readOnlyTools = [
-            "readFile", "glob", "grep", "listDir", "structSearch", "diff",
-            "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
-            "shellHistory", "readOutput", "searchOutput", "readTerminal",
-            "webSearch", "webFetch", "webSimilar", "diagnostics",
-        ];
         Self {
             defaultMode: PermitMode::Ask,
-            rules: readOnlyTools
+            rules: READ_ONLY_TOOLS
                 .iter()
                 .map(|&tool| Rule { tool: tool.into(), pattern: None, allow: true })
                 .collect(),
@@ -380,6 +473,27 @@ impl Permissions {
     }
 }
 
+/// Decide how a user-supplied pattern from the permit prompt should be
+/// stored on a persisted [`Rule`] for the given action. Most tools want
+/// the pattern to remain a substring constraint, but tools whose
+/// [`actionKey`] returns an empty keyArg (e.g. `jobList`, `jobOutput`,
+/// `jobStop`, `terminalList`) need the pattern stripped to `None` —
+/// otherwise the substring matcher in [`Permissions::check`] would never
+/// fire (`"".contains("jobStop")` is false).
+///
+/// The "exact tool match" normalization only fires when the pattern
+/// equals the tool name AND the tool exposes no keyArg, so a user typing
+/// `"shell"` as a custom pattern for the `shell` tool is preserved as a
+/// real substring rule rather than silently widened to allow-all.
+pub fn normalizeRulePattern(action: &ToolAction, pattern: &str) -> Option<String> {
+    let (toolName, keyArg) = actionKey(action);
+    if keyArg.is_empty() && pattern == toolName {
+        None
+    } else {
+        Some(pattern.to_string())
+    }
+}
+
 /// Extract the tool name and key argument from an action.
 pub fn actionKey(action: &ToolAction) -> (&str, &str) {
     match action {
@@ -392,10 +506,25 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::MoveFile { dest, .. } => ("moveFile", dest),
         ToolAction::DeleteFile { path, .. } => ("deleteFile", path),
         ToolAction::MakeDirs { path } => ("makeDirs", path),
-        ToolAction::ShellHistory => ("shellHistory", ""),
+        ToolAction::ShellHistory { .. } => ("shellHistory", ""),
         ToolAction::ReadOutput { .. } => ("readOutput", ""),
         ToolAction::SearchOutput { pattern, .. } => ("searchOutput", pattern),
         ToolAction::ReadTerminal { .. } => ("readTerminal", ""),
+        ToolAction::TerminalSpawn { name } => ("terminalSpawn", name.as_deref().unwrap_or("")),
+        ToolAction::TerminalSwitch { name } => ("terminalSwitch", name),
+        ToolAction::TerminalKill { name } => ("terminalKill", name),
+        ToolAction::TerminalList => ("terminalList", ""),
+        ToolAction::JobOutput { .. } => ("jobOutput", ""),
+        ToolAction::JobStop { .. } => ("jobStop", ""),
+        ToolAction::Monitor { command, .. } => ("monitor", command),
+        ToolAction::MonitorStop { .. } => ("monitorStop", ""),
+        ToolAction::MonitorList => ("monitorList", ""),
+        ToolAction::JobList => ("jobList", ""),
+        ToolAction::ScheduleWakeup { .. } => ("scheduleWakeup", ""),
+        ToolAction::CronCreate { spec, .. } => ("cronCreate", spec),
+        ToolAction::CronList => ("cronList", ""),
+        ToolAction::CronDelete { .. } => ("cronDelete", ""),
+        ToolAction::FileWatch { path, .. } => ("fileWatch", path),
         ToolAction::Glob { pattern, .. } => ("glob", pattern),
         ToolAction::Grep { pattern, .. } => ("grep", pattern),
         ToolAction::ListDir { path, .. } => ("listDir", path),
@@ -522,5 +651,200 @@ mod tests {
             args: "{}".into(),
         };
         assert_eq!(perms.check(&action), Verdict::Deny);
+    }
+
+    #[test]
+    fn shellAlwaysNeedsApprovalUnderReadOnly() {
+        use crate::tool::ShellImpact;
+        // Even a model-classified "read" shell command must request
+        // approval. The model's self-classification is not trusted.
+        let perms = Permissions::allowReadOnly();
+        let action = ToolAction::Shell {
+            command: "cat foo.txt".into(),
+            explanation: "read a file".into(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: false,
+        };
+        assert_eq!(perms.check(&action), Verdict::NeedsApproval);
+    }
+
+    #[test]
+    fn terminalListAutoApprovedUnderReadOnly() {
+        // Inventory is harmless — terminalList should be auto-approved.
+        let perms = Permissions::allowReadOnly();
+        assert_eq!(
+            perms.check(&ToolAction::TerminalList),
+            Verdict::Allow,
+        );
+    }
+
+    #[test]
+    fn normalizeStripsPatternForEmptyKeyArgTools() {
+        // jobStop has empty keyArg — a Some(pattern) rule would never
+        // fire, so the helper must strip the pattern.
+        let action = ToolAction::JobStop { jobId: 1 };
+        assert_eq!(normalizeRulePattern(&action, "jobStop"), None);
+    }
+
+    #[test]
+    fn normalizePreservesPatternForShellEvenWhenItEqualsToolName() {
+        use crate::tool::ShellImpact;
+        // The danger case: a user types "shell" as a custom pattern for
+        // the shell tool. That's a legitimate substring constraint —
+        // never widen it to allow-all.
+        let action = ToolAction::Shell {
+            command: "shell --help".into(),
+            explanation: "test".into(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: false,
+        };
+        assert_eq!(
+            normalizeRulePattern(&action, "shell"),
+            Some("shell".into()),
+        );
+
+        // A normal substring also stays as-is.
+        assert_eq!(
+            normalizeRulePattern(&action, "git status"),
+            Some("git status".into()),
+        );
+    }
+
+    #[test]
+    fn normalizePreservesPatternForBackgroundShellEvenWhenItEqualsToolName() {
+        use crate::tool::ShellImpact;
+        // Background shell calls share the keyArg shape with foreground
+        // shell — any user-typed pattern is a real substring constraint.
+        let action = ToolAction::Shell {
+            command: "shell".into(),
+            explanation: "test".into(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: true,
+        };
+        assert_eq!(
+            normalizeRulePattern(&action, "shell"),
+            Some("shell".into()),
+        );
+    }
+
+    #[test]
+    fn terminalMutatorsHaveSuggestedPatterns() {
+        // Without these suggestions the permit prompt would hang the
+        // user in a dead state where Shift+A points at the custom field
+        // but the keystroke pipeline doesn't accept input. Each mutator
+        // gets both the specific-name pattern and a tool-wide fallback.
+        let kill = suggestPatterns(&ToolAction::TerminalKill {
+            name: "build".into(),
+        });
+        assert_eq!(kill, vec!["build", "terminalKill"]);
+
+        let switch = suggestPatterns(&ToolAction::TerminalSwitch {
+            name: "logs".into(),
+        });
+        assert_eq!(switch, vec!["logs", "terminalSwitch"]);
+
+        let spawnNamed = suggestPatterns(&ToolAction::TerminalSpawn {
+            name: Some("worker".into()),
+        });
+        assert_eq!(spawnNamed, vec!["worker", "terminalSpawn"]);
+
+        // Spawn with no name has no specific suggestion — just tool-wide.
+        let spawnAuto = suggestPatterns(&ToolAction::TerminalSpawn { name: None });
+        assert_eq!(spawnAuto, vec!["terminalSpawn"]);
+    }
+
+    #[test]
+    fn terminalMutatorsImpactAboveRead() {
+        use crate::tool::ShellImpact;
+        // Read-tier in the confirm UI implies "harmless." None of these
+        // are harmless: spawn/switch mutate routing state, kill destroys
+        // a PTY and any work in it.
+        assert!(matches!(
+            toolImpact(&ToolAction::TerminalSpawn { name: None }),
+            ShellImpact::MinorMod,
+        ));
+        assert!(matches!(
+            toolImpact(&ToolAction::TerminalSwitch { name: "main".into() }),
+            ShellImpact::MinorMod,
+        ));
+        assert!(matches!(
+            toolImpact(&ToolAction::TerminalKill { name: "build".into() }),
+            ShellImpact::Delete,
+        ));
+        // Inventory is genuinely read-only.
+        assert!(matches!(
+            toolImpact(&ToolAction::TerminalList),
+            ShellImpact::Read,
+        ));
+    }
+
+    #[test]
+    fn backgroundShellExplanationForwarded() {
+        use crate::tool::ShellImpact;
+        // The agent supplies an `explanation` on every shell call,
+        // foreground or background — the approval UI must surface it
+        // identically in both cases.
+        let action = ToolAction::Shell {
+            command: "cargo build --release".into(),
+            explanation: "build the release binary".into(),
+            impact: ShellImpact::MinorMod,
+            timeout: None,
+            terminal: None,
+            runInBackground: true,
+        };
+        assert_eq!(
+            toolExplanation(&action),
+            Some("build the release binary"),
+        );
+        // Empty explanation still reports None so the UI doesn't render
+        // an empty section.
+        let empty = ToolAction::Shell {
+            command: "ls".into(),
+            explanation: String::new(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: true,
+        };
+        assert_eq!(toolExplanation(&empty), None);
+    }
+
+    #[test]
+    fn toolWideRuleMatchesEmptyKeyArgTools() {
+        // `jobStop` / `jobOutput` / `jobList` have an empty keyArg, so
+        // a rule with `pattern: Some("jobStop")` would never fire
+        // (`"".contains("jobStop")` is false). Tool-wide rules
+        // (pattern: None) must work for these.
+        let mut perms = Permissions::askForEverything();
+        perms.addRule(Rule {
+            tool: "jobStop".into(),
+            pattern: None,
+            allow: true,
+        });
+        assert_eq!(
+            perms.check(&ToolAction::JobStop { jobId: 1 }),
+            Verdict::Allow,
+        );
+
+        // Sanity: a pattern: Some("jobStop") rule must NOT match the
+        // same action — that's the bug we normalized at the construction
+        // site. This test guarantees future refactors don't regress the
+        // matcher into pretending the substring match works.
+        let mut bad = Permissions::askForEverything();
+        bad.addRule(Rule {
+            tool: "jobStop".into(),
+            pattern: Some("jobStop".into()),
+            allow: true,
+        });
+        assert_eq!(
+            bad.check(&ToolAction::JobStop { jobId: 1 }),
+            Verdict::NeedsApproval,
+        );
     }
 }

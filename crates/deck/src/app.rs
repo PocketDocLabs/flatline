@@ -18,7 +18,7 @@ use crossterm::{
 use ratatui::{
     Terminal as RatatuiTerminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
@@ -29,7 +29,8 @@ use construct::control::{LogEvent, SessionRequest, TuiRequest};
 use construct::permissions::Permissions;
 use construct::prompt::{DomainModule, InterfaceMode};
 use construct::session::Session;
-use construct::shell::{ShellIo, spawnShell};
+use construct::shell::ShellIo;
+use construct::shells::{ShellRegistry, SpawnedBy};
 
 use crate::agent_panel::AgentPanel;
 use crate::fork_picker::{ForkAction, ForkPicker};
@@ -38,7 +39,8 @@ use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
 use crate::rewind_picker::{RewindAction, RewindPicker};
 use crate::selection::{self, PanelId, SelectionState};
 use crate::session_picker::{PickerAction, SessionPicker};
-use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
+use crate::terminal::TerminalState;
+use crate::terminal_pane::TerminalPane;
 
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
@@ -58,6 +60,16 @@ enum Focus {
     Agent,
 }
 
+/// Status-bar items that can be highlighted + activated. Cache is left
+/// out — no overlay to open. Cost/Context fire the same requests as the
+/// `/cost` and `/context` slash commands.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum StatusChipKind {
+    Jobs,
+    Cost,
+    Context,
+}
+
 /// Internal deck-update messages. Produced by tasks that await oneshot replies
 /// to `TuiRequest`s; drained by `runLoop` alongside `LogEvent`s so slash
 /// commands don't block the TUI while the session task is mid-turn.
@@ -74,6 +86,96 @@ enum DeckUpdate {
     CommandAck(construct::control::CommandAck),
     /// Resume completed — picker should close on ok, show error on failure.
     ResumeResult(construct::control::CommandAck),
+    /// Background-job snapshot for the `/jobs` panel.
+    TasksList(Vec<construct::jobs::JobInfo>),
+    /// Wake-source snapshot for the `/jobs` panel schedules section.
+    WakesList(Vec<construct::wakes::WakeSourceInfo>),
+    /// Initial output snapshot for the inspect popup — opens the popup.
+    TaskOutputOpen {
+        id: construct::jobs::JobId,
+        snap: construct::jobs::JobOutputSnapshot,
+    },
+    /// Periodic refresh while the inspect popup is open. `snap` is None
+    /// when the task vanished (e.g. /clear rebuilt the JobPlane); the
+    /// app uses that signal to clear the in-flight refresh flag without
+    /// applying a snapshot. `sinceLine` is the request parameter the
+    /// fetch was issued with — the inspector compares it against its
+    /// current `requestedSinceLine` and ignores snapshots whose
+    /// pagination window no longer matches (avoids the race where a
+    /// pre-paginate tail fetch arrives after the user has paged back).
+    TaskOutputRefresh {
+        id: construct::jobs::JobId,
+        sinceLine: Option<u64>,
+        snap: Option<construct::jobs::JobOutputSnapshot>,
+    },
+}
+
+/// Send a `ListJobs` request to the session and forward the reply
+/// through `deckUpdateTx` as a `TasksList` deck update. Only fires when
+/// the panel is currently open — no point repopulating if there's no
+/// rendering target. Used by `TaskSpawned/Complete/Stopped` handlers to
+/// keep the panel fresh without per-event diffing.
+fn refreshTasksPanel(
+    tasksPanel: &Option<crate::jobs_panel::JobsPanel>,
+    requestTx: &mpsc::Sender<TuiRequest>,
+    deckUpdateTx: &mpsc::Sender<DeckUpdate>,
+) {
+    let Some(panel) = tasksPanel else { return };
+
+    let listRequestTx = requestTx.clone();
+    let listDeckTx = deckUpdateTx.clone();
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let _ = listRequestTx.send(TuiRequest::ListJobs { reply: rTx }).await;
+        if let Ok(list) = rRx.await {
+            let _ = listDeckTx.send(DeckUpdate::TasksList(list)).await;
+        }
+    });
+    // Same shape for the schedules section (delay/cron/file-watch).
+    let wakesRequestTx = requestTx.clone();
+    let wakesDeckTx = deckUpdateTx.clone();
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let _ = wakesRequestTx.send(TuiRequest::ListWakes { reply: rTx }).await;
+        if let Ok(list) = rRx.await {
+            let _ = wakesDeckTx.send(DeckUpdate::WakesList(list)).await;
+        }
+    });
+
+    // Also refresh inspector output if the popup is open. If the user
+    // paged backward, their pinned `sinceLine` is honored; otherwise the
+    // default tail fetch flows.
+    if let Some(id) = panel.inspectorTaskId() {
+        let sinceLine = panel.inspectorSinceLine();
+        spawnInspectorFetch(requestTx.clone(), deckUpdateTx.clone(), id, sinceLine);
+    }
+}
+
+fn spawnInspectorFetch(
+    requestTx: mpsc::Sender<TuiRequest>,
+    deckUpdateTx: mpsc::Sender<DeckUpdate>,
+    id: construct::jobs::JobId,
+    sinceLine: Option<u64>,
+) {
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let _ = requestTx
+            .send(TuiRequest::GetTaskOutput {
+                id,
+                sinceLine,
+                reply: rTx,
+            })
+            .await;
+        // ALWAYS emit a refresh — even when the task is gone (snap=None)
+        // — so the runLoop's `inspectorInFlight` flag can clear and the
+        // coalescing logic doesn't get stuck suppressing future fetches.
+        // Echo `sinceLine` so the inspector can ignore snapshots whose
+        // pagination window has been superseded by a newer page key.
+        let snap = rRx.await.ok().flatten();
+        let _ = deckUpdateTx
+            .send(DeckUpdate::TaskOutputRefresh { id, sinceLine, snap })
+            .await;
+    });
 }
 
 /// Axis lock for trackpad scroll — prevents diagonal scrolling.
@@ -246,12 +348,19 @@ pub async fn run() -> Result<()> {
         // Terminal gets ~60% width minus borders, full height minus status bar and borders.
         let termCols = (size.width * 3 / 5).saturating_sub(2);
         let termRows = size.height.saturating_sub(3);
-        let (shell, shellIo) = spawnShell(termCols, termRows)?;
-        let termState = TerminalState::new(termCols, termRows);
-        Ok((terminal, shell, shellIo, termState, termCols, termRows))
+        // Channel for the registry to deliver newly-spawned ShellIos to deck.
+        // Tuple carries (name, io, spawnedBy) so the deck can auto-switch
+        // to user-initiated tabs without coordinating with LogEvent ordering.
+        let (shellIoTx, shellIoRx) =
+            mpsc::channel::<(String, ShellIo, SpawnedBy)>(8);
+        let (shells, mainIo) =
+            ShellRegistry::newWithMain(termCols, termRows, shellIoTx)?;
+        let shells = std::sync::Arc::new(tokio::sync::Mutex::new(shells));
+        let termPane = TerminalPane::newWithMain(mainIo, termCols, termRows);
+        Ok((terminal, shells, shellIoRx, termPane, termCols, termRows))
     })();
 
-    let (mut terminal, shell, mut shellIo, mut termState, _termCols, _termRows) = match setupResult
+    let (mut terminal, shells, mut shellIoRx, mut termPane, _termCols, _termRows) = match setupResult
     {
         Ok(v) => v,
         Err(e) => {
@@ -293,11 +402,13 @@ pub async fn run() -> Result<()> {
     let (requestTx, mut requestRx) = mpsc::channel::<TuiRequest>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
     let (steerTx, steerRx) = mpsc::channel::<construct::session::UserInput>(16);
+    let (userBgTx, userBgRx) = mpsc::channel::<()>(4);
     let (deckUpdateTx, mut deckUpdateRx) = mpsc::channel::<DeckUpdate>(32);
 
     // Spawn the agent session task.
     let mut cancelRx = cancelRx;
     let mut steerRx = steerRx;
+    let mut userBgRx = userBgRx;
     tokio::spawn(async move {
         let config = match construct::config::load() {
             Ok(c) => c,
@@ -316,7 +427,7 @@ pub async fn run() -> Result<()> {
         let mut session = match Session::new(
             &config,
             permissions,
-            shell,
+            shells,
             InterfaceMode::SharedTerminal,
             &[DomainModule::Swe],
         ) {
@@ -338,14 +449,186 @@ pub async fn run() -> Result<()> {
             _ => {}
         }
 
+        // Take the wake-batch receiver. The session's batcher coalesces
+        // wake fires into `WakeBatch` values; we select on this alongside
+        // userInputRx so a batch only injects when the session is idle
+        // — wakes that arrive mid-turn queue in the receiver and fire
+        // immediately after the current turn completes. Slot-replaced
+        // on /clear and /resume from the new session.
+        let mut wakeBatchRx = session.takeWakeBatchRx();
+
+        // Split the inbound TuiRequest stream so jobs-panel queries can run
+        // concurrently with `session.send`. Without this, a JobPlane
+        // request stays in the channel until the agent's turn ends,
+        // which defeats the whole point of the control panel (inspect/kill
+        // the task that's running RIGHT NOW).
+        //
+        // The slot pattern (`RwLock<Arc<Mutex<JobPlane>>>`) lets us
+        // hot-swap the inner plane on /clear and /resume: the session
+        // actor writes a new Arc when it rebuilds `session`, the
+        // handler reads the current Arc on every request, and the old
+        // plane drops as soon as nothing references it (which kills its
+        // running tasks via `JobPlane::Drop`).
+        let jobPlaneSlot: std::sync::Arc<
+            std::sync::RwLock<std::sync::Arc<std::sync::Mutex<construct::jobs::JobPlane>>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(session.jobPlaneHandle()));
+        // Same hot-swap pattern for the wake registry — it lives on the
+        // session and gets a fresh instance on /clear and /resume.
+        let wakeRegistrySlot: std::sync::Arc<
+            std::sync::RwLock<std::sync::Arc<tokio::sync::Mutex<construct::wakes::WakeRegistry>>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(session.wakeRegistryHandle()));
+        // Shell registry handle stays valid across /clear and /resume
+        // because `intoShells()` returns the same Arc that gets passed
+        // to the new Session — no slot swap needed.
+        let shellsArc = session.shellsHandle();
+        let (taskPlaneReqTx, mut taskPlaneReqRx) = mpsc::channel::<TuiRequest>(16);
+        let (terminalReqTx, mut terminalReqRx) = mpsc::channel::<TuiRequest>(16);
+        let (otherReqTx, mut otherReqRx) = mpsc::channel::<TuiRequest>(16);
+        tokio::spawn(async move {
+            while let Some(req) = requestRx.recv().await {
+                match &req {
+                    TuiRequest::ListJobs { .. }
+                    | TuiRequest::ListWakes { .. }
+                    | TuiRequest::KillTask { .. }
+                    | TuiRequest::GetTaskOutput { .. } => {
+                        let _ = taskPlaneReqTx.send(req).await;
+                    }
+                    TuiRequest::SpawnTerminal { .. }
+                    | TuiRequest::KillTerminal { .. }
+                    | TuiRequest::ListTerminals { .. } => {
+                        let _ = terminalReqTx.send(req).await;
+                    }
+                    _ => {
+                        let _ = otherReqTx.send(req).await;
+                    }
+                }
+            }
+        });
+        let shellsHandler = shellsArc.clone();
+        let handlerLogTx = logTx.clone();
+        tokio::spawn(async move {
+            use construct::shells::SpawnedBy;
+            while let Some(req) = terminalReqRx.recv().await {
+                match req {
+                    TuiRequest::SpawnTerminal { name, reply } => {
+                        let result = {
+                            let mut guard = shellsHandler.lock().await;
+                            guard.spawn(name, SpawnedBy::User).await
+                        };
+                        match result {
+                            Ok(resolved) => {
+                                let _ = handlerLogTx
+                                    .send(LogEvent::TerminalSpawned {
+                                        name: resolved.clone(),
+                                        spawnedBy: SpawnedBy::User.into(),
+                                    })
+                                    .await;
+                                let _ = reply.send(Ok(resolved));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e.to_string()));
+                            }
+                        }
+                    }
+                    TuiRequest::KillTerminal { name, reply } => {
+                        let result = {
+                            let mut guard = shellsHandler.lock().await;
+                            guard.kill(&name)
+                        };
+                        let ack = match result {
+                            Ok(()) => {
+                                let _ = handlerLogTx
+                                    .send(LogEvent::TerminalClosed { name: name.clone() })
+                                    .await;
+                                construct::control::CommandAck::ok(format!(
+                                    "Killed terminal '{name}'."
+                                ))
+                            }
+                            Err(e) => construct::control::CommandAck::err(e.to_string()),
+                        };
+                        let _ = reply.send(ack);
+                    }
+                    TuiRequest::ListTerminals { reply } => {
+                        let list = shellsHandler.lock().await.list();
+                        let _ = reply.send(list);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let handlerSlot = jobPlaneSlot.clone();
+        let wakeSlotForHandler = wakeRegistrySlot.clone();
+        tokio::spawn(async move {
+            while let Some(req) = taskPlaneReqRx.recv().await {
+                // Read the slot fresh per request so /clear and /resume
+                // hot-swaps take effect immediately.
+                let plane = handlerSlot.read().unwrap().clone();
+                match req {
+                    TuiRequest::ListJobs { reply } => {
+                        let list = plane.lock().unwrap().list();
+                        let _ = reply.send(list);
+                    }
+                    TuiRequest::ListWakes { reply } => {
+                        let reg = wakeSlotForHandler.read().unwrap().clone();
+                        let list = reg.lock().await.list();
+                        let _ = reply.send(list);
+                    }
+                    TuiRequest::KillTask { id, reply } => {
+                        let result = plane.lock().unwrap().stop(id);
+                        let ack = match result {
+                            Ok(()) => construct::control::CommandAck::ok(format!(
+                                "Killing task #{id}."
+                            )),
+                            Err(e) => construct::control::CommandAck::err(e.to_string()),
+                        };
+                        let _ = reply.send(ack);
+                    }
+                    TuiRequest::GetTaskOutput { id, sinceLine, reply } => {
+                        let snap = plane.lock().unwrap().output(id, sinceLine, 500).ok();
+                        let _ = reply.send(snap);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         loop {
+            // Helper future: yields the next wake batch if the receiver
+            // is present, otherwise blocks forever so the select arm
+            // becomes a no-op. Wakes that arrive while a turn is
+            // running stay in the receiver until this select wins
+            // again — no racing spawns, no out-of-order delivery.
+            let nextWakeBatch = async {
+                match &mut wakeBatchRx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
+                batch = nextWakeBatch => {
+                    if let Some(batch) = batch {
+                        cancelRx.borrow_and_update();
+                        if let Err(e) = session.injectWakeBatch(
+                            batch,
+                            &logTx,
+                            &sessionRequestTx,
+                            &mut cancelRx,
+                            &mut steerRx,
+                            &mut userBgRx,
+                        ).await {
+                            let _ = logTx
+                                .send(LogEvent::Error(format!("Wake injection error: {e}")))
+                                .await;
+                        }
+                    }
+                }
                 msg = userInputRx.recv() => {
                     match msg {
                         Some(msg) => {
                             // Clear any stale cancel notification from a previous turn.
                             cancelRx.borrow_and_update();
-                            if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx).await {
+                            if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx).await {
                                 let _ = logTx
                                     .send(LogEvent::Error(format!("Agent error: {e}")))
                                     .await;
@@ -354,21 +637,41 @@ pub async fn run() -> Result<()> {
                         None => break,
                     }
                 }
-                req = requestRx.recv() => {
+                req = otherReqRx.recv() => {
                     match req {
                         Some(TuiRequest::ResumeSession { sessionId: id, reply }) => {
+                            // Disarm the OLD wake registry's schedulers BEFORE awaiting
+                            // resume — otherwise a pending delay/cron/file-watch can
+                            // fire during the await window and enqueue a synthetic
+                            // wake that hits the new session.
+                            {
+                                let oldWakes = wakeRegistrySlot.read().unwrap().clone();
+                                oldWakes.lock().await.disarmAll();
+                            }
                             // Consume old session, keep the shell.
-                            let shell = session.intoShell();
+                            let shells = session.intoShells();
                             match Session::resume(
                                 &config,
                                 mainAgentPermissions(&config),
-                                shell,
+                                shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
                                 &id,
                             ).await {
                                 Ok(s) => {
                                     session = s;
+                                    // Point the task-plane handler at the new session's
+                                    // plane so /tasks reflects the resumed state. The
+                                    // old Arc drops with the previous Session, which
+                                    // kills any tasks it was hosting via JobPlane::Drop.
+                                    *jobPlaneSlot.write().unwrap() =
+                                        session.jobPlaneHandle();
+                                    *wakeRegistrySlot.write().unwrap() =
+                                        session.wakeRegistryHandle();
+                                    // Replace the wake-batch receiver — the old one
+                                    // belonged to the old session's batcher, which has
+                                    // been cancelled by disarmAll above.
+                                    wakeBatchRx = session.takeWakeBatchRx();
                                     // Re-init MCP for the resumed session.
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
@@ -418,7 +721,14 @@ pub async fn run() -> Result<()> {
                                                 Err(e) => tracing::warn!("failed to load MCP config: {e}"),
                                                 _ => {}
                                             }
+                                            // (Old wakes already disarmed above before
+                                            // the resume attempt — no race here.)
                                             session = s;
+                                            *jobPlaneSlot.write().unwrap() =
+                                                session.jobPlaneHandle();
+                                            *wakeRegistrySlot.write().unwrap() =
+                                                session.wakeRegistryHandle();
+                                            wakeBatchRx = session.takeWakeBatchRx();
                                         }
                                         Err(e2) => {
                                             let _ = logTx
@@ -433,16 +743,31 @@ pub async fn run() -> Result<()> {
                             }
                         }
                         Some(TuiRequest::Clear { reply }) => {
-                            let shell = session.intoShell();
+                            // Disarm the OLD wake registry BEFORE constructing the
+                            // replacement session so a pending delay/cron/file-watch
+                            // can't fire during the construction window.
+                            {
+                                let oldWakes = wakeRegistrySlot.read().unwrap().clone();
+                                oldWakes.lock().await.disarmAll();
+                            }
+                            let shells = session.intoShells();
                             match Session::new(
                                 &config,
                                 mainAgentPermissions(&config),
-                                shell,
+                                shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
                             ) {
                                 Ok(s) => {
                                     session = s;
+                                    // Hot-swap the task-plane handler's view of the
+                                    // current plane. Dropping the old Arc cancels any
+                                    // tasks the cleared session was hosting.
+                                    *jobPlaneSlot.write().unwrap() =
+                                        session.jobPlaneHandle();
+                                    *wakeRegistrySlot.write().unwrap() =
+                                        session.wakeRegistryHandle();
+                                    wakeBatchRx = session.takeWakeBatchRx();
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
                                             session.initMcp(servers).await;
@@ -553,7 +878,7 @@ pub async fn run() -> Result<()> {
                         Some(TuiRequest::RetryLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
                             match session.retryLastTurn(
-                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx,
+                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
                             ).await {
                                 Ok(()) => {
                                     let _ = reply.send(construct::control::CommandAck::ok(""));
@@ -571,7 +896,7 @@ pub async fn run() -> Result<()> {
                         Some(TuiRequest::ContinueLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
                             match session.continueLastTurn(
-                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx,
+                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
                             ).await {
                                 Ok(()) => {
                                     let _ = reply.send(construct::control::CommandAck::ok(""));
@@ -586,6 +911,32 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                         }
+                        // Terminal-management requests are routed to the
+                        // dedicated handler above so they don't block on
+                        // `session.send`. Listed here exhaustively so a
+                        // future router change doesn't silently drop
+                        // them.
+                        Some(TuiRequest::SpawnTerminal { .. })
+                        | Some(TuiRequest::KillTerminal { .. })
+                        | Some(TuiRequest::ListTerminals { .. }) => {
+                            tracing::warn!(
+                                "terminal-mgmt request slipped past the router; ignoring",
+                            );
+                        }
+                        // ListJobs / KillTask / GetTaskOutput are routed
+                        // to the dedicated task-plane handler spawned
+                        // above. They are filtered out at the router, so
+                        // they should never reach this loop. Match them
+                        // exhaustively to keep the compiler happy in
+                        // case the router is later changed.
+                        Some(TuiRequest::ListJobs { .. })
+                        | Some(TuiRequest::ListWakes { .. })
+                        | Some(TuiRequest::KillTask { .. })
+                        | Some(TuiRequest::GetTaskOutput { .. }) => {
+                            tracing::warn!(
+                                "task-plane request slipped past the router; ignoring",
+                            );
+                        }
                         None => break,
                     }
                 }
@@ -595,8 +946,8 @@ pub async fn run() -> Result<()> {
 
     let result = runLoop(
         &mut terminal,
-        &mut shellIo,
-        &mut termState,
+        &mut termPane,
+        &mut shellIoRx,
         &mut agentPanel,
         &mut focus,
         &mut selState,
@@ -609,6 +960,7 @@ pub async fn run() -> Result<()> {
         &deckUpdateTx,
         &cancelTx,
         &steerTx,
+        &userBgTx,
         contextWindow,
         rollingBaseline,
         cachingEnabled,
@@ -637,8 +989,8 @@ pub async fn run() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn runLoop(
     terminal: &mut RatatuiTerminal<CrosstermBackend<io::Stdout>>,
-    shellIo: &mut ShellIo,
-    termState: &mut TerminalState,
+    termPane: &mut TerminalPane,
+    shellIoRx: &mut mpsc::Receiver<(String, ShellIo, SpawnedBy)>,
     agentPanel: &mut AgentPanel,
     focus: &mut Focus,
     selState: &mut SelectionState,
@@ -651,6 +1003,7 @@ async fn runLoop(
     deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
+    userBgTx: &mpsc::Sender<()>,
     contextWindow: usize,
     rollingBaseline: f64,
     cachingEnabled: bool,
@@ -669,6 +1022,39 @@ async fn runLoop(
     let mut lspPanel: Option<LspPanel> = None;
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
+    let mut tasksPanel: Option<crate::jobs_panel::JobsPanel> = None;
+    let mut layoutPanel: Option<crate::layout::control_panel::ControlPanel> = None;
+    // Status-bar chips: each frame the draw closure refills this with the
+    // chips it rendered and their on-screen x range, so mouse + keyboard
+    // handlers between frames can hit-test / navigate them.
+    let mut statusChipsLayout: Vec<(StatusChipKind, u16, u16, u16)> = Vec::new();
+    let mut statusFocus: Option<usize> = None;
+    // Deck-side mirror of running-task count, kept up-to-date from
+    // TaskSpawned / TaskComplete / TaskStopped log events. Drives the
+    // status-strip running-task indicator. Per-task detail is fetched
+    // on demand via TuiRequest::ListJobs when the panel opens.
+    let mut taskRunningCount: usize = 0;
+    // Completed/stopped task ids the user hasn't yet acknowledged by
+    // opening /tasks. Keeps the status chip visible after a short-lived
+    // task finishes so a user away from the screen still sees there was
+    // activity. Cleared on panel open.
+    let mut unreadCompletedTaskIds: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    // Active monitors mirror: incremented on MonitorRegistered, decremented
+    // on MonitorStopped or MonitorAutoStopped.
+    let mut monitorActiveCount: usize = 0;
+    // Armed wake-source count: WakeRegistered minus WakeDisarmed. Note:
+    // monitor and bg-task registrations each emit a WakeRegistered too,
+    // so this counts ALL active wake sources, not just user-armed
+    // delays/crons/fileWatches.
+    let mut wakeSourceCount: usize = 0;
+    // Inspector refresh coalescing — without this, a task emitting many
+    // lines per second would spawn one full GetTaskOutput fetch per line.
+    // We keep at most one fetch in flight at a time; if `TaskOutput`
+    // arrives while one is mid-flight we just mark the inspector dirty
+    // and refire on completion.
+    let mut inspectorInFlight: bool = false;
+    let mut inspectorDirty: bool = false;
     // Stash for the oneshot reply to the currently-open permit prompt (either
     // top-level or subagent). Set when we receive a `SessionRequest::Permit`
     // and show the prompt; consumed when the user responds.
@@ -677,6 +1063,33 @@ async fn runLoop(
     let projectDir = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+
+    // Slice 6c: discover the persisted layout. The discovered tree is
+    // the session-scope template (ratio/orient/structure); per-frame
+    // we sync the terminal list into it from termPane. On parse error
+    // we fall back to defaults and push a one-line notice so the user
+    // knows the file was ignored without a scary modal.
+    let (mut sessionLayout, mut sessionLayoutPath) = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match crate::layout::discovery::discoverLayout(&cwd) {
+            Some(disc) => match disc.result {
+                Ok(layout) => (layout, Some(disc.path)),
+                Err(msg) => {
+                    agentPanel.pushNotice(&format!(
+                        "\u{26A0}\u{FE0E} layout file {} ignored: {msg}",
+                        disc.path.display(),
+                    ));
+                    (crate::layout::Layout::defaultPhase1(), Some(disc.path))
+                }
+            },
+            None => (crate::layout::Layout::defaultPhase1(), None),
+        }
+    };
+    // Name of the currently-applied layout preset (None when the
+    // discovered layout doesn't match a built-in preset). The Ctrl+O
+    // panel and /layout slash command both read this.
+    let mut activePresetName: Option<String> =
+        crate::layout::control_panel::matchPresetName(&sessionLayout);
     let mut needsRedraw = true;
     let mut lastQuitPress: Option<Instant> = None;
     // Title state: the current topic and the animated spinner that fronts it
@@ -697,9 +1110,8 @@ async fn runLoop(
     let mut lastDraw = Instant::now() - DRAW_MIN_INTERVAL;
 
     loop {
-        // Mark the frame dirty when the VT emulator has new content. Ratatui's
-        // buffer diff handles the update — no full clear needed.
-        if termState.takeDirty() {
+        // Mark the frame dirty when the active VT emulator has new content.
+        if termPane.activeStateMut().takeDirty() {
             needsRedraw = true;
         }
 
@@ -715,11 +1127,30 @@ async fn runLoop(
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(area);
 
-                // Horizontal split: terminal | agent panel.
-                let hChunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(vChunks[0]);
+                // Phase 6b/c: render geometry comes from the layout
+                // tree. The session-scope `sessionLayout` is loaded
+                // from disk at startup (or default); each frame we
+                // clone it and reconcile terminal names from termPane
+                // before computing rects. Terminal list is reconciled
+                // here — not persisted — because terminals are
+                // session-runtime, not config.
+                let mut layoutTree = sessionLayout.clone();
+                for name in termPane.names() {
+                    layoutTree.addTerminal(name); // idempotent
+                }
+                layoutTree.setActiveTerminal(termPane.active());
+                let layoutAreas = layoutTree.computeAreas(vChunks[0]);
+                let termRect = layoutAreas
+                    .iter()
+                    .find(|a| matches!(a.window, crate::layout::WindowId::Terminal(_)))
+                    .map(|a| a.rect)
+                    .unwrap_or(vChunks[0]);
+                let agentRect = layoutAreas
+                    .iter()
+                    .find(|a| a.window == crate::layout::WindowId::AgentPanel)
+                    .map(|a| a.rect)
+                    .unwrap_or(vChunks[0]);
+                let hChunks = [termRect, agentRect];
 
                 // Terminal.
                 let termBorder = if *focus == Focus::Terminal {
@@ -727,8 +1158,9 @@ async fn runLoop(
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
-                let termTitle = if termState.displayOffset() > 0 {
-                    format!(" terminal [\u{2191}{}\u{FE0E}] ", termState.displayOffset())
+                let displayOffset = termPane.activeStateRef().displayOffset();
+                let termTitle = if displayOffset > 0 {
+                    format!(" terminal [\u{2191}{}\u{FE0E}] ", displayOffset)
                 } else {
                     " terminal ".to_string()
                 };
@@ -736,22 +1168,24 @@ async fn runLoop(
                     .borders(Borders::ALL)
                     .border_style(termBorder)
                     .title(termTitle);
-                let termInner = termBlock.inner(hChunks[0]);
+                let outerTermArea = hChunks[0];
+                let termBlockInner = termBlock.inner(outerTermArea);
 
-                // Sync terminal grid size with render area — a mismatch causes
-                // content to overflow or underflow the panel borders.
-                let gridCols = termState.columns();
-                if gridCols != termInner.width as usize
-                    || termState.screenLines() != termInner.height as usize
-                {
-                    termState.resize(termInner.width, termInner.height);
-                    let _ = shellIo
-                        .resizeTx
-                        .try_send((termInner.width, termInner.height));
+                // Tab strip occupies the first row of the inner area.
+                let (tabBarRect, termInner) = if termBlockInner.height > 1 {
+                    (
+                        Rect { x: termBlockInner.x, y: termBlockInner.y, width: termBlockInner.width, height: 1 },
+                        Rect { x: termBlockInner.x, y: termBlockInner.y + 1, width: termBlockInner.width, height: termBlockInner.height - 1 },
+                    )
+                } else {
+                    (Rect::default(), termBlockInner)
+                };
+
+                frame.render_widget(termBlock, outerTermArea);
+                if tabBarRect.height > 0 {
+                    termPane.renderTabBar(tabBarRect, frame.buffer_mut(), *focus == Focus::Terminal);
                 }
-
-                frame.render_widget(termBlock, hChunks[0]);
-                frame.render_stateful_widget(EmbeddedTerminal, termInner, termState);
+                termPane.renderActive(termInner, frame.buffer_mut());
 
                 // Capture content rects for mouse hit-testing.
                 selState.termContentRect = termInner;
@@ -777,7 +1211,7 @@ async fn runLoop(
                 selState.inputContentRect = agentPanel.lastInputRect;
 
                 // Expand selection for double/triple/quad click (needs Buffer).
-                let termOffset = termState.displayOffset() as u16;
+                let termOffset = termPane.activeStateRef().displayOffset() as u16;
                 let agentOffset = agentPanel.displayOffset();
                 if let Some((panel, clickCount)) = selState.pendingExpand.take() {
                     if panel == PanelId::Input {
@@ -799,7 +1233,7 @@ async fn runLoop(
                                         // Select the command output region under the cursor.
                                         let clickGrid = sel.startGridLine();
                                         if let Some((startGrid, endGrid)) =
-                                            termState.commandRegionAt(clickGrid)
+                                            termPane.activeStateRef().commandRegionAt(clickGrid)
                                         {
                                             sel.setBounds(0, startGrid, rect.width, endGrid);
                                         } else {
@@ -863,7 +1297,7 @@ async fn runLoop(
                                     termInner,
                                     frame.buffer_mut(),
                                     termOffset,
-                                    termState,
+                                    termPane.activeStateRef(),
                                 );
                                 selection::copyToClipboard(&text);
                             }
@@ -889,7 +1323,7 @@ async fn runLoop(
                         frame.set_cursor_position(ratatui::layout::Position::new(col, row));
                     }
                 } else if *focus == Focus::Terminal {
-                    if let Some((col, row)) = termState.cursorViewportPos() {
+                    if let Some((col, row)) = termPane.activeStateRef().cursorViewportPos() {
                         frame.set_cursor_position(ratatui::layout::Position::new(
                             termInner.x + col,
                             termInner.y + row,
@@ -913,6 +1347,10 @@ async fn runLoop(
                 let barWidth = vChunks[1].width as usize;
                 let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
 
+                // Refill chip-layout each frame; mouse + keyboard nav read
+                // it between frames.
+                statusChipsLayout.clear();
+
                 if quitHintActive {
                     let hint = " \u{25B8} press Ctrl+Q again to quit";
                     spans.push(Span::raw(hint.to_string()));
@@ -927,30 +1365,95 @@ async fn runLoop(
                     let ctxStr = formatContextPct(tokenCount, contextWindow);
                     let cacheSpans = cacheHeatSpans(cachingEnabled, lastCacheHitAt, barBg, barFg);
 
-                    // Assemble right-aligned spans: cost  ctx  cache-glyph cache-word.
-                    let mut rightSpans: Vec<Span<'static>> = Vec::with_capacity(6);
+                    // Build the items in render order (= nav order, left
+                    // to right). Each entry carries its kind so we can
+                    // hit-test it, plus its span text so we can compute
+                    // its on-screen x range. Cache isn't in this list —
+                    // it has no overlay to open.
+                    let mut items: Vec<(StatusChipKind, String)> = Vec::new();
+                    // Status chip shows whenever ANY task/monitor/wake
+                    // surface state exists. Running task count is the
+                    // primary signal when present; otherwise the chip
+                    // still appears so unread completions, registered
+                    // monitors, and armed wake sources stay discoverable.
+                    let hasBackground = !unreadCompletedTaskIds.is_empty()
+                        || monitorActiveCount > 0
+                        || wakeSourceCount > 0;
+                    if taskRunningCount > 0 {
+                        items.push((
+                            StatusChipKind::Jobs,
+                            format!(
+                                "\u{25F4} {taskRunningCount} task{}",
+                                if taskRunningCount == 1 { "" } else { "s" }
+                            ),
+                        ));
+                    } else if hasBackground {
+                        items.push((StatusChipKind::Jobs, "\u{25F4} tasks".into()));
+                    }
                     if !costStr.is_empty() {
-                        rightSpans.push(Span::raw(costStr));
+                        items.push((StatusChipKind::Cost, costStr.clone()));
                     }
                     if !ctxStr.is_empty() {
-                        if !rightSpans.is_empty() {
-                            rightSpans.push(Span::raw("  "));
-                        }
-                        rightSpans.push(Span::raw(ctxStr));
+                        items.push((StatusChipKind::Context, ctxStr.clone()));
                     }
+
+                    // Clamp focus if the navigable set shrunk this frame.
+                    if let Some(idx) = statusFocus {
+                        if items.is_empty() {
+                            statusFocus = None;
+                        } else if idx >= items.len() {
+                            statusFocus = Some(items.len() - 1);
+                        }
+                    }
+
+                    // Assemble right-aligned spans exactly as before
+                    // (no glyph affordances, no brackets) — just paint
+                    // the focused item in inverse so the user can see
+                    // which one Enter will activate. Track each item's
+                    // offset so we can resolve its x range after pad
+                    // is computed.
+                    let mut rightSpans: Vec<Span<'static>> = Vec::with_capacity(8);
+                    let mut itemRanges: Vec<(StatusChipKind, usize, usize)> = Vec::new();
+                    let mut cursorOff: usize = 0;
+                    for (i, (kind, text)) in items.iter().enumerate() {
+                        if i > 0 {
+                            rightSpans.push(Span::raw("  "));
+                            cursorOff += 2;
+                        }
+                        let len = text.chars().count();
+                        if statusFocus == Some(i) {
+                            rightSpans.push(Span::styled(
+                                text.clone(),
+                                Style::default().bg(barFg).fg(barBg).add_modifier(Modifier::BOLD),
+                            ));
+                        } else {
+                            rightSpans.push(Span::raw(text.clone()));
+                        }
+                        itemRanges.push((*kind, cursorOff, len));
+                        cursorOff += len;
+                    }
+
+                    // Cache: plain info, not navigable.
                     if !cacheSpans.is_empty() {
                         if !rightSpans.is_empty() {
                             rightSpans.push(Span::raw("  "));
+                            cursorOff += 2;
                         }
+                        let cacheLen: usize = cacheSpans.iter().map(|s| s.content.chars().count()).sum();
                         rightSpans.extend(cacheSpans);
                         rightSpans.push(Span::raw(" cache"));
+                        cursorOff += cacheLen + " cache".chars().count();
                     }
 
-                    let rightWidth: usize =
-                        rightSpans.iter().map(|s| s.content.chars().count()).sum();
                     // Trailing space + 1 char leading pad keeps the bar breathing.
-                    let pad = barWidth.saturating_sub(rightWidth + 1);
+                    let pad = barWidth.saturating_sub(cursorOff + 1);
                     spans.push(Span::raw(" ".repeat(pad)));
+                    let leftEdge = vChunks[1].x + pad as u16;
+                    for (kind, off, len) in itemRanges {
+                        let xs = leftEdge + off as u16;
+                        let xe = xs + len as u16;
+                        statusChipsLayout.push((kind, xs, xe, vChunks[1].y));
+                    }
                     spans.extend(rightSpans);
                     spans.push(Span::raw(" "));
                 }
@@ -979,6 +1482,16 @@ async fn runLoop(
                     panel.render(area, frame.buffer_mut());
                 }
 
+                // Tasks panel overlay.
+                if let Some(ref mut panel) = tasksPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
+
+                // Layout control panel overlay (Ctrl+O).
+                if let Some(ref panel) = layoutPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
+
                 // LSP panel overlay.
                 if let Some(ref mut panel) = lspPanel {
                     panel.render(area, frame.buffer_mut());
@@ -1001,9 +1514,26 @@ async fn runLoop(
             })?;
         }
 
-        // Drain PTY output.
-        while let Ok(bytes) = shellIo.outputRx.try_recv() {
-            termState.process(&bytes);
+        // Drain PTY output for every terminal — non-active tabs feed
+        // their state too so switching tabs shows up-to-date content.
+        if termPane.drainOutputs() {
+            needsRedraw = true;
+        }
+
+        // Drain registry-spawned ShellIos. New entries land here when
+        // the agent's `terminalSpawn` tool or the user's Ctrl+T fires.
+        // User-initiated spawns auto-focus the new tab; agent-initiated
+        // ones don't disturb the user's current focus.
+        while let Ok((name, io, spawnedBy)) = shellIoRx.try_recv() {
+            // Match dimensions of the active terminal so initial render
+            // doesn't double-resize on first frame.
+            let cols = termPane.activeStateRef().columns() as u16;
+            let rows = termPane.activeStateRef().screenLines() as u16;
+            termPane.add(name.clone(), io, cols, rows);
+            if matches!(spawnedBy, SpawnedBy::User) {
+                termPane.setActive(&name);
+                *focus = Focus::Terminal;
+            }
             needsRedraw = true;
         }
 
@@ -1138,6 +1668,16 @@ async fn runLoop(
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     currentTopic = None;
+                    // Fresh session => fresh JobPlane; the old plane's
+                    // Drop kills any running tasks but the TaskStopped
+                    // events may not reach us before the channel detaches,
+                    // so resync the counter from a fresh ListJobs rather
+                    // than trusting the per-event delta.
+                    taskRunningCount = 0;
+                    unreadCompletedTaskIds.clear();
+                    monitorActiveCount = 0;
+                    wakeSourceCount = 0;
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                     writeTerminalTitle(TITLE_IDLE_GLYPH, None);
                 }
                 LogEvent::Rewound { targetTurnId } => {
@@ -1168,6 +1708,12 @@ async fn runLoop(
                 LogEvent::SessionRestored { turns, markers } => {
                     agentPanel.clearDisplay();
                     tokenCount = 0;
+                    // Resumed session has a fresh JobPlane.
+                    taskRunningCount = 0;
+                    unreadCompletedTaskIds.clear();
+                    monitorActiveCount = 0;
+                    wakeSourceCount = 0;
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                     replayTranscript(agentPanel, &turns);
                     for (stage, blockIdx) in &markers {
                         agentPanel.pushCompactionMarker(stage, *blockIdx);
@@ -1181,57 +1727,52 @@ async fn runLoop(
                     tracing::info!(agent = %agentType, "subagent started");
                     agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
                 }
-                LogEvent::SubagentEvent {
-                    sessionId: _,
-                    event,
-                } => {
+                LogEvent::SubagentEvent { sessionId, event } => {
                     match *event {
                         LogEvent::ToolAutoApproved {
                             ref name,
                             ref summary,
                         } => {
-                            agentPanel.subagentToolLine(name, summary);
+                            agentPanel.subagentToolLine(&sessionId, name, summary);
                         }
                         LogEvent::ToolStarted {
                             ref name,
                             ref summary,
                         } => {
-                            agentPanel.subagentToolLine(name, summary);
+                            agentPanel.subagentToolLine(&sessionId, name, summary);
                         }
                         LogEvent::ToolResult {
                             ref name,
                             ref output,
                         } => {
-                            // Brief one-liner for the inline block.
                             let brief = if output.len() > 60 {
                                 format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
                             } else {
                                 output.clone()
                             };
-                            agentPanel.subagentToolLine(name, &brief);
-                            // Full output for the overlay transcript.
-                            agentPanel.subagentToolResult(name, output);
+                            agentPanel.subagentToolLine(&sessionId, name, &brief);
+                            agentPanel.subagentToolResult(&sessionId, name, output);
                         }
                         LogEvent::ContentDelta(ref text) => {
-                            agentPanel.subagentContent(text);
+                            agentPanel.subagentContent(&sessionId, text);
                         }
                         LogEvent::Error(ref msg) => {
-                            agentPanel.subagentToolLine("error", msg);
+                            agentPanel.subagentToolLine(&sessionId, "error", msg);
                         }
                         _ => {}
                     }
                 }
-                LogEvent::SubagentShellOutput { data, .. } => {
-                    agentPanel.feedSubagentShell(&data);
+                LogEvent::SubagentShellOutput { sessionId, data } => {
+                    agentPanel.feedSubagentShell(&sessionId, &data);
                 }
                 LogEvent::SubagentComplete {
+                    sessionId,
                     agentType,
                     turns,
                     content,
-                    ..
                 } => {
                     tracing::info!(agent = %agentType, turns = turns, "subagent completed");
-                    agentPanel.subagentComplete(&agentType, turns, &content);
+                    agentPanel.subagentComplete(&sessionId, &agentType, turns, &content);
                 }
                 LogEvent::ScratchpadRecovered {
                     matchedTag,
@@ -1243,6 +1784,171 @@ async fn runLoop(
                         matchedTag, recoveredChars, snippet,
                     );
                     agentPanel.pushCommandResult(&msg);
+                }
+                LogEvent::JobSpawned { id, kind: _, command } => {
+                    taskRunningCount += 1;
+                    agentPanel.pushNotice(&format!(
+                        "\u{25F4} task #{id} spawned: {command}"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::JobOutput { id, line: _ } => {
+                    // Stream into the inspector if it's currently open on
+                    // this task. Coalesce: keep at most one fetch in
+                    // flight; if another line arrives mid-flight, mark
+                    // dirty and refire when the in-flight one returns.
+                    let openOnThis = tasksPanel
+                        .as_ref()
+                        .and_then(|p| p.inspectorTaskId())
+                        == Some(id);
+                    if openOnThis {
+                        if inspectorInFlight {
+                            inspectorDirty = true;
+                        } else {
+                            inspectorInFlight = true;
+                            let sinceLine = tasksPanel
+                                .as_ref()
+                                .and_then(|p| p.inspectorSinceLine());
+                            spawnInspectorFetch(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                id,
+                                sinceLine,
+                            );
+                        }
+                    }
+                }
+                LogEvent::JobComplete { id, exitCode } => {
+                    if taskRunningCount > 0 {
+                        taskRunningCount -= 1;
+                    }
+                    // Mark as unread unless the panel is already open
+                    // (in which case the user sees the row land live).
+                    if tasksPanel.is_none() {
+                        unreadCompletedTaskIds.insert(id);
+                    }
+                    let code = exitCode.map(|c| format!("exit {c}")).unwrap_or_else(|| "—".into());
+                    agentPanel.pushNotice(&format!(
+                        "\u{2713} task #{id} completed ({code})"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::JobStopped { id, reason } => {
+                    if taskRunningCount > 0 {
+                        taskRunningCount -= 1;
+                    }
+                    if tasksPanel.is_none() {
+                        unreadCompletedTaskIds.insert(id);
+                    }
+                    agentPanel.pushNotice(&format!(
+                        "\u{2717} task #{id} stopped: {reason}"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::MonitorRegistered { id, description, filter, .. } => {
+                    monitorActiveCount += 1;
+                    agentPanel.pushNotice(&format!(
+                        "\u{2299} monitor #{id} \"{description}\" \u{00B7} /{filter}/"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::MonitorEvent { id: _, line: _, eventCount: _ } => {
+                    // Per-line monitor events are noisy by design. The
+                    // counter and last-event time update via the periodic
+                    // /tasks refresh; we don't push a notice per line
+                    // because a single noisy watcher would flood the
+                    // conversation. Phase 5's wake plane is the consumer
+                    // that actually acts on these.
+                }
+                LogEvent::MonitorAutoStopped { id, reason } => {
+                    if monitorActiveCount > 0 {
+                        monitorActiveCount -= 1;
+                    }
+                    agentPanel.pushNotice(&format!(
+                        "\u{2717}\u{FE0E} monitor #{id} auto-stopped: {reason}"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::MonitorStopped { id } => {
+                    if monitorActiveCount > 0 {
+                        monitorActiveCount -= 1;
+                    }
+                    agentPanel.pushNotice(&format!(
+                        "\u{2718}\u{FE0E} monitor #{id} stopped"
+                    ));
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::TerminalSpawned { name, spawnedBy } => {
+                    use construct::control::TerminalSpawnedBy;
+                    let by = match spawnedBy {
+                        TerminalSpawnedBy::User => "user",
+                        TerminalSpawnedBy::Agent => "agent",
+                    };
+                    agentPanel
+                        .pushNotice(&format!("\u{2295} terminal '{name}' spawned by {by}"));
+                }
+                LogEvent::TerminalClosed { name } => {
+                    // Just drop the tab. The textual confirmation is
+                    // either the ToolResult (agent-initiated kill) or
+                    // the user already saw the tab disappear.
+                    termPane.remove(&name);
+                }
+                LogEvent::TerminalActiveForAgent { name } => {
+                    // Agent's default target changed; deck doesn't follow
+                    // the agent's focus, but we surface the change.
+                    agentPanel.pushNotice(&format!(
+                        "\u{2192} agent target terminal: '{name}'"
+                    ));
+                }
+                LogEvent::TerminalRenamed { from, to } => {
+                    agentPanel.pushNotice(&format!(
+                        "\u{2192} terminal renamed: '{from}' -> '{to}'"
+                    ));
+                }
+                LogEvent::WakeBatchInjected { count, summary } => {
+                    // The session task formatted, recorded, and started
+                    // a turn for this batch already — we just render a
+                    // notice. Single-fire batches show the source +
+                    // payload preview; multi-fire batches collapse to
+                    // a counter so a noisy stampede doesn't flood the
+                    // panel with one chip per match.
+                    let chip = if count > 1 {
+                        format!("\u{2299} {count} wakes \u{00B7} {summary}")
+                    } else {
+                        format!("\u{2299} {summary}")
+                    };
+                    agentPanel.pushNotice(&chip);
+                }
+                LogEvent::AutoBgWarning { command, elapsedSecs, userTriggered } => {
+                    // The framework auto-respawned the command as a real
+                    // bg job. The corresponding LogEvent::JobSpawned will
+                    // fire separately with the new job id — no need to
+                    // duplicate that here.
+                    let preview = if command.len() > 80 {
+                        format!("{}\u{2026}", &command[..command.floor_char_boundary(80)])
+                    } else {
+                        command.clone()
+                    };
+                    let notice = if userTriggered {
+                        format!(
+                            "\u{29D6}\u{FE0E} shell auto-bg'd (Ctrl+B): {preview}"
+                        )
+                    } else {
+                        format!(
+                            "\u{29D6}\u{FE0E} shell auto-bg'd ({elapsedSecs}s elapsed): {preview}"
+                        )
+                    };
+                    agentPanel.pushNotice(&notice);
+                }
+                LogEvent::WakeRegistered { .. } => {
+                    wakeSourceCount += 1;
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                }
+                LogEvent::WakeDisarmed { .. } => {
+                    if wakeSourceCount > 0 {
+                        wakeSourceCount -= 1;
+                    }
+                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
             }
         }
@@ -1265,6 +1971,15 @@ async fn runLoop(
                 } => {
                     let isSubagent =
                         matches!(origin, construct::control::PermitOrigin::Subagent { .. });
+                    // Extract the subagent sessionId before `origin` is
+                    // consumed by `showToolRequest` so we can pre-focus
+                    // the right tab in the popup.
+                    let subagentSid =
+                        if let construct::control::PermitOrigin::Subagent { sessionId } = &origin {
+                            Some(sessionId.clone())
+                        } else {
+                            None
+                        };
                     agentPanel.showToolRequest(
                         &name,
                         &summary,
@@ -1280,11 +1995,27 @@ async fn runLoop(
                         unseenPermitPending = true;
                         writeTerminalTitle(TITLE_PERMIT_GLYPH, currentTopic.as_deref());
                     }
-                    // Parent permits auto-close the popup so the main-panel
-                    // prompt becomes visible. Subagent permits stay routed
-                    // through the popup (which renders them inline).
-                    if !isSubagent && subagentPanel.is_some() {
-                        subagentPanel = None;
+                    if isSubagent {
+                        // Focus the requesting subagent's tab so the user
+                        // sees whose permit they're approving. Auto-open
+                        // the popup when multiple subagents are running —
+                        // otherwise the inline permit prompt is shown on
+                        // the main panel and the popup stays available
+                        // for explicit `v`.
+                        if let Some(sid) = subagentSid {
+                            agentPanel.selectSubagentBySessionId(&sid);
+                            if agentPanel.activeSubagents.len() > 1 && subagentPanel.is_none() {
+                                subagentPanel = Some(
+                                    crate::subagent_panel::SubagentPanel::live(),
+                                );
+                            }
+                        }
+                    } else {
+                        // Parent permits auto-close the popup so the
+                        // main-panel prompt becomes visible.
+                        if subagentPanel.is_some() {
+                            subagentPanel = None;
+                        }
                     }
                 }
             }
@@ -1332,6 +2063,74 @@ async fn runLoop(
                         }
                     } else if !ack.message.is_empty() {
                         agentPanel.pushCommandResult(&ack.message);
+                    }
+                }
+                DeckUpdate::TasksList(list) => {
+                    if let Some(ref mut panel) = tasksPanel {
+                        panel.refresh(list);
+                    } else {
+                        // Panel transition closed → open: user has now
+                        // seen any pending completions, so the unread
+                        // set clears.
+                        unreadCompletedTaskIds.clear();
+                        tasksPanel = Some(crate::jobs_panel::JobsPanel::new(list));
+                    }
+                    needsRedraw = true;
+                }
+                DeckUpdate::WakesList(list) => {
+                    if let Some(ref mut panel) = tasksPanel {
+                        panel.refreshWakes(list);
+                        needsRedraw = true;
+                    }
+                }
+                DeckUpdate::TaskOutputOpen { id, snap } => {
+                    if let Some(ref mut panel) = tasksPanel {
+                        panel.applyInspectorOpen(id, snap);
+                        needsRedraw = true;
+                    }
+                }
+                DeckUpdate::TaskOutputRefresh { id, sinceLine, snap } => {
+                    if let Some(ref mut panel) = tasksPanel {
+                        if let Some(snap) = snap {
+                            // Tagged-fetch race guard: if the user paged
+                            // back while this fetch was in flight, the
+                            // panel's `requestedSinceLine` has already
+                            // moved on. Pass the fetched-against value
+                            // so the panel can drop stale snapshots
+                            // instead of momentarily clobbering the
+                            // paged-back view.
+                            if panel.applyInspectorSnapshot(id, sinceLine, snap) {
+                                needsRedraw = true;
+                            }
+                        }
+                        // Snap=None means the task is gone from the
+                        // session. The next ListJobs refresh will drop
+                        // the inspector via JobsPanel::refresh, so we
+                        // don't need to touch the panel here.
+                    }
+                    // Coalescing: the in-flight fetch just returned. If
+                    // TaskOutput events landed while it was flying, fire
+                    // one more refresh — only on the same id, only if the
+                    // inspector is still open on it.
+                    inspectorInFlight = false;
+                    if inspectorDirty {
+                        inspectorDirty = false;
+                        let stillOpen = tasksPanel
+                            .as_ref()
+                            .and_then(|p| p.inspectorTaskId())
+                            == Some(id);
+                        if stillOpen {
+                            inspectorInFlight = true;
+                            let sinceLine = tasksPanel
+                                .as_ref()
+                                .and_then(|p| p.inspectorSinceLine());
+                            spawnInspectorFetch(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                id,
+                                sinceLine,
+                            );
+                        }
                     }
                 }
                 DeckUpdate::ResumeResult(ack) => {
@@ -1386,8 +2185,7 @@ async fn runLoop(
         // Handle input.
         let (quit, hadInput, wasResized) = handleInput(
             focus,
-            shellIo,
-            termState,
+            termPane,
             agentPanel,
             selState,
             scrollLock,
@@ -1396,6 +2194,7 @@ async fn runLoop(
             deckUpdateTx,
             cancelTx,
             steerTx,
+            userBgTx,
             &mut sessionPicker,
             &mut rewindPicker,
             &mut forkPicker,
@@ -1404,6 +2203,7 @@ async fn runLoop(
             &mut mcpPanel,
             &mut lspPanel,
             &mut subagentPanel,
+            &mut tasksPanel,
             &mut permissionsPanel,
             &mut pendingPermitReply,
             &projectDir,
@@ -1414,6 +2214,12 @@ async fn runLoop(
             &mut unseenPermitPending,
             &currentTopic,
             &titleSpinner,
+            &mut statusFocus,
+            &statusChipsLayout,
+            &mut sessionLayout,
+            &mut sessionLayoutPath,
+            &mut activePresetName,
+            &mut layoutPanel,
         )
         .await?;
         if quit {
@@ -1436,8 +2242,7 @@ async fn runLoop(
 #[allow(clippy::too_many_arguments)]
 async fn handleInput(
     focus: &mut Focus,
-    shellIo: &ShellIo,
-    termState: &mut TerminalState,
+    termPane: &mut TerminalPane,
     agentPanel: &mut AgentPanel,
     selState: &mut SelectionState,
     scrollLock: &mut ScrollAxisLock,
@@ -1446,6 +2251,7 @@ async fn handleInput(
     deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
+    userBgTx: &mpsc::Sender<()>,
     sessionPicker: &mut Option<SessionPicker>,
     rewindPicker: &mut Option<RewindPicker>,
     forkPicker: &mut Option<ForkPicker>,
@@ -1454,6 +2260,7 @@ async fn handleInput(
     mcpPanel: &mut Option<McpPanel>,
     lspPanel: &mut Option<LspPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
+    tasksPanel: &mut Option<crate::jobs_panel::JobsPanel>,
     permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
     pendingPermitReply: &mut Option<oneshot::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
@@ -1464,6 +2271,12 @@ async fn handleInput(
     unseenPermitPending: &mut bool,
     currentTopic: &Option<String>,
     titleSpinner: &TitleSpinner,
+    statusFocus: &mut Option<usize>,
+    statusChipsLayout: &[(StatusChipKind, u16, u16, u16)],
+    sessionLayout: &mut crate::layout::Layout,
+    sessionLayoutPath: &mut Option<std::path::PathBuf>,
+    activePresetName: &mut Option<String>,
+    layoutPanel: &mut Option<crate::layout::control_panel::ControlPanel>,
 ) -> Result<(bool, bool, bool)> {
     // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
@@ -1544,6 +2357,24 @@ async fn handleInput(
                     break;
                 }
 
+                // Ctrl+O: toggle the layout control panel. Press once
+                // to open, press again to dismiss. Closing this way
+                // does not run the unsaved-changes confirm — same as
+                // any other global keybind dropping out of a popup.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+                    if layoutPanel.is_some() {
+                        *layoutPanel = None;
+                    } else {
+                        *layoutPanel = Some(
+                            crate::layout::control_panel::ControlPanel::new(
+                                sessionLayout.clone(),
+                                activePresetName.clone(),
+                            ),
+                        );
+                    }
+                    break;
+                }
+
                 // Ctrl+H: toggle the hotkey-tips popup.
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
                     *helpPopupOpen = !*helpPopupOpen;
@@ -1612,6 +2443,8 @@ async fn handleInput(
                         || mcpPanel.is_some()
                         || lspPanel.is_some()
                         || permissionsPanel.is_some()
+                        || tasksPanel.is_some()
+                        || layoutPanel.is_some()
                     {
                         // Let the overlay handle Tab (falls through to overlay dispatch below).
                     } else if !(*focus == Focus::Agent && agentPanel.completionActive()) {
@@ -1647,6 +2480,17 @@ async fn handleInput(
                             if let Some(tx) = pendingPermitReply.take() {
                                 let _ = tx.send($resp);
                             }
+                            // Clear the unseen-permit title indicator immediately so
+                            // the user doesn't have to leave-and-refocus to dismiss it.
+                            if *unseenPermitPending {
+                                *unseenPermitPending = false;
+                                let glyph = if agentPanel.isActive() && currentTopic.is_some() {
+                                    titleSpinner.current()
+                                } else {
+                                    TITLE_IDLE_GLYPH
+                                };
+                                writeTerminalTitle(glyph, currentTopic.as_deref());
+                            }
                         };
                     }
 
@@ -1656,10 +2500,21 @@ async fn handleInput(
                             sendPermit!(PermitResponse::Allow);
                         }
                         // Shift+A: always allow (persist to project config).
+                        // An empty pattern would persist `keyArg.contains("")`
+                        // — i.e. allow-all for the tool — so guard against it.
                         KeyCode::Char('A') => {
-                            let pattern = agentPanel.selectedPattern();
-                            agentPanel.approvePending();
-                            sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                            match agentPanel.selectedPattern() {
+                                Some(pattern) => {
+                                    agentPanel.approvePending();
+                                    sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                                }
+                                None => {
+                                    agentPanel.pushNotice(
+                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
+                                         type one in the custom field first, or press y to allow once.",
+                                    );
+                                }
+                            }
                         }
                         KeyCode::Char('n') => {
                             agentPanel.denyPending();
@@ -1667,9 +2522,18 @@ async fn handleInput(
                         }
                         // Shift+D: always deny (persist to project config).
                         KeyCode::Char('D') => {
-                            let pattern = agentPanel.selectedPattern();
-                            agentPanel.denyPending();
-                            sendPermit!(PermitResponse::AlwaysDeny { pattern });
+                            match agentPanel.selectedPattern() {
+                                Some(pattern) => {
+                                    agentPanel.denyPending();
+                                    sendPermit!(PermitResponse::AlwaysDeny { pattern });
+                                }
+                                None => {
+                                    agentPanel.pushNotice(
+                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
+                                         type one in the custom field first, or press n to deny once.",
+                                    );
+                                }
+                            }
                         }
                         // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1688,7 +2552,7 @@ async fn handleInput(
                         KeyCode::Char('v') | KeyCode::Char('V') => {
                             // Open the subagent panel — Live mode reads
                             // transcript + shell from agentPanel.activeSubagent.
-                            if agentPanel.activeSubagent.is_some() {
+                            if !agentPanel.activeSubagents.is_empty() {
                                 *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                             }
                         }
@@ -1721,6 +2585,60 @@ async fn handleInput(
                             });
                         }
                         PickerAction::None => {}
+                    }
+                    break;
+                }
+
+                // Tasks panel intercepts all keys when active.
+                if let Some(panel) = tasksPanel.as_mut() {
+                    use crate::jobs_panel::PanelAction;
+                    match panel.handleKey(key) {
+                        PanelAction::Close => {
+                            *tasksPanel = None;
+                        }
+                        PanelAction::Kill(id) => {
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::KillTask { id, reply },
+                            );
+                        }
+                        PanelAction::Inspect(id) => {
+                            let requestTx2 = requestTx.clone();
+                            let deckUpdateTx2 = deckUpdateTx.clone();
+                            tokio::spawn(async move {
+                                let (rTx, rRx) = oneshot::channel();
+                                let _ = requestTx2
+                                    .send(TuiRequest::GetTaskOutput {
+                                        id,
+                                        sinceLine: None,
+                                        reply: rTx,
+                                    })
+                                    .await;
+                                if let Ok(Some(snap)) = rRx.await {
+                                    let _ = deckUpdateTx2
+                                        .send(DeckUpdate::TaskOutputOpen { id, snap })
+                                        .await;
+                                }
+                            });
+                        }
+                        PanelAction::Refetch(id) => {
+                            // Page key flipped sinceLine — fetch with the
+                            // panel's current pin. Spawn directly (the
+                            // dedicated task-plane handler services it
+                            // even mid-turn) instead of routing through
+                            // the inspectorInFlight coalescer, which is
+                            // for periodic refreshes coming off live
+                            // TaskOutput events.
+                            let sinceLine = panel.inspectorSinceLine();
+                            spawnInspectorFetch(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                id,
+                                sinceLine,
+                            );
+                        }
+                        PanelAction::None => {}
                     }
                     break;
                 }
@@ -1799,6 +2717,62 @@ async fn handleInput(
                     break;
                 }
 
+                // Layout control panel (Ctrl+O) intercepts all keys when active.
+                if let Some(panel) = layoutPanel.as_mut() {
+                    use crate::layout::control_panel::PanelAction as LayoutAction;
+                    match panel.handleKey(key) {
+                        LayoutAction::Close => {
+                            *layoutPanel = None;
+                        }
+                        LayoutAction::ApplyPreset { name, layout } => {
+                            *sessionLayout = layout.clone();
+                            *activePresetName = Some(name.clone());
+                            panel.confirmApplied(name, layout);
+                        }
+                        LayoutAction::Save => {
+                            let path = sessionLayoutPath.clone().unwrap_or_else(|| {
+                                // No discovered file — save to ~/.config/flatline/layout.toml.
+                                crate::layout::discovery::configFallbackPath().unwrap_or_else(|| {
+                                    std::path::PathBuf::from(".flatline").join("layout.toml")
+                                })
+                            });
+                            match crate::layout::discovery::writeLayout(&path, sessionLayout) {
+                                Ok(()) => {
+                                    *sessionLayoutPath = Some(path.clone());
+                                    panel.confirmSaved();
+                                    agentPanel.pushNotice(&format!(
+                                        "\u{2713} layout saved: {}",
+                                        path.display(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    agentPanel.pushNotice(&format!(
+                                        "\u{26A0}\u{FE0E} layout save failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        LayoutAction::Reset => {
+                            let cwd = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            let (resetLayout, resetPath) = match crate::layout::discovery::discoverLayout(&cwd) {
+                                Some(d) => match d.result {
+                                    Ok(l) => (l, Some(d.path)),
+                                    Err(_) => (crate::layout::Layout::defaultPhase1(), Some(d.path)),
+                                },
+                                None => (crate::layout::Layout::defaultPhase1(), None),
+                            };
+                            let name = crate::layout::control_panel::matchPresetName(&resetLayout);
+                            *sessionLayout = resetLayout.clone();
+                            *sessionLayoutPath = resetPath;
+                            *activePresetName = name.clone();
+                            panel.resetTo(resetLayout, name);
+                        }
+                        LayoutAction::None => {}
+                    }
+                    break;
+                }
+
                 // LSP panel intercepts all keys when active.
                 if let Some(panel) = lspPanel {
                     match panel.handleKey(key) {
@@ -1812,7 +2786,7 @@ async fn handleInput(
                                 "\u{2699}\u{FE0E} Installing {serverId}: {command}",
                             ));
                             let cmdBytes = format!("{command}\n").into_bytes();
-                            let _ = shellIo.inputTx.try_send(cmdBytes);
+                            termPane.sendInput(cmdBytes);
                         }
                         LspPanelAction::None => {}
                     }
@@ -1843,6 +2817,42 @@ async fn handleInput(
                     break;
                 }
 
+                // Status-bar chip navigation. When a chip is focused,
+                // intercept arrows/Enter/Esc so the keys steer the bar
+                // instead of falling through to the terminal/agent panes.
+                if let Some(idx) = *statusFocus {
+                    let count = statusChipsLayout.len();
+                    match key.code {
+                        KeyCode::Left => {
+                            if idx > 0 {
+                                *statusFocus = Some(idx - 1);
+                            }
+                            break;
+                        }
+                        KeyCode::Right => {
+                            if idx + 1 < count {
+                                *statusFocus = Some(idx + 1);
+                            }
+                            break;
+                        }
+                        KeyCode::Esc | KeyCode::Up => {
+                            *statusFocus = None;
+                            break;
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some((kind, _, _, _)) = statusChipsLayout.get(idx) {
+                                openStatusChipPanel(*kind, requestTx, deckUpdateTx);
+                            }
+                            *statusFocus = None;
+                            break;
+                        }
+                        _ => {
+                            // Any other key drops chip focus and falls through.
+                            *statusFocus = None;
+                        }
+                    }
+                }
+
                 match focus {
                     Focus::Terminal => {
                         if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -1851,16 +2861,41 @@ async fn handleInput(
                             }
                             continue;
                         }
-                        // Ctrl+C triggers the killchain for captured commands.
+                        // Ctrl+T spawns a new terminal for the user.
                         if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('t')
+                        {
+                            // Fire-and-forget — the new ShellIo arrives via
+                            // shellIoRx and the matching tab is added on the
+                            // main loop's drain pass.
+                            let (replyTx, _replyRx) = oneshot::channel();
+                            let _ = requestTx
+                                .send(TuiRequest::SpawnTerminal {
+                                    name: None,
+                                    reply: replyTx,
+                                })
+                                .await;
+                        }
+                        // Ctrl+1..9 jumps to a specific tab.
+                        else if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char(c) if c.is_ascii_digit() && c != '0')
+                        {
+                            if let KeyCode::Char(c) = key.code {
+                                let idx = (c as u8 - b'1') as usize;
+                                termPane.jumpTo(idx);
+                            }
+                        }
+                        // Ctrl+C triggers the killchain for captured commands.
+                        else if key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.code == KeyCode::Char('c')
                         {
-                            let _ = shellIo.killTx.try_send(());
+                            termPane.sendKill();
                         } else if let Some(bytes) = keyToBytes(&key) {
+                            let termState = termPane.activeStateMut();
                             if termState.displayOffset() > 0 {
                                 termState.scrollToBottom();
                             }
-                            let _ = shellIo.inputTx.try_send(bytes);
+                            termPane.sendInput(bytes);
                         }
                     }
                     Focus::Agent => {
@@ -1963,6 +2998,21 @@ async fn handleInput(
                                                     *sessionPicker =
                                                         Some(SessionPicker::new(projectDir));
                                                 }
+                                                crate::command::CommandOutput::Action(
+                                                    crate::command::CommandAction::ShowLayout,
+                                                ) => {
+                                                    // /layout opens the Ctrl+O panel. Path
+                                                    // + applied-preset info appears in the
+                                                    // panel header.
+                                                    if layoutPanel.is_none() {
+                                                        *layoutPanel = Some(
+                                                            crate::layout::control_panel::ControlPanel::new(
+                                                                sessionLayout.clone(),
+                                                                activePresetName.clone(),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
                                                 crate::command::CommandOutput::Action(action) => {
                                                     dispatchSlashCommand(
                                                         action,
@@ -2000,6 +3050,10 @@ async fn handleInput(
                                 KeyCode::Char('u') if ctrl => ta.killToStart(),
                                 KeyCode::Char('y') if ctrl => ta.yank(),
                                 KeyCode::Char('t') if ctrl => agentPanel.toggleThinking(),
+                                KeyCode::Char('b') if ctrl => {
+                                    // Send the in-flight shell command to background.
+                                    let _ = userBgTx.try_send(());
+                                }
                                 KeyCode::Char(c) if !supr => ta.insert(c),
                                 KeyCode::Backspace if supr => ta.killToStart(),
                                 KeyCode::Backspace if alt => ta.deleteWordLeft(),
@@ -2035,6 +3089,12 @@ async fn handleInput(
                                         if let Some(entry) = agentPanel.history.navigateDown() {
                                             let entry = entry.to_string();
                                             ta.setText(&entry);
+                                        } else if !statusChipsLayout.is_empty() {
+                                            // Past the end of history → land
+                                            // focus on the first chip so the
+                                            // bar acts like a menu reachable
+                                            // by walking down.
+                                            *statusFocus = Some(0);
                                         }
                                     } else {
                                         ta.moveDown();
@@ -2082,18 +3142,38 @@ async fn handleInput(
                     || mcpPanel.is_some()
                     || lspPanel.is_some()
                     || permissionsPanel.is_some()
+                    || tasksPanel.is_some()
+                    || layoutPanel.is_some()
                 {
                     break;
+                }
+                // Click on a status-bar chip opens its panel directly.
+                // Hover/move highlights without opening.
+                if let Some((kind, hit)) = chipHitTest(&mouse, statusChipsLayout) {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            openStatusChipPanel(kind, requestTx, deckUpdateTx);
+                            *statusFocus = None;
+                            hadInput = true;
+                            break;
+                        }
+                        MouseEventKind::Moved => {
+                            *statusFocus = Some(hit);
+                            hadInput = true;
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
                 if handleMouse(
                     mouse,
                     focus,
                     agentPanel,
-                    termState,
+                    termPane,
                     selState,
-                    shellIo,
                     scrollLock,
                     subagentPanel,
+                    requestTx,
                 ) {
                     hadInput = true;
                 }
@@ -2115,13 +3195,17 @@ async fn handleInput(
                         agentPanel.textArea.insertStr(&normalized);
                     }
                     Focus::Terminal => {
-                        if termState.displayOffset() > 0 {
-                            termState.scrollToBottom();
-                        }
+                        let bracketed = {
+                            let termState = termPane.activeStateMut();
+                            if termState.displayOffset() > 0 {
+                                termState.scrollToBottom();
+                            }
+                            termState.bracketedPaste()
+                        };
                         // Shells treat CR as "execute"; normalize to LF so multi-line
                         // pastes land as a single buffered command when possible.
                         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        let payload = if termState.bracketedPaste() {
+                        let payload = if bracketed {
                             let mut buf = Vec::with_capacity(normalized.len() + 12);
                             buf.extend_from_slice(b"\x1b[200~");
                             buf.extend_from_slice(normalized.as_bytes());
@@ -2130,7 +3214,7 @@ async fn handleInput(
                         } else {
                             normalized.into_bytes()
                         };
-                        let _ = shellIo.inputTx.try_send(payload);
+                        termPane.sendInput(payload);
                     }
                     _ => {}
                 }
@@ -2139,9 +3223,9 @@ async fn handleInput(
                 hadInput = true;
                 resized = true;
                 let termCols = (cols * 3 / 5).saturating_sub(2);
-                let termRows = rows.saturating_sub(3);
-                let _ = shellIo.resizeTx.try_send((termCols, termRows));
-                termState.resize(termCols, termRows);
+                // Reserve 1 row for tab strip + 1 for status + 2 for borders.
+                let termRows = rows.saturating_sub(4);
+                termPane.resizeAll(termCols, termRows);
             }
             _ => {}
         }
@@ -2161,16 +3245,16 @@ fn handleMouse(
     mouse: event::MouseEvent,
     focus: &mut Focus,
     agentPanel: &mut AgentPanel,
-    termState: &mut TerminalState,
+    termPane: &mut TerminalPane,
     selState: &mut SelectionState,
-    _shellIo: &ShellIo,
     scrollLock: &mut ScrollAxisLock,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
+    requestTx: &mpsc::Sender<TuiRequest>,
 ) -> bool {
     // Resolve display offset for the given panel.
-    fn panelOffset(panel: PanelId, termState: &TerminalState, agentPanel: &AgentPanel) -> u16 {
+    fn panelOffset(panel: PanelId, termPane: &TerminalPane, agentPanel: &AgentPanel) -> u16 {
         match panel {
-            PanelId::Terminal => termState.displayOffset() as u16,
+            PanelId::Terminal => termPane.activeStateRef().displayOffset() as u16,
             PanelId::Agent => agentPanel.displayOffset(),
             PanelId::Input => 0,
         }
@@ -2178,6 +3262,35 @@ fn handleMouse(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Tab strip — click on a tab to switch, click [+] to spawn.
+            if termPane.clickInTabBar(mouse.column, mouse.row) {
+                use crate::terminal_pane::TabClick;
+                match termPane.handleClick(mouse.column, mouse.row) {
+                    TabClick::Switch(name) => {
+                        termPane.setActive(&name);
+                        *focus = Focus::Terminal;
+                        return true;
+                    }
+                    TabClick::NewTab => {
+                        let (replyTx, _replyRx) = oneshot::channel();
+                        let _ = requestTx.try_send(TuiRequest::SpawnTerminal {
+                            name: None,
+                            reply: replyTx,
+                        });
+                        return true;
+                    }
+                    TabClick::Close(name) => {
+                        let (replyTx, _replyRx) = oneshot::channel();
+                        let _ = requestTx.try_send(TuiRequest::KillTerminal {
+                            name,
+                            reply: replyTx,
+                        });
+                        return true;
+                    }
+                    TabClick::Empty => {}
+                }
+            }
+
             // Check input area first (not part of panel hit-testing).
             if selState
                 .inputContentRect
@@ -2222,7 +3335,7 @@ fn handleMouse(
 
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let gridLine =
-                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                    selection::toGridLine(screenRow, panelOffset(panel, termPane, agentPanel));
 
                 // Single click on a reasoning header toggles it.
                 if panel == PanelId::Agent && agentPanel.toggleReasoningAtGridLine(gridLine) {
@@ -2241,8 +3354,10 @@ fn handleMouse(
 
                 // Click on subagent header [view] opens the overlay panel.
                 if panel == PanelId::Agent && agentPanel.isSubagentHeaderLine(gridLine) {
-                    if agentPanel.activeSubagent.is_some() {
+                    if !agentPanel.activeSubagents.is_empty() {
                         // Live subagent — popup reads from agentPanel each frame.
+                        // Clicking opens with the current selected tab; the
+                        // user can cycle with [ / ] inside the popup.
                         *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                         return true;
                     } else if let Some((agentType, sid)) = agentPanel.lastSubagentSession() {
@@ -2321,7 +3436,7 @@ fn handleMouse(
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
                 let gridLine =
-                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                    selection::toGridLine(screenRow, panelOffset(panel, termPane, agentPanel));
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
                 }
@@ -2339,7 +3454,7 @@ fn handleMouse(
                 let (col, screenRow) = selState.toLocal(panel, mouse.column, mouse.row);
                 let (col, screenRow) = selState.clampLocal(panel, col, screenRow);
                 let gridLine =
-                    selection::toGridLine(screenRow, panelOffset(panel, termState, agentPanel));
+                    selection::toGridLine(screenRow, panelOffset(panel, termPane, agentPanel));
 
                 if let Some(sel) = selState.selectionForMut(panel) {
                     sel.update(col, gridLine);
@@ -2374,12 +3489,12 @@ fn handleMouse(
                     }
                 }
                 Some(PanelId::Terminal) => {
-                    termState.scrollUp(3);
+                    termPane.activeStateMut().scrollUp(3);
                     // Extend selection into scrollback during drag.
                     if selState.selectingIn == Some(PanelId::Terminal) {
                         let (_, screenRow) =
                             selState.toLocal(PanelId::Terminal, mouse.column, mouse.row);
-                        let offset = termState.displayOffset() as u16;
+                        let offset = termPane.activeStateRef().displayOffset() as u16;
                         if let Some(sel) = &mut selState.termSelection {
                             sel.extendRow(selection::toGridLine(screenRow, offset));
                         }
@@ -2409,11 +3524,11 @@ fn handleMouse(
                     }
                 }
                 Some(PanelId::Terminal) => {
-                    termState.scrollDown(3);
+                    termPane.activeStateMut().scrollDown(3);
                     if selState.selectingIn == Some(PanelId::Terminal) {
                         let (_, screenRow) =
                             selState.toLocal(PanelId::Terminal, mouse.column, mouse.row);
-                        let offset = termState.displayOffset() as u16;
+                        let offset = termPane.activeStateRef().displayOffset() as u16;
                         if let Some(sel) = &mut selState.termSelection {
                             sel.extendRow(selection::toGridLine(screenRow, offset));
                         }
@@ -2552,12 +3667,19 @@ fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     const ROWS: &[(&str, &str)] = &[
         ("Tab", "Switch focus between terminal and agent"),
         ("Esc", "Cancel running turn / close overlay"),
+        ("Ctrl+T", "Spawn a new terminal"),
+        ("Ctrl+B", "Hand a running shell to the agent (background)"),
+        ("Ctrl+1..9", "Jump to terminal tab N"),
         ("Ctrl+Q \u{00d7}2", "Quit flatline (double-tap)"),
         ("Ctrl+L", "Force terminal redraw"),
         ("Ctrl+H", "Toggle this help"),
         (
             "\u{2191} / \u{2193}",
             "Scroll / history navigation in agent panel",
+        ),
+        (
+            "\u{2193} (after history)",
+            "Focus the status bar; \u{2190}/\u{2192} cycle, Enter opens",
         ),
     ];
 
@@ -2669,6 +3791,28 @@ fn extractTerminalUnwrapped(
     result
 }
 
+/// Build a one-line replay notice from a wake-turn transcript content.
+/// The content is the `<wakes count="N">…</wakes>` envelope written by
+/// `Session::injectWakeBatch`; we just want a compact summary line.
+fn wakeNoticeFromContent(content: &str) -> String {
+    let count = content
+        .split_once("count=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .and_then(|(n, _)| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let firstSource = content
+        .split_once("source=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(s, _)| s.to_string());
+    let label = match (count, firstSource) {
+        (n, Some(src)) if n > 1 => format!("\u{2299} {n} wakes (first: {src})"),
+        (_, Some(src)) => format!("\u{2299} wake \u{00B7} {src}"),
+        (n, None) if n > 0 => format!("\u{2299} {n} wakes"),
+        _ => "\u{2299} wake".to_string(),
+    };
+    label
+}
+
 /// Convert deck's CommandAction to construct's CommandAction.
 /// Replay transcript turns into the agent panel for a resumed session.
 fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn]) {
@@ -2696,6 +3840,15 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                 panel
                     .entries
                     .push(crate::agent_panel::PanelEntry::User(display));
+            }
+            TurnRole::Wake => {
+                // Wake turns replay as a notice, not a user bubble. The
+                // model's history still sees the user-shaped content via
+                // context::reconstruct; this is purely display.
+                let summary = wakeNoticeFromContent(&turn.content);
+                panel
+                    .entries
+                    .push(crate::agent_panel::PanelEntry::SessionNotice(summary));
             }
             TurnRole::Assistant => {
                 if let Some(ref reasoning) = turn.reasoning {
@@ -2909,6 +4062,70 @@ fn spawnAckRequest<F>(
     });
 }
 
+/// Return the chip under a mouse event, plus its index in the layout,
+/// if the event coordinates fall on a tracked status-bar chip.
+fn chipHitTest(
+    mouse: &event::MouseEvent,
+    chips: &[(StatusChipKind, u16, u16, u16)],
+) -> Option<(StatusChipKind, usize)> {
+    for (i, (kind, xs, xe, y)) in chips.iter().enumerate() {
+        if mouse.row == *y && mouse.column >= *xs && mouse.column < *xe {
+            return Some((*kind, i));
+        }
+    }
+    None
+}
+
+/// Open the overlay bound to a status-bar item. Mirrors the wiring of
+/// the equivalent slash commands so the same panels appear regardless
+/// of how the user reached them.
+fn openStatusChipPanel(
+    kind: StatusChipKind,
+    requestTx: &mpsc::Sender<TuiRequest>,
+    deckUpdateTx: &mpsc::Sender<DeckUpdate>,
+) {
+    let requestTx = requestTx.clone();
+    let deckUpdateTx = deckUpdateTx.clone();
+    match kind {
+        StatusChipKind::Jobs => {
+            tokio::spawn(async move {
+                let (jTx, jRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ListJobs { reply: jTx }).await;
+                if let Ok(list) = jRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::TasksList(list)).await;
+                }
+                let (wTx, wRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ListWakes { reply: wTx }).await;
+                if let Ok(list) = wRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::WakesList(list)).await;
+                }
+            });
+        }
+        StatusChipKind::Cost => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::ShowCost { reply: rTx }).await;
+                if let Ok(text) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
+                }
+            });
+        }
+        StatusChipKind::Context => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx
+                    .send(TuiRequest::ShowContext { reply: rTx })
+                    .await;
+                if let Ok(state) = rRx.await {
+                    let _ = deckUpdateTx
+                        .send(DeckUpdate::ContextDisplay(state))
+                        .await;
+                }
+            });
+        }
+    }
+}
+
 /// Dispatch a parsed slash-command action. Each variant constructs a
 /// `TuiRequest` with an appropriate oneshot reply channel and spawns a
 /// task to forward the reply to the deck update channel.
@@ -2930,17 +4147,27 @@ fn dispatchSlashCommand(
         crate::command::CommandAction::Undo => {
             spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::Undo { reply });
         }
-        crate::command::CommandAction::Rewind { target: _ } => {
-            // /rewind opens the picker. Fetch options first.
-            tokio::spawn(async move {
-                let (rTx, rRx) = oneshot::channel();
-                let _ = requestTx
-                    .send(TuiRequest::GetRewindOptions { reply: rTx })
-                    .await;
-                if let Ok(turns) = rRx.await {
-                    let _ = deckUpdateTx.send(DeckUpdate::RewindOptions(turns)).await;
-                }
-            });
+        crate::command::CommandAction::Rewind { target } => {
+            if target.is_empty() {
+                // No target → open the picker.
+                tokio::spawn(async move {
+                    let (rTx, rRx) = oneshot::channel();
+                    let _ = requestTx
+                        .send(TuiRequest::GetRewindOptions { reply: rTx })
+                        .await;
+                    if let Ok(turns) = rRx.await {
+                        let _ = deckUpdateTx.send(DeckUpdate::RewindOptions(turns)).await;
+                    }
+                });
+            } else {
+                // Direct rewind to the named turn id. Does NOT save a
+                // fork — matches the picker's destructive rewind path.
+                spawnAckRequest(requestTx, deckUpdateTx, move |reply| TuiRequest::Rewind {
+                    target,
+                    saveFork: false,
+                    reply,
+                });
+            }
         }
         crate::command::CommandAction::Forks { forkId: None } => {
             tokio::spawn(async move {
@@ -3027,6 +4254,21 @@ fn dispatchSlashCommand(
                     let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
                 }
             });
+        }
+        crate::command::CommandAction::Tasks => {
+            // /tasks (alias /jobs) opens the same panel as the status
+            // chip — fetch jobs + wakes and let the TasksList /
+            // WakesList handlers create the panel.
+            openStatusChipPanel(StatusChipKind::Jobs, &requestTx, &deckUpdateTx);
+        }
+        crate::command::CommandAction::ShowLayout => {
+            // /layout reads the local sessionLayoutPath at the input
+            // handler site — should never reach here. Render a notice
+            // so a future caller that forgets to intercept gets a hint
+            // rather than a silent no-op.
+            tracing::warn!(
+                "/layout reached dispatchSlashCommand — should have been handled inline"
+            );
         }
     }
 }

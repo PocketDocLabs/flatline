@@ -87,3 +87,8 @@ tower-service = "0.3"
 # LSP
 async-lsp = { version = "0.2", features = ["tokio"] }
 dashmap = "6"
+
+# Wake scheduling
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }

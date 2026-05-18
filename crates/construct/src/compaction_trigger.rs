@@ -136,3 +136,53 @@ impl Tracker {
             && self.exhausted.contains(&StagePick::S4)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trigger thresholds: S1 / S2 share the 80 % band, S3 opens at
+    /// 90 %, S4 at 100 %. Under 80 % no stage fires.
+    #[test]
+    fn evaluate_threshold_bands() {
+        // 100 token compactLimit (1000 window × 0.10 ratio).
+        let tracker = Tracker::new(1000, 0.10);
+
+        // Under 80 % → no stage.
+        assert_eq!(tracker.evaluate(79), None);
+
+        // 80 % → S1 (cheapest first within the 80 % band).
+        assert_eq!(tracker.evaluate(80), Some(StagePick::S1));
+
+        // 90 % with S1 fresh → still S1.
+        assert_eq!(tracker.evaluate(90), Some(StagePick::S1));
+
+        // 100 % with S1 fresh → still S1.
+        assert_eq!(tracker.evaluate(100), Some(StagePick::S1));
+    }
+
+    /// Stages escalate in the order S1 → S2 (80 % band), then S3 once
+    /// the usage reaches the 90 % band, then S4 at 100 %.
+    #[test]
+    fn evaluate_escalates_after_exhaustion() {
+        let mut tracker = Tracker::new(1000, 0.10);
+
+        // 80 %: S1 first, then S2 after S1 exhausts.
+        tracker.markExhausted(StagePick::S1);
+        assert_eq!(tracker.evaluate(80), Some(StagePick::S2));
+
+        // S2 exhausted at 80 % → nothing (S3 waits for 90 %).
+        tracker.markExhausted(StagePick::S2);
+        assert_eq!(tracker.evaluate(85), None);
+
+        // 90 % opens S3.
+        assert_eq!(tracker.evaluate(90), Some(StagePick::S3));
+
+        // S3 exhausted at 90 % → nothing (S4 waits for 100 %).
+        tracker.markExhausted(StagePick::S3);
+        assert_eq!(tracker.evaluate(95), None);
+
+        // 100 % opens S4.
+        assert_eq!(tracker.evaluate(100), Some(StagePick::S4));
+    }
+}

@@ -40,9 +40,14 @@ pub fn reconstruct(
 
     // Build sets for compaction op filtering.
     let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
+    let activeTurnIds: HashSet<&str> = chain.iter().map(|t| t.id.as_str()).collect();
+    // Known turn IDs across the entire transcript — used to distinguish
+    // "afterTurn references a real turn that's off this branch" from
+    // "afterTurn is a legacy block id from before the schema migration."
+    let knownTurnIds: HashSet<&str> = allTurns.iter().map(|t| t.id.as_str()).collect();
 
     let allOps = compactionLog.loadAll()?;
-    let ops = filterOpsForChain(allOps, &activeBlockIds);
+    let ops = filterOpsForChain(allOps, &activeBlockIds, &activeTurnIds, &knownTurnIds);
 
     let transformed = applyOps(&chain, &ops);
     Ok(assembleMessages(&transformed))
@@ -74,25 +79,56 @@ fn walkChain<'a>(allTurns: &'a [Turn], headTurnId: &str) -> Vec<&'a Turn> {
     chain
 }
 
-/// Filter compaction ops to those whose targets are in the active chain.
+/// Filter compaction ops to those whose targets and timing match the
+/// active chain.
 ///
-/// - FileDedup/MiddleOut: apply all (toolCallId matching is a natural no-op
-///   for turns not in the chain).
-/// - BlockCompact: apply if blockId is in active chain.
-/// - TopicCompact/FullCompact: apply if ALL source blocks are in active chain
-///   (cross-branch summaries are invalid).
-fn filterOpsForChain(ops: Vec<CompactionOp>, activeBlockIds: &HashSet<&str>) -> Vec<CompactionOp> {
+/// Two filters apply:
+///
+/// 1. **Temporal** (rewind correctness) — `afterTurn` was the head turn
+///    id at the moment compaction ran. If that turn is not on the
+///    active chain back from the current head, the op was recorded on
+///    a branch we've since rewound past and must not apply. Legacy ops
+///    written before the afterTurn schema migration stored a block id
+///    there instead of a turn id; we recognize those (afterTurn is not
+///    any known turn id) and apply them unconditionally to preserve
+///    backward compatibility.
+///
+/// 2. **Branch coverage** — even when temporally valid, structural ops
+///    that reference blocks must reference only blocks on this branch.
+///    - FileDedup/MiddleOut: tool_call_id matching is a natural no-op
+///      for turns not in the chain.
+///    - BlockCompact: apply if blockId is in active chain.
+///    - TopicCompact/FullCompact: apply if ALL source blocks are in
+///      active chain (cross-branch summaries are invalid).
+fn filterOpsForChain(
+    ops: Vec<CompactionOp>,
+    activeBlockIds: &HashSet<&str>,
+    activeTurnIds: &HashSet<&str>,
+    knownTurnIds: &HashSet<&str>,
+) -> Vec<CompactionOp> {
     ops.into_iter()
-        .filter(|op| match op {
-            CompactionOp::FileDedup { .. } | CompactionOp::MiddleOut { .. } => true,
-            CompactionOp::BlockCompact { blockId, .. } => {
-                activeBlockIds.contains(blockId.as_str())
+        .filter(|op| {
+            // Temporal gate: drop ops whose afterTurn is a real turn
+            // that's off the active branch. Tolerate legacy afterTurn
+            // values (block ids from before the migration) by treating
+            // unknown-turn references as "always apply".
+            let afterTurn = op.afterTurn();
+            if knownTurnIds.contains(afterTurn) && !activeTurnIds.contains(afterTurn) {
+                return false;
             }
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                sourceBlockIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
-            }
-            CompactionOp::FullCompact { sourceIds, .. } => {
-                sourceIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
+
+            // Branch coverage gate.
+            match op {
+                CompactionOp::FileDedup { .. } | CompactionOp::MiddleOut { .. } => true,
+                CompactionOp::BlockCompact { blockId, .. } => {
+                    activeBlockIds.contains(blockId.as_str())
+                }
+                CompactionOp::TopicCompact { sourceBlockIds, .. } => {
+                    sourceBlockIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
+                }
+                CompactionOp::FullCompact { sourceIds, .. } => {
+                    sourceIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
+                }
             }
         })
         .collect()
@@ -356,7 +392,9 @@ fn assembleMessages(turns: &[TransformedTurn]) -> Vec<Message> {
                             reasoning,
                         });
                     }
-                    TurnRole::User => {
+                    TurnRole::User | TurnRole::Wake => {
+                        // Wake turns are user-shaped to the model — the
+                        // distinction only matters for transcript display.
                         flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                         let msgContent = rebuildContent(&content, &turn.attachments);
                         history.push(Message::User { content: msgContent });
@@ -612,7 +650,9 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
 
     let chain = walkChain(&allTurns, input.headTurnId);
     let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
-    let filteredOps = filterOpsForChain(ops, &activeBlockIds);
+    let activeTurnIds: HashSet<&str> = chain.iter().map(|t| t.id.as_str()).collect();
+    let knownTurnIds: HashSet<&str> = allTurns.iter().map(|t| t.id.as_str()).collect();
+    let filteredOps = filterOpsForChain(ops, &activeBlockIds, &activeTurnIds, &knownTurnIds);
     let transformed = applyOps(&chain, &filteredOps);
 
     // Count unique blocks in the chain (each block = one user-visible turn).
@@ -1475,6 +1515,119 @@ mod tests {
 
         let toolCount = msgs.iter().filter(|m| matches!(m, Message::Tool { .. })).count();
         assert_eq!(toolCount, 0, "compacted block's tool results should be gone");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rewind temporal correctness
+    // -----------------------------------------------------------------------
+
+    /// A compaction recorded AFTER a rewind point must not apply when
+    /// reconstructing from that earlier head. The compaction's
+    /// `afterTurn` references a turn off the active branch, so the
+    /// op is temporally invalid for the rewound chain.
+    #[test]
+    fn rewind_ignores_compactions_recorded_later() {
+        let mut s = TestSession::new();
+        // Block 1.
+        s.user("First task");
+        s.toolCall("c200", "readFile", serde_json::json!({"path": "/big"}));
+        let bigContent = "x".repeat(10_000);
+        s.toolResult("c200", &bigContent);
+        s.assistant("Read it.", None);
+        let rewindTarget = s.headTurnId.clone().unwrap();
+
+        // Block 2 — written AFTER the rewind target.
+        s.user("Second task");
+        s.assistant("Done.", None);
+        let laterHead = s.headTurnId.clone().unwrap();
+
+        // Record a middle-out compaction whose afterTurn is the LATER head.
+        let mut log = s.compactionLog();
+        log.recordMiddleOut(vec!["c200".into()], &laterHead, 200).unwrap();
+        drop(log);
+
+        // Reconstructing from the later head should see the truncation
+        // (op is on the active chain at that point).
+        let log = s.compactionLog();
+        let lateMsgs = reconstruct(&s.transcript, &log, &laterHead).unwrap();
+        let lateToolBody = lateMsgs.iter().find_map(|m| {
+            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
+        }).unwrap();
+        assert!(lateToolBody.contains("bytes truncated"), "later head sees truncation");
+
+        // Reconstructing from the EARLIER head must NOT see the truncation
+        // — the op was recorded after a turn that isn't on this branch.
+        let earlyMsgs = reconstruct(&s.transcript, &log, &rewindTarget).unwrap();
+        let earlyToolBody = earlyMsgs.iter().find_map(|m| {
+            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
+        }).unwrap();
+        assert!(
+            !earlyToolBody.contains("bytes truncated"),
+            "rewound head must not see compaction recorded after the rewind point"
+        );
+        assert_eq!(earlyToolBody.len(), 10_000, "raw tool result restored");
+    }
+
+    /// Same rewind correctness for S2 BlockCompact ops.
+    #[test]
+    fn rewind_ignores_block_compact_recorded_later() {
+        let mut s = TestSession::new();
+        // Block 1.
+        s.user("Task one");
+        s.toolCall("c210", "shell", serde_json::json!({"cmd": "ls"}));
+        s.toolResult("c210", "file1\nfile2");
+        s.assistant("Listed.", None);
+        let rewindTarget = s.headTurnId.clone().unwrap();
+        let block1Id = s.transcript.loadAll().unwrap().iter()
+            .find(|t| t.content == "Task one")
+            .map(|t| t.blockId.clone())
+            .unwrap();
+
+        // Block 2 written AFTER, used as afterTurn for the S2 op.
+        s.user("Task two");
+        s.assistant("Ok.", None);
+        let laterHead = s.headTurnId.clone().unwrap();
+
+        let mut log = s.compactionLog();
+        log.recordBlockCompact(&block1Id, "block 1 summary", vec![], &laterHead).unwrap();
+        drop(log);
+
+        // From the rewound head, no S2 summary should appear.
+        let log = s.compactionLog();
+        let msgs = reconstruct(&s.transcript, &log, &rewindTarget).unwrap();
+        let hasCompressed = msgs.iter().any(|m| {
+            if let Message::User { content } = m {
+                content.textContent().contains("<compressed_content>")
+            } else { false }
+        });
+        assert!(
+            !hasCompressed,
+            "rewind to before S2 compaction must not see the summary"
+        );
+    }
+
+    /// Legacy ops with an afterTurn that isn't a known turn id (e.g.
+    /// a pre-migration block id) must still apply unconditionally.
+    #[test]
+    fn legacy_afterTurn_block_id_still_applies() {
+        let mut s = TestSession::new();
+        s.user("Read big file");
+        s.toolCall("c220", "readFile", serde_json::json!({"path": "/big"}));
+        let bigContent = "x".repeat(10_000);
+        s.toolResult("c220", &bigContent);
+        s.assistant("Got it.", None);
+
+        // afterTurn = a value that isn't any real turn id (simulates
+        // legacy block-id semantics from before the schema migration).
+        let mut log = s.compactionLog();
+        log.recordMiddleOut(vec!["c220".into()], "b_legacy_unknown", 200).unwrap();
+        drop(log);
+
+        let msgs = s.reconstruct();
+        let toolBody = msgs.iter().find_map(|m| {
+            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
+        }).unwrap();
+        assert!(toolBody.contains("bytes truncated"), "legacy afterTurn should still apply");
     }
 
     // -----------------------------------------------------------------------

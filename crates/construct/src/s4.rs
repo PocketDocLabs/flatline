@@ -1,19 +1,31 @@
-//! S4 — full conversation compaction (single LLM call).
+//! S4 — deep recompaction (single LLM call).
 //!
-//! Fires at 90% of compactLimit when S3 is exhausted. Merges all
-//! existing S3 topic summaries and any prior S4 briefings into a
-//! single structured handoff briefing.
+//! Last-resort recompression of the OLDER compacted layers when S1–S3
+//! are exhausted. Despite the historical "full compaction" name, S4
+//! does NOT touch the most recent context: a protected band of the
+//! newest [`DEFAULT_PROTECTED_RATIO`] characters of effective content
+//! is held verbatim, so the model always has a high-fidelity working
+//! set even after repeated S4 firings.
 //!
-//! Unlike S2/S3, S4 reads **post-compaction** content (the summaries
-//! themselves), not originals from the transcript. It's the one layer
-//! allowed to summarize summaries.
+//! Sources fed into S4:
+//! - Prior S4 briefings (already deep; merged so we don't carry
+//!   ever-growing chains of `<prior_briefing>` blocks).
+//! - S3 topic summaries whose sourceBlocks are entirely outside the
+//!   protected band and not already covered by a later S4.
+//! - Orphan S2 block summaries whose blocks were never lifted into an
+//!   S3 or S4 op AND fall outside the protected band — these are
+//!   typically single-block topics or fragments S3 wouldn't touch.
+//!
+//! Reads the post-compaction summaries from the log directly; the
+//! transcript is consulted only to compute the protected band.
 //!
 //! # Public API
 //! - [`run`] — execute S4 compaction
 //! - [`S4Result`] — what was produced
+//! - [`DEFAULT_PROTECTED_RATIO`] — fraction of effective context held verbatim
 //!
 //! # Dependencies
-//! `crate::api`, `crate::compaction`, `crate::message`
+//! `crate::api`, `crate::compaction`, `crate::message`, `crate::transcript`
 
 use std::collections::HashSet;
 
@@ -22,6 +34,12 @@ use anyhow::{Context, Result};
 use crate::api;
 use crate::compaction::{CompactionLog, CompactionOp};
 use crate::message::Message;
+use crate::transcript::Transcript;
+
+/// Fraction of effective context (newest end) that S4 must NEVER
+/// touch. Holds the model's working set in full fidelity even after
+/// repeated S4 firings.
+pub const DEFAULT_PROTECTED_RATIO: f64 = 0.30;
 
 pub struct S4Result {
     pub didWork: bool,
@@ -31,19 +49,46 @@ pub struct S4Result {
     pub cost: Option<f64>,
 }
 
-/// Merge S3 topic summaries and existing S4 briefings into a single
-/// handoff briefing.
+/// Recompress the deepest eligible compacted layers into a single
+/// handoff briefing while protecting the newest portion of context.
 ///
-/// Reads summaries from the compaction log (not the transcript).
-/// Produces a single structured briefing via one utility model call.
+/// The protected band is computed from the active branch using each
+/// block's effective size (compacted summary length if available,
+/// otherwise the raw char count). Any candidate op whose blocks
+/// intersect the protected band is skipped.
 pub async fn run(
+    transcript: &Transcript,
     compactionLog: &CompactionLog,
+    headTurnId: &str,
     client: &api::Client,
     utilityModel: &str,
 ) -> Result<S4Result> {
     let ops = compactionLog.loadAll()?;
 
-    // Collect S3 topic summaries and existing S4 briefings.
+    let allTurns = transcript.loadAll()?;
+    let activeTurns = crate::transcript::walkBranchTurns(&allTurns, headTurnId);
+    let protectedBand = computeProtectedBand(&activeTurns, &ops, DEFAULT_PROTECTED_RATIO);
+
+    // Blocks already absorbed by any S4 op — those S3/S2 ops are
+    // redundant when the S4 briefing they fed into is being
+    // recompressed below.
+    let s4Covered: HashSet<String> = ops
+        .iter()
+        .flat_map(|op| match op {
+            CompactionOp::FullCompact { sourceIds, .. } => sourceIds.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+
+    // Blocks already absorbed by S3.
+    let s3Covered: HashSet<String> = ops
+        .iter()
+        .flat_map(|op| match op {
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+
     let mut sections: Vec<String> = Vec::new();
     let mut allSourceBlockIds: Vec<String> = Vec::new();
     let mut seenBlocks: HashSet<String> = HashSet::new();
@@ -56,8 +101,12 @@ pub async fn run(
                 sourceBlockIds,
                 ..
             } => {
-                // Skip if this topic's blocks are already covered by a later S4.
-                if sourceBlockIds.iter().any(|bid| seenBlocks.contains(bid)) {
+                if sourceBlockIds.iter().any(|bid| protectedBand.contains(bid)) {
+                    continue;
+                }
+                if sourceBlockIds.iter().all(|bid| s4Covered.contains(bid)) {
+                    // Already folded into a prior S4 briefing; that
+                    // briefing carries the content forward.
                     continue;
                 }
                 let blockRange = formatBlockRange(sourceBlockIds);
@@ -72,11 +121,39 @@ pub async fn run(
                     }
                 }
             }
+            CompactionOp::BlockCompact {
+                blockId, summary, ..
+            } => {
+                if protectedBand.contains(blockId) {
+                    continue;
+                }
+                if s3Covered.contains(blockId) || s4Covered.contains(blockId) {
+                    // Already absorbed by S3 or S4 — including it
+                    // again would duplicate content.
+                    continue;
+                }
+                sections.push(format!(
+                    "<block_summary block=\"{blockId}\">\n\
+                     {summary}\n\
+                     </block_summary>"
+                ));
+                if seenBlocks.insert(blockId.clone()) {
+                    allSourceBlockIds.push(blockId.clone());
+                }
+            }
             CompactionOp::FullCompact {
                 summary,
                 sourceIds,
                 ..
             } => {
+                // Prior briefings are always older than the recent
+                // band by construction — they were produced from old
+                // S3/S4 content. We still gate them: if any covered
+                // block sits in the protected band (shouldn't happen,
+                // but defensively), skip.
+                if sourceIds.iter().any(|bid| protectedBand.contains(bid)) {
+                    continue;
+                }
                 sections.push(format!(
                     "<prior_briefing>\n\
                      {summary}\n\
@@ -114,12 +191,13 @@ pub async fn run(
         sectionCount = sections.len(),
         sourceBlocks = allSourceBlockIds.len(),
         inputChars = mixedContent.len(),
-        "S4: compacting topic summaries into briefing"
+        protectedBlocks = protectedBand.len(),
+        "S4: recompressing older layers"
     );
 
     let messages = vec![
         Message::System {
-            content: FULL_COMPACT_SYSTEM.to_string(),
+            content: DEEP_RECOMPACT_SYSTEM.to_string(),
         },
         Message::User {
             content: userPrompt.into(),
@@ -134,6 +212,23 @@ pub async fn run(
     let cost = usage.and_then(|u| u.cost);
     let summary = extractCompactedString(&response);
 
+    // Reduction gate: a "summary" longer than what we fed in is not
+    // useful — drop it so the tracker treats S4 as exhausted instead
+    // of growing context and re-firing.
+    if summary.len() >= mixedContent.len() {
+        tracing::warn!(
+            inputChars = mixedContent.len(),
+            outputChars = summary.len(),
+            "S4: model output did not reduce — discarding"
+        );
+        return Ok(S4Result {
+            didWork: false,
+            summary: String::new(),
+            sourceBlockIds: Vec::new(),
+            cost,
+        });
+    }
+
     tracing::info!(
         outputChars = summary.len(),
         cost = ?cost,
@@ -147,6 +242,156 @@ pub async fn run(
         cost,
     })
 }
+
+/// Compute the set of block IDs in the protected recent band.
+///
+/// Walks the active branch from newest to oldest, accumulating each
+/// block's *effective* size (its S2 summary length when one exists,
+/// otherwise the raw char count). The newest blocks summing to
+/// `protectRatio` of total effective chars form the protected band.
+/// S2 blocks that have been superseded by S3 or S4 are excluded — they
+/// no longer contribute to live context.
+fn computeProtectedBand(
+    activeTurns: &[crate::transcript::Turn],
+    ops: &[CompactionOp],
+    protectRatio: f64,
+) -> HashSet<String> {
+    let compactedSizes = crate::compaction::compactedBlockSizes(ops);
+    let superseded = crate::compaction::supersededBlocks(ops);
+
+    let mut blocks: Vec<(String, usize)> = Vec::new();
+    let mut currentBlockId = String::new();
+    let mut currentRawSize: usize = 0;
+    for turn in activeTurns {
+        if turn.blockId != currentBlockId {
+            if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
+                let effective = compactedSizes
+                    .get(&currentBlockId)
+                    .copied()
+                    .unwrap_or(currentRawSize);
+                blocks.push((currentBlockId.clone(), effective));
+            }
+            currentBlockId = turn.blockId.clone();
+            currentRawSize = 0;
+        }
+        currentRawSize += turn.content.len();
+    }
+    if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
+        let effective = compactedSizes
+            .get(&currentBlockId)
+            .copied()
+            .unwrap_or(currentRawSize);
+        blocks.push((currentBlockId, effective));
+    }
+
+    let total: usize = blocks.iter().map(|(_, s)| s).sum();
+    if total == 0 {
+        return HashSet::new();
+    }
+    let target = (total as f64 * protectRatio) as usize;
+
+    let mut band = HashSet::new();
+    let mut cumulative: usize = 0;
+    for (blockId, size) in blocks.iter().rev() {
+        if cumulative >= target {
+            break;
+        }
+        band.insert(blockId.clone());
+        cumulative += size;
+    }
+    band
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::{Turn, TurnRole, TurnStatus};
+
+    fn makeTurn(id: &str, blockId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+        Turn {
+            id: id.to_string(),
+            blockId: blockId.to_string(),
+            topicId: String::new(),
+            role,
+            content: content.to_string(),
+            ts: 0,
+            parentId: parentId.map(|s| s.to_string()),
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
+            cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
+        }
+    }
+
+    /// The newest 30% of effective chars must end up in the protected
+    /// band. Blocks already absorbed by S3/S4 (`superseded`) are
+    /// invisible to the calculation — they aren't in live context.
+    #[test]
+    fn protected_band_holds_newest_thirty_percent() {
+        let turns = vec![
+            makeTurn("t1", "b_aaa", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_bbb", TurnRole::User, &"x".repeat(100), Some("t1")),
+            makeTurn("t3", "b_ccc", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_ddd", TurnRole::User, &"x".repeat(100), Some("t3")),
+            makeTurn("t5", "b_eee", TurnRole::User, &"x".repeat(100), Some("t4")),
+            makeTurn("t6", "b_fff", TurnRole::User, &"x".repeat(100), Some("t5")),
+            makeTurn("t7", "b_ggg", TurnRole::User, &"x".repeat(100), Some("t6")),
+            makeTurn("t8", "b_hhh", TurnRole::User, &"x".repeat(100), Some("t7")),
+            makeTurn("t9", "b_iii", TurnRole::User, &"x".repeat(100), Some("t8")),
+            makeTurn("t10", "b_jjj", TurnRole::User, &"x".repeat(100), Some("t9")),
+        ];
+        // 10 blocks × 100 chars = 1000 effective. 30% = 300, so the
+        // newest 3 blocks form the band.
+        let band = computeProtectedBand(&turns, &[], 0.30);
+        assert!(band.contains("b_jjj"), "newest block must be protected");
+        assert!(band.contains("b_iii"));
+        assert!(band.contains("b_hhh"));
+        assert!(
+            !band.contains("b_ggg"),
+            "older blocks must NOT be protected"
+        );
+        assert!(!band.contains("b_aaa"));
+    }
+
+    /// Blocks superseded by an S3 op are removed from live context, so
+    /// they shouldn't consume protected-band budget. The band should
+    /// expand backward to cover more of the still-live tail.
+    #[test]
+    fn protected_band_skips_superseded_blocks() {
+        let turns = vec![
+            makeTurn("t1", "b_old1", TurnRole::User, &"x".repeat(100), None),
+            makeTurn("t2", "b_old2", TurnRole::User, &"x".repeat(100), Some("t1")),
+            makeTurn("t3", "b_old3", TurnRole::User, &"x".repeat(100), Some("t2")),
+            makeTurn("t4", "b_new1", TurnRole::User, &"x".repeat(100), Some("t3")),
+            makeTurn("t5", "b_new2", TurnRole::User, &"x".repeat(100), Some("t4")),
+        ];
+        // Old three blocks are merged into one topic summary.
+        let ops = vec![CompactionOp::TopicCompact {
+            stage: "s3".into(),
+            topicLabel: "Merged".into(),
+            summary: "x".repeat(30),
+            sourceBlockIds: vec!["b_old1".into(), "b_old2".into(), "b_old3".into()],
+            afterTurn: "t5".into(),
+            ts: 0,
+        }];
+        // Live: just b_new1 (100) + b_new2 (100) = 200 effective.
+        // 30% = 60 → newest block (b_new2) only.
+        let band = computeProtectedBand(&turns, &ops, 0.30);
+        assert!(band.contains("b_new2"));
+        assert!(!band.contains("b_old1"), "superseded blocks not in band");
+        assert!(!band.contains("b_old2"));
+        assert!(!band.contains("b_old3"));
+    }
+}
+
 
 /// Extract content from `<compacted_monolithic_string>` tags.
 fn extractCompactedString(response: &str) -> String {
@@ -171,7 +416,7 @@ fn formatBlockRange(blockIds: &[String]) -> String {
     format!("{}\u{2013}{}", blockIds[0], blockIds[blockIds.len() - 1])
 }
 
-const FULL_COMPACT_SYSTEM: &str = "\
+const DEEP_RECOMPACT_SYSTEM: &str = "\
 You compress an entire conversation into a handoff briefing. The next \
 agent taking over this session will have ONLY your output as context \
 (plus tools to search the full transcript if needed).\n\

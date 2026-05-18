@@ -849,12 +849,19 @@ pub fn persistPermissionRule(
             }
         }
     } else {
-        let mut rules: Vec<toml::Value> = currentPermissions
+        // Seeding a brand-new [permissions] table — the caller already
+        // applied `addRule(newRule)` to `currentPermissions` before
+        // invoking us, so `currentPermissions.rules` is the complete,
+        // correct set. Pushing `newRule` again here would duplicate it
+        // in the first-ever persisted file. `_ = newRule` keeps the
+        // contract on the function signature unchanged; the rule is
+        // persisted via the rules collection below.
+        let _ = &newRule;
+        let rules: Vec<toml::Value> = currentPermissions
             .rules
             .iter()
             .map(ruleToToml)
             .collect();
-        rules.push(ruleToToml(&newRule));
 
         let mut permTable = toml::Table::new();
         permTable.insert(
@@ -1129,6 +1136,51 @@ mod tests {
         assert!(cfg.light.promptThinking);
         assert!(cfg.utility.model.contains("kimi"));
         assert!(!cfg.utility.promptThinking);
+    }
+
+    #[test]
+    fn firstPersistDoesNotDuplicateNewRule() {
+        // Setup: a project root in a tempdir, no existing config file,
+        // and a Permissions instance that already has `addRule(newRule)`
+        // applied — matching the in-session call order.
+        use crate::permissions::{Permissions, Rule};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let mut perms = Permissions::askForEverything();
+        let newRule = Rule {
+            tool: "shell".into(),
+            pattern: Some("git status".into()),
+            allow: true,
+        };
+        perms.addRule(newRule);
+
+        persistPermissionRule(root, &perms, "shell", "git status", true)
+            .expect("persist rule");
+
+        let written = std::fs::read_to_string(root.join(".flatline").join("config.toml"))
+            .expect("read persisted config");
+        // Should appear exactly once in the file. Two copies would be the
+        // duplicate-on-first-persist bug.
+        let occurrences = written.matches("pattern = \"git status\"").count();
+        assert_eq!(
+            occurrences, 1,
+            "rule duplicated on first persist:\n{written}",
+        );
+
+        // Second persist of a different rule appends, not duplicates.
+        let secondRule = Rule {
+            tool: "shell".into(),
+            pattern: Some("ls -la".into()),
+            allow: true,
+        };
+        perms.addRule(secondRule);
+        persistPermissionRule(root, &perms, "shell", "ls -la", true)
+            .expect("persist second");
+        let written2 = std::fs::read_to_string(root.join(".flatline").join("config.toml"))
+            .expect("read again");
+        assert_eq!(written2.matches("pattern = \"git status\"").count(), 1);
+        assert_eq!(written2.matches("pattern = \"ls -la\"").count(), 1);
     }
 
     #[test]

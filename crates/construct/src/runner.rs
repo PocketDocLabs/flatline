@@ -23,6 +23,35 @@ use crate::permissions::Permissions;
 use crate::prompt::{DomainModule, InterfaceMode};
 use crate::session::Session;
 use crate::shell;
+use crate::shells::ShellRegistry;
+
+/// Build a registry seeded with `main` plus a black-hole drainer for
+/// every PTY's output and any future-spawned IO channels. Headless mode
+/// has nothing to render; we just keep the channels alive.
+fn headlessRegistry()
+-> anyhow::Result<std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>> {
+    use crate::shells::SpawnedBy;
+    let (ioTx, mut ioRx) = mpsc::channel::<(String, shell::ShellIo, SpawnedBy)>(8);
+    let (registry, mainIo) = ShellRegistry::newWithMain(120, 40, ioTx)?;
+
+    // Drain main shell.
+    tokio::spawn(async move {
+        let mut rx = mainIo.outputRx;
+        while rx.recv().await.is_some() {}
+    });
+
+    // Drain any later-spawned shells.
+    tokio::spawn(async move {
+        while let Some((_name, io, _by)) = ioRx.recv().await {
+            tokio::spawn(async move {
+                let mut rx = io.outputRx;
+                while rx.recv().await.is_some() {}
+            });
+        }
+    });
+
+    Ok(std::sync::Arc::new(tokio::sync::Mutex::new(registry)))
+}
 
 use crate::tool::ToolSet;
 
@@ -142,13 +171,7 @@ pub struct RunResult {
 ///     prompt: User prompt to execute.
 ///     runConfig: Execution parameters.
 pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result<RunResult> {
-    let (agentShell, shellIo) = shell::spawnShell(120, 40)?;
-
-    // Drain PTY output in the background — headless mode has no terminal display.
-    tokio::spawn(async move {
-        let mut rx = shellIo.outputRx;
-        while rx.recv().await.is_some() {}
-    });
+    let agentShells = headlessRegistry()?;
 
     // Apply model override. Clear provider routing when switching models
     // since pinned providers are model-specific.
@@ -180,7 +203,7 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
     let mut session = Session::new(
         &config,
         permissions,
-        agentShell,
+        agentShells,
         InterfaceMode::Headless,
         &[DomainModule::Swe],
     )?;
@@ -228,19 +251,13 @@ pub async fn runStreaming(
     prompt: &str,
     runConfig: &RunConfig,
 ) -> Result<(tokio::task::JoinHandle<Result<RunResult>>, mpsc::Receiver<LogEvent>)> {
-    let (agentShell, shellIo) = shell::spawnShell(120, 40)?;
-
-    // Drain PTY output in the background.
-    tokio::spawn(async move {
-        let mut rx = shellIo.outputRx;
-        while rx.recv().await.is_some() {}
-    });
+    let agentShells = headlessRegistry()?;
 
     let permissions = Permissions::allowAll();
     let mut session = Session::new(
         config,
         permissions,
-        agentShell,
+        agentShells,
         InterfaceMode::Headless,
         &[DomainModule::Swe],
     )?;
@@ -276,9 +293,11 @@ pub async fn runStreaming(
 
         // Subagents don't support mid-turn steering.
         let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+        // Headless: no user keybind.
+        let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
         let sendResult = session
-            .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx)
+            .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx)
             .await;
 
         // Shut down background LSP/MCP cleanly so their senders drop before
@@ -359,9 +378,10 @@ pub fn runSession<'a>(
     let input = crate::session::UserInput::from(prompt.to_string());
     // Headless runners don't support mid-turn steering.
     let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+    let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
     let sendResult = session
-        .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx)
+        .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx)
         .await;
 
     // Shut down background LSP/MCP cleanly so their senders drop before

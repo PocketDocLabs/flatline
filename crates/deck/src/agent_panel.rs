@@ -217,8 +217,14 @@ pub struct AgentPanel {
     pendingToolCalls: Vec<PendingToolCall>,
     /// When the first pending tool call appeared (shared elapsed clock).
     pendingToolCallStartTime: Option<Instant>,
-    /// Active subagent state (for the overlay panel).
-    pub activeSubagent: Option<ActiveSubagent>,
+    /// Active subagent state. Multiple entries exist when the parent
+    /// has fanned out parallel `task(runInBackground: true)` calls; each
+    /// entry is keyed by sessionId on its inner struct. `selectedSubagent`
+    /// points into this vec for the popup's "current tab".
+    pub activeSubagents: Vec<ActiveSubagent>,
+    /// Index into `activeSubagents` of the tab currently shown in the
+    /// subagent popup. `None` when the vec is empty.
+    pub selectedSubagent: Option<usize>,
     /// Last wall-clock time the throbber was ticked.
     lastThrobberTick: Instant,
     /// Scroll offset from the bottom (in visual lines).
@@ -303,7 +309,8 @@ impl AgentPanel {
             toolStartTime: None,
             pendingToolCalls: Vec::new(),
             pendingToolCallStartTime: None,
-            activeSubagent: None,
+            activeSubagents: Vec::new(),
+            selectedSubagent: None,
             lastThrobberTick: Instant::now(),
             scrollOffset: 0,
             newContentWhileScrolled: false,
@@ -550,6 +557,17 @@ impl AgentPanel {
     }
 
     /// Finalize streaming state after a cancellation.
+    ///
+    /// Importantly does NOT touch `activeSubagents` or mark SubagentBlock
+    /// entries done. Two reasons:
+    /// 1. Foreground subagents propagate the cancel through their child
+    ///    cancelRx and emit their own `SubagentComplete` shortly after,
+    ///    which is the path that correctly marks their block done.
+    /// 2. Background subagents (`task(runInBackground: true)`) are
+    ///    detached from the parent's turn lifecycle — cancelling the
+    ///    parent must not also clear their UI state. They keep running
+    ///    in `JobPlane` and `jobStop` is the dedicated way to kill
+    ///    them.
     pub fn finalizeCancelled(&mut self) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
@@ -558,21 +576,11 @@ impl AgentPanel {
         self.toolActive = false;
         self.toolStartTime = None;
         self.retryStatus = None;
-        self.activeSubagent = None;
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
         self.queuedMessages.clear();
         self.textArea.placeholder = "Type a message...";
-        // Mark any active subagent block as done.
-        for entry in self.entries.iter_mut().rev() {
-            if let PanelEntry::SubagentBlock { done, .. } = entry {
-                if !*done {
-                    *done = true;
-                    break;
-                }
-            }
-        }
         self.entries.push(PanelEntry::Cancelled);
     }
 
@@ -588,7 +596,9 @@ impl AgentPanel {
     ) {
         if !self.turnActive { return; }
         self.finalizeStreaming();
-        // Extract raw command for shell tools (used for code block preview).
+        // Extract raw command for shell tools so the approval prompt
+        // shows the full command in a code block, not just the summary
+        // line. Foreground and background shell share the same shape.
         let command = construct::tool::parse(name, args).ok().and_then(|action| {
             match action {
                 construct::tool::ToolAction::Shell { command, .. } => Some(command),
@@ -608,13 +618,23 @@ impl AgentPanel {
         self.permitPatterns = construct::tool::parse(name, args)
             .map(|a| construct::permissions::suggestPatterns(&a))
             .unwrap_or_default();
-        self.permitSelectedPattern = 0;
         // Pre-fill custom with the most specific pattern.
         self.permitCustomPattern = self.permitPatterns
             .first()
             .cloned()
             .unwrap_or_default();
-        self.permitEditingCustom = false;
+        if self.permitPatterns.is_empty() {
+            // No suggestions — land directly in the custom field so the
+            // user can type a pattern. Otherwise `nextPattern` can never
+            // advance past index 0 of a zero-length list, and Shift+A
+            // would dead-end with "type one in the custom field" while
+            // the keystroke pipeline ignores typed chars.
+            self.permitSelectedPattern = 0;
+            self.permitEditingCustom = true;
+        } else {
+            self.permitSelectedPattern = 0;
+            self.permitEditingCustom = false;
+        }
         self.permitCodeScrollX = 0;
 
         // Tool request arrived — DO NOT snap scroll, user may be reading
@@ -661,23 +681,44 @@ impl AgentPanel {
         )
     }
 
-    /// Feed PTY bytes from the running subagent's shell into its VT emulator.
-    /// No-op if no subagent is active.
-    pub fn feedSubagentShell(&mut self, data: &[u8]) {
-        if let Some(ref mut sub) = self.activeSubagent {
+    /// SessionId of the subagent whose permit is currently pending, if any.
+    /// Returns None for top-level permits and when no permit is pending.
+    pub fn pendingPermitSubagentSessionId(&self) -> Option<String> {
+        match &self.pendingPermitOrigin {
+            Some(construct::control::PermitOrigin::Subagent { sessionId }) => {
+                Some(sessionId.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Feed PTY bytes from a subagent's shell into its VT emulator.
+    /// No-op if the sessionId isn't a live subagent (e.g. the run
+    /// already completed and the entry was reaped).
+    pub fn feedSubagentShell(&mut self, sessionId: &str, data: &[u8]) {
+        if let Some(sub) = self.findSubagentMut(sessionId) {
             sub.shellTerm.process(data);
         }
     }
 
-    /// Get the currently selected "always allow" pattern.
-    pub fn selectedPattern(&self) -> String {
-        if self.permitSelectedPattern >= self.permitPatterns.len() {
-            // Custom field selected.
+    /// Get the currently selected "always allow" pattern. Returns `None`
+    /// when the user hasn't picked a non-empty pattern — the caller must
+    /// refuse to persist an empty pattern (it would match every future
+    /// invocation of the tool).
+    pub fn selectedPattern(&self) -> Option<String> {
+        let raw = if self.permitSelectedPattern >= self.permitPatterns.len() {
             self.permitCustomPattern.clone()
         } else {
-            self.permitPatterns.get(self.permitSelectedPattern)
+            self.permitPatterns
+                .get(self.permitSelectedPattern)
                 .cloned()
                 .unwrap_or_default()
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     }
 
@@ -745,13 +786,23 @@ impl AgentPanel {
     // -- Subagent lifecycle --
 
     pub fn subagentStarted(&mut self, sessionId: &str, agentType: &str, prompt: &str) {
-        if !self.turnActive { return; }
+        // No `turnActive` gate. Background subagents (`task(runInBackground:
+        // true)`) outlive the parent's turn; their lifecycle events must
+        // continue to update the conversation timeline and the popup
+        // after `finishTurn` has flipped `turnActive` to false. Otherwise
+        // a backgrounded subagent stays visually "running" forever even
+        // though JobPlane has correctly completed it.
         self.finalizeStreaming();
         // Remove the preceding ToolRequest for the task tool — the SubagentBlock replaces it.
         if let Some(PanelEntry::ToolRequest { .. }) = self.entries.last() {
             self.entries.pop();
         }
-        self.activeSubagent = Some(ActiveSubagent::new(sessionId, agentType));
+        // Push a new ActiveSubagent and focus it. With parallel subagents
+        // the latest spawn becomes the selected tab; the user can switch
+        // with [ / ] in the popup.
+        self.activeSubagents
+            .push(ActiveSubagent::new(sessionId, agentType));
+        self.selectedSubagent = Some(self.activeSubagents.len() - 1);
         self.entries.push(PanelEntry::SubagentBlock {
             agentType: agentType.into(),
             prompt: prompt.into(),
@@ -771,20 +822,23 @@ impl AgentPanel {
         self.idleWhileScrolled = false;
     }
 
-    pub fn subagentToolLine(&mut self, name: &str, summary: &str) {
-        if !self.turnActive { return; }
-        // Find the active SubagentBlock and append.
-        if let Some(PanelEntry::SubagentBlock { toolLines, .. }) = self.entries.iter_mut().rev()
-            .find(|e| matches!(e, PanelEntry::SubagentBlock { done: false, .. }))
+    /// Append a tool-activity line to a specific subagent (by sessionId)
+    /// in both the conversation-timeline SubagentBlock and the popup
+    /// transcript. Routing by sessionId is required because multiple
+    /// parallel subagents may have unfinished SubagentBlock entries at
+    /// the same time.
+    pub fn subagentToolLine(&mut self, sessionId: &str, name: &str, summary: &str) {
+        // Background subagents fire tool lines after the parent turn ends.
+        if let Some(PanelEntry::SubagentBlock { toolLines, .. }) =
+            self.findSubagentBlockMut(sessionId)
         {
             toolLines.push((name.into(), summary.into()));
         }
-        if let Some(ref mut sub) = self.activeSubagent {
+        if let Some(sub) = self.findSubagentMut(sessionId) {
             sub.transcript.push(PanelEntry::ToolApproved {
                 name: format!("{name}: {summary}"),
             });
         }
-        // Subagent tool activity — DO NOT snap scroll
         if self.scrollOffset == 0 {
             self.newContentWhileScrolled = false;
         } else {
@@ -793,9 +847,9 @@ impl AgentPanel {
         self.idleWhileScrolled = false;
     }
 
-    /// Push a full tool result to the subagent's transcript (for the overlay).
-    pub fn subagentToolResult(&mut self, name: &str, output: &str) {
-        if let Some(ref mut sub) = self.activeSubagent {
+    /// Push a full tool result to a specific subagent's overlay transcript.
+    pub fn subagentToolResult(&mut self, sessionId: &str, name: &str, output: &str) {
+        if let Some(sub) = self.findSubagentMut(sessionId) {
             sub.transcript.push(PanelEntry::ToolResult {
                 name: name.into(),
                 output: output.into(),
@@ -803,10 +857,9 @@ impl AgentPanel {
         }
     }
 
-    pub fn subagentContent(&mut self, text: &str) {
-        // Content goes to transcript for the overlay.
-        if let Some(ref mut sub) = self.activeSubagent {
-            // Append to existing Assistant entry or create new one.
+    /// Append streaming content to a specific subagent's overlay transcript.
+    pub fn subagentContent(&mut self, sessionId: &str, text: &str) {
+        if let Some(sub) = self.findSubagentMut(sessionId) {
             if let Some(PanelEntry::Assistant(existing)) = sub.transcript.last_mut() {
                 existing.push_str(text);
             } else {
@@ -815,10 +868,23 @@ impl AgentPanel {
         }
     }
 
-    pub fn subagentComplete(&mut self, _agentType: &str, turns: usize, finalContent: &str) {
-        if !self.turnActive { return; }
-        if let Some(PanelEntry::SubagentBlock { done, turns: t, content, contentExpanded: _, .. }) = self.entries.iter_mut().rev()
-            .find(|e| matches!(e, PanelEntry::SubagentBlock { done: false, .. }))
+    pub fn subagentComplete(
+        &mut self,
+        sessionId: &str,
+        _agentType: &str,
+        turns: usize,
+        finalContent: &str,
+    ) {
+        // No `turnActive` gate — background subagents complete after the
+        // parent turn ends and we still need to mark the SubagentBlock
+        // done and reap the live entry.
+        if let Some(PanelEntry::SubagentBlock {
+            done,
+            turns: t,
+            content,
+            contentExpanded: _,
+            ..
+        }) = self.findSubagentBlockMut(sessionId)
         {
             *done = true;
             *t = turns;
@@ -826,6 +892,96 @@ impl AgentPanel {
                 *content = Some(finalContent.into());
             }
         }
+        // Drop the live entry — the SubagentBlock entry in the timeline
+        // preserves the final state. If the user had this subagent open
+        // in the popup, advance to the next live one (or close if none).
+        self.removeSubagent(sessionId);
+    }
+
+    // -- subagent registry helpers ------------------------------------
+
+    /// Lookup the index of a subagent in `activeSubagents` by session id.
+    pub fn findSubagentIndex(&self, sessionId: &str) -> Option<usize> {
+        self.activeSubagents
+            .iter()
+            .position(|s| s.sessionId == sessionId)
+    }
+
+    pub fn findSubagentMut(&mut self, sessionId: &str) -> Option<&mut ActiveSubagent> {
+        let idx = self.findSubagentIndex(sessionId)?;
+        self.activeSubagents.get_mut(idx)
+    }
+
+    /// Currently-focused subagent for the popup. None when no parallel
+    /// subagents are live.
+    pub fn currentSubagent(&self) -> Option<&ActiveSubagent> {
+        self.selectedSubagent
+            .and_then(|i| self.activeSubagents.get(i))
+    }
+
+    /// Mutable variant of [`currentSubagent`].
+    pub fn currentSubagentMut(&mut self) -> Option<&mut ActiveSubagent> {
+        self.selectedSubagent
+            .and_then(move |i| self.activeSubagents.get_mut(i))
+    }
+
+    /// Focus a specific subagent in the popup. No-op for unknown ids.
+    pub fn selectSubagentBySessionId(&mut self, sessionId: &str) {
+        if let Some(idx) = self.findSubagentIndex(sessionId) {
+            self.selectedSubagent = Some(idx);
+        }
+    }
+
+    /// Cycle the popup's tab selection by `delta` (+1 next, -1 prev).
+    pub fn cycleSubagent(&mut self, delta: i32) {
+        if self.activeSubagents.is_empty() {
+            self.selectedSubagent = None;
+            return;
+        }
+        let len = self.activeSubagents.len() as i32;
+        let cur = self.selectedSubagent.unwrap_or(0) as i32;
+        let next = ((cur + delta).rem_euclid(len)) as usize;
+        self.selectedSubagent = Some(next);
+    }
+
+    /// Remove a subagent by session id. Adjusts `selectedSubagent` so
+    /// the popup either shows another live subagent or closes naturally.
+    pub fn removeSubagent(&mut self, sessionId: &str) {
+        let Some(idx) = self.findSubagentIndex(sessionId) else { return };
+        self.activeSubagents.remove(idx);
+        self.selectedSubagent = match self.selectedSubagent {
+            None => None,
+            Some(s) if self.activeSubagents.is_empty() => {
+                let _ = s;
+                None
+            }
+            Some(s) if s > idx => Some(s - 1),
+            Some(s) if s == idx => {
+                // The removed one was selected — pick the next live one.
+                if idx < self.activeSubagents.len() {
+                    Some(idx)
+                } else {
+                    Some(self.activeSubagents.len() - 1)
+                }
+            }
+            Some(s) => Some(s),
+        };
+    }
+
+    /// Find the SubagentBlock entry in the conversation timeline for a
+    /// given session. Matches the unfinished block tagged with that
+    /// sessionId; returns None for unknown ids or already-done entries.
+    fn findSubagentBlockMut(&mut self, sessionId: &str) -> Option<&mut PanelEntry> {
+        self.entries.iter_mut().rev().find(|e| {
+            matches!(
+                e,
+                PanelEntry::SubagentBlock {
+                    sessionId: Some(sid),
+                    done: false,
+                    ..
+                } if sid == sessionId
+            )
+        })
     }
 
     /// Toggle the content section of a subagent block (expand/collapse).
@@ -955,11 +1111,16 @@ impl AgentPanel {
         if !self.turnActive { return; }
         self.toolActive = false;
         self.toolStartTime = None;
-        // Replace the ToolActive entry with the result.
-        if let Some(last) = self.entries.last() {
-            if matches!(last, PanelEntry::ToolActive { .. }) {
-                self.entries.pop();
-            }
+        // Replace the most recent ToolActive entry with the result.
+        // Searching from the end (rather than checking only `last`)
+        // tolerates other entries that may have been pushed between
+        // ToolStarted and ToolResult — e.g. terminal lifecycle notices.
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        {
+            self.entries.remove(pos);
         }
         // Commit any in-flight streaming before the tool result.
         self.finalizeStreaming();
@@ -1000,6 +1161,14 @@ impl AgentPanel {
         self.isStreaming = false;
         self.thinkingStartTime = None;
         self.scrollOffset = 0;
+    }
+
+    /// Append a transient notice (e.g. "terminal 'build' spawned") to
+    /// the conversation without touching turn state. Unlike
+    /// `pushCommandResult`, this is safe to call mid-turn — the agent's
+    /// next streamed content keeps flowing.
+    pub fn pushNotice(&mut self, text: &str) {
+        self.entries.push(PanelEntry::CommandResult(text.into()));
     }
 
     /// Push a /context display and reset turn state.
@@ -1234,8 +1403,7 @@ impl AgentPanel {
             && self.streamingContent.is_empty()
             && self.pendingContent.is_empty()
             && self.streamingReasoning.is_empty();
-        let subagentRunning = self.activeSubagent.is_some()
-            && !self.entries.iter().rev().any(|e| matches!(e, PanelEntry::SubagentBlock { done: true, .. }));
+        let subagentRunning = !self.activeSubagents.is_empty();
         let pendingToolCall = !self.pendingToolCalls.is_empty();
         if !(waiting
             || self.reasoningActive
@@ -1358,25 +1526,33 @@ impl AgentPanel {
                         if let PanelEntry::Reasoning { text, expanded } = &mut self.entries[idx] {
                             let delta = countReasoningLines(text, w);
                             *expanded = !*expanded;
-                            if *expanded {
-                                self.scrollOffset = self.scrollOffset.saturating_add(delta);
-                                // Preempt streaming compensation so it doesn't double-adjust.
-                                self.lastMaxScroll = self.lastMaxScroll.saturating_add(delta);
-                            } else {
-                                self.scrollOffset = self.scrollOffset.saturating_sub(delta);
-                                self.lastMaxScroll = self.lastMaxScroll.saturating_sub(delta);
+                            // NOTE: Only pre-adjust when scrolled up. At the bottom the
+                            // natural reflow keeps the view at the newest content, and
+                            // bumping scrollOffset here makes the [↑N] indicator flash on
+                            // for one frame before render clamps it back down.
+                            if self.scrollOffset > 0 {
+                                if *expanded {
+                                    self.scrollOffset = self.scrollOffset.saturating_add(delta);
+                                    // Preempt streaming compensation so it doesn't double-adjust.
+                                    self.lastMaxScroll = self.lastMaxScroll.saturating_add(delta);
+                                } else {
+                                    self.scrollOffset = self.scrollOffset.saturating_sub(delta);
+                                    self.lastMaxScroll = self.lastMaxScroll.saturating_sub(delta);
+                                }
                             }
                         }
                     }
                     None => {
                         let delta = countReasoningLines(&self.streamingReasoning, w);
                         self.thinkingExpanded = !self.thinkingExpanded;
-                        if self.thinkingExpanded {
-                            self.scrollOffset = self.scrollOffset.saturating_add(delta);
-                            self.lastMaxScroll = self.lastMaxScroll.saturating_add(delta);
-                        } else {
-                            self.scrollOffset = self.scrollOffset.saturating_sub(delta);
-                            self.lastMaxScroll = self.lastMaxScroll.saturating_sub(delta);
+                        if self.scrollOffset > 0 {
+                            if self.thinkingExpanded {
+                                self.scrollOffset = self.scrollOffset.saturating_add(delta);
+                                self.lastMaxScroll = self.lastMaxScroll.saturating_add(delta);
+                            } else {
+                                self.scrollOffset = self.scrollOffset.saturating_sub(delta);
+                                self.lastMaxScroll = self.lastMaxScroll.saturating_sub(delta);
+                            }
                         }
                     }
                 }
@@ -2756,14 +2932,12 @@ impl AgentPanel {
                 let style = Style::default().fg(Color::Yellow);
                 let blobLines = self.throbber.renderLines();
                 let statusText = format!("{summary}  ({elapsed}s)");
-                // First line: throbber char + summary + elapsed.
                 lines.push(Line::from(vec![
                     blobLines[0].spans.first().cloned().unwrap_or_default(),
                     Span::raw(" "),
                     Span::styled(statusText, style),
                 ]));
                 cont.push(false);
-                // Second line: throbber continuation.
                 lines.push(blobLines[1].clone());
                 cont.push(true);
             }
@@ -2878,12 +3052,37 @@ impl AgentPanel {
                 };
 
                 if *done {
-                    let footerLabel = format!(" \u{2713}\u{FE0E} {agentType} ({turns} turns) ");
+                    // Inspect the content for the outcome markers the
+                    // background subagent runner prepends. A completed
+                    // run gets a green ✓; cancelled/errored runs get a
+                    // red ⊘ / ✗ so the block doesn't visually scan as
+                    // success.
+                    let (footerGlyph, footerColor, footerSummary) = match content
+                        .as_deref()
+                        .unwrap_or("")
+                    {
+                        s if s.starts_with("[subagent cancelled by user]") => (
+                            "\u{2298}",
+                            Color::Red,
+                            "cancelled".to_string(),
+                        ),
+                        s if s.starts_with("[subagent errored") => (
+                            "\u{2717}\u{FE0E}",
+                            Color::Red,
+                            "errored".to_string(),
+                        ),
+                        _ => (
+                            "\u{2713}\u{FE0E}",
+                            Color::Green,
+                            format!("{turns} turns"),
+                        ),
+                    };
+                    let footerLabel = format!(" {footerGlyph} {agentType} ({footerSummary}) ");
 
                     if let Some(contentText) = content {
-                        // Divider: ├─ ✓ explore (N turns) ─┤
+                        // Divider with the outcome-aware color.
                         lines.push(makeBorderLine("\u{251C}", "\u{2524}",
-                            &footerLabel, Style::default().fg(Color::Green), &indent));
+                            &footerLabel, Style::default().fg(footerColor), &indent));
                         cont.push(false);
 
                         let toggleEntryIdx = entryIndex;
@@ -3053,12 +3252,12 @@ impl AgentPanel {
                     } else {
                         // No content — simple bottom border.
                         lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                            &footerLabel, Style::default().fg(Color::Green), &indent));
+                            &footerLabel, Style::default().fg(footerColor), &indent));
                         cont.push(false);
                     }
                 } else {
-                    let elapsed = self.activeSubagent
-                        .as_ref()
+                    let elapsed = self
+                        .currentSubagent()
                         .map(|s| s.startTime.elapsed().as_secs())
                         .unwrap_or(0);
                     let blobLines = self.throbber.renderLines();

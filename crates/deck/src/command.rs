@@ -56,7 +56,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "rewind",
         aliases: &[],
-        description: "Rewind conversation to a turn/block/topic",
+        description: "Rewind conversation; pass a turnId to skip the picker",
     },
     CommandDef {
         name: "resume",
@@ -93,6 +93,16 @@ pub const COMMANDS: &[CommandDef] = &[
         aliases: &[],
         description: "Show session and rolling cost breakdown",
     },
+    CommandDef {
+        name: "tasks",
+        aliases: &["jobs"],
+        description: "Show background jobs, monitors, and wake schedules",
+    },
+    CommandDef {
+        name: "layout",
+        aliases: &[],
+        description: "Show the resolved layout file path (Ctrl+O opens the panel)",
+    },
 ];
 
 /// Return commands whose name or aliases start with the given prefix.
@@ -116,7 +126,8 @@ pub enum CommandAction {
     ShowContext,
     /// Restore project to before the last file-modifying tool.
     Undo,
-    /// Rewind conversation (destructive — no fork saved).
+    /// Rewind conversation. Empty `target` opens the picker; a non-empty
+    /// `target` is dispatched directly (used for `/rewind <turnId>`).
     Rewind { target: String },
     /// List saved forks or switch to one by ID.
     Forks { forkId: Option<String> },
@@ -132,6 +143,11 @@ pub enum CommandAction {
     Permissions,
     /// Show cost breakdown.
     ShowCost,
+    /// Open the background jobs / monitors / schedules panel.
+    Tasks,
+    /// Show the resolved layout file path. The Ctrl+O panel is the
+    /// interactive entry point; this command is the text fallback.
+    ShowLayout,
 }
 
 /// How command output should be rendered.
@@ -178,7 +194,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "context" => CommandOutput::Action(CommandAction::ShowContext),
         "undo" => CommandOutput::Action(CommandAction::Undo),
         "rewind" => CommandOutput::Action(CommandAction::Rewind {
-            target: String::new(),
+            target: args.to_string(),
         }),
         "resume" => {
             let sessionId = if args.is_empty() {
@@ -201,6 +217,8 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "lsp" => CommandOutput::Action(CommandAction::Lsp),
         "permissions" => CommandOutput::Action(CommandAction::Permissions),
         "cost" => CommandOutput::Action(CommandAction::ShowCost),
+        "tasks" => CommandOutput::Action(CommandAction::Tasks),
+        "layout" => CommandOutput::Action(CommandAction::ShowLayout),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }
 }
@@ -216,5 +234,59 @@ fn executeHelp(args: &str) -> CommandOutput {
         CommandOutput::Inline(format!(
             "No help topic: \"{args}\". Type /help for available commands."
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tasksCommandAndJobsAliasReturnSameAction() {
+        // Slice 6a: /tasks (canonical) and /jobs (alias) both open the
+        // jobs panel via CommandAction::Tasks. Guards against the alias
+        // silently breaking if either string is edited.
+        for input in ["/tasks", "/jobs"] {
+            match tryHandle(input) {
+                Some(CommandOutput::Action(CommandAction::Tasks)) => {}
+                other => panic!(
+                    "expected CommandAction::Tasks for {input}, got {:?}",
+                    match other {
+                        Some(CommandOutput::Action(a)) => format!("Action({a:?})"),
+                        Some(CommandOutput::Inline(s)) => format!("Inline({s})"),
+                        None => "None".into(),
+                    },
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn layoutCommandReturnsShowLayoutAction() {
+        match tryHandle("/layout") {
+            Some(CommandOutput::Action(CommandAction::ShowLayout)) => {}
+            other => panic!(
+                "expected CommandAction::ShowLayout, got {:?}",
+                match other {
+                    Some(CommandOutput::Action(a)) => format!("Action({a:?})"),
+                    Some(CommandOutput::Inline(s)) => format!("Inline({s})"),
+                    None => "None".into(),
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn tasksAppearsInCompletions() {
+        let matches = completions("ta");
+        assert!(
+            matches.iter().any(|c| c.name == "tasks"),
+            "completions for `ta` should include /tasks",
+        );
+        let matches = completions("jo");
+        assert!(
+            matches.iter().any(|c| c.name == "tasks"),
+            "completions for `jo` should match the /jobs alias and surface /tasks",
+        );
     }
 }

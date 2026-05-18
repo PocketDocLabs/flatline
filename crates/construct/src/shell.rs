@@ -161,6 +161,10 @@ pub struct CommandRecord {
 pub struct Shell {
     cmdTx: mpsc::Sender<ShellRequest>,
     inputTx: mpsc::Sender<Vec<u8>>,
+    /// Tear-down signal. Sending here closes the PTY and exits the
+    /// driver task; the harness's `ShellIo::outputRx` then sees its
+    /// sender drop, signaling "shell ended". Used by `ShellRegistry::kill`.
+    shutdownTx: mpsc::Sender<()>,
     history: Arc<Mutex<Vec<CommandRecord>>>,
     vt: Arc<Mutex<ShellVt>>,
 }
@@ -169,6 +173,13 @@ impl Shell {
     /// Send Ctrl+C to the shell to interrupt any running command.
     pub fn interrupt(&self) {
         let _ = self.inputTx.try_send(vec![0x03]);
+    }
+
+    /// Tear down the shell: close the PTY, exit the driver task. The
+    /// underlying process receives SIGHUP when its controlling terminal
+    /// goes away. Idempotent — multiple calls are safe.
+    pub fn shutdown(&self) {
+        let _ = self.shutdownTx.try_send(());
     }
 
     /// Execute a command in the shell and return captured output.
@@ -367,6 +378,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     let (resizeTx, mut resizeRx) = mpsc::channel::<(u16, u16)>(4);
     let (cmdTx, mut cmdRx) = mpsc::channel::<ShellRequest>(4);
     let (killTx, mut killRx) = mpsc::channel::<()>(4);
+    let (shutdownTx, mut shutdownRx) = mpsc::channel::<()>(1);
 
     let history: Arc<Mutex<Vec<CommandRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let historyRef = Arc::clone(&history);
@@ -419,7 +431,12 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                 result.output
             };
 
-            if timedOut {
+            // Only claim "timed out" when we genuinely couldn't extract
+            // the exit code. If `extractResult` parsed an exit code,
+            // the command's END marker reached the buffer — the run
+            // finished, our kill chain was just slow to notice. Slapping
+            // the marker on anyway would cause a false AUTO_BG_INTERRUPT.
+            if timedOut && result.exitCode.is_none() {
                 response.push_str("\n(command timed out and was interrupted)");
             }
 
@@ -476,6 +493,24 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     }
                 } => {
                     if let Some(ref mut cap) = captureState {
+                        // Race recovery: a chunk containing the END
+                        // marker may have arrived in the same tick as
+                        // the deadline. If we SIGINT now we'll clear
+                        // the shell's pending line 2 (the END printf)
+                        // at the prompt — destroying our own signal.
+                        // Re-check the buffer before advancing kill
+                        // phase.
+                        let endPattern = format!("__FLATLINE_END_{}_", cap.uuid);
+                        if String::from_utf8_lossy(&cap.buffer).contains(&endPattern) {
+                            let cap = captureState.take().unwrap();
+                            let (_, remaining) = finalizeCapture(cap, &historyRef, false);
+                            if !remaining.is_empty() {
+                                feedVt(&remaining);
+                                let _ = outputTx.try_send(remaining);
+                            }
+                            continue;
+                        }
+
                         let nextDeadline = tokio::time::Instant::now()
                             + Duration::from_secs(SHELL_ESCALATION_SECS);
 
@@ -542,18 +577,21 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     feedVt(&echoBytes);
                     let _ = outputTx.try_send(echoBytes);
 
-                    // NOTE: Markers use printf with %s so the shell's command
-                    // echo never contains the exact uuid pattern. This prevents
-                    // PTY line-wrapping from creating false marker matches.
-                    // The DisplayFilter mutes all output until the actual start
-                    // marker appears, hiding the echoed command text.
+                    // SINGLE-LINE WRAPPER: set the per-command uuid
+                    // variable, emit START, then run the user's command.
+                    // The END marker is emitted by the shell's natural
+                    // `precmd` hook (injected via shell integration)
+                    // immediately after the command finishes — no
+                    // separate follow-up line that would race with the
+                    // shell's prompt redraw and hang until timeout.
                     //
-                    // The exit-code capture goes on a NEW LINE after the command.
-                    // A semicolon join would break heredocs — the shell needs the
-                    // delimiter (e.g. EOF) on a line by itself.
+                    // Heredoc-safe: setting `_flatline_uuid` is on the
+                    // same logical line as the user command via `;`,
+                    // not on a separate line that would attach to a
+                    // heredoc delimiter.
                     let cmd = req.command.trim_end();
                     let wrapped = format!(
-                        "printf '__FLATLINE_START_%s__\\n' '{uuid}'; printf '\\e]133;C\\a'; {cmd}\n__flatline_ec=$?; printf '\\e]133;D;%s\\a' \"$__flatline_ec\"; printf '\\n__FLATLINE_END_%s_%s__\\n' '{uuid}' \"$__flatline_ec\"\n",
+                        "_flatline_uuid='{uuid}'; printf '__FLATLINE_START_%s__\\n' '{uuid}'; {cmd}\n",
                     );
                     // Queue for chunked write — large commands (heredocs)
                     // would deadlock if written in one blocking call.
@@ -595,15 +633,26 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     }
                 }
 
+                // Tear-down — close the PTY and exit the loop. The PTY
+                // reader thread sees EOF on its next read and exits,
+                // which drops outputTx so the harness knows the shell
+                // is gone.
+                Some(()) = shutdownRx.recv() => {
+                    break;
+                }
+
                 // All channels closed — shut down.
                 else => break,
             }
         }
+        // Master and writer drop here when the task exits; the OS
+        // sends SIGHUP to the shell's process group.
     });
 
     let shell = Shell {
         cmdTx,
         inputTx: inputTx.clone(),
+        shutdownTx,
         history,
         vt,
     };
@@ -894,14 +943,29 @@ fn injectShellIntegration(shell: &str, cmd: &mut CommandBuilder) -> Result<()> {
             std::fs::write(integrationDir.join(file), content)?;
         }
 
-        // .zshrc: source original, restore ZDOTDIR, add hooks.
+        // .zshrc: source original, restore ZDOTDIR, add hooks. The
+        // precmd hook does double duty: emits the standard OSC 133
+        // boundary markers, AND when the caller has set
+        // `_flatline_uuid`, emits a per-command END marker carrying
+        // that uuid and the just-finished command's exit code. That
+        // lets the wrapper be a single line (no need for a follow-up
+        // "; printf END" statement that the shell would have to read
+        // as a second line — which always raced with the prompt and
+        // hung until timeout).
         let zshrc = format!(
             r#"[[ -f "{originalZdotdir}/.zshrc" ]] && source "{originalZdotdir}/.zshrc"
 ZDOTDIR="{originalZdotdir}"
 # Agent shell has no interactive history — disable ! expansion
 # so globs like [!.]* don't trigger "event not found".
 set +H
-flatline_precmd() {{ printf '\e]133;D;%s\a\e]133;A\a' "$?" }}
+flatline_precmd() {{
+    local _ec=$?
+    printf '\e]133;D;%s\a\e]133;A\a' "$_ec"
+    if [[ -n "$_flatline_uuid" ]]; then
+        printf '\n__FLATLINE_END_%s_%s__\n' "$_flatline_uuid" "$_ec"
+        _flatline_uuid=""
+    fi
+}}
 flatline_preexec() {{ printf '\e]133;C\a' }}
 precmd_functions+=(flatline_precmd)
 preexec_functions+=(flatline_preexec)
@@ -914,7 +978,14 @@ preexec_functions+=(flatline_preexec)
 # Agent shell has no interactive history — disable ! expansion
 # so globs like [!.]* don't trigger "event not found".
 set +H
-flatline_prompt_command() { printf '\033]133;D;%s\a\033]133;A\a' "$?"; }
+flatline_prompt_command() {
+    local _ec=$?
+    printf '\033]133;D;%s\a\033]133;A\a' "$_ec"
+    if [[ -n "$_flatline_uuid" ]]; then
+        printf '\n__FLATLINE_END_%s_%s__\n' "$_flatline_uuid" "$_ec"
+        _flatline_uuid=""
+    fi
+}
 PROMPT_COMMAND="flatline_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 trap 'printf "\033]133;C\a"' DEBUG
 "#;
