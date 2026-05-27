@@ -409,6 +409,7 @@ pub async fn run() -> Result<()> {
     let mut cancelRx = cancelRx;
     let mut steerRx = steerRx;
     let mut userBgRx = userBgRx;
+    let sessionCancelTx = cancelTx.clone();
     tokio::spawn(async move {
         let config = match construct::config::load() {
             Ok(c) => c,
@@ -608,6 +609,12 @@ pub async fn run() -> Result<()> {
             tokio::select! {
                 batch = nextWakeBatch => {
                     if let Some(batch) = batch {
+                        // A wake starts a fresh model turn, just like a typed
+                        // user message. If Esc left the shared cancel watch at
+                        // `true`, clear it before `sendInner` checks the flag;
+                        // otherwise the wake chip appears but the turn cancels
+                        // before streaming anything.
+                        let _ = sessionCancelTx.send(false);
                         cancelRx.borrow_and_update();
                         if let Err(e) = session.injectWakeBatch(
                             batch,

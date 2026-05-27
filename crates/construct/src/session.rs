@@ -29,19 +29,19 @@ use crate::compaction_trigger;
 use crate::config::Config;
 use crate::context;
 use crate::control::{LogEvent, PermitOrigin, SessionRequest};
+use crate::jobs::JobPlane;
+use crate::lsp;
+use crate::mcp;
 use crate::message::{
     Content, FunctionCall, Message, ReasoningConfig, StreamEvent, TokenUsage, ToolCall, ToolDef,
 };
-use crate::permissions::{PermitMode, Permissions, Verdict};
+use crate::permissions::{Permissions, PermitMode, Verdict};
 use crate::prompt::{self, DomainModule, InterfaceMode};
 use crate::shell::Shell;
 use crate::shells::{ShellRegistry, SpawnedBy};
-use crate::jobs::JobPlane;
 use crate::tool;
 use crate::topic::{TopicDecision, TopicTracker};
-use crate::transcript::{self, Transcript, SessionMeta};
-use crate::lsp;
-use crate::mcp;
+use crate::transcript::{self, SessionMeta, Transcript};
 use crate::web;
 
 /// A user input message with optional image attachments.
@@ -67,7 +67,10 @@ pub struct Attachment {
 
 impl From<String> for UserInput {
     fn from(text: String) -> Self {
-        UserInput { text, attachments: Vec::new() }
+        UserInput {
+            text,
+            attachments: Vec::new(),
+        }
     }
 }
 
@@ -115,15 +118,11 @@ pub struct Rider {
 ///    `jobStop` aborts the run cooperatively.
 /// 3. Completion calls `handle.complete(...)` / `handle.killed()` /
 ///    `handle.errored(...)` so the JobPlane's state machine and the
-///    F2 control panel panel both reflect the outcome.
+///    tasks panel both reflect the outcome.
 async fn runSubagentTaskInBackground(
     mut child: Session,
     childMainIo: crate::shell::ShellIo,
-    mut childIoRx: mpsc::Receiver<(
-        String,
-        crate::shell::ShellIo,
-        crate::shells::SpawnedBy,
-    )>,
+    mut childIoRx: mpsc::Receiver<(String, crate::shell::ShellIo, crate::shells::SpawnedBy)>,
     handle: crate::jobs::SubagentJobHandle,
     prompt: String,
     agentType: String,
@@ -419,7 +418,11 @@ fn buildChildPermissions(
             "cronDelete",
             "fileWatch",
         ] {
-            rules.push(Rule { tool: tool.into(), pattern: None, allow: false });
+            rules.push(Rule {
+                tool: tool.into(),
+                pattern: None,
+                allow: false,
+            });
         }
     }
 
@@ -456,7 +459,11 @@ fn renderRiderPrefix(riders: &[Rider]) -> String {
     }
     let mut out = String::from("<CRITICAL_INSTRUCTIONS>\n");
     for r in riders {
-        out.push_str(&format!("<{id}>\n{body}\n</{id}>\n", id = r.id, body = r.content));
+        out.push_str(&format!(
+            "<{id}>\n{body}\n</{id}>\n",
+            id = r.id,
+            body = r.content
+        ));
     }
     out.push_str("</CRITICAL_INSTRUCTIONS>\n\n");
     out
@@ -490,7 +497,11 @@ fn buildRequestMessages(
                     content: prependToContent(content, &prefix),
                 }
             }
-            Message::Assistant { content, tool_calls, reasoning } if promptThinking => {
+            Message::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } if promptThinking => {
                 let merged = match (reasoning.as_ref(), content.as_ref()) {
                     (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
                     (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
@@ -529,7 +540,12 @@ fn prependToContent(content: &Content, prefix: &str) -> Content {
                 }
             }
             if !attached {
-                out.insert(0, ContentBlock::Text { text: prefix.to_string() });
+                out.insert(
+                    0,
+                    ContentBlock::Text {
+                        text: prefix.to_string(),
+                    },
+                );
             }
             Content::Blocks(out)
         }
@@ -551,7 +567,7 @@ pub struct Session {
     /// break Send.
     pub shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
     /// Background-job registry. Shared via `Arc<Mutex<>>` so the deck's
-    /// F2 control panel request handler can run concurrently with `session.send`
+    /// tasks-panel request handler can run concurrently with `session.send`
     /// (the latter holds `&mut self` for the whole turn). Use
     /// `jobPlaneHandle()` to clone the handle.
     pub jobs: std::sync::Arc<std::sync::Mutex<JobPlane>>,
@@ -606,7 +622,7 @@ pub struct Session {
 impl Session {
     /// Clone of the task-plane handle for callers that need to query or
     /// mutate it independently of the session's `&mut self` borrow
-    /// (e.g. a dedicated F2 control panel request handler running concurrently
+    /// (e.g. a dedicated tasks-panel request handler running concurrently
     /// with `session.send`).
     pub fn jobPlaneHandle(&self) -> std::sync::Arc<std::sync::Mutex<JobPlane>> {
         self.jobs.clone()
@@ -684,18 +700,19 @@ impl Session {
         let transcript = Transcript::create(&sessionId)?;
         let snapshots = crate::snapshot::SnapshotStore::open(transcript.sessionDir())?;
         let compactionLog = CompactionLog::open(transcript.sessionDir())?;
-        let compactionTracker = compaction_trigger::Tracker::new(
-            config.heavy.contextWindow,
-            config.compactRatio,
-        );
+        let compactionTracker =
+            compaction_trigger::Tracker::new(config.heavy.contextWindow, config.compactRatio);
         // System prompt is ephemeral — never recorded in transcript.
         tracing::info!(sessionId = %sessionId, "session created");
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
         let projectLsp = lsp::config::loadProjectLsp(
-            config.projectRoot.as_deref()
+            config
+                .projectRoot
+                .as_deref()
                 .unwrap_or(&std::env::current_dir().unwrap_or_default()),
-        ).unwrap_or_default();
+        )
+        .unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
         let (wakeArc, wakeBatchRx) = crate::wakes::WakeRegistry::new();
@@ -777,7 +794,13 @@ impl Session {
         interface: InterfaceMode,
         domains: &[DomainModule],
         sessionId: &str,
-    ) -> std::result::Result<Self, (anyhow::Error, std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>)> {
+    ) -> std::result::Result<
+        Self,
+        (
+            anyhow::Error,
+            std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
+        ),
+    > {
         Self::resumeInner(config, permissions, shells, interface, domains, sessionId).await
     }
 
@@ -788,7 +811,13 @@ impl Session {
         interface: InterfaceMode,
         domains: &[DomainModule],
         sessionId: &str,
-    ) -> std::result::Result<Self, (anyhow::Error, std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>)> {
+    ) -> std::result::Result<
+        Self,
+        (
+            anyhow::Error,
+            std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
+        ),
+    > {
         let client = match api::Client::new(&config) {
             Ok(c) => c,
             Err(e) => return Err((e, shells)),
@@ -847,10 +876,8 @@ impl Session {
         }];
         history.extend(reconstructed);
 
-        let compactionTracker = compaction_trigger::Tracker::new(
-            config.heavy.contextWindow,
-            config.compactRatio,
-        );
+        let compactionTracker =
+            compaction_trigger::Tracker::new(config.heavy.contextWindow, config.compactRatio);
 
         // Restore topic tracker state from meta.json.
         let mut topicTracker = TopicTracker::new();
@@ -878,12 +905,16 @@ impl Session {
         // Rebuild filesRead from history — hash current disk content for staleness detection.
         let mut filesRead: HashMap<String, [u8; 20]> = HashMap::new();
         for msg in &history {
-            if let Message::Assistant { tool_calls: Some(calls), .. } = msg {
+            if let Message::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = msg
+            {
                 for call in calls {
                     if call.function.name == "readFile" {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                            &call.function.arguments,
-                        ) {
+                        if let Ok(args) =
+                            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                        {
                             if let Some(path) = args["path"].as_str() {
                                 let norm = normalizePath(path);
                                 if let Ok(bytes) = std::fs::read(&norm) {
@@ -906,9 +937,12 @@ impl Session {
 
         let exaClient = web::ExaClient::new(&config.web.searchKey);
         let projectLsp = lsp::config::loadProjectLsp(
-            config.projectRoot.as_deref()
+            config
+                .projectRoot
+                .as_deref()
                 .unwrap_or(&std::env::current_dir().unwrap_or_default()),
-        ).unwrap_or_default();
+        )
+        .unwrap_or_default();
         let lspManager = lsp::LspManager::new(&config.lsp, &projectLsp);
 
         let (wakeArc, wakeBatchRx) = crate::wakes::WakeRegistry::new();
@@ -1053,8 +1087,7 @@ impl Session {
     fn rebuildTopicTracker(&mut self) {
         let branchTurns = self.loadBranchTurns().unwrap_or_default();
 
-        let mut labelSources: Vec<crate::topic::TopicInfo> =
-            self.topicTracker.topics().to_vec();
+        let mut labelSources: Vec<crate::topic::TopicInfo> = self.topicTracker.topics().to_vec();
         if let Ok(meta) = Transcript::loadMeta(self.transcript.sessionDir()) {
             for t in meta.topics {
                 if !labelSources.iter().any(|x| x.topicId == t.topicId) {
@@ -1065,7 +1098,8 @@ impl Session {
 
         let rebuilt = crate::topic::rebuildTopicInfos(&branchTurns, &labelSources);
         self.topicTracker.restoreState(rebuilt);
-        self.transcript.setTopicId(self.topicTracker.currentTopicId());
+        self.transcript
+            .setTopicId(self.topicTracker.currentTopicId());
     }
 
     /// Load turns for display — extends past the current head through any
@@ -1184,32 +1218,41 @@ impl Session {
         userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-        // Drain stale steer messages from a previous cancelled turn.
-        while steerRx.try_recv().is_ok() {}
-        // Drain stale user-bg requests from a previous turn.
-        while userBgRx.try_recv().is_ok() {}
+            // Drain stale steer messages from a previous cancelled turn.
+            while steerRx.try_recv().is_ok() {}
+            // Drain stale user-bg requests from a previous turn.
+            while userBgRx.try_recv().is_ok() {}
 
-        let userMessage = &input.text;
-        tracing::info!(len = userMessage.len(), attachments = input.attachments.len(), "user message received");
+            let userMessage = &input.text;
+            tracing::info!(
+                len = userMessage.len(),
+                attachments = input.attachments.len(),
+                "user message received"
+            );
 
-        // Warm up LSP servers on first send (scans project, starts matching servers).
-        if !self.lspWarmedUp {
-            self.lspWarmedUp = true;
-            let projectDir = std::env::current_dir().unwrap_or_default();
-            self.lspManager.warmUp(&projectDir).await;
-        }
+            // Warm up LSP servers on first send (scans project, starts matching servers).
+            if !self.lspWarmedUp {
+                self.lspWarmedUp = true;
+                let projectDir = std::env::current_dir().unwrap_or_default();
+                self.lspManager.warmUp(&projectDir).await;
+            }
 
-        // Build content — multimodal if attachments present. Riders are
-        // applied later against the API-call copy; `self.history` and the
-        // transcript get the clean user text.
-        let (content, turnAttachments) = buildUserContent(userMessage, &input.attachments);
-        self.history.push(Message::User { content });
-        match self.transcript.recordUser(userMessage, self.headTurnId.as_deref(), turnAttachments) {
-            Ok(turnId) => self.headTurnId = Some(turnId),
-            Err(e) => tracing::warn!("transcript write failed: {e}"),
-        }
+            // Build content — multimodal if attachments present. Riders are
+            // applied later against the API-call copy; `self.history` and the
+            // transcript get the clean user text.
+            let (content, turnAttachments) = buildUserContent(userMessage, &input.attachments);
+            self.history.push(Message::User { content });
+            match self.transcript.recordUser(
+                userMessage,
+                self.headTurnId.as_deref(),
+                turnAttachments,
+            ) {
+                Ok(turnId) => self.headTurnId = Some(turnId),
+                Err(e) => tracing::warn!("transcript write failed: {e}"),
+            }
 
-        self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+                .await
         })
     }
 
@@ -1247,10 +1290,23 @@ impl Session {
                 }
                 while userBgRx.try_recv().is_ok() {}
                 let combined = UserInput {
-                    text: queued.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n\n"),
+                    text: queued
+                        .iter()
+                        .map(|i| i.text.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
                     attachments: queued.into_iter().flat_map(|i| i.attachments).collect(),
                 };
-                return self.send(&combined, logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await;
+                return self
+                    .send(
+                        &combined,
+                        logTx,
+                        sessionRequestTx,
+                        cancelRx,
+                        steerRx,
+                        userBgRx,
+                    )
+                    .await;
             }
             while userBgRx.try_recv().is_ok() {}
 
@@ -1259,10 +1315,7 @@ impl Session {
             }
 
             let envelope = formatWakeBatch(&batch);
-            tracing::info!(
-                count = batch.fires.len(),
-                "injecting coalesced wake batch",
-            );
+            tracing::info!(count = batch.fires.len(), "injecting coalesced wake batch",);
 
             // Warm up LSP servers on first send.
             if !self.lspWarmedUp {
@@ -1276,19 +1329,25 @@ impl Session {
             // notice instead of a real user bubble.
             let (content, _atts) = buildUserContent(&envelope, &[]);
             self.history.push(Message::User { content });
-            match self.transcript.recordWake(&envelope, self.headTurnId.as_deref()) {
+            match self
+                .transcript
+                .recordWake(&envelope, self.headTurnId.as_deref())
+            {
                 Ok(turnId) => self.headTurnId = Some(turnId),
                 Err(e) => tracing::warn!("wake transcript write failed: {e}"),
             }
 
             // Surface the batch to the deck for UI rendering. One
             // WakeBatchInjected per batch — no per-fire chips.
-            let _ = logTx.send(LogEvent::WakeBatchInjected {
-                count: batch.fires.len(),
-                summary: wakeBatchSummary(&batch),
-            }).await;
+            let _ = logTx
+                .send(LogEvent::WakeBatchInjected {
+                    count: batch.fires.len(),
+                    summary: wakeBatchSummary(&batch),
+                })
+                .await;
 
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+                .await
         })
     }
 
@@ -1343,7 +1402,8 @@ impl Session {
             }
 
             tracing::info!("retrying last turn");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+                .await
         })
     }
 
@@ -1372,7 +1432,8 @@ impl Session {
             }
 
             tracing::info!("continuing from partial assistant response");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx).await
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+                .await
         })
     }
 
@@ -1405,9 +1466,7 @@ impl Session {
         let checkpointClone = self.checkpoint.clone();
         if let Some(cp) = checkpointClone {
             let turnId = self.transcript.currentBlock().to_string();
-            self.pendingCheckpoint = Some(tokio::spawn(async move {
-                cp.snapshot(&turnId).await
-            }));
+            self.pendingCheckpoint = Some(tokio::spawn(async move { cp.snapshot(&turnId).await }));
         }
 
         const MAX_RETRIES: u32 = 5;
@@ -1417,423 +1476,480 @@ impl Session {
         // collection at the bottom of this block always runs.
         let result: Result<()> = 'turns: {
             loop {
-            // Check for cancellation between turns.
-            if *cancelRx.borrow() {
-                tracing::info!("turn cancelled before streaming");
-                let _ = logTx.send(LogEvent::TurnCancelled).await;
-                break 'turns Ok(());
-            }
-
-            tracing::debug!(historyLen = self.history.len(), "starting turn");
-            // NOTE: Err from streamOneTurn means either a permanent API error
-            // or a transient one that already exhausted the API client's own
-            // 8-attempt retry loop. Don't retry again here — only retry
-            // mid-stream SSE errors (returned as TurnResult::TransientError).
-            let turnResult = self.streamOneTurn(logTx, cancelRx).await?;
-
-            match turnResult {
-                TurnResult::TransientError(msg) => {
-                    retryCount += 1;
-                    if retryCount > MAX_RETRIES {
-                        let _ = logTx.send(LogEvent::Error(msg)).await;
-                        break 'turns Ok(());
-                    }
-                    tracing::warn!(
-                        attempt = retryCount,
-                        max = MAX_RETRIES,
-                        error = %msg,
-                        "transient API error, retrying"
-                    );
-                    let _ = logTx.send(LogEvent::Retrying {
-                        attempt: retryCount,
-                        maxAttempts: MAX_RETRIES,
-                    }).await;
-                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s.
-                    let delay = Duration::from_secs(1 << (retryCount - 1));
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                TurnResult::Done { promptTokens } => {
-                    retryCount = 0;
-                    if let Some(tokens) = promptTokens {
-                        self.compactionTracker.updateTokens(tokens);
-                        self.checkCompactionTrigger(logTx).await;
-                    }
-                    // Extend turn if user queued messages during streaming.
-                    if self.drainSteer(steerRx, logTx).await {
-                        tracing::info!("extending turn with queued user messages");
-                        continue;
-                    }
-                    tracing::info!("turn complete (no tool calls)");
-                    let _ = logTx.send(LogEvent::TurnComplete).await;
-                    break 'turns Ok(());
-                }
-                TurnResult::Cancelled => {
-                    tracing::info!("turn cancelled during streaming");
+                // Check for cancellation between turns.
+                if *cancelRx.borrow() {
+                    tracing::info!("turn cancelled before streaming");
                     let _ = logTx.send(LogEvent::TurnCancelled).await;
                     break 'turns Ok(());
                 }
-                TurnResult::ToolCalls { calls, content, reasoning, promptTokens } => {
-                    retryCount = 0;
-                    // Update token count but don't trigger compaction mid-loop.
-                    if let Some(tokens) = promptTokens {
-                        self.compactionTracker.updateTokens(tokens);
-                    }
-                    // Hard budget enforcement.
-                    if let Some(limit) = self.maxBudgetUsd {
-                        if self.costTracker.sessionCost() >= limit {
-                            let msg = format!(
-                                "Budget limit reached ({} / {}). Stopping.",
-                                crate::cost::formatCost(self.costTracker.sessionCost()),
-                                crate::cost::formatCost(limit),
-                            );
-                            tracing::warn!(%msg, "hard budget limit hit");
+
+                tracing::debug!(historyLen = self.history.len(), "starting turn");
+                // NOTE: Err from streamOneTurn means either a permanent API error
+                // or a transient one that already exhausted the API client's own
+                // 8-attempt retry loop. Don't retry again here — only retry
+                // mid-stream SSE errors (returned as TurnResult::TransientError).
+                let turnResult = self.streamOneTurn(logTx, cancelRx).await?;
+
+                match turnResult {
+                    TurnResult::TransientError(msg) => {
+                        retryCount += 1;
+                        if retryCount > MAX_RETRIES {
                             let _ = logTx.send(LogEvent::Error(msg)).await;
                             break 'turns Ok(());
                         }
-                    }
-                    tracing::info!(
-                        callCount = calls.len(),
-                        hasContent = content.is_some(),
-                        hasReasoning = reasoning.is_some(),
-                        "turn produced tool calls"
-                    );
-                    // Record each tool call to transcript.
-                    for call in &calls {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&call.function.arguments)
-                                .unwrap_or(serde_json::Value::Null);
-                        match self.transcript.recordToolCall(
-                            &call.id,
-                            &call.function.name,
-                            &args,
-                        ) {
-                            Ok(turnId) => self.headTurnId = Some(turnId),
-                            Err(e) => tracing::warn!("transcript write failed: {e}"),
-                        }
-                    }
-
-                    self.history.push(buildAssistantMessage(
-                        content, Some(calls.clone()), reasoning
-                    ));
-
-                    // Checkpoint must complete before tools modify files.
-                    if let Some(handle) = self.pendingCheckpoint.take() {
-                        match handle.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => tracing::warn!("checkpoint snapshot failed: {e}"),
-                            Err(e) => tracing::warn!("checkpoint task panicked: {e}"),
-                        }
-                    }
-
-                    let mut aborted = false;
-
-                    for (callIdx, call) in calls.iter().enumerate() {
-                        // Check for cancellation between tool calls.
-                        if *cancelRx.borrow() {
-                            tracing::info!("cancelled between tool calls");
-                            for remaining in &calls[callIdx..] {
-                                self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
-                            }
-                            let _ = logTx.send(LogEvent::TurnCancelled).await;
-                            break 'turns Ok(());
-                        }
-
-                        let action = match tool::parse(
-                            &call.function.name,
-                            &call.function.arguments,
-                        ) {
-                            Ok(a) => a,
-                            Err(msg) => {
-                                self.pushToolResult(&call.id, msg.into());
-                                continue;
-                            }
-                        };
-                        let summary = tool::summarize(&action);
-
-                        // Pre-emptive LSP notification: send didChange with proposed
-                        // content so RA starts analyzing while the user reviews.
-                        // Stores (path, original_content) for revert on denial.
-                        let lspPreemptive: Option<(String, String)> = if let Some((path, proposed)) = tool::proposedContent(&action) {
-                            let original = std::fs::read_to_string(&path).ok();
-                            self.lspManager.touchFile(&path, &proposed).await;
-                            original.map(|orig| (path, orig))
-                        } else {
-                            None
-                        };
-
-                        let verdict = self.permissions.check(&action);
-
-                        tracing::debug!(
-                            tool = %call.function.name,
-                            verdict = ?verdict,
-                            "checking tool permission"
+                        tracing::warn!(
+                            attempt = retryCount,
+                            max = MAX_RETRIES,
+                            error = %msg,
+                            "transient API error, retrying"
                         );
-
-                        let approved = match verdict {
-                            Verdict::Allow => {
-                                let _ = logTx
-                                    .send(LogEvent::ToolAutoApproved {
-                                        name: call.function.name.clone(),
-                                        summary: summary.clone(),
-                                    })
-                                    .await;
-                                true
+                        let _ = logTx
+                            .send(LogEvent::Retrying {
+                                attempt: retryCount,
+                                maxAttempts: MAX_RETRIES,
+                            })
+                            .await;
+                        // Exponential backoff: 1s, 2s, 4s, 8s, 16s.
+                        let delay = Duration::from_secs(1 << (retryCount - 1));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    TurnResult::Done { promptTokens } => {
+                        retryCount = 0;
+                        if let Some(tokens) = promptTokens {
+                            self.compactionTracker.updateTokens(tokens);
+                            self.checkCompactionTrigger(logTx).await;
+                        }
+                        // Extend turn if user queued messages during streaming.
+                        if self.drainSteer(steerRx, logTx).await {
+                            tracing::info!("extending turn with queued user messages");
+                            continue;
+                        }
+                        tracing::info!("turn complete (no tool calls)");
+                        let _ = logTx.send(LogEvent::TurnComplete).await;
+                        break 'turns Ok(());
+                    }
+                    TurnResult::Cancelled => {
+                        tracing::info!("turn cancelled during streaming");
+                        let _ = logTx.send(LogEvent::TurnCancelled).await;
+                        break 'turns Ok(());
+                    }
+                    TurnResult::ToolCalls {
+                        calls,
+                        content,
+                        reasoning,
+                        promptTokens,
+                    } => {
+                        retryCount = 0;
+                        // Update token count but don't trigger compaction mid-loop.
+                        if let Some(tokens) = promptTokens {
+                            self.compactionTracker.updateTokens(tokens);
+                        }
+                        // Hard budget enforcement.
+                        if let Some(limit) = self.maxBudgetUsd {
+                            if self.costTracker.sessionCost() >= limit {
+                                let msg = format!(
+                                    "Budget limit reached ({} / {}). Stopping.",
+                                    crate::cost::formatCost(self.costTracker.sessionCost()),
+                                    crate::cost::formatCost(limit),
+                                );
+                                tracing::warn!(%msg, "hard budget limit hit");
+                                let _ = logTx.send(LogEvent::Error(msg)).await;
+                                break 'turns Ok(());
                             }
-                            Verdict::Deny => {
-                                let _ = logTx
-                                    .send(LogEvent::ToolAutoDenied {
-                                        name: call.function.name.clone(),
-                                        summary: summary.clone(),
-                                    })
-                                    .await;
-                                false
+                        }
+                        tracing::info!(
+                            callCount = calls.len(),
+                            hasContent = content.is_some(),
+                            hasReasoning = reasoning.is_some(),
+                            "turn produced tool calls"
+                        );
+                        // Record each tool call to transcript.
+                        for call in &calls {
+                            let args: serde_json::Value =
+                                serde_json::from_str(&call.function.arguments)
+                                    .unwrap_or(serde_json::Value::Null);
+                            match self.transcript.recordToolCall(
+                                &call.id,
+                                &call.function.name,
+                                &args,
+                            ) {
+                                Ok(turnId) => self.headTurnId = Some(turnId),
+                                Err(e) => tracing::warn!("transcript write failed: {e}"),
                             }
-                            Verdict::NeedsApproval => {
-                                match self.permissions.defaultMode {
-                                    PermitMode::Ask => {
-                                        let diff = tool::diffPreview(&action);
-                                        let explanation = crate::permissions::toolExplanation(&action)
-                                            .map(|s| s.to_string());
-                                        let impact = crate::permissions::toolImpact(&action);
-                                        let (replyTx, replyRx) = oneshot::channel();
-                                        let _ = sessionRequestTx
-                                            .send(SessionRequest::Permit {
-                                                origin: PermitOrigin::Top,
-                                                name: call.function.name.clone(),
-                                                summary,
-                                                args: call.function.arguments.clone(),
-                                                diff,
-                                                explanation,
-                                                impact,
-                                                reply: replyTx,
-                                            })
-                                            .await;
+                        }
 
-                                        // Wait for supervisor response or cancellation.
-                                        tokio::select! {
-                                            permit = replyRx => {
-                                                use crate::permissions::PermitResponse;
-                                                match permit {
-                                                    Ok(PermitResponse::Allow) => true,
-                                                    Ok(PermitResponse::AlwaysAllow { pattern }) => {
-                                                        let (toolName, _) = crate::permissions::actionKey(&action);
-                                                        let rulePattern = crate::permissions::normalizeRulePattern(
-                                                            &action, &pattern,
-                                                        );
-                                                        let persistPattern = rulePattern
-                                                            .clone()
-                                                            .unwrap_or_default();
-                                                        self.permissions.addRule(crate::permissions::Rule {
-                                                            tool: toolName.into(),
-                                                            pattern: rulePattern,
-                                                            allow: true,
-                                                        });
-                                                        // Persist to .flatline/config.toml if we have a project root.
-                                                        if let Some(ref root) = self.config.projectRoot {
-                                                            if let Err(e) = crate::config::persistPermissionRule(
-                                                                root,
-                                                                &self.permissions,
-                                                                toolName,
-                                                                &persistPattern,
-                                                                true,
-                                                            ) {
-                                                                tracing::warn!("failed to persist permission rule: {e}");
+                        self.history.push(buildAssistantMessage(
+                            content,
+                            Some(calls.clone()),
+                            reasoning,
+                        ));
+
+                        // Checkpoint must complete before tools modify files.
+                        if let Some(handle) = self.pendingCheckpoint.take() {
+                            match handle.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => tracing::warn!("checkpoint snapshot failed: {e}"),
+                                Err(e) => tracing::warn!("checkpoint task panicked: {e}"),
+                            }
+                        }
+
+                        let mut aborted = false;
+
+                        for (callIdx, call) in calls.iter().enumerate() {
+                            // Check for cancellation between tool calls.
+                            if *cancelRx.borrow() {
+                                tracing::info!("cancelled between tool calls");
+                                for remaining in &calls[callIdx..] {
+                                    self.pushToolResult(
+                                        &remaining.id,
+                                        crate::message::Content::text("Cancelled by user."),
+                                    );
+                                }
+                                let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                break 'turns Ok(());
+                            }
+
+                            let action =
+                                match tool::parse(&call.function.name, &call.function.arguments) {
+                                    Ok(a) => a,
+                                    Err(msg) => {
+                                        self.pushToolResult(&call.id, msg.into());
+                                        continue;
+                                    }
+                                };
+                            let summary = tool::summarize(&action);
+
+                            // Pre-emptive LSP notification: send didChange with proposed
+                            // content so RA starts analyzing while the user reviews.
+                            // Stores (path, original_content) for revert on denial.
+                            let lspPreemptive: Option<(String, String)> =
+                                if let Some((path, proposed)) = tool::proposedContent(&action) {
+                                    let original = std::fs::read_to_string(&path).ok();
+                                    self.lspManager.touchFile(&path, &proposed).await;
+                                    original.map(|orig| (path, orig))
+                                } else {
+                                    None
+                                };
+
+                            let verdict = self.permissions.check(&action);
+
+                            tracing::debug!(
+                                tool = %call.function.name,
+                                verdict = ?verdict,
+                                "checking tool permission"
+                            );
+
+                            let approved = match verdict {
+                                Verdict::Allow => {
+                                    let _ = logTx
+                                        .send(LogEvent::ToolAutoApproved {
+                                            name: call.function.name.clone(),
+                                            summary: summary.clone(),
+                                        })
+                                        .await;
+                                    true
+                                }
+                                Verdict::Deny => {
+                                    let _ = logTx
+                                        .send(LogEvent::ToolAutoDenied {
+                                            name: call.function.name.clone(),
+                                            summary: summary.clone(),
+                                        })
+                                        .await;
+                                    false
+                                }
+                                Verdict::NeedsApproval => {
+                                    match self.permissions.defaultMode {
+                                        PermitMode::Ask => {
+                                            let diff = tool::diffPreview(&action);
+                                            let explanation =
+                                                crate::permissions::toolExplanation(&action)
+                                                    .map(|s| s.to_string());
+                                            let impact = crate::permissions::toolImpact(&action);
+                                            let (replyTx, replyRx) = oneshot::channel();
+                                            let _ = sessionRequestTx
+                                                .send(SessionRequest::Permit {
+                                                    origin: PermitOrigin::Top,
+                                                    name: call.function.name.clone(),
+                                                    summary,
+                                                    args: call.function.arguments.clone(),
+                                                    diff,
+                                                    explanation,
+                                                    impact,
+                                                    reply: replyTx,
+                                                })
+                                                .await;
+
+                                            // Wait for supervisor response or cancellation.
+                                            tokio::select! {
+                                                permit = replyRx => {
+                                                    use crate::permissions::PermitResponse;
+                                                    match permit {
+                                                        Ok(PermitResponse::Allow) => true,
+                                                        Ok(PermitResponse::AlwaysAllow { pattern }) => {
+                                                            let (toolName, _) = crate::permissions::actionKey(&action);
+                                                            let rulePattern = crate::permissions::normalizeRulePattern(
+                                                                &action, &pattern,
+                                                            );
+                                                            let persistPattern = rulePattern
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            self.permissions.addRule(crate::permissions::Rule {
+                                                                tool: toolName.into(),
+                                                                pattern: rulePattern,
+                                                                allow: true,
+                                                            });
+                                                            // Persist to .flatline/config.toml if we have a project root.
+                                                            if let Some(ref root) = self.config.projectRoot {
+                                                                if let Err(e) = crate::config::persistPermissionRule(
+                                                                    root,
+                                                                    &self.permissions,
+                                                                    toolName,
+                                                                    &persistPattern,
+                                                                    true,
+                                                                ) {
+                                                                    tracing::warn!("failed to persist permission rule: {e}");
+                                                                }
                                                             }
+                                                            true
                                                         }
-                                                        true
-                                                    }
-                                                    Ok(PermitResponse::AlwaysDeny { pattern }) => {
-                                                        let (toolName, _) = crate::permissions::actionKey(&action);
-                                                        let rulePattern = crate::permissions::normalizeRulePattern(
-                                                            &action, &pattern,
-                                                        );
-                                                        let persistPattern = rulePattern
-                                                            .clone()
-                                                            .unwrap_or_default();
-                                                        self.permissions.addRule(crate::permissions::Rule {
-                                                            tool: toolName.into(),
-                                                            pattern: rulePattern,
-                                                            allow: false,
-                                                        });
-                                                        if let Some(ref root) = self.config.projectRoot {
-                                                            if let Err(e) = crate::config::persistPermissionRule(
-                                                                root,
-                                                                &self.permissions,
-                                                                toolName,
-                                                                &persistPattern,
-                                                                false,
-                                                            ) {
-                                                                tracing::warn!("failed to persist deny rule: {e}");
+                                                        Ok(PermitResponse::AlwaysDeny { pattern }) => {
+                                                            let (toolName, _) = crate::permissions::actionKey(&action);
+                                                            let rulePattern = crate::permissions::normalizeRulePattern(
+                                                                &action, &pattern,
+                                                            );
+                                                            let persistPattern = rulePattern
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            self.permissions.addRule(crate::permissions::Rule {
+                                                                tool: toolName.into(),
+                                                                pattern: rulePattern,
+                                                                allow: false,
+                                                            });
+                                                            if let Some(ref root) = self.config.projectRoot {
+                                                                if let Err(e) = crate::config::persistPermissionRule(
+                                                                    root,
+                                                                    &self.permissions,
+                                                                    toolName,
+                                                                    &persistPattern,
+                                                                    false,
+                                                                ) {
+                                                                    tracing::warn!("failed to persist deny rule: {e}");
+                                                                }
                                                             }
+                                                            false
                                                         }
-                                                        false
+                                                        // Deny or disconnected reply → reject.
+                                                        Ok(PermitResponse::Deny) | Err(_) => false,
                                                     }
-                                                    // Deny or disconnected reply → reject.
-                                                    Ok(PermitResponse::Deny) | Err(_) => false,
                                                 }
-                                            }
-                                            _ = cancelRx.changed() => {
-                                                tracing::info!("cancelled during permission wait");
-                                                for remaining in &calls[callIdx..] {
-                                                    self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                                _ = cancelRx.changed() => {
+                                                    tracing::info!("cancelled during permission wait");
+                                                    for remaining in &calls[callIdx..] {
+                                                        self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                                    }
+                                                    let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                                    break 'turns Ok(());
                                                 }
-                                                let _ = logTx.send(LogEvent::TurnCancelled).await;
-                                                break 'turns Ok(());
                                             }
                                         }
-                                    }
-                                    PermitMode::Deny => {
-                                        let _ = logTx
-                                            .send(LogEvent::ToolDenied {
-                                                name: call.function.name.clone(),
-                                            })
-                                            .await;
-                                        false
-                                    }
-                                    PermitMode::Abort => {
-                                        let _ = logTx
-                                            .send(LogEvent::TurnAborted {
-                                                name: call.function.name.clone(),
-                                            })
-                                            .await;
-                                        aborted = true;
-                                        false
+                                        PermitMode::Deny => {
+                                            let _ = logTx
+                                                .send(LogEvent::ToolDenied {
+                                                    name: call.function.name.clone(),
+                                                })
+                                                .await;
+                                            false
+                                        }
+                                        PermitMode::Abort => {
+                                            let _ = logTx
+                                                .send(LogEvent::TurnAborted {
+                                                    name: call.function.name.clone(),
+                                                })
+                                                .await;
+                                            aborted = true;
+                                            false
+                                        }
                                     }
                                 }
-                            }
-                        };
+                            };
 
-                        // Revert pre-emptive LSP notification if denied/aborted.
-                        if !approved {
-                            if let Some((ref path, ref original)) = lspPreemptive {
-                                self.lspManager.touchFile(path, original).await;
-                            }
-                        }
-
-                        if aborted {
-                            self.pushToolResult(&call.id, "Turn aborted: tool call not permitted.".into());
-                            for remaining in &calls[callIdx + 1..] {
-                                self.pushToolResult(&remaining.id, "Turn aborted: tool call not permitted.".into());
-                            }
-                            break;
-                        }
-
-                        // Guard: editFile/writeFile require a prior readFile of the same path.
-                        if approved {
-                            if let Some(ref rejection) = self.checkReadBeforeWrite(&action) {
-                                tracing::info!(
-                                    tool = %call.function.name,
-                                    "rejected: file not read first"
-                                );
-                                // Revert pre-emptive LSP notification.
+                            // Revert pre-emptive LSP notification if denied/aborted.
+                            if !approved {
                                 if let Some((ref path, ref original)) = lspPreemptive {
                                     self.lspManager.touchFile(path, original).await;
                                 }
-                                let _ = logTx.send(LogEvent::ToolResult {
-                                    name: call.function.name.clone(),
-                                    output: rejection.clone(),
-                                }).await;
-                                self.pushToolResult(&call.id, rejection.clone().into());
-                                continue;
                             }
-                        }
 
-                        let output = if approved {
-                            tracing::info!(tool = %call.function.name, "executing tool");
+                            if aborted {
+                                self.pushToolResult(
+                                    &call.id,
+                                    "Turn aborted: tool call not permitted.".into(),
+                                );
+                                for remaining in &calls[callIdx + 1..] {
+                                    self.pushToolResult(
+                                        &remaining.id,
+                                        "Turn aborted: tool call not permitted.".into(),
+                                    );
+                                }
+                                break;
+                            }
 
-                            if tool::needsTask(&action) {
-                                // Subagent events handle all TUI rendering — no ToolStarted needed.
-                                let (taskPrompt, taskAgent, runInBackground) = match &action {
-                                    tool::ToolAction::Task { prompt, agent, runInBackground } => (
-                                        prompt.clone(),
-                                        agent.as_deref().unwrap_or("general").to_string(),
-                                        *runInBackground,
-                                    ),
-                                    _ => unreachable!(),
-                                };
-                                let result = if runInBackground {
-                                    self.executeTaskBackground(
-                                        &taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx,
-                                    ).await
+                            // Guard: editFile/writeFile require a prior readFile of the same path.
+                            if approved {
+                                if let Some(ref rejection) = self.checkReadBeforeWrite(&action) {
+                                    tracing::info!(
+                                        tool = %call.function.name,
+                                        "rejected: file not read first"
+                                    );
+                                    // Revert pre-emptive LSP notification.
+                                    if let Some((ref path, ref original)) = lspPreemptive {
+                                        self.lspManager.touchFile(path, original).await;
+                                    }
+                                    let _ = logTx
+                                        .send(LogEvent::ToolResult {
+                                            name: call.function.name.clone(),
+                                            output: rejection.clone(),
+                                        })
+                                        .await;
+                                    self.pushToolResult(&call.id, rejection.clone().into());
+                                    continue;
+                                }
+                            }
+
+                            let output = if approved {
+                                tracing::info!(tool = %call.function.name, "executing tool");
+
+                                if tool::needsTask(&action) {
+                                    // Subagent events handle all TUI rendering — no ToolStarted needed.
+                                    let (taskPrompt, taskAgent, runInBackground) = match &action {
+                                        tool::ToolAction::Task {
+                                            prompt,
+                                            agent,
+                                            runInBackground,
+                                        } => (
+                                            prompt.clone(),
+                                            agent.as_deref().unwrap_or("general").to_string(),
+                                            *runInBackground,
+                                        ),
+                                        _ => unreachable!(),
+                                    };
+                                    let result = if runInBackground {
+                                        self.executeTaskBackground(
+                                            &taskPrompt,
+                                            &taskAgent,
+                                            logTx,
+                                            sessionRequestTx,
+                                            cancelRx,
+                                        )
+                                        .await
+                                    } else {
+                                        self.executeTask(
+                                            &taskPrompt,
+                                            &taskAgent,
+                                            logTx,
+                                            sessionRequestTx,
+                                            cancelRx,
+                                        )
+                                        .await
+                                    };
+                                    // NOTE: No ToolResult event — SubagentComplete already notified the TUI.
+                                    crate::message::Content::text(result)
                                 } else {
-                                    self.executeTask(
-                                        &taskPrompt, &taskAgent, logTx, sessionRequestTx, cancelRx,
-                                    ).await
-                                };
-                                // NOTE: No ToolResult event — SubagentComplete already notified the TUI.
-                                crate::message::Content::text(result)
-                            } else {
-                            // Emit ToolStarted for non-task tools.
-                            let _ = logTx
-                                .send(LogEvent::ToolStarted {
-                                    name: call.function.name.clone(),
-                                    summary: tool::summarize(&action),
-                                })
-                                .await;
+                                    // Emit ToolStarted for non-task tools.
+                                    let _ = logTx
+                                        .send(LogEvent::ToolStarted {
+                                            name: call.function.name.clone(),
+                                            summary: tool::summarize(&action),
+                                        })
+                                        .await;
 
-                            if tool::needsMcp(&action) {
-                                crate::message::Content::text(self.executeMcpTool(&action).await)
-                            } else if tool::needsTranscript(&action) {
-                                crate::message::Content::text(self.executeTranscriptTool(&action))
-                            } else if tool::needsWeb(&action) {
-                                crate::message::Content::text(self.executeWebTool(&action).await)
-                            } else if tool::needsLsp(&action) {
-                                crate::message::Content::text(self.executeLspTool(&action).await)
-                            }
-                            else if tool::needsRegistry(&action) {
-                                crate::message::Content::text(self.executeTerminalTool(&action, logTx).await)
-                            }
-                            else if tool::needsJobPlane(&action) {
-                                crate::message::Content::text(self.executeJobTool(&action, logTx).await)
-                            }
-                            else if tool::needsMonitor(&action) {
-                                crate::message::Content::text(self.executeMonitorTool(&action, logTx).await)
-                            }
-                            else if tool::needsWakes(&action) {
-                                crate::message::Content::text(self.executeWakeTool(&action, logTx).await)
-                            }
-                            // Resolve target shell for shell-using tools. The
-                            // shell handle is also used for cancel-side
-                            // interrupt() if a Shell call is racing cancel.
-                            else {
-                                let resolvedShell = self.resolveShell(&action).await;
-                                // Display name for output labeling — what the
-                                // model called the terminal, or the agent's
-                                // current target if it omitted the field.
-                                let targetName = match action.terminal() {
-                                    Some(s) => s.to_string(),
-                                    None => self.shells.lock().await.activeForAgent().to_string(),
-                                };
-                                match resolvedShell {
-                                    Err(e) => crate::message::Content::text(e),
-                                    Ok(shell) => {
-                                        // Race tool execution against cancel + user-triggered
-                                        // bg (Ctrl+B) for shell commands. Auto-bg on a long
-                                        // run is not a separate timer — the shell's own
-                                        // timeout (default + model override) does the work;
-                                        // when it fires the result carries a sentinel suffix
-                                        // and we wrap with structured guidance below.
-                                        if matches!(action, tool::ToolAction::Shell { .. }) {
-                                            let (shellCommand, modelTimeout) = match &action {
-                                                tool::ToolAction::Shell { command, timeout, .. } => {
-                                                    (command.clone(), *timeout)
-                                                }
-                                                _ => (String::new(), None),
-                                            };
-                                            let effectiveTimeout = modelTimeout
-                                                .unwrap_or(crate::shell::SHELL_DEFAULT_TIMEOUT_SECS);
-                                            let execFut = tool::execute(&action, &shell, &targetName);
-                                            tokio::pin!(execFut);
-                                            // Build a "converted to bg" result. When the shell's
-                                            // timeout elapses or the user presses Ctrl+B we don't
-                                            // hand the model a "decide what to do" prompt — we
-                                            // auto-respawn the same command as a real JobPlane
-                                            // bg job and tell the model the new job id.
-                                            // NOTE: the bg job restarts from scratch — the
-                                            // foreground attempt was already killed by the
-                                            // shell driver. Idempotency is the caller's problem.
-                                            let buildConverted = |jobId: u64, elapsed: u64, userBg: bool, partial: &str| {
+                                    if tool::needsMcp(&action) {
+                                        crate::message::Content::text(
+                                            self.executeMcpTool(&action).await,
+                                        )
+                                    } else if tool::needsTranscript(&action) {
+                                        crate::message::Content::text(
+                                            self.executeTranscriptTool(&action),
+                                        )
+                                    } else if tool::needsWeb(&action) {
+                                        crate::message::Content::text(
+                                            self.executeWebTool(&action).await,
+                                        )
+                                    } else if tool::needsLsp(&action) {
+                                        crate::message::Content::text(
+                                            self.executeLspTool(&action).await,
+                                        )
+                                    } else if tool::needsRegistry(&action) {
+                                        crate::message::Content::text(
+                                            self.executeTerminalTool(&action, logTx).await,
+                                        )
+                                    } else if tool::needsJobPlane(&action) {
+                                        crate::message::Content::text(
+                                            self.executeJobTool(&action, logTx).await,
+                                        )
+                                    } else if tool::needsMonitor(&action) {
+                                        crate::message::Content::text(
+                                            self.executeMonitorTool(&action, logTx).await,
+                                        )
+                                    } else if tool::needsWakes(&action) {
+                                        crate::message::Content::text(
+                                            self.executeWakeTool(&action, logTx).await,
+                                        )
+                                    }
+                                    // Resolve target shell for shell-using tools. The
+                                    // shell handle is also used for cancel-side
+                                    // interrupt() if a Shell call is racing cancel.
+                                    else {
+                                        let resolvedShell = self.resolveShell(&action).await;
+                                        // Display name for output labeling — what the
+                                        // model called the terminal, or the agent's
+                                        // current target if it omitted the field.
+                                        let targetName = match action.terminal() {
+                                            Some(s) => s.to_string(),
+                                            None => self
+                                                .shells
+                                                .lock()
+                                                .await
+                                                .activeForAgent()
+                                                .to_string(),
+                                        };
+                                        match resolvedShell {
+                                            Err(e) => crate::message::Content::text(e),
+                                            Ok(shell) => {
+                                                // Race tool execution against cancel + user-triggered
+                                                // bg (Ctrl+B) for shell commands. Auto-bg on a long
+                                                // run is not a separate timer — the shell's own
+                                                // timeout (default + model override) does the work;
+                                                // when it fires the result carries a sentinel suffix
+                                                // and we wrap with structured guidance below.
+                                                if matches!(action, tool::ToolAction::Shell { .. })
+                                                {
+                                                    let (shellCommand, modelTimeout) = match &action
+                                                    {
+                                                        tool::ToolAction::Shell {
+                                                            command,
+                                                            timeout,
+                                                            ..
+                                                        } => (command.clone(), *timeout),
+                                                        _ => (String::new(), None),
+                                                    };
+                                                    let effectiveTimeout = modelTimeout.unwrap_or(
+                                                        crate::shell::SHELL_DEFAULT_TIMEOUT_SECS,
+                                                    );
+                                                    let execFut =
+                                                        tool::execute(&action, &shell, &targetName);
+                                                    tokio::pin!(execFut);
+                                                    // Build a "converted to bg" result. When the shell's
+                                                    // timeout elapses or the user presses Ctrl+B we don't
+                                                    // hand the model a "decide what to do" prompt — we
+                                                    // auto-respawn the same command as a real JobPlane
+                                                    // bg job and tell the model the new job id.
+                                                    // NOTE: the bg job restarts from scratch — the
+                                                    // foreground attempt was already killed by the
+                                                    // shell driver. Idempotency is the caller's problem.
+                                                    let buildConverted = |jobId: u64, elapsed: u64, userBg: bool, partial: &str| {
                                                 let trigger = if userBg {
                                                     format!("you pressed Ctrl+B")
                                                 } else {
@@ -1845,266 +1961,288 @@ impl Session {
                                                      NOTE: job #{jobId} is a FRESH run of the same command \u{2014} the foreground attempt was killed and not migrated. You will be notified when job #{jobId} completes (do not poll). Use jobOutput(jobId: {jobId}) for a mid-flight peek; jobStop(jobId: {jobId}) to cancel."
                                                 )
                                             };
-                                            loop {
-                                            tokio::select! {
-                                                result = &mut execFut => {
+                                                    loop {
+                                                        tokio::select! {
+                                                            result = &mut execFut => {
+                                                                tracing::debug!(
+                                                                    tool = %call.function.name,
+                                                                    outputLen = result.charCount(),
+                                                                    "tool execution complete"
+                                                                );
+                                                                // Shell appends this suffix when its
+                                                                // deadline elapsed without an exit code.
+                                                                // Auto-convert to a bg job and return the
+                                                                // new job id to the model.
+                                                                let text = match &result {
+                                                                    crate::message::Content::Text(s) => s.clone(),
+                                                                    _ => String::new(),
+                                                                };
+                                                                let marker = "\n(command timed out and was interrupted)";
+                                                                if text.contains(marker) {
+                                                                    let stripped = text.replace(marker, "");
+                                                                    let id = self.jobs.lock().unwrap().reserveJobId();
+                                                                    let (wakeId, fireTx) = {
+                                                                        let mut g = self.wakes.lock().await;
+                                                                        let wid = g.registerTaskComplete(id, logTx);
+                                                                        (wid, g.fireSender())
+                                                                    };
+                                                                    let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
+                                                                        id,
+                                                                        shellCommand.clone(),
+                                                                        logTx.clone(),
+                                                                        Some(crate::jobs::TaskWakeCtx {
+                                                                            wakeId,
+                                                                            registry: self.wakes.clone(),
+                                                                            fireTx,
+                                                                        }),
+                                                                    );
+                                                                    match spawnResult {
+                                                                        Ok(_) => {
+                                                                            let _ = logTx
+                                                                                .send(LogEvent::AutoBgWarning {
+                                                                                    command: shellCommand.clone(),
+                                                                                    elapsedSecs: effectiveTimeout,
+                                                                                    userTriggered: false,
+                                                                                })
+                                                                                .await;
+                                                                            break crate::message::Content::text(
+                                                                                buildConverted(id, effectiveTimeout, false, &stripped)
+                                                                            );
+                                                                        }
+                                                                        Err(e) => {
+                                                                            self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                                                                            break crate::message::Content::text(format!(
+                                                                                "Command exceeded its {effectiveTimeout}s timeout. Auto-bg conversion FAILED: {e}\n\nPartial output:\n{stripped}"
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                }
+                                                                break result;
+                                                            }
+                                                            _ = userBgRx.recv() => {
+                                                                // User pressed Ctrl+B — interrupt the
+                                                                // foreground attempt and respawn as a
+                                                                // tracked bg job.
+                                                                shell.interrupt();
+                                                                let partial = (&mut execFut).await;
+                                                                let partialText = match &partial {
+                                                                    crate::message::Content::Text(s) => s.clone(),
+                                                                    _ => String::new(),
+                                                                };
+                                                                // Strip the shell's timeout suffix if it
+                                                                // landed (Ctrl+B may race with deadline).
+                                                                let cleaned = partialText
+                                                                    .replace("\n(command timed out and was interrupted)", "");
+                                                                let id = self.jobs.lock().unwrap().reserveJobId();
+                                                                let (wakeId, fireTx) = {
+                                                                    let mut g = self.wakes.lock().await;
+                                                                    let wid = g.registerTaskComplete(id, logTx);
+                                                                    (wid, g.fireSender())
+                                                                };
+                                                                let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
+                                                                    id,
+                                                                    shellCommand.clone(),
+                                                                    logTx.clone(),
+                                                                    Some(crate::jobs::TaskWakeCtx {
+                                                                        wakeId,
+                                                                        registry: self.wakes.clone(),
+                                                                        fireTx,
+                                                                    }),
+                                                                );
+                                                                match spawnResult {
+                                                                    Ok(_) => {
+                                                                        let _ = logTx
+                                                                            .send(LogEvent::AutoBgWarning {
+                                                                                command: shellCommand.clone(),
+                                                                                elapsedSecs: 0,
+                                                                                userTriggered: true,
+                                                                            })
+                                                                            .await;
+                                                                        break crate::message::Content::text(
+                                                                            buildConverted(id, 0, true, &cleaned)
+                                                                        );
+                                                                    }
+                                                                    Err(e) => {
+                                                                        self.wakes.lock().await.unregisterPassive(wakeId, logTx);
+                                                                        break crate::message::Content::text(format!(
+                                                                            "User-triggered bg conversion FAILED: {e}\n\nPartial output:\n{cleaned}"
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ = cancelRx.changed() => {
+                                                                if !*cancelRx.borrow() {
+                                                                    // Spurious wakeup — retry select.
+                                                                    continue;
+                                                                }
+                                                                tracing::info!(tool = %call.function.name, "cancelled during shell execution");
+                                                                shell.interrupt();
+                                                                self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
+                                                                for remaining in &calls[callIdx + 1..] {
+                                                                    self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                                                }
+                                                                let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                                                break 'turns Ok(());
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    // File operations are fast — no cancel race needed.
+                                                    let result =
+                                                        tool::execute(&action, &shell, &targetName)
+                                                            .await;
                                                     tracing::debug!(
                                                         tool = %call.function.name,
                                                         outputLen = result.charCount(),
                                                         "tool execution complete"
                                                     );
-                                                    // Shell appends this suffix when its
-                                                    // deadline elapsed without an exit code.
-                                                    // Auto-convert to a bg job and return the
-                                                    // new job id to the model.
-                                                    let text = match &result {
-                                                        crate::message::Content::Text(s) => s.clone(),
-                                                        _ => String::new(),
-                                                    };
-                                                    let marker = "\n(command timed out and was interrupted)";
-                                                    if text.contains(marker) {
-                                                        let stripped = text.replace(marker, "");
-                                                        let id = self.jobs.lock().unwrap().reserveJobId();
-                                                        let (wakeId, fireTx) = {
-                                                            let mut g = self.wakes.lock().await;
-                                                            let wid = g.registerTaskComplete(id, logTx);
-                                                            (wid, g.fireSender())
-                                                        };
-                                                        let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
-                                                            id,
-                                                            shellCommand.clone(),
-                                                            logTx.clone(),
-                                                            Some(crate::jobs::TaskWakeCtx {
-                                                                wakeId,
-                                                                registry: self.wakes.clone(),
-                                                                fireTx,
-                                                            }),
-                                                        );
-                                                        match spawnResult {
-                                                            Ok(_) => {
-                                                                let _ = logTx
-                                                                    .send(LogEvent::AutoBgWarning {
-                                                                        command: shellCommand.clone(),
-                                                                        elapsedSecs: effectiveTimeout,
-                                                                        userTriggered: false,
-                                                                    })
-                                                                    .await;
-                                                                break crate::message::Content::text(
-                                                                    buildConverted(id, effectiveTimeout, false, &stripped)
-                                                                );
-                                                            }
-                                                            Err(e) => {
-                                                                self.wakes.lock().await.unregisterPassive(wakeId, logTx);
-                                                                break crate::message::Content::text(format!(
-                                                                    "Command exceeded its {effectiveTimeout}s timeout. Auto-bg conversion FAILED: {e}\n\nPartial output:\n{stripped}"
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    break result;
-                                                }
-                                                _ = userBgRx.recv() => {
-                                                    // User pressed Ctrl+B — interrupt the
-                                                    // foreground attempt and respawn as a
-                                                    // tracked bg job.
-                                                    shell.interrupt();
-                                                    let partial = (&mut execFut).await;
-                                                    let partialText = match &partial {
-                                                        crate::message::Content::Text(s) => s.clone(),
-                                                        _ => String::new(),
-                                                    };
-                                                    // Strip the shell's timeout suffix if it
-                                                    // landed (Ctrl+B may race with deadline).
-                                                    let cleaned = partialText
-                                                        .replace("\n(command timed out and was interrupted)", "");
-                                                    let id = self.jobs.lock().unwrap().reserveJobId();
-                                                    let (wakeId, fireTx) = {
-                                                        let mut g = self.wakes.lock().await;
-                                                        let wid = g.registerTaskComplete(id, logTx);
-                                                        (wid, g.fireSender())
-                                                    };
-                                                    let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
-                                                        id,
-                                                        shellCommand.clone(),
-                                                        logTx.clone(),
-                                                        Some(crate::jobs::TaskWakeCtx {
-                                                            wakeId,
-                                                            registry: self.wakes.clone(),
-                                                            fireTx,
-                                                        }),
-                                                    );
-                                                    match spawnResult {
-                                                        Ok(_) => {
-                                                            let _ = logTx
-                                                                .send(LogEvent::AutoBgWarning {
-                                                                    command: shellCommand.clone(),
-                                                                    elapsedSecs: 0,
-                                                                    userTriggered: true,
-                                                                })
-                                                                .await;
-                                                            break crate::message::Content::text(
-                                                                buildConverted(id, 0, true, &cleaned)
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            self.wakes.lock().await.unregisterPassive(wakeId, logTx);
-                                                            break crate::message::Content::text(format!(
-                                                                "User-triggered bg conversion FAILED: {e}\n\nPartial output:\n{cleaned}"
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                                _ = cancelRx.changed() => {
-                                                    if !*cancelRx.borrow() {
-                                                        // Spurious wakeup — retry select.
-                                                        continue;
-                                                    }
-                                                    tracing::info!(tool = %call.function.name, "cancelled during shell execution");
-                                                    shell.interrupt();
-                                                    self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
-                                                    for remaining in &calls[callIdx + 1..] {
-                                                        self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
-                                                    }
-                                                    let _ = logTx.send(LogEvent::TurnCancelled).await;
-                                                    break 'turns Ok(());
+                                                    result
                                                 }
                                             }
+                                        }
+                                    }
+                                } // Close the else block for non-task tools.
+                            } else {
+                                let _ = logTx
+                                    .send(LogEvent::ToolDenied {
+                                        name: call.function.name.clone(),
+                                    })
+                                    .await;
+                                crate::message::Content::text("User denied this action.")
+                            };
+
+                            // Track file reads for the edit gate (hash for staleness detection).
+                            if call.function.name == "readFile" {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                    &call.function.arguments,
+                                ) {
+                                    if let Some(path) = args["path"].as_str() {
+                                        let norm = normalizePath(path);
+                                        if let Ok(bytes) = std::fs::read(&norm) {
+                                            let digest =
+                                                sha1_smol::Sha1::from(&bytes).digest().bytes();
+                                            self.filesRead.insert(norm.clone(), digest);
+                                        }
+                                        // Sync file with LSP server (lazy spawn if needed).
+                                        if let Ok(content) = std::fs::read_to_string(&norm) {
+                                            if let Some(hint) =
+                                                self.lspManager.touchFile(&norm, &content).await
+                                            {
+                                                let _ = logTx
+                                                    .send(LogEvent::LspHint {
+                                                        serverId: hint.serverId,
+                                                        installHint: hint.installHint,
+                                                    })
+                                                    .await;
                                             }
-                                        } else {
-                                            // File operations are fast — no cancel race needed.
-                                            let result = tool::execute(&action, &shell, &targetName).await;
-                                            tracing::debug!(
-                                                tool = %call.function.name,
-                                                outputLen = result.charCount(),
-                                                "tool execution complete"
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Update hash after successful file mutations.
+                            if matches!(
+                                call.function.name.as_str(),
+                                "editFile" | "writeFile" | "multiEdit"
+                            ) {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                    &call.function.arguments,
+                                ) {
+                                    if let Some(path) = args["path"].as_str() {
+                                        let norm = normalizePath(path);
+                                        if let Ok(bytes) = std::fs::read(&norm) {
+                                            let digest =
+                                                sha1_smol::Sha1::from(&bytes).digest().bytes();
+                                            self.filesRead.insert(norm, digest);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Collect LSP diagnostics after file mutations.
+                            // Diff against baseline to only show errors introduced by the edit.
+                            let mut output = output;
+                            if matches!(
+                                call.function.name.as_str(),
+                                "editFile" | "writeFile" | "multiEdit"
+                            ) {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                    &call.function.arguments,
+                                ) {
+                                    if let Some(path) = args["path"].as_str() {
+                                        // Baseline: cached diagnostics from before the edit
+                                        // (populated by the pre-emptive touchFile or prior reads).
+                                        let baseline =
+                                            self.lspManager.getRawCachedDiagnostics(path);
+
+                                        let content =
+                                            std::fs::read_to_string(path).unwrap_or_default();
+                                        let (postEdit, hint) = self
+                                            .lspManager
+                                            .getRawDiagnostics(
+                                                path,
+                                                &content,
+                                                std::time::Duration::from_secs(10),
+                                            )
+                                            .await;
+
+                                        // Multiset diff: only new errors survive.
+                                        let newErrors =
+                                            lsp::diagnostics::diffDiagnostics(&baseline, &postEdit);
+                                        if !newErrors.is_empty() {
+                                            let formatted = lsp::diagnostics::formatDiagnostics(
+                                                path,
+                                                &newErrors,
+                                                async_lsp::lsp_types::DiagnosticSeverity::ERROR,
                                             );
-                                            result
+                                            if !formatted.is_empty() {
+                                                // Append diagnostics to text content.
+                                                let mut text = output.textContent().to_string();
+                                                text.push_str("\n\nNew LSP errors after edit:\n");
+                                                text.push_str(&formatted);
+                                                output = crate::message::Content::text(text);
+                                            }
+                                        }
+                                        if let Some(hint) = hint {
+                                            let _ = logTx
+                                                .send(LogEvent::LspHint {
+                                                    serverId: hint.serverId,
+                                                    installHint: hint.installHint,
+                                                })
+                                                .await;
                                         }
                                     }
                                 }
                             }
-                            } // Close the else block for non-task tools.
-                        } else {
-                            let _ = logTx
-                                .send(LogEvent::ToolDenied {
-                                    name: call.function.name.clone(),
-                                })
-                                .await;
-                            crate::message::Content::text("User denied this action.")
-                        };
 
-                        // Track file reads for the edit gate (hash for staleness detection).
-                        if call.function.name == "readFile" {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                &call.function.arguments,
-                            ) {
-                                if let Some(path) = args["path"].as_str() {
-                                    let norm = normalizePath(path);
-                                    if let Ok(bytes) = std::fs::read(&norm) {
-                                        let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                        self.filesRead.insert(norm.clone(), digest);
-                                    }
-                                    // Sync file with LSP server (lazy spawn if needed).
-                                    if let Ok(content) = std::fs::read_to_string(&norm) {
-                                        if let Some(hint) = self.lspManager.touchFile(&norm, &content).await {
-                                            let _ = logTx.send(LogEvent::LspHint {
-                                                serverId: hint.serverId,
-                                                installHint: hint.installHint,
-                                            }).await;
-                                        }
-                                    }
-                                }
+                            // Emit ToolResult AFTER diagnostics injection so the TUI
+                            // shows the same content the model sees. Skip the emit
+                            // when the tool was denied — `ToolDenied` already told
+                            // the TUI, and re-rendering "User denied this action."
+                            // as a tool-result block duplicates that signal. The
+                            // transcript/history still gets the content below so
+                            // the model sees the denial.
+                            if approved {
+                                let _ = logTx
+                                    .send(LogEvent::ToolResult {
+                                        name: call.function.name.clone(),
+                                        output: output.textContent().to_string(),
+                                    })
+                                    .await;
                             }
+
+                            self.pushToolResult(&call.id, output);
                         }
 
-                        // Update hash after successful file mutations.
-                        if matches!(call.function.name.as_str(), "editFile" | "writeFile" | "multiEdit") {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                &call.function.arguments,
-                            ) {
-                                if let Some(path) = args["path"].as_str() {
-                                    let norm = normalizePath(path);
-                                    if let Ok(bytes) = std::fs::read(&norm) {
-                                        let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                        self.filesRead.insert(norm, digest);
-                                    }
-                                }
-                            }
+                        if aborted {
+                            let _ = logTx.send(LogEvent::TurnComplete).await;
+                            break 'turns Ok(());
                         }
-
-                        // Collect LSP diagnostics after file mutations.
-                        // Diff against baseline to only show errors introduced by the edit.
-                        let mut output = output;
-                        if matches!(call.function.name.as_str(), "editFile" | "writeFile" | "multiEdit") {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                &call.function.arguments,
-                            ) {
-                                if let Some(path) = args["path"].as_str() {
-                                    // Baseline: cached diagnostics from before the edit
-                                    // (populated by the pre-emptive touchFile or prior reads).
-                                    let baseline = self.lspManager.getRawCachedDiagnostics(path);
-
-                                    let content = std::fs::read_to_string(path).unwrap_or_default();
-                                    let (postEdit, hint) = self.lspManager.getRawDiagnostics(
-                                        path,
-                                        &content,
-                                        std::time::Duration::from_secs(10),
-                                    ).await;
-
-                                    // Multiset diff: only new errors survive.
-                                    let newErrors = lsp::diagnostics::diffDiagnostics(&baseline, &postEdit);
-                                    if !newErrors.is_empty() {
-                                        let formatted = lsp::diagnostics::formatDiagnostics(
-                                            path,
-                                            &newErrors,
-                                            async_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                                        );
-                                        if !formatted.is_empty() {
-                                            // Append diagnostics to text content.
-                                            let mut text = output.textContent().to_string();
-                                            text.push_str("\n\nNew LSP errors after edit:\n");
-                                            text.push_str(&formatted);
-                                            output = crate::message::Content::text(text);
-                                        }
-                                    }
-                                    if let Some(hint) = hint {
-                                        let _ = logTx.send(LogEvent::LspHint {
-                                            serverId: hint.serverId,
-                                            installHint: hint.installHint,
-                                        }).await;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Emit ToolResult AFTER diagnostics injection so the TUI
-                        // shows the same content the model sees. Skip the emit
-                        // when the tool was denied — `ToolDenied` already told
-                        // the TUI, and re-rendering "User denied this action."
-                        // as a tool-result block duplicates that signal. The
-                        // transcript/history still gets the content below so
-                        // the model sees the denial.
-                        if approved {
-                            let _ = logTx
-                                .send(LogEvent::ToolResult {
-                                    name: call.function.name.clone(),
-                                    output: output.textContent().to_string(),
-                                })
-                                .await;
-                        }
-
-                        self.pushToolResult(&call.id, output);
+                        // Inject queued user messages before the next API call.
+                        self.drainSteer(steerRx, logTx).await;
                     }
-
-                    if aborted {
-                        let _ = logTx.send(LogEvent::TurnComplete).await;
-                        break 'turns Ok(());
-                    }
-                    // Inject queued user messages before the next API call.
-                    self.drainSteer(steerRx, logTx).await;
                 }
             }
-        }
         };
 
         // Collect topic classification before returning — the eval ran
@@ -2155,12 +2293,17 @@ impl Session {
         let (content, turnAttachments) = buildUserContent(&combined, &allAttachments);
         self.history.push(Message::User { content });
 
-        match self.transcript.recordUser(&combined, self.headTurnId.as_deref(), turnAttachments) {
+        match self
+            .transcript
+            .recordUser(&combined, self.headTurnId.as_deref(), turnAttachments)
+        {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("steer transcript write failed: {e}"),
         }
 
-        let _ = logTx.send(LogEvent::SteerInjected { texts: allTexts }).await;
+        let _ = logTx
+            .send(LogEvent::SteerInjected { texts: allTexts })
+            .await;
         true
     }
 
@@ -2424,14 +2567,10 @@ impl Session {
         // `</scratchpad` w/ no `>`), the streaming extractor flushes the
         // entire buffer as reasoning and the visible answer is lost. Scan
         // the reasoning tail for a malformed close and split it back out.
-        if self.config.heavy.promptThinking
-            && contentBuf.is_empty()
-            && !reasoningBuf.is_empty()
-        {
+        if self.config.heavy.promptThinking && contentBuf.is_empty() && !reasoningBuf.is_empty() {
             if let Some(recovery) = crate::text::recoverScratchpadClose(&reasoningBuf) {
                 let recoveredChars = recovery.content.chars().count();
-                let snippet: String =
-                    recovery.content.chars().take(80).collect::<String>();
+                let snippet: String = recovery.content.chars().take(80).collect::<String>();
                 let snippet = if recoveredChars > 80 {
                     format!("{snippet}…")
                 } else {
@@ -2505,7 +2644,9 @@ impl Session {
             }
             self.turnsWithUsage = self.turnsWithUsage.saturating_add(1);
         } else {
-            tracing::warn!("no usage data received from API — provider may not support stream_options.include_usage");
+            tracing::warn!(
+                "no usage data received from API — provider may not support stream_options.include_usage"
+            );
         }
 
         tracing::debug!(
@@ -2519,7 +2660,11 @@ impl Session {
 
         if !calls.is_empty() {
             // Record any text content or reasoning that accompanied the tool calls.
-            let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
+            let reasonRef = if reasoningBuf.is_empty() {
+                None
+            } else {
+                Some(reasoningBuf.as_str())
+            };
             if !contentBuf.is_empty() || reasonRef.is_some() {
                 let meta = transcript::AssistantMeta {
                     reasoning: reasonRef,
@@ -2529,7 +2674,7 @@ impl Session {
                     model: Some(self.config.heavy.model.as_str()),
                     finishReason: lastFinishReason.as_deref(),
                     snapshotHash: snapshotHash.as_deref(),
-                status: transcript::TurnStatus::Completed,
+                    status: transcript::TurnStatus::Completed,
                 };
                 match self.transcript.recordAssistant(&contentBuf, meta) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
@@ -2546,7 +2691,12 @@ impl Session {
             } else {
                 Some(reasoningBuf)
             };
-            Ok(TurnResult::ToolCalls { calls, content, reasoning, promptTokens: reportedTokens })
+            Ok(TurnResult::ToolCalls {
+                calls,
+                content,
+                reasoning,
+                promptTokens: reportedTokens,
+            })
         } else {
             let content = if contentBuf.is_empty() {
                 None
@@ -2571,7 +2721,7 @@ impl Session {
                     model: Some(self.config.heavy.model.as_str()),
                     finishReason: lastFinishReason.as_deref(),
                     snapshotHash: snapshotHash.as_deref(),
-                status: transcript::TurnStatus::Completed,
+                    status: transcript::TurnStatus::Completed,
                 };
                 match self.transcript.recordAssistant(textRef, meta) {
                     Ok(turnId) => self.headTurnId = Some(turnId),
@@ -2579,11 +2729,12 @@ impl Session {
                 }
             }
 
-            self.history.push(buildAssistantMessage(
-                content, None, reasoning
-            ));
+            self.history
+                .push(buildAssistantMessage(content, None, reasoning));
 
-            Ok(TurnResult::Done { promptTokens: reportedTokens })
+            Ok(TurnResult::Done {
+                promptTokens: reportedTokens,
+            })
         }
     }
 
@@ -2618,18 +2769,10 @@ impl Session {
             // didWork tracks whether this stage reduced context.
             // If false, we loop to try the next stage.
             let didWork = match stage {
-                compaction_trigger::StagePick::S1 => {
-                    self.runS1(&stageStr, logTx).await
-                }
-                compaction_trigger::StagePick::S2 => {
-                    self.runS2(&stageStr, logTx).await
-                }
-                compaction_trigger::StagePick::S3 => {
-                    self.runS3(&stageStr, logTx).await
-                }
-                compaction_trigger::StagePick::S4 => {
-                    self.runS4Trigger(&stageStr, logTx).await
-                }
+                compaction_trigger::StagePick::S1 => self.runS1(&stageStr, logTx).await,
+                compaction_trigger::StagePick::S2 => self.runS2(&stageStr, logTx).await,
+                compaction_trigger::StagePick::S3 => self.runS3(&stageStr, logTx).await,
+                compaction_trigger::StagePick::S4 => self.runS4Trigger(&stageStr, logTx).await,
             };
 
             if didWork || self.compactionTracker.allExhausted() {
@@ -2640,11 +2783,7 @@ impl Session {
     }
 
     /// Run S1 mechanical pruning. Returns true if context was reduced.
-    async fn runS1(
-        &mut self,
-        stageStr: &str,
-        logTx: &mpsc::Sender<LogEvent>,
-    ) -> bool {
+    async fn runS1(&mut self, stageStr: &str, logTx: &mpsc::Sender<LogEvent>) -> bool {
         // Build toolCallId → blockId map so truncation markers
         // can point the model to historyFetch for full content.
         let blockHints = match self.transcript.loadAll() {
@@ -2693,10 +2832,10 @@ impl Session {
         if s1Result.didWork {
             let afterTurn = self.headTurnId.clone().unwrap_or_default();
             if !s1Result.dedupedCallIds.is_empty() {
-                if let Err(e) = self.compactionLog.recordFileDedup(
-                    s1Result.dedupedCallIds.clone(),
-                    &afterTurn,
-                ) {
+                if let Err(e) = self
+                    .compactionLog
+                    .recordFileDedup(s1Result.dedupedCallIds.clone(), &afterTurn)
+                {
                     tracing::warn!("compaction log write failed: {e}");
                 }
             }
@@ -2727,18 +2866,15 @@ impl Session {
                 .await;
             true
         } else {
-            self.compactionTracker.markExhausted(compaction_trigger::StagePick::S1);
+            self.compactionTracker
+                .markExhausted(compaction_trigger::StagePick::S1);
             tracing::debug!("S1 exhausted \u{2014} nothing to prune");
             false
         }
     }
 
     /// Run S2 block compaction. Returns true if context was reduced.
-    async fn runS2(
-        &mut self,
-        stageStr: &str,
-        logTx: &mpsc::Sender<LogEvent>,
-    ) -> bool {
+    async fn runS2(&mut self, stageStr: &str, logTx: &mpsc::Sender<LogEvent>) -> bool {
         let headTurn = self.headTurnId.clone().unwrap_or_default();
         let s2Result = match crate::s2::run(
             &self.transcript,
@@ -2748,11 +2884,14 @@ impl Session {
             &self.config.utility.model,
             self.config.heavy.contextWindow,
             self.config.compactRatio,
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("S2 compaction failed: {e}");
-                self.compactionTracker.markExhausted(compaction_trigger::StagePick::S2);
+                self.compactionTracker
+                    .markExhausted(compaction_trigger::StagePick::S2);
                 return false;
             }
         };
@@ -2761,7 +2900,8 @@ impl Session {
             self.costTracker.record(cost, &self.config.utility.model);
         }
         if !s2Result.didWork {
-            self.compactionTracker.markExhausted(compaction_trigger::StagePick::S2);
+            self.compactionTracker
+                .markExhausted(compaction_trigger::StagePick::S2);
             tracing::debug!("S2 exhausted \u{2014} no blocks to compact");
             return false;
         }
@@ -2792,20 +2932,18 @@ impl Session {
         self.compactionTracker.clearExhaustion();
         let reduction = format!("compressed {blockCount} blocks");
         // S2 zone always starts at the oldest block (index 0).
-        let _ = logTx.send(LogEvent::CompactionComplete {
-            stage: stageStr.to_string(),
-            reduction,
-            markerBlock: Some(0),
-        }).await;
+        let _ = logTx
+            .send(LogEvent::CompactionComplete {
+                stage: stageStr.to_string(),
+                reduction,
+                markerBlock: Some(0),
+            })
+            .await;
         true
     }
 
     /// Run S3 topic compaction. Returns true if context was reduced.
-    async fn runS3(
-        &mut self,
-        stageStr: &str,
-        logTx: &mpsc::Sender<LogEvent>,
-    ) -> bool {
+    async fn runS3(&mut self, stageStr: &str, logTx: &mpsc::Sender<LogEvent>) -> bool {
         let headId = self.headTurnId.as_deref().unwrap_or("");
         let s3Result = match crate::s3::run(
             &self.transcript,
@@ -2816,11 +2954,14 @@ impl Session {
             &self.config.utility.model,
             self.config.heavy.contextWindow,
             self.config.compactRatio,
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("S3 compaction failed: {e}");
-                self.compactionTracker.markExhausted(compaction_trigger::StagePick::S3);
+                self.compactionTracker
+                    .markExhausted(compaction_trigger::StagePick::S3);
                 return false;
             }
         };
@@ -2829,7 +2970,8 @@ impl Session {
             self.costTracker.record(cost, &self.config.utility.model);
         }
         if !s3Result.didWork {
-            self.compactionTracker.markExhausted(compaction_trigger::StagePick::S3);
+            self.compactionTracker
+                .markExhausted(compaction_trigger::StagePick::S3);
             tracing::debug!("S3 exhausted \u{2014} no topics to compact");
             return false;
         }
@@ -2858,11 +3000,13 @@ impl Session {
         }
         self.compactionTracker.clearExhaustion();
         let reduction = format!("compressed {topicCount} topics");
-        let _ = logTx.send(LogEvent::CompactionComplete {
-            stage: stageStr.to_string(),
-            reduction,
-            markerBlock: Some(0),
-        }).await;
+        let _ = logTx
+            .send(LogEvent::CompactionComplete {
+                stage: stageStr.to_string(),
+                reduction,
+                markerBlock: Some(0),
+            })
+            .await;
         true
     }
 
@@ -2870,11 +3014,7 @@ impl Session {
     /// briefings, and orphan S2 summaries from outside the protected
     /// recent band into a single handoff briefing. Returns true if
     /// context was reduced.
-    async fn runS4Trigger(
-        &mut self,
-        stageStr: &str,
-        logTx: &mpsc::Sender<LogEvent>,
-    ) -> bool {
+    async fn runS4Trigger(&mut self, stageStr: &str, logTx: &mpsc::Sender<LogEvent>) -> bool {
         let headId = self.headTurnId.as_deref().unwrap_or("");
         let s4Result = match crate::s4::run(
             &self.transcript,
@@ -2929,14 +3069,15 @@ impl Session {
         }
 
         self.compactionTracker.clearExhaustion();
-        let reduction = format!(
-            "merged {blockCount} source blocks into briefing ({summaryLen} chars)"
-        );
-        let _ = logTx.send(LogEvent::CompactionComplete {
-            stage: stageStr.to_string(),
-            reduction,
-            markerBlock: Some(0),
-        }).await;
+        let reduction =
+            format!("merged {blockCount} source blocks into briefing ({summaryLen} chars)");
+        let _ = logTx
+            .send(LogEvent::CompactionComplete {
+                stage: stageStr.to_string(),
+                reduction,
+                markerBlock: Some(0),
+            })
+            .await;
         true
     }
 
@@ -3059,7 +3200,11 @@ impl Session {
         logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
         match action {
-            tool::ToolAction::Shell { command, runInBackground: true, .. } => {
+            tool::ToolAction::Shell {
+                command,
+                runInBackground: true,
+                ..
+            } => {
                 // Reserve the job id, register the wake against it,
                 // THEN spawn the drainer with wakeCtx already set.
                 // This closes the attach-after-spawn race: a fast
@@ -3096,7 +3241,11 @@ impl Session {
                     }
                 }
             }
-            tool::ToolAction::JobOutput { jobId, sinceLine, maxLines } => {
+            tool::ToolAction::JobOutput {
+                jobId,
+                sinceLine,
+                maxLines,
+            } => {
                 let cap = maxLines.unwrap_or(200);
                 match self.jobs.lock().unwrap().output(*jobId, *sinceLine, cap) {
                     Ok(snap) => formatJobOutput(*jobId, &snap, *sinceLine),
@@ -3117,10 +3266,9 @@ impl Session {
                     .map(|t| t.state);
                 match self.jobs.lock().unwrap().stop(*jobId) {
                     Ok(()) => match preState {
-                        Some(s) if s.isTerminal() => format!(
-                            "Job #{jobId} was already {:?} \u{2014} no signal sent.",
-                            s,
-                        ),
+                        Some(s) if s.isTerminal() => {
+                            format!("Job #{jobId} was already {:?} \u{2014} no signal sent.", s,)
+                        }
                         _ => format!("Sent kill signal to job #{jobId}."),
                     },
                     Err(e) => format!("Failed to stop job: {e}"),
@@ -3226,7 +3374,10 @@ impl Session {
         logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
         match action {
-            tool::ToolAction::ScheduleWakeup { delaySeconds, prompt } => {
+            tool::ToolAction::ScheduleWakeup {
+                delaySeconds,
+                prompt,
+            } => {
                 if *delaySeconds == 0 {
                     return "delaySeconds must be at least 1".into();
                 }
@@ -3252,7 +3403,11 @@ impl Session {
                      Cancel with cronDelete({id})."
                 )
             }
-            tool::ToolAction::CronCreate { spec, prompt, recurring } => {
+            tool::ToolAction::CronCreate {
+                spec,
+                prompt,
+                recurring,
+            } => {
                 let regArc = self.wakes.clone();
                 let specOwned = spec.clone();
                 let promptOwned = prompt.clone();
@@ -3274,7 +3429,11 @@ impl Session {
                         "Armed wake #{id} \u{2014} cron `{spec}`{}.\n\
                          You'll receive a <wake source=\"cron#{id}\" kind=\"Cron\"> message on each fire. \
                          Cancel with cronDelete({id}).",
-                        if *recurring { " (recurring)" } else { " (one-shot)" },
+                        if *recurring {
+                            " (recurring)"
+                        } else {
+                            " (one-shot)"
+                        },
                     ),
                     Err(e) => format!("Failed to arm cron: {e}"),
                 }
@@ -3324,10 +3483,8 @@ impl Session {
             tool::ToolAction::HistoryFetch { blockId } => {
                 match self.transcript.loadAll() {
                     Ok(turns) => {
-                        let blockTurns: Vec<_> = turns
-                            .iter()
-                            .filter(|t| t.blockId == *blockId)
-                            .collect();
+                        let blockTurns: Vec<_> =
+                            turns.iter().filter(|t| t.blockId == *blockId).collect();
 
                         if blockTurns.is_empty() {
                             return format!("No block found with ID \"{blockId}\".");
@@ -3361,7 +3518,10 @@ impl Session {
                             // Indicate attachments.
                             if let Some(ref atts) = turn.attachments {
                                 if !atts.is_empty() {
-                                    output.push_str(&format!("[+{} image(s) attached]\n", atts.len()));
+                                    output.push_str(&format!(
+                                        "[+{} image(s) attached]\n",
+                                        atts.len()
+                                    ));
                                 }
                             }
                             output.push('\n');
@@ -3380,9 +3540,10 @@ impl Session {
                         for turn in &turns {
                             // Filter by mediaType if specified.
                             if let Some(mt) = mediaType {
-                                let hasMatchingMedia = turn.attachments.as_ref().map_or(false, |atts| {
-                                    atts.iter().any(|a| a.mimeType.starts_with(mt.as_str()))
-                                });
+                                let hasMatchingMedia =
+                                    turn.attachments.as_ref().map_or(false, |atts| {
+                                        atts.iter().any(|a| a.mimeType.starts_with(mt.as_str()))
+                                    });
                                 if !hasMatchingMedia {
                                     continue;
                                 }
@@ -3399,7 +3560,9 @@ impl Session {
                                     crate::transcript::TurnRole::Wake => "wake",
                                 };
                                 // Annotate if turn has attachments.
-                                let imageNote = turn.attachments.as_ref()
+                                let imageNote = turn
+                                    .attachments
+                                    .as_ref()
                                     .filter(|a| !a.is_empty())
                                     .map(|a| format!(" [+{} image(s)]", a.len()))
                                     .unwrap_or_default();
@@ -3418,7 +3581,8 @@ impl Session {
                         let totalMatches = matches.len();
                         // Limit output to first 20 matches.
                         let shown = matches.len().min(20);
-                        let mut output = format!("Found {totalMatches} matches for \"{query}\":\n\n");
+                        let mut output =
+                            format!("Found {totalMatches} matches for \"{query}\":\n\n");
                         for (blockId, turnInfo, snippet) in &matches[..shown] {
                             output.push_str(&format!(
                                 "- **{blockId}** {turnInfo}: ...{snippet}...\n"
@@ -3593,11 +3757,8 @@ impl Session {
         // Spawn an isolated shell registry for the subagent. Phase 1
         // child sessions only ever have a `main` shell — terminal-mgmt
         // tools are filtered out of subagent toolsets in `filterDefs`.
-        let (childIoTx, mut childIoRx) = mpsc::channel::<(
-            String,
-            crate::shell::ShellIo,
-            crate::shells::SpawnedBy,
-        )>(8);
+        let (childIoTx, mut childIoRx) =
+            mpsc::channel::<(String, crate::shell::ShellIo, crate::shells::SpawnedBy)>(8);
         let (childRegistry, childMainIo) =
             match crate::shells::ShellRegistry::newWithMain(120, 40, childIoTx) {
                 Ok(r) => r,
@@ -3774,7 +3935,14 @@ impl Session {
         let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
         let (_childUserBgTx, mut childUserBgRx) = mpsc::channel::<()>(1);
         let sendResult = child
-            .send(&childInput, &childLogTx, &childRequestTx, &mut childCancelRx, &mut childSteerRx, &mut childUserBgRx)
+            .send(
+                &childInput,
+                &childLogTx,
+                &childRequestTx,
+                &mut childCancelRx,
+                &mut childSteerRx,
+                &mut childUserBgRx,
+            )
             .await;
 
         // Drop senders so forwarding tasks exit.
@@ -3853,11 +4021,8 @@ impl Session {
             runner::AgentTier::Utility => childConfig.utility.clone(),
         };
 
-        let (childIoTx, childIoRx) = mpsc::channel::<(
-            String,
-            crate::shell::ShellIo,
-            crate::shells::SpawnedBy,
-        )>(8);
+        let (childIoTx, childIoRx) =
+            mpsc::channel::<(String, crate::shell::ShellIo, crate::shells::SpawnedBy)>(8);
         let (childRegistry, childMainIo) =
             match crate::shells::ShellRegistry::newWithMain(120, 40, childIoTx) {
                 Ok(r) => r,
@@ -3943,7 +4108,10 @@ impl Session {
         };
 
         match action {
-            tool::ToolAction::Mcp { qualifiedName, args } => {
+            tool::ToolAction::Mcp {
+                qualifiedName,
+                args,
+            } => {
                 if qualifiedName == "mcpToolSearch" {
                     mgr.executeSearch(args).await
                 } else {
@@ -3965,7 +4133,8 @@ impl Session {
             _ => async_lsp::lsp_types::DiagnosticSeverity::ERROR,
         };
 
-        self.lspManager.getDiagnosticsForTool(path, minSeverity, std::time::Duration::from_secs(15))
+        self.lspManager
+            .getDiagnosticsForTool(path, minSeverity, std::time::Duration::from_secs(15))
             .await
     }
 
@@ -3976,7 +4145,9 @@ impl Session {
     }
 
     /// Get permissions data for the /permissions panel.
-    pub fn permissionsStatusData(&self) -> (
+    pub fn permissionsStatusData(
+        &self,
+    ) -> (
         crate::permissions::PermitMode,
         Vec<crate::permissions::Rule>,
         crate::permissions::PermissionsSource,
@@ -4079,25 +4250,35 @@ impl Session {
     fn pushToolResult(&mut self, callId: &str, content: crate::message::Content) {
         // Extract image attachments for transcript persistence.
         let turnAttachments = if content.hasImages() {
-            let atts: Vec<crate::transcript::TurnAttachment> = content.imageUris().iter().map(|uri| {
-                // Parse data URI: "data:image/png;base64,..."
-                let (mime, data) = if let Some(rest) = uri.strip_prefix("data:") {
-                    if let Some((header, b64)) = rest.split_once(",") {
-                        let mime = header.strip_suffix(";base64").unwrap_or(header);
-                        (mime.to_string(), b64.to_string())
+            let atts: Vec<crate::transcript::TurnAttachment> = content
+                .imageUris()
+                .iter()
+                .map(|uri| {
+                    // Parse data URI: "data:image/png;base64,..."
+                    let (mime, data) = if let Some(rest) = uri.strip_prefix("data:") {
+                        if let Some((header, b64)) = rest.split_once(",") {
+                            let mime = header.strip_suffix(";base64").unwrap_or(header);
+                            (mime.to_string(), b64.to_string())
+                        } else {
+                            ("image/png".into(), String::new())
+                        }
                     } else {
                         ("image/png".into(), String::new())
+                    };
+                    crate::transcript::TurnAttachment {
+                        mimeType: mime,
+                        data,
                     }
-                } else {
-                    ("image/png".into(), String::new())
-                };
-                crate::transcript::TurnAttachment { mimeType: mime, data }
-            }).collect();
+                })
+                .collect();
             if atts.is_empty() { None } else { Some(atts) }
         } else {
             None
         };
-        match self.transcript.recordToolResult(callId, content.textContent(), turnAttachments) {
+        match self
+            .transcript
+            .recordToolResult(callId, content.textContent(), turnAttachments)
+        {
             Ok(turnId) => self.headTurnId = Some(turnId),
             Err(e) => tracing::warn!("transcript write failed: {e}"),
         }
@@ -4154,9 +4335,9 @@ impl Session {
     pub async fn undoCheckpoint(&self) -> crate::control::CommandAck {
         match &self.checkpoint {
             Some(cp) => match cp.undo().await {
-                Ok(turnId) => crate::control::CommandAck::ok(
-                    format!("Restored to checkpoint: {turnId}"),
-                ),
+                Ok(turnId) => {
+                    crate::control::CommandAck::ok(format!("Restored to checkpoint: {turnId}"))
+                }
                 Err(e) => crate::control::CommandAck::err(format!("Undo failed: {e}")),
             },
             None => crate::control::CommandAck::err("Checkpoint system not initialized."),
@@ -4207,7 +4388,11 @@ impl Session {
             models.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
             let last = models.len() - 1;
             for (i, (model, cost)) in models.iter().enumerate() {
-                let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+                let branch = if i == last {
+                    "\u{2514}\u{2500}"
+                } else {
+                    "\u{251C}\u{2500}"
+                };
                 let short = model.rsplit('/').next().unwrap_or(model);
                 out.push_str(&format!(
                     "{branch} {:<20} {}\n",
@@ -4313,11 +4498,7 @@ impl Session {
     }
 
     /// Switch to a previously saved fork.
-    pub async fn switchFork(
-        &mut self,
-        forkId: &str,
-        logTx: &mpsc::Sender<LogEvent>,
-    ) -> String {
+    pub async fn switchFork(&mut self, forkId: &str, logTx: &mpsc::Sender<LogEvent>) -> String {
         let mut meta = match Transcript::loadMeta(self.transcript.sessionDir()) {
             Ok(m) => m,
             Err(e) => return format!("Failed to load session metadata: {e}"),
@@ -4419,7 +4600,11 @@ impl Session {
             .iter()
             .find(|t| matches!(t.role, crate::transcript::TurnRole::User))
             .map(|t| {
-                let first = t.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                let first = t
+                    .content
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
                 let trimmed = first.trim();
                 if trimmed.len() > 60 {
                     format!("{}\u{2026}", &trimmed[..trimmed.floor_char_boundary(59)])
@@ -4484,8 +4669,9 @@ impl Session {
     /// Returns an error message if the file hasn't been read or has changed on disk, None if OK.
     fn checkReadBeforeWrite(&self, action: &tool::ToolAction) -> Option<String> {
         let targetPath = match action {
-            tool::ToolAction::EditFile { path, .. }
-            | tool::ToolAction::MultiEdit { path, .. } => path,
+            tool::ToolAction::EditFile { path, .. } | tool::ToolAction::MultiEdit { path, .. } => {
+                path
+            }
             tool::ToolAction::WriteFile { path, .. } => {
                 // writeFile to a new file is fine — no read needed.
                 if !std::path::Path::new(path).exists() {
@@ -4661,37 +4847,49 @@ fn snippet(s: &str, n: usize) -> String {
 fn buildUserContent(
     text: &str,
     attachments: &[Attachment],
-) -> (crate::message::Content, Option<Vec<crate::transcript::TurnAttachment>>) {
+) -> (
+    crate::message::Content,
+    Option<Vec<crate::transcript::TurnAttachment>>,
+) {
     use base64::Engine;
 
-    let encoded: Vec<(String, Vec<u8>)> = attachments.iter().map(|att| {
-        if let Some((w, h)) = att.rgbaDimensions {
-            let png = encodeRgbaToPng(&att.data, w, h);
-            ("image/png".to_string(), png)
-        } else {
-            (att.mimeType.clone(), att.data.clone())
-        }
-    }).collect();
+    let encoded: Vec<(String, Vec<u8>)> = attachments
+        .iter()
+        .map(|att| {
+            if let Some((w, h)) = att.rgbaDimensions {
+                let png = encodeRgbaToPng(&att.data, w, h);
+                ("image/png".to_string(), png)
+            } else {
+                (att.mimeType.clone(), att.data.clone())
+            }
+        })
+        .collect();
 
     let content = if encoded.is_empty() {
         crate::message::Content::text(text)
     } else {
-        let imageUris: Vec<String> = encoded.iter().map(|(mime, data)| {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-            format!("data:{mime};base64,{b64}")
-        }).collect();
+        let imageUris: Vec<String> = encoded
+            .iter()
+            .map(|(mime, data)| {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+                format!("data:{mime};base64,{b64}")
+            })
+            .collect();
         crate::message::Content::withImages(text, imageUris)
     };
 
     let turnAttachments = if encoded.is_empty() {
         None
     } else {
-        Some(encoded.iter().map(|(mime, data)| {
-            crate::transcript::TurnAttachment {
-                mimeType: mime.clone(),
-                data: base64::engine::general_purpose::STANDARD.encode(data),
-            }
-        }).collect())
+        Some(
+            encoded
+                .iter()
+                .map(|(mime, data)| crate::transcript::TurnAttachment {
+                    mimeType: mime.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                })
+                .collect(),
+        )
     };
 
     (content, turnAttachments)
@@ -4713,10 +4911,7 @@ fn encodeRgbaToPng(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 
     let mut buf = Vec::new();
     final_img
-        .write_to(
-            &mut std::io::Cursor::new(&mut buf),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .expect("PNG encoding failed");
     buf
 }
@@ -4898,7 +5093,10 @@ fn formatJobList(tasks: &[crate::jobs::JobInfo]) -> String {
         };
         let age = info.spawnedAt.elapsed().as_secs();
         let cmdPreview = if info.command.len() > 80 {
-            format!("{}\u{2026}", &info.command[..info.command.floor_char_boundary(80)])
+            format!(
+                "{}\u{2026}",
+                &info.command[..info.command.floor_char_boundary(80)]
+            )
         } else {
             info.command.clone()
         };
@@ -4927,14 +5125,22 @@ fn formatMonitorList(monitors: &[crate::monitors::MonitorInfo]) -> String {
             None => "never".into(),
         };
         let cmdPreview = if info.command.len() > 60 {
-            format!("{}\u{2026}", &info.command[..info.command.floor_char_boundary(60)])
+            format!(
+                "{}\u{2026}",
+                &info.command[..info.command.floor_char_boundary(60)]
+            )
         } else {
             info.command.clone()
         };
         out.push_str(&format!(
             "  #{} \"{}\" {} | /{}/ \u{2014} {} \u{00B7} {} events \u{00B7} last {}\n",
-            info.id, info.description, cmdPreview, info.filter,
-            stateLabel, info.eventCount, lastEvent,
+            info.id,
+            info.description,
+            cmdPreview,
+            info.filter,
+            stateLabel,
+            info.eventCount,
+            lastEvent,
         ));
     }
     out
@@ -4961,7 +5167,10 @@ fn formatWakeList(sources: &[crate::wakes::WakeSourceInfo]) -> String {
         let age = info.createdAt.elapsed().as_secs();
         out.push_str(&format!(
             "  #{} [{}] {} \u{00B7} {} fires \u{00B7} {age}s ago{promptPreview}\n",
-            info.id, info.kind.asStr(), info.summary, info.firesSoFar,
+            info.id,
+            info.kind.asStr(),
+            info.summary,
+            info.firesSoFar,
         ));
     }
     out
@@ -4974,9 +5183,9 @@ mod tests {
 
     #[test]
     fn noRidersLeavesHistoryUnchanged() {
-        let history = vec![
-            Message::User { content: Content::Text("hello".into()) },
-        ];
+        let history = vec![Message::User {
+            content: Content::Text("hello".into()),
+        }];
         let out = buildRequestMessages(&history, &[], false);
         assert_eq!(out.len(), 1);
         if let Message::User { content } = &out[0] {
@@ -4988,9 +5197,9 @@ mod tests {
 
     #[test]
     fn singleRiderWrapsInCriticalInstructions() {
-        let history = vec![
-            Message::User { content: Content::Text("fix the bug".into()) },
-        ];
+        let history = vec![Message::User {
+            content: Content::Text("fix the bug".into()),
+        }];
         let riders = vec![Rider {
             id: "THINKING",
             content: "Body text.".into(),
@@ -5007,12 +5216,18 @@ mod tests {
 
     #[test]
     fn multipleRidersStackInOneWrapper() {
-        let history = vec![
-            Message::User { content: Content::Text("do stuff".into()) },
-        ];
+        let history = vec![Message::User {
+            content: Content::Text("do stuff".into()),
+        }];
         let riders = vec![
-            Rider { id: "THINKING", content: "Think first.".into() },
-            Rider { id: "MODE", content: "Review only.".into() },
+            Rider {
+                id: "THINKING",
+                content: "Think first.".into(),
+            },
+            Rider {
+                id: "MODE",
+                content: "Review only.".into(),
+            },
         ];
         let out = buildRequestMessages(&history, &riders, false);
         let text = if let Message::User { content } = &out[0] {
@@ -5031,15 +5246,22 @@ mod tests {
     #[test]
     fn ridersApplyOnlyToLatestUserMessage() {
         let history = vec![
-            Message::User { content: Content::Text("first".into()) },
+            Message::User {
+                content: Content::Text("first".into()),
+            },
             Message::Assistant {
                 content: Some("ok".into()),
                 tool_calls: None,
                 reasoning: None,
             },
-            Message::User { content: Content::Text("second".into()) },
+            Message::User {
+                content: Content::Text("second".into()),
+            },
         ];
-        let riders = vec![Rider { id: "X", content: "body".into() }];
+        let riders = vec![Rider {
+            id: "X",
+            content: "body".into(),
+        }];
         let out = buildRequestMessages(&history, &riders, false);
         assert_eq!(out.len(), 3);
         if let Message::User { content } = &out[0] {
@@ -5054,21 +5276,31 @@ mod tests {
     #[test]
     fn promptThinkingBakesScratchpadAtApiBoundary() {
         let history = vec![
-            Message::User { content: Content::Text("q".into()) },
+            Message::User {
+                content: Content::Text("q".into()),
+            },
             Message::Assistant {
                 content: Some("answer".into()),
                 tool_calls: None,
                 reasoning: Some("thought".into()),
             },
-            Message::User { content: Content::Text("followup".into()) },
+            Message::User {
+                content: Content::Text("followup".into()),
+            },
         ];
         let out = buildRequestMessages(&history, &[], true);
-        if let Message::Assistant { content, reasoning, .. } = &out[1] {
+        if let Message::Assistant {
+            content, reasoning, ..
+        } = &out[1]
+        {
             assert_eq!(
                 content.as_deref(),
                 Some("<scratchpad>\nthought\n</scratchpad>\nanswer"),
             );
-            assert!(reasoning.is_none(), "reasoning field cleared in promptThinking mode");
+            assert!(
+                reasoning.is_none(),
+                "reasoning field cleared in promptThinking mode"
+            );
         } else {
             panic!("expected assistant at idx 1");
         }
@@ -5076,15 +5308,16 @@ mod tests {
 
     #[test]
     fn promptThinkingOffLeavesReasoningSeparate() {
-        let history = vec![
-            Message::Assistant {
-                content: Some("answer".into()),
-                tool_calls: None,
-                reasoning: Some("thought".into()),
-            },
-        ];
+        let history = vec![Message::Assistant {
+            content: Some("answer".into()),
+            tool_calls: None,
+            reasoning: Some("thought".into()),
+        }];
         let out = buildRequestMessages(&history, &[], false);
-        if let Message::Assistant { content, reasoning, .. } = &out[0] {
+        if let Message::Assistant {
+            content, reasoning, ..
+        } = &out[0]
+        {
             assert_eq!(content.as_deref(), Some("answer"));
             assert_eq!(reasoning.as_deref(), Some("thought"));
         } else {
@@ -5106,12 +5339,7 @@ mod tests {
         assert_eq!(bytes, Some(0));
 
         // Same name echoed in a later chunk must NOT fire firstName again.
-        let (firstName, _) = acc.accumulate(
-            0,
-            None,
-            Some("editFile".into()),
-            None,
-        );
+        let (firstName, _) = acc.accumulate(0, None, Some("editFile".into()), None);
         assert!(firstName.is_none());
     }
 
@@ -5145,7 +5373,12 @@ mod tests {
     #[test]
     fn previewResolvesOncePathValueCloses() {
         let mut acc = ToolCallAccumulator::new();
-        acc.accumulate(0, None, Some("editFile".into()), Some(r#"{"path": "crates"#.into()));
+        acc.accumulate(
+            0,
+            None,
+            Some("editFile".into()),
+            Some(r#"{"path": "crates"#.into()),
+        );
         // Value still open — preview should be None.
         let (name, args) = acc.pendingCall(0).unwrap();
         assert_eq!(crate::tool_preview::previewForTool(name, args), None);
@@ -5162,7 +5395,12 @@ mod tests {
     #[test]
     fn previewGrepRefinesWhenPathArrivesAfterPattern() {
         let mut acc = ToolCallAccumulator::new();
-        acc.accumulate(0, None, Some("grep".into()), Some(r#"{"pattern": "ToolCall""#.into()));
+        acc.accumulate(
+            0,
+            None,
+            Some("grep".into()),
+            Some(r#"{"pattern": "ToolCall""#.into()),
+        );
         let (name, args) = acc.pendingCall(0).unwrap();
         assert_eq!(
             crate::tool_preview::previewForTool(name, args).as_deref(),

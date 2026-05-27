@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::control::{LogEvent, WakeKind as ControlWakeKind};
 
@@ -95,7 +95,11 @@ pub enum WakeKind {
     Delay { fireAt: Instant, prompt: String },
     /// Recurring cron schedule. `spec` is a 5- or 6-field cron string.
     /// When `recurring` is false the source disarms after the first fire.
-    Cron { spec: String, recurring: bool, prompt: String },
+    Cron {
+        spec: String,
+        recurring: bool,
+        prompt: String,
+    },
     /// Watch a filesystem path for events. Fires the wake for each
     /// matching event the OS reports.
     FileWatch { path: PathBuf, prompt: String },
@@ -120,7 +124,7 @@ impl WakeKind {
     }
 }
 
-/// Lightweight snapshot for `cronList` / `wakeList` and the F2 control panel panel.
+/// Lightweight snapshot for `cronList`, `wakeList`, and the /tasks schedules panel.
 #[derive(Debug, Clone)]
 pub struct WakeSourceInfo {
     pub id: WakeId,
@@ -245,7 +249,14 @@ impl WakeRegistry {
         let summary = formatDuration(duration);
         let (cancelTx, cancelRx) = watch::channel(false);
         let registryArc2 = registryArc.clone();
-        tokio::spawn(delayScheduler(id, fireAt, prompt.clone(), cancelRx, logTx.clone(), registryArc2));
+        tokio::spawn(delayScheduler(
+            id,
+            fireAt,
+            prompt.clone(),
+            cancelRx,
+            logTx.clone(),
+            registryArc2,
+        ));
         let info = WakeSourceInfo {
             id,
             kind: ControlWakeKind::Delay,
@@ -254,9 +265,19 @@ impl WakeRegistry {
             createdAt: Instant::now(),
             firesSoFar: 0,
         };
-        g.sources.insert(id, WakeSource { info, cancelTx: Some(cancelTx) });
+        g.sources.insert(
+            id,
+            WakeSource {
+                info,
+                cancelTx: Some(cancelTx),
+            },
+        );
         g.order.push(id);
-        let _ = logTx.try_send(LogEvent::WakeRegistered { id, kind: ControlWakeKind::Delay, summary });
+        let _ = logTx.try_send(LogEvent::WakeRegistered {
+            id,
+            kind: ControlWakeKind::Delay,
+            summary,
+        });
         id
     }
 
@@ -302,9 +323,19 @@ impl WakeRegistry {
             createdAt: Instant::now(),
             firesSoFar: 0,
         };
-        g.sources.insert(id, WakeSource { info, cancelTx: Some(cancelTx) });
+        g.sources.insert(
+            id,
+            WakeSource {
+                info,
+                cancelTx: Some(cancelTx),
+            },
+        );
         g.order.push(id);
-        let _ = logTx.try_send(LogEvent::WakeRegistered { id, kind: ControlWakeKind::Cron, summary });
+        let _ = logTx.try_send(LogEvent::WakeRegistered {
+            id,
+            kind: ControlWakeKind::Cron,
+            summary,
+        });
         Ok(id)
     }
 
@@ -358,9 +389,19 @@ impl WakeRegistry {
             createdAt: Instant::now(),
             firesSoFar: 0,
         };
-        g.sources.insert(id, WakeSource { info, cancelTx: Some(cancelTx) });
+        g.sources.insert(
+            id,
+            WakeSource {
+                info,
+                cancelTx: Some(cancelTx),
+            },
+        );
         g.order.push(id);
-        let _ = logTx.try_send(LogEvent::WakeRegistered { id, kind: ControlWakeKind::FileWatch, summary });
+        let _ = logTx.try_send(LogEvent::WakeRegistered {
+            id,
+            kind: ControlWakeKind::FileWatch,
+            summary,
+        });
         Ok(id)
     }
 
@@ -379,9 +420,19 @@ impl WakeRegistry {
             createdAt: Instant::now(),
             firesSoFar: 0,
         };
-        self.sources.insert(id, WakeSource { info, cancelTx: None });
+        self.sources.insert(
+            id,
+            WakeSource {
+                info,
+                cancelTx: None,
+            },
+        );
         self.order.push(id);
-        let _ = logTx.try_send(LogEvent::WakeRegistered { id, kind: ControlWakeKind::MonitorMatch, summary });
+        let _ = logTx.try_send(LogEvent::WakeRegistered {
+            id,
+            kind: ControlWakeKind::MonitorMatch,
+            summary,
+        });
         id
     }
 
@@ -400,9 +451,19 @@ impl WakeRegistry {
             createdAt: Instant::now(),
             firesSoFar: 0,
         };
-        self.sources.insert(id, WakeSource { info, cancelTx: None });
+        self.sources.insert(
+            id,
+            WakeSource {
+                info,
+                cancelTx: None,
+            },
+        );
         self.order.push(id);
-        let _ = logTx.try_send(LogEvent::WakeRegistered { id, kind: ControlWakeKind::TaskComplete, summary });
+        let _ = logTx.try_send(LogEvent::WakeRegistered {
+            id,
+            kind: ControlWakeKind::TaskComplete,
+            summary,
+        });
         id
     }
 
@@ -412,13 +473,10 @@ impl WakeRegistry {
     /// the registry lock; `firesSoFar` is bumped by the batcher when
     /// the queued fire is drained, so concurrent stampedes don't race
     /// on the counter under the registry lock.
-    pub fn enqueueFire(
-        &self,
-        id: WakeId,
-        source: String,
-        payload: String,
-    ) -> bool {
-        let Some(src) = self.sources.get(&id) else { return false };
+    pub fn enqueueFire(&self, id: WakeId, source: String, payload: String) -> bool {
+        let Some(src) = self.sources.get(&id) else {
+            return false;
+        };
         let kind = src.info.kind;
         let _ = self.fireTx.send(WakeFire {
             wakeId: id,
@@ -435,10 +493,7 @@ impl WakeRegistry {
     /// build a `WakeFire` against a known wake id and push it directly.
     /// `firesSoFar` is updated later by the batcher when the fire is
     /// pulled off the queue.
-    pub fn enqueueFromCallback(
-        sender: &mpsc::UnboundedSender<WakeFire>,
-        fire: WakeFire,
-    ) {
+    pub fn enqueueFromCallback(sender: &mpsc::UnboundedSender<WakeFire>, fire: WakeFire) {
         let _ = sender.send(fire);
     }
 
@@ -509,10 +564,12 @@ async fn batcherActor(
                     }
                 }
             }
-            let _ = batchTx.send(WakeBatch {
-                fires: batch,
-                closedAt: Instant::now(),
-            }).await;
+            let _ = batchTx
+                .send(WakeBatch {
+                    fires: batch,
+                    closedAt: Instant::now(),
+                })
+                .await;
         }
         if cancelled {
             return;
@@ -673,21 +730,34 @@ mod tests {
             let reg = reg.clone();
             let tx = tx.clone();
             move || WakeRegistry::armDelay(&reg, Duration::from_millis(100), "ping".into(), tx)
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(id > 0);
         // First log event is WakeRegistered.
         let reg1 = rx.recv().await.unwrap();
-        assert!(matches!(reg1, LogEvent::WakeRegistered { kind: ControlWakeKind::Delay, .. }));
+        assert!(matches!(
+            reg1,
+            LogEvent::WakeRegistered {
+                kind: ControlWakeKind::Delay,
+                ..
+            }
+        ));
         // After ~100ms + the batch window the wake arrives as a batch.
         let batch = tokio::time::timeout(
             Duration::from_millis(100) + WAKE_BATCH_WINDOW + Duration::from_millis(300),
             batchRx.recv(),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(batch.fires.len(), 1);
         assert!(matches!(batch.fires[0].kind, ControlWakeKind::Delay));
         // The one-shot disarm log event lands on the log channel.
-        let dis = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            .unwrap().unwrap();
+        let dis = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(dis, LogEvent::WakeDisarmed { .. }));
         assert_eq!(reg.lock().await.len(), 0);
     }
@@ -699,17 +769,25 @@ mod tests {
             let reg = reg.clone();
             let tx = tx.clone();
             move || WakeRegistry::armDelay(&reg, Duration::from_secs(60), "ping".into(), tx)
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let _ = rx.recv().await; // WakeRegistered
         assert!(reg.lock().await.disarm(id, &tx));
-        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            .unwrap().unwrap();
+        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev, LogEvent::WakeDisarmed { .. }));
         // No batch should be produced.
-        assert!(tokio::time::timeout(
-            WAKE_BATCH_WINDOW + Duration::from_millis(100),
-            batchRx.recv(),
-        ).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                WAKE_BATCH_WINDOW + Duration::from_millis(100),
+                batchRx.recv(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -720,12 +798,17 @@ mod tests {
         let (reg, tx, _rx, mut batchRx) = buildTestRegistry();
         let id = reg.lock().await.registerMonitor(7, &tx);
         for i in 0..10 {
-            reg.lock().await.enqueueFire(id, "monitor#7".into(), format!("line {i}"));
+            reg.lock()
+                .await
+                .enqueueFire(id, "monitor#7".into(), format!("line {i}"));
         }
         let batch = tokio::time::timeout(
             WAKE_BATCH_WINDOW + Duration::from_millis(200),
             batchRx.recv(),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(batch.fires.len(), 10);
         for (i, f) in batch.fires.iter().enumerate() {
             assert_eq!(f.payload, format!("line {i}"));

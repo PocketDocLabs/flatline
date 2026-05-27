@@ -4,7 +4,7 @@
 //! Unlike the regular `shell` tool, a [`BgJob`] does not block the
 //! agent's turn — `bashSpawn` returns a handle immediately. Output is
 //! line-buffered into a bounded ring so the agent can poll via
-//! `jobOutput`; the deck mirrors task state for the F2 control panel panel.
+//! `jobOutput`; the deck mirrors task state for the /tasks panel.
 //!
 //! Tasks live until the session ends. There is no auto-cleanup of
 //! completed tasks in phase 2; user can `jobStop` running ones.
@@ -53,17 +53,14 @@ pub enum JobKind {
     Bash,
     /// `task(runInBackground: true)` — a child session running on its
     /// own tokio task. `agentType` is `"explore"`, `"general"`, etc.
-    /// `prompt` is captured so F2 control panel can show what the agent is
+    /// `prompt` is captured so the tasks panel can show what the agent is
     /// working on without polling.
     Subagent { agentType: String, prompt: String },
     /// `monitor(...)` task — bash task whose lines are passed through a
     /// regex filter and counted as events. `description` is the short
     /// label shown in panels and notifications; `filter` is the raw
     /// pattern string (compiled regex lives in MonitorPlane).
-    Monitor {
-        description: String,
-        filter: String,
-    },
+    Monitor { description: String, filter: String },
 }
 
 /// Lifecycle state of a task.
@@ -81,7 +78,7 @@ impl JobState {
     }
 }
 
-/// Lightweight snapshot for the `jobList` tool + F2 control panel panel.
+/// Lightweight snapshot for the `jobList` tool and /tasks panel.
 #[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: JobId,
@@ -120,7 +117,11 @@ struct LineRing {
 
 impl LineRing {
     fn new(capacity: usize) -> Self {
-        Self { items: VecDeque::with_capacity(capacity), capacity, totalPushed: 0 }
+        Self {
+            items: VecDeque::with_capacity(capacity),
+            capacity,
+            totalPushed: 0,
+        }
     }
 
     fn push(&mut self, line: String) {
@@ -257,10 +258,9 @@ impl SubagentJobHandle {
     pub fn pushLine(&self, line: impl Into<String>) {
         let line = line.into();
         self.inner.lock().unwrap().stdoutTail.push(line.clone());
-        let _ = self.logTx.try_send(LogEvent::JobOutput {
-            id: self.id,
-            line,
-        });
+        let _ = self
+            .logTx
+            .try_send(LogEvent::JobOutput { id: self.id, line });
     }
 
     /// Mark the subagent complete with the given exit code. 0 = success.
@@ -284,15 +284,19 @@ impl SubagentJobHandle {
                 exitCode: Some(exitCode),
             })
             .await;
-        self.fireWake(wakeCtx, format!(
-            "Subagent task #{id} exited with code {exitCode}.\n\
+        self.fireWake(
+            wakeCtx,
+            format!(
+                "Subagent task #{id} exited with code {exitCode}.\n\
              Tail of output:\n{tailPreview}",
-            id = self.id,
-        )).await;
+                id = self.id,
+            ),
+        )
+        .await;
     }
 
     /// Mark the subagent errored with a reason string (will be surfaced
-    /// in F2 control panel and via `jobOutput`).
+    /// in the tasks panel and via `jobOutput`).
     pub async fn errored(&self, reason: String) {
         let (wakeCtx, tailPreview) = {
             let mut g = self.inner.lock().unwrap();
@@ -313,11 +317,15 @@ impl SubagentJobHandle {
                 reason: reason.clone(),
             })
             .await;
-        self.fireWake(wakeCtx, format!(
-            "Subagent task #{id} errored: {reason}.\n\
+        self.fireWake(
+            wakeCtx,
+            format!(
+                "Subagent task #{id} errored: {reason}.\n\
              Tail of output:\n{tailPreview}",
-            id = self.id,
-        )).await;
+                id = self.id,
+            ),
+        )
+        .await;
     }
 
     /// Mark the subagent killed (cooperative cancellation completed).
@@ -337,7 +345,10 @@ impl SubagentJobHandle {
             })
             .await;
         if let Some(ctx) = wakeCtx {
-            ctx.registry.lock().await.unregisterPassive(ctx.wakeId, &self.logTx);
+            ctx.registry
+                .lock()
+                .await
+                .unregisterPassive(ctx.wakeId, &self.logTx);
         }
     }
 
@@ -351,7 +362,10 @@ impl SubagentJobHandle {
             payload,
             firedAt: Instant::now(),
         });
-        ctx.registry.lock().await.unregisterPassive(ctx.wakeId, &self.logTx);
+        ctx.registry
+            .lock()
+            .await
+            .unregisterPassive(ctx.wakeId, &self.logTx);
     }
 
     /// True once `jobStop` (or session shutdown) has signaled cancel.
@@ -385,10 +399,9 @@ impl SubagentLineSender {
     pub fn push(&self, line: impl Into<String>) {
         let line = line.into();
         self.inner.lock().unwrap().stdoutTail.push(line.clone());
-        let _ = self.logTx.try_send(LogEvent::JobOutput {
-            id: self.id,
-            line,
-        });
+        let _ = self
+            .logTx
+            .try_send(LogEvent::JobOutput { id: self.id, line });
     }
 }
 
@@ -415,7 +428,12 @@ impl Drop for JobPlane {
 
 impl JobPlane {
     pub fn new(cwd: Option<std::path::PathBuf>) -> Self {
-        Self { jobs: HashMap::new(), order: Vec::new(), nextId: 1, cwd }
+        Self {
+            jobs: HashMap::new(),
+            order: Vec::new(),
+            nextId: 1,
+            cwd,
+        }
     }
 
     // NOTE: attachWakeCtx removed — the race it served was closed by
@@ -436,11 +454,7 @@ impl JobPlane {
     /// features (pipes, redirects, env expansion, bashisms) work.
     /// Stdout and stderr are interleaved into the same ring buffer in
     /// line order of arrival.
-    pub fn spawnBash(
-        &mut self,
-        command: String,
-        logTx: mpsc::Sender<LogEvent>,
-    ) -> Result<JobId> {
+    pub fn spawnBash(&mut self, command: String, logTx: mpsc::Sender<LogEvent>) -> Result<JobId> {
         let id = self.reserveJobId();
         self.spawnBashInner(id, command, JobKind::Bash, "bash", None, logTx, None)
     }
@@ -474,7 +488,10 @@ impl JobPlane {
         logTx: mpsc::Sender<LogEvent>,
     ) -> Result<JobId> {
         let id = self.reserveJobId();
-        let kind = JobKind::Monitor { description, filter };
+        let kind = JobKind::Monitor {
+            description,
+            filter,
+        };
         self.spawnBashInner(id, command, kind, "monitor", Some(onLine), logTx, None)
     }
 
@@ -537,9 +554,16 @@ impl JobPlane {
         let drainerLog = logTx.clone();
         tokio::spawn(async move {
             runBashTask(
-                id, command, cwd, drainerInner, killRx, drainerLog, onLine,
+                id,
+                command,
+                cwd,
+                drainerInner,
+                killRx,
+                drainerLog,
+                onLine,
                 fireWakeOnComplete,
-            ).await;
+            )
+            .await;
         });
 
         Ok(id)
@@ -589,7 +613,7 @@ impl JobPlane {
             })
         };
 
-        // For F2 control panel list rendering the "command" string is the prompt
+        // For tasks-panel list rendering the "command" string is the prompt
         // preview — same column as bash uses for the command.
         let summary = format!("task[{agentType}]: {prompt}");
 
@@ -737,9 +761,7 @@ async fn runBashTask(
                 g.state = JobState::Errored(msg.clone());
                 g.completedAt = Some(Instant::now());
             }
-            let _ = logTx
-                .send(LogEvent::JobStopped { id, reason: msg })
-                .await;
+            let _ = logTx.send(LogEvent::JobStopped { id, reason: msg }).await;
             return;
         }
     };
@@ -911,7 +933,10 @@ async fn runBashTask(
                     payload,
                     firedAt: Instant::now(),
                 });
-                ctx.registry.lock().await.unregisterPassive(ctx.wakeId, &logTxClone);
+                ctx.registry
+                    .lock()
+                    .await
+                    .unregisterPassive(ctx.wakeId, &logTxClone);
             }
         }
     };
@@ -925,7 +950,10 @@ async fn runBashTask(
                 g.completedAt = Some(Instant::now());
             }
             let _ = logTx
-                .send(LogEvent::JobComplete { id, exitCode: Some(code) })
+                .send(LogEvent::JobComplete {
+                    id,
+                    exitCode: Some(code),
+                })
                 .await;
             if let Some(preview) = &tailPreview {
                 fireWake(format!(
@@ -942,13 +970,18 @@ async fn runBashTask(
                 g.state = JobState::Errored(msg.clone());
                 g.completedAt = Some(Instant::now());
             }
-            let _ = logTx.send(LogEvent::JobStopped { id, reason: msg.clone() }).await;
+            let _ = logTx
+                .send(LogEvent::JobStopped {
+                    id,
+                    reason: msg.clone(),
+                })
+                .await;
             if let Some(preview) = &tailPreview {
                 fireWake(format!(
                     "Background task #{id} ({command}) errored: {msg}.\n\
                      Tail of output:\n{preview}"
                 ))
-                    .await;
+                .await;
             }
         }
         Outcome::Killed => {
@@ -960,14 +993,20 @@ async fn runBashTask(
                 g.completedAt = Some(Instant::now());
             }
             let _ = logTx
-                .send(LogEvent::JobStopped { id, reason: "killed".into() })
+                .send(LogEvent::JobStopped {
+                    id,
+                    reason: "killed".into(),
+                })
                 .await;
             // No wake fired for kills — the user/agent initiated the
             // stop and already knows about it. But we DO still need to
             // unregister the passive wake source so /jobs schedules
             // doesn't keep showing a phantom row for a dead job.
             if let Some(ctx) = wakeCtx {
-                ctx.registry.lock().await.unregisterPassive(ctx.wakeId, &logTx);
+                ctx.registry
+                    .lock()
+                    .await
+                    .unregisterPassive(ctx.wakeId, &logTx);
             }
         }
     }
@@ -1072,12 +1111,9 @@ mod tests {
         let (tx, rx) = mpsc::channel(1024);
         let drainer = drain(rx);
         let mut plane = JobPlane::new(None);
-        let id = plane
-            .spawnBash("yes hello &".into(), tx.clone())
-            .unwrap();
+        let id = plane.spawnBash("yes hello &".into(), tx.clone()).unwrap();
 
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             if plane.jobs[&id].state().isTerminal() {
                 break;
@@ -1130,11 +1166,14 @@ mod tests {
         // Snapshot before completion: ring has the lines, state is Running.
         let snap = plane.output(id, None, 100).unwrap();
         assert_eq!(snap.totalLines, 3);
-        assert_eq!(snap.lines, vec![
-            "starting search".to_string(),
-            "found 3 candidates".into(),
-            "returning summary".into(),
-        ]);
+        assert_eq!(
+            snap.lines,
+            vec![
+                "starting search".to_string(),
+                "found 3 candidates".into(),
+                "returning summary".into(),
+            ]
+        );
         assert_eq!(snap.state, JobState::Running);
 
         handle.complete(0).await;
@@ -1151,20 +1190,24 @@ mod tests {
         while let Some(ev) = rx.recv().await {
             events.push(ev);
         }
-        let spawned = events.iter().any(|e| matches!(
-            e, LogEvent::JobSpawned { id: i, kind, .. }
-            if *i == id && kind == "subagent"
-        ));
+        let spawned = events.iter().any(|e| {
+            matches!(
+                e, LogEvent::JobSpawned { id: i, kind, .. }
+                if *i == id && kind == "subagent"
+            )
+        });
         assert!(spawned, "TaskSpawned event missing: {events:?}");
         let outputCount = events
             .iter()
             .filter(|e| matches!(e, LogEvent::JobOutput { id: i, .. } if *i == id))
             .count();
         assert_eq!(outputCount, 3);
-        let complete = events.iter().any(|e| matches!(
-            e, LogEvent::JobComplete { id: i, exitCode: Some(0) }
-            if *i == id
-        ));
+        let complete = events.iter().any(|e| {
+            matches!(
+                e, LogEvent::JobComplete { id: i, exitCode: Some(0) }
+                if *i == id
+            )
+        });
         assert!(complete, "TaskComplete event missing: {events:?}");
     }
 
@@ -1192,7 +1235,11 @@ mod tests {
             let wid = g.registerTaskComplete(taskId, &tx);
             (wid, g.fireSender())
         };
-        let wakeCtx = TaskWakeCtx { wakeId, registry: regArc.clone(), fireTx };
+        let wakeCtx = TaskWakeCtx {
+            wakeId,
+            registry: regArc.clone(),
+            fireTx,
+        };
 
         let handle = plane.spawnSubagentWithId(
             taskId,
@@ -1252,7 +1299,11 @@ mod tests {
             let wid = g.registerTaskComplete(taskId, &tx);
             (wid, g.fireSender())
         };
-        let wakeCtx = TaskWakeCtx { wakeId, registry: regArc.clone(), fireTx };
+        let wakeCtx = TaskWakeCtx {
+            wakeId,
+            registry: regArc.clone(),
+            fireTx,
+        };
 
         let handle = plane.spawnSubagentWithId(
             taskId,
@@ -1283,11 +1334,7 @@ mod tests {
         // closure-based kill path for subagents.
         let (tx, _rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
-        let handle = plane.spawnSubagent(
-            "general".into(),
-            "go do the thing".into(),
-            tx.clone(),
-        );
+        let handle = plane.spawnSubagent("general".into(), "go do the thing".into(), tx.clone());
         let id = handle.id;
         assert!(!handle.cancelRequested());
         plane.stop(id).unwrap();
@@ -1321,7 +1368,9 @@ mod tests {
         assert!(plane.jobs[&id].state().isTerminal());
 
         // Stopping the now-completed task must succeed silently.
-        plane.stop(id).expect("stop on terminal task should be no-op");
+        plane
+            .stop(id)
+            .expect("stop on terminal task should be no-op");
 
         // Stopping an unknown id is still an error.
         assert!(plane.stop(9999).is_err());
@@ -1399,7 +1448,10 @@ mod tests {
         let drainer = drain(rx);
         let mut plane = JobPlane::new(None);
         let id = plane
-            .spawnBash("for i in 1 2 3 4 5; do echo line$i; done".into(), tx.clone())
+            .spawnBash(
+                "for i in 1 2 3 4 5; do echo line$i; done".into(),
+                tx.clone(),
+            )
             .unwrap();
 
         for _ in 0..50 {

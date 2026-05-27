@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::permissions::{PermissionsSource, PermitMode, Permissions, Rule};
+use crate::permissions::{Permissions, PermissionsSource, PermitMode, Rule};
 
 const CONFIG_DIR: &str = "flatline";
 const CONFIG_FILE: &str = "config.toml";
@@ -232,7 +232,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
         _ => ModelConfig {
             provider: "openrouter".into(),
             key: String::new(),
-            model: "anthropic/claude-sonnet-4-6".into(),
+            model: "anthropic/claude-sonnet-4.6".into(),
             baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
             promptThinking: false,
@@ -246,13 +246,13 @@ fn modelDefaults(provider: &str) -> ModelConfig {
 
 /// Tier-specific starter defaults, used when the profile map is empty entirely.
 /// Heavy = Opus w/ prompt-thinking, Light = Sonnet w/ prompt-thinking,
-/// Utility = Kimi K2.5 on OpenRouter, no prompt-thinking.
+/// Utility = Kimi K2.6 on OpenRouter, no prompt-thinking.
 fn tierDefaults(tier: Tier) -> ModelConfig {
     match tier {
         Tier::Heavy => ModelConfig {
             provider: "openrouter".into(),
             key: String::new(),
-            model: "anthropic/claude-opus-4-6".into(),
+            model: "anthropic/claude-opus-4.6".into(),
             baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
             promptThinking: true,
@@ -264,7 +264,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
         Tier::Light => ModelConfig {
             provider: "openrouter".into(),
             key: String::new(),
-            model: "anthropic/claude-sonnet-4-6".into(),
+            model: "anthropic/claude-sonnet-4.6".into(),
             baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
             promptThinking: true,
@@ -276,7 +276,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
         Tier::Utility => ModelConfig {
             provider: "openrouter".into(),
             key: String::new(),
-            model: "moonshotai/kimi-k2.5".into(),
+            model: "moonshotai/kimi-k2.6".into(),
             baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
             promptThinking: false,
@@ -550,8 +550,7 @@ fn loadPartial(path: &Path) -> Result<PartialConfig> {
     // Legacy detection: top-level [main] or [utility] means pre-profile config.
     detectLegacy(&contents, path)?;
 
-    toml::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 /// Emit a human-readable error and exit(2) if the config uses the old
@@ -680,7 +679,12 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
     // same named profile naturally resolve to identical ModelConfigs.
     let heavy = lookupProfile(&partial.profile, &heavyName, "heavyProfile", Tier::Heavy)?;
     let light = lookupProfile(&partial.profile, &lightName, "lightProfile", Tier::Light)?;
-    let utility = lookupProfile(&partial.profile, &utilityName, "utilityProfile", Tier::Utility)?;
+    let utility = lookupProfile(
+        &partial.profile,
+        &utilityName,
+        "utilityProfile",
+        Tier::Utility,
+    )?;
 
     Ok(Config {
         heavyProfile: heavyName,
@@ -742,7 +746,9 @@ fn resolveModel(partial: Option<PartialModelConfig>) -> ModelConfig {
         providerOrder: partial.providerOrder.unwrap_or(defaults.providerOrder),
         maxTokens: partial.maxTokens.or(defaults.maxTokens),
         contextWindow: partial.contextWindow.unwrap_or(defaults.contextWindow),
-        supportsAnthropicCache: partial.supportsAnthropicCache.or(defaults.supportsAnthropicCache),
+        supportsAnthropicCache: partial
+            .supportsAnthropicCache
+            .or(defaults.supportsAnthropicCache),
     }
 }
 
@@ -774,19 +780,19 @@ fn defaultConfigToml() -> String {
          compactRatio   = {compact}\n\n\
          [profile.opus]\n\
          provider       = \"openrouter\"\n\
-         model          = \"anthropic/claude-opus-4-6\"\n\
+         model          = \"anthropic/claude-opus-4.6\"\n\
          promptThinking = true\n\
          providerOrder  = [\"Anthropic\"]\n\
          contextWindow  = 250000\n\n\
          [profile.sonnet]\n\
          provider       = \"openrouter\"\n\
-         model          = \"anthropic/claude-sonnet-4-6\"\n\
+         model          = \"anthropic/claude-sonnet-4.6\"\n\
          promptThinking = true\n\
          providerOrder  = [\"Anthropic\"]\n\
          contextWindow  = 250000\n\n\
          [profile.kimi]\n\
          provider       = \"openrouter\"\n\
-         model          = \"moonshotai/kimi-k2.5\"\n\
+         model          = \"moonshotai/kimi-k2.6\"\n\
          contextWindow  = 256000\n\n\
          [profile.deepseekPro]\n\
          provider       = \"deepseek\"\n\
@@ -830,12 +836,15 @@ pub fn persistPermissionRule(
         String::new()
     };
 
-    let mut doc: toml::Table =
-        toml::from_str(&existing).unwrap_or_default();
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
 
     let newRule = Rule {
         tool: toolName.to_string(),
-        pattern: if pattern.is_empty() { None } else { Some(pattern.to_string()) },
+        pattern: if pattern.is_empty() {
+            None
+        } else {
+            Some(pattern.to_string())
+        },
         allow,
     };
 
@@ -857,11 +866,7 @@ pub fn persistPermissionRule(
         // contract on the function signature unchanged; the rule is
         // persisted via the rules collection below.
         let _ = &newRule;
-        let rules: Vec<toml::Value> = currentPermissions
-            .rules
-            .iter()
-            .map(ruleToToml)
-            .collect();
+        let rules: Vec<toml::Value> = currentPermissions.rules.iter().map(ruleToToml).collect();
 
         let mut permTable = toml::Table::new();
         permTable.insert(
@@ -892,11 +897,7 @@ fn ruleToToml(rule: &Rule) -> toml::Value {
 }
 
 /// Save a full permissions set to `.flatline/config.toml`.
-pub fn savePermissions(
-    projectRoot: &Path,
-    defaultMode: &PermitMode,
-    rules: &[Rule],
-) -> Result<()> {
+pub fn savePermissions(projectRoot: &Path, defaultMode: &PermitMode, rules: &[Rule]) -> Result<()> {
     let projectDir = projectRoot.join(PROJECT_DIR);
     let configPath = projectDir.join(PROJECT_CONFIG);
 
@@ -954,7 +955,11 @@ mod tests {
     fn resolveWithHeavy(partial: PartialConfig, heavy: &str) -> Config {
         resolveMerged(
             partial,
-            ProfileOverrides { heavy: Some(heavy), light: None, utility: None },
+            ProfileOverrides {
+                heavy: Some(heavy),
+                light: None,
+                utility: None,
+            },
         )
         .expect("resolve")
     }
@@ -969,7 +974,7 @@ mod tests {
             heavyProfile = "foo"
             [profile.foo]
             provider = "openrouter"
-            model = "anthropic/claude-opus-4-6"
+            model = "anthropic/claude-opus-4.6"
             providerOrder = ["Anthropic"]
             "#,
         );
@@ -1155,8 +1160,7 @@ mod tests {
         };
         perms.addRule(newRule);
 
-        persistPermissionRule(root, &perms, "shell", "git status", true)
-            .expect("persist rule");
+        persistPermissionRule(root, &perms, "shell", "git status", true).expect("persist rule");
 
         let written = std::fs::read_to_string(root.join(".flatline").join("config.toml"))
             .expect("read persisted config");
@@ -1175,8 +1179,7 @@ mod tests {
             allow: true,
         };
         perms.addRule(secondRule);
-        persistPermissionRule(root, &perms, "shell", "ls -la", true)
-            .expect("persist second");
+        persistPermissionRule(root, &perms, "shell", "ls -la", true).expect("persist second");
         let written2 = std::fs::read_to_string(root.join(".flatline").join("config.toml"))
             .expect("read again");
         assert_eq!(written2.matches("pattern = \"git status\"").count(), 1);
@@ -1191,7 +1194,14 @@ mod tests {
         let toml = defaultConfigToml();
         let partial: PartialConfig = ::toml::from_str(&toml).expect("parse starter toml");
 
-        for name in ["opus", "sonnet", "kimi", "deepseekPro", "deepseekFlash", "deepseekUtility"] {
+        for name in [
+            "opus",
+            "sonnet",
+            "kimi",
+            "deepseekPro",
+            "deepseekFlash",
+            "deepseekUtility",
+        ] {
             assert!(
                 partial.profile.contains_key(name),
                 "starter toml missing profile {name}"
@@ -1201,12 +1211,137 @@ mod tests {
         let pro = partial.profile.get("deepseekPro").unwrap();
         assert_eq!(pro.provider.as_deref(), Some("deepseek"));
         assert_eq!(pro.model.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(pro.reasoning.as_ref().unwrap().effort.as_deref(), Some("max"));
+        assert_eq!(
+            pro.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
 
         let flash = partial.profile.get("deepseekFlash").unwrap();
-        assert_eq!(flash.reasoning.as_ref().unwrap().effort.as_deref(), Some("high"));
+        assert_eq!(
+            flash.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
 
         let util = partial.profile.get("deepseekUtility").unwrap();
-        assert_eq!(util.reasoning.as_ref().unwrap().effort.as_deref(), Some("disabled"));
+        assert_eq!(
+            util.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("disabled")
+        );
+    }
+
+    /// Hit OpenRouter's public model catalog and `/endpoints` per-model
+    /// API and assert every default OpenRouter `model` slug we ship —
+    /// across `tierDefaults`, `modelDefaults`, and `defaultConfigToml` —
+    /// (a) exists in the catalog and (b) is still served by every
+    /// provider in its `providerOrder` pin. A pinned provider that has
+    /// dropped the model is functionally identical to a 404 — OR will
+    /// return "no endpoints found" at runtime — so the test fails it.
+    ///
+    /// `#[ignore]` because it requires network. Run with
+    /// `cargo test --package construct defaultOpenrouterModelsAndProvidersExist -- --ignored`.
+    #[test]
+    #[ignore = "network: hits openrouter.ai/api/v1/models{,/endpoints}"]
+    fn defaultOpenrouterModelsAndProvidersExist() {
+        // (model, providerOrder) for every default OR profile/model we ship.
+        let starter: PartialConfig = ::toml::from_str(&defaultConfigToml()).unwrap();
+        let mut shipped: Vec<(String, Vec<String>)> = starter
+            .profile
+            .values()
+            .filter(|p| p.provider.as_deref() == Some("openrouter"))
+            .filter_map(|p| {
+                p.model
+                    .clone()
+                    .map(|m| (m, p.providerOrder.clone().unwrap_or_default()))
+            })
+            .collect();
+        for tier in [Tier::Heavy, Tier::Light, Tier::Utility] {
+            let m = tierDefaults(tier);
+            if m.provider == "openrouter" {
+                shipped.push((m.model, m.providerOrder));
+            }
+        }
+        let mFallback = modelDefaults("openrouter");
+        if mFallback.provider == "openrouter" {
+            shipped.push((mFallback.model, mFallback.providerOrder));
+        }
+        shipped.sort();
+        shipped.dedup();
+        assert!(!shipped.is_empty(), "no OpenRouter defaults collected");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        // Catalog: every model slug currently listed.
+        let catalog: Vec<String> = rt.block_on(async {
+            let body = client
+                .get("https://openrouter.ai/api/v1/models")
+                .send()
+                .await
+                .expect("GET /models")
+                .text()
+                .await
+                .expect("body");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+            v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(String::from))
+                .collect()
+        });
+        assert!(
+            catalog.len() > 50,
+            "suspiciously small catalog: {}",
+            catalog.len()
+        );
+
+        // Step 1 — every shipped model exists in the catalog.
+        let missingModels: Vec<&String> = shipped
+            .iter()
+            .map(|(m, _)| m)
+            .filter(|s| !catalog.contains(s))
+            .collect();
+        assert!(
+            missingModels.is_empty(),
+            "default OpenRouter model slugs not in catalog: {missingModels:?}",
+        );
+
+        // Step 2 — for each model with a providerOrder pin, fetch its
+        // endpoints and confirm every pinned provider is still serving
+        // it. OR's `/api/v1/models/{slug}/endpoints` returns provider
+        // names under `data.endpoints[].provider_name`.
+        let mut failures: Vec<String> = Vec::new();
+        for (model, order) in &shipped {
+            if order.is_empty() {
+                continue;
+            }
+            let url = format!("https://openrouter.ai/api/v1/models/{model}/endpoints");
+            let providers: Vec<String> = rt.block_on(async {
+                let body = client.get(&url).send().await.unwrap().text().await.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                v["data"]["endpoints"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|e| e["provider_name"].as_str().map(String::from))
+                    .collect()
+            });
+            for pin in order {
+                let needle = pin.to_ascii_lowercase();
+                let found = providers
+                    .iter()
+                    .any(|p| p.to_ascii_lowercase().contains(&needle));
+                if !found {
+                    failures.push(format!(
+                        "{model}: pinned provider {pin:?} not in active endpoints {providers:?}",
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

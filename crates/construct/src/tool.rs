@@ -69,7 +69,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     -oL tail -F /path'` to keep output flowing.\n\n\
                     Background jobs bypass the named terminal (output \
                     buffered in a 5000-line ring; retrieve via jobOutput, \
-                    stop via jobStop).".into(),
+                    stop via jobStop)."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -112,7 +113,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "readFile".into(),
                 description: "Read the contents of a file. Returns numbered lines. \
-                    For large files, use offset and limit to read specific ranges.".into(),
+                    For large files, use offset and limit to read specific ranges."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -145,7 +147,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "writeFile".into(),
                 description: "Write content to a file, creating it if needed. \
                     Overwrites the entire file. Prefer editFile for small changes. \
-                    You must readFile the target before overwriting an existing file.".into(),
+                    You must readFile the target before overwriting an existing file."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -170,7 +173,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     The old_string must match exactly one location in the file \
                     (unless replace_all is true). Include enough surrounding \
                     context in old_string to make the match unique. \
-                    You must readFile the target before editing.".into(),
+                    You must readFile the target before editing."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -203,7 +207,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     All edits are atomic \u{2014} if any edit fails, none are applied. \
                     Each edit works like editFile: old_string must match exactly one \
                     location (unless replace_all is true for that edit). \
-                    You must readFile the target before using this tool.".into(),
+                    You must readFile the target before using this tool."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -244,7 +249,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "copyFile".into(),
                 description: "Copy a file or directory tree from source to destination. \
                     Creates parent directories of dest as needed. Refuses to overwrite \
-                    an existing destination unless overwrite=true.".into(),
+                    an existing destination unless overwrite=true."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -265,7 +271,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "moveFile".into(),
                 description: "Move or rename a file or directory. Creates parent \
                     directories of dest as needed. Refuses to overwrite an existing \
-                    destination unless overwrite=true.".into(),
+                    destination unless overwrite=true."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -285,7 +292,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "deleteFile".into(),
                 description: "Delete a file or empty directory. For directory trees, \
-                    set recursive=true. This operation is destructive and not undoable.".into(),
+                    set recursive=true. This operation is destructive and not undoable."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -304,7 +312,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "makeDirs".into(),
                 description: "Create a directory and any missing parents. \
-                    Succeeds silently if the directory already exists.".into(),
+                    Succeeds silently if the directory already exists."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -321,7 +330,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "List recent shell commands for a terminal with their index, \
                     exit code, and output size. Use readOutput to read a specific \
                     command's full output. History is per-terminal — pass `terminal` \
-                    to inspect a specific terminal, otherwise the agent's target terminal is used.".into(),
+                    to inspect a specific terminal, otherwise the agent's target terminal is used."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -341,7 +351,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Read the output of a previous shell command by index. \
                     Indices are per-terminal — pair this with `terminal` if you ran \
                     the command in a non-default terminal. Use shellHistory to see \
-                    available commands. Supports offset/limit for navigating large output.".into(),
+                    available commands. Supports offset/limit for navigating large output."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -370,9 +381,11 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "searchOutput".into(),
-                description: "Search a previous command's output for a pattern (regex or substring). \
+                description:
+                    "Search a previous command's output for a pattern (regex or substring). \
                     Returns matching lines with surrounding context. Indices are per-terminal — \
-                    pair with `terminal` to search a specific terminal's history.".into(),
+                    pair with `terminal` to search a specific terminal's history."
+                        .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -403,7 +416,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "readTerminal".into(),
                 description: "Read recent terminal scrollback for a terminal — everything \
                     visible there including user commands and their output. Pair with \
-                    `terminal` to read a specific one.".into(),
+                    `terminal` to read a specific one."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -426,7 +440,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "glob".into(),
                 description: "Find files matching a glob pattern. Returns paths sorted \
                     by modification time (newest first). Capped at 100 results. \
-                    Set metadata=true to append size and mtime per file.".into(),
+                    Set metadata=true to append size and mtime per file."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -455,7 +470,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     Uses ripgrep with Rust regex syntax: alternation is `|` \
                     (not `\\|`), metachars `.+*?()[]{}|^$\\` need escaping. \
                     Three output modes: 'files' (file paths only), 'content' \
-                    (matching lines with context), 'count' (match counts per file).".into(),
+                    (matching lines with context), 'count' (match counts per file)."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -504,7 +520,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "List directory contents as an indented tree. Shows directories \
                     first (with trailing /), then files. Excludes .git, node_modules, \
                     target, __pycache__, .venv. Capped at 200 entries. \
-                    Set metadata=true to append size and mtime per file.".into(),
+                    Set metadata=true to append size and mtime per file."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -540,7 +557,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Search code using AST structural patterns. \
                     Matches syntax tree structure, not text. Use $IDENT for single nodes, \
                     $$$ARGS for multiple nodes. Example: '$EXPR.unwrap()' finds all .unwrap() \
-                    calls.".into(),
+                    calls."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -568,7 +586,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Show differences between files or git revisions. Two modes: \
                     (1) Git mode: provide 'path' and optional 'ref' (defaults to HEAD) to \
                     see changes. (2) File mode: provide 'path_a' and 'path_b' to diff two \
-                    files directly.".into(),
+                    files directly."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -600,7 +619,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Find files by fuzzy name matching. Scores filenames against your \
                     query using subsequence matching with bonuses for word boundaries and \
                     consecutive characters. Returns top 20 matches. Use when you know \
-                    roughly what a file is called but not its exact path.".into(),
+                    roughly what a file is called but not its exact path."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -623,7 +643,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "fileOutline".into(),
                 description: "Show the structural outline of a file — functions, classes, \
                     structs, traits, impls, and other top-level declarations. Returns \
-                    declaration lines with line numbers.".into(),
+                    declaration lines with line numbers."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -642,7 +663,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "viewSymbol".into(),
                 description: "Look up a symbol by name in a file and return its full definition. \
                     Finds the declaration (function, struct, class, etc.) and returns the \
-                    complete code block.".into(),
+                    complete code block."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -663,9 +685,11 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "relatedFiles".into(),
-                description: "Find files related to a given file by parsing its import/use/require \
+                description:
+                    "Find files related to a given file by parsing its import/use/require \
                     statements and listing sibling files in the same directory. Helps discover \
-                    the dependency graph around a file.".into(),
+                    the dependency graph around a file."
+                        .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -684,7 +708,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "webSearch".into(),
                 description: "Search the web. Returns titles, URLs, and content snippets. \
-                    Use when you need current information beyond your training data.".into(),
+                    Use when you need current information beyond your training data."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -717,7 +742,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "webFetch".into(),
                 description: "Fetch a URL and return its content as markdown. For large pages, \
                     provide a prompt to extract only relevant information via a sidecar model. \
-                    Results cached for 15 minutes.".into(),
+                    Results cached for 15 minutes."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -748,7 +774,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "webSimilar".into(),
                 description: "Find web pages semantically similar to a given URL. \
                     Uses embedding-based similarity \u{2014} good for finding related docs, \
-                    alternative implementations, or similar projects.".into(),
+                    alternative implementations, or similar projects."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -783,7 +810,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     from the transcript. Use this to access details that may have been \
                     compacted or truncated from the current context. Returns all turns \
                     (user message, assistant responses, tool calls, tool results) in the block, \
-                    including any images that were attached.".into(),
+                    including any images that were attached."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -804,7 +832,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     Returns matching blocks with snippets, block IDs, and topic labels. \
                     Use this to find specific information that may have been compacted \
                     away from the current context. Use mediaType to filter for turns \
-                    with specific attachment types (e.g. 'image').".into(),
+                    with specific attachment types (e.g. 'image')."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -842,7 +871,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     immediately with a task id and you'll be notified when \
                     the subagent completes \u{2014} do NOT poll \
                     `jobOutput` while waiting. Use `jobList` to see \
-                    what's still running.".into(),
+                    what's still running."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -874,7 +904,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Get LSP diagnostics (errors/warnings) for a file or directory. \
                     Use after making changes to verify correctness, or to check project \
                     health before declaring work complete. Requires a language server to be \
-                    available for the file type.".into(),
+                    available for the file type."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -901,7 +932,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     e.g. to run a TUI tool that would interfere with the main shell, \
                     or to give the user a tab while you work in another. \
                     Foreground `shell` calls block the turn; use \
-                    `shell(runInBackground: true)` for non-blocking commands.".into(),
+                    `shell(runInBackground: true)` for non-blocking commands."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -924,7 +956,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     shell, shellHistory, readOutput, searchOutput, and readTerminal calls \
                     when they omit the `terminal` field. Independent from the user's \
                     focused tab in the deck; switching the agent's target does NOT switch \
-                    the user's view.".into(),
+                    the user's view."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -947,7 +980,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     in that case future calls with `terminal: \"main\"` will return \
                     a 'closed' error, so check `terminalList` if you're unsure. Any \
                     in-flight commands targeting the killed terminal will also return \
-                    a 'closed' error.".into(),
+                    a 'closed' error."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -965,7 +999,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "terminalList".into(),
                 description: "List all live terminals with their names, age, and \
-                    which one is currently active.".into(),
+                    which one is currently active."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -986,7 +1021,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     output. Use it when you want a mid-flight peek or to \
                     page through historical output via `sinceLine`. Omit \
                     `sinceLine` for the most recent tail; `maxLines` caps \
-                    the response (default 200, max 500).".into(),
+                    the response (default 200, max 500)."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1016,7 +1052,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Kill a running background job by id. Sends SIGTERM to \
                     the job's process group (so the shell wrapper and any child \
                     processes it spawned), waits briefly, then SIGKILLs anything \
-                    still alive. No-op if the job is already terminal.".into(),
+                    still alive. No-op if the job is already terminal."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1035,7 +1072,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "jobList".into(),
                 description: "List all background jobs (running, completed, killed, errored) \
                     with their command, age, total lines emitted, and state. Use to \
-                    rediscover job ids if you've lost track.".into(),
+                    rediscover job ids if you've lost track."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1077,13 +1115,14 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     keep the filter selective \u{2014} but selective means \
                     \"lines you'd act on,\" not just success. Monitors \
                     sustaining >500 matches/sec for 5s auto-stop; tighten \
-                    the filter and re-register.".into(),
+                    the filter and re-register."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "description": {
                             "type": "string",
-                            "description": "Short label shown in every notification and in F2 control panel. Be specific: \"errors in deploy.log\", not \"watching logs\"."
+                            "description": "Short label shown in every notification and in the tasks panel. Be specific: \"errors in deploy.log\", not \"watching logs\"."
                         },
                         "command": {
                             "type": "string",
@@ -1110,7 +1149,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "monitorStop".into(),
                 description: "Stop a monitor by id. Also kills the backing bash task so \
                     the watched process exits cleanly. No-op on already-terminal \
-                    monitors.".into(),
+                    monitors."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1128,7 +1168,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "monitorList".into(),
                 description: "Snapshot of every monitor (running, stopped, auto-stopped) \
-                    with command, filter, event count, last-event age, and state.".into(),
+                    with command, filter, event count, last-event age, and state."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1145,7 +1186,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     user-shaped message carrying `prompt` as its payload. \
                     Use for \"remind me to check X in 5 minutes\" without \
                     blocking the conversation. The minimum granularity is \
-                    ~1s (scheduler tick). Cancellable via cronDelete(wakeId).".into(),
+                    ~1s (scheduler tick). Cancellable via cronDelete(wakeId)."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1176,7 +1218,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     but with a calendar-aware specification).\n\n\
                     Cron evaluation uses wall-clock so machine sleep doesn't \
                     permanently shift the schedule. Cancel via \
-                    `cronDelete(wakeId)`.".into(),
+                    `cronDelete(wakeId)`."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1204,7 +1247,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "Snapshot every active wake source (delay, cron, \
                     file-watch, plus passive monitor/task sources) with id, \
                     kind, summary, prompt, and fire count. Use to rediscover \
-                    wake ids you've lost track of.".into(),
+                    wake ids you've lost track of."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1218,7 +1262,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "cronDelete".into(),
                 description: "Disarm any wake source by id. Works for delay, \
                     cron, and file-watch sources. Named `cronDelete` for \
-                    convenience but accepts any wake id from cronList.".into(),
+                    convenience but accepts any wake id from cronList."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1247,7 +1292,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     notifications). Linux uses inotify. Watching a noisy \
                     directory (e.g. node_modules during a build) will fire \
                     many wakes \u{2014} narrow the path or use a Monitor with \
-                    a filter instead.".into(),
+                    a filter instead."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1306,30 +1352,86 @@ pub enum ToolAction {
         /// the JobPlane; retrieve output via `jobOutput`.
         runInBackground: bool,
     },
-    ReadFile { path: String, offset: Option<usize>, limit: Option<usize>, anchor: Option<usize> },
-    WriteFile { path: String, content: String },
-    EditFile { path: String, oldString: String, newString: String, replaceAll: bool },
-    MultiEdit { path: String, edits: Vec<EditOp> },
-    CopyFile { src: String, dest: String, overwrite: bool },
-    MoveFile { src: String, dest: String, overwrite: bool },
-    DeleteFile { path: String, recursive: bool },
-    MakeDirs { path: String },
-    ShellHistory { terminal: Option<String> },
-    ReadOutput { index: usize, offset: Option<usize>, limit: Option<usize>, terminal: Option<String> },
-    SearchOutput { index: usize, pattern: String, context: usize, terminal: Option<String> },
-    ReadTerminal { lines: usize, terminal: Option<String> },
+    ReadFile {
+        path: String,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        anchor: Option<usize>,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    EditFile {
+        path: String,
+        oldString: String,
+        newString: String,
+        replaceAll: bool,
+    },
+    MultiEdit {
+        path: String,
+        edits: Vec<EditOp>,
+    },
+    CopyFile {
+        src: String,
+        dest: String,
+        overwrite: bool,
+    },
+    MoveFile {
+        src: String,
+        dest: String,
+        overwrite: bool,
+    },
+    DeleteFile {
+        path: String,
+        recursive: bool,
+    },
+    MakeDirs {
+        path: String,
+    },
+    ShellHistory {
+        terminal: Option<String>,
+    },
+    ReadOutput {
+        index: usize,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        terminal: Option<String>,
+    },
+    SearchOutput {
+        index: usize,
+        pattern: String,
+        context: usize,
+        terminal: Option<String>,
+    },
+    ReadTerminal {
+        lines: usize,
+        terminal: Option<String>,
+    },
     /// Spawn a new terminal. Name auto-generated when None.
-    TerminalSpawn { name: Option<String> },
+    TerminalSpawn {
+        name: Option<String>,
+    },
     /// Set the active default target for shell-using tool calls.
-    TerminalSwitch { name: String },
+    TerminalSwitch {
+        name: String,
+    },
     /// Kill a named terminal.
-    TerminalKill { name: String },
+    TerminalKill {
+        name: String,
+    },
     /// Snapshot of all terminals.
     TerminalList,
     /// Retrieve buffered output for a task.
-    JobOutput { jobId: u64, sinceLine: Option<u64>, maxLines: Option<usize> },
+    JobOutput {
+        jobId: u64,
+        sinceLine: Option<u64>,
+        maxLines: Option<usize>,
+    },
     /// Kill a running job.
-    JobStop { jobId: u64 },
+    JobStop {
+        jobId: u64,
+    },
     /// Snapshot of all tasks.
     JobList,
     /// Register a line-streamed monitor backed by a bash task. Lines
@@ -1343,39 +1445,84 @@ pub enum ToolAction {
         filter: String,
     },
     /// Stop a monitor (and its backing bash task).
-    MonitorStop { monitorId: u64 },
+    MonitorStop {
+        monitorId: u64,
+    },
     /// Snapshot of all monitors.
     MonitorList,
     /// Arm a one-shot delay wake. Fires after `delaySeconds` with the
     /// model-supplied `prompt` as the wake payload.
-    ScheduleWakeup { delaySeconds: u64, prompt: String },
+    ScheduleWakeup {
+        delaySeconds: u64,
+        prompt: String,
+    },
     /// Arm a cron-scheduled wake. 5-field cron in local time.
-    CronCreate { spec: String, prompt: String, recurring: bool },
+    CronCreate {
+        spec: String,
+        prompt: String,
+        recurring: bool,
+    },
     /// Snapshot all wake sources (delay, cron, file-watch).
     CronList,
     /// Disarm a wake source by id. Works for any wake kind, named
     /// `cronDelete` because cron is the most common case the model
     /// will want to cancel.
-    CronDelete { wakeId: u64 },
+    CronDelete {
+        wakeId: u64,
+    },
     /// Arm a filesystem watch. Each fs event under `path` (created,
     /// modified, removed) fires a wake with the `prompt` payload.
-    FileWatch { path: String, prompt: String },
-    Glob { pattern: String, path: Option<String>, metadata: bool },
+    FileWatch {
+        path: String,
+        prompt: String,
+    },
+    Glob {
+        pattern: String,
+        path: Option<String>,
+        metadata: bool,
+    },
     Grep {
-        pattern: String, path: Option<String>, include: Option<String>,
-        fileType: Option<String>, outputMode: String, caseSensitive: Option<bool>,
-        contextLines: Option<usize>, multiline: bool,
+        pattern: String,
+        path: Option<String>,
+        include: Option<String>,
+        fileType: Option<String>,
+        outputMode: String,
+        caseSensitive: Option<bool>,
+        contextLines: Option<usize>,
+        multiline: bool,
     },
-    ListDir { path: String, depth: usize, offset: usize, limit: usize, metadata: bool },
-    StructSearch { pattern: String, language: String, path: Option<String> },
+    ListDir {
+        path: String,
+        depth: usize,
+        offset: usize,
+        limit: usize,
+        metadata: bool,
+    },
+    StructSearch {
+        pattern: String,
+        language: String,
+        path: Option<String>,
+    },
     Diff {
-        path: Option<String>, gitRef: Option<String>,
-        pathA: Option<String>, pathB: Option<String>,
+        path: Option<String>,
+        gitRef: Option<String>,
+        pathA: Option<String>,
+        pathB: Option<String>,
     },
-    FuzzyFind { query: String, path: Option<String> },
-    FileOutline { path: String },
-    ViewSymbol { file: String, symbol: String },
-    RelatedFiles { path: String },
+    FuzzyFind {
+        query: String,
+        path: Option<String>,
+    },
+    FileOutline {
+        path: String,
+    },
+    ViewSymbol {
+        file: String,
+        symbol: String,
+    },
+    RelatedFiles {
+        path: String,
+    },
     WebSearch {
         query: String,
         allowedDomains: Option<Vec<String>>,
@@ -1393,8 +1540,13 @@ pub enum ToolAction {
         blockedDomains: Option<Vec<String>>,
         maxResults: Option<usize>,
     },
-    HistoryFetch { blockId: String },
-    HistorySearch { query: String, mediaType: Option<String> },
+    HistoryFetch {
+        blockId: String,
+    },
+    HistorySearch {
+        query: String,
+        mediaType: Option<String>,
+    },
     Task {
         prompt: String,
         agent: Option<String>,
@@ -1404,9 +1556,18 @@ pub enum ToolAction {
         /// retrieves the final content from the task's ring buffer.
         runInBackground: bool,
     },
-    Diagnostics { path: String, severity: String },
-    Mcp { qualifiedName: String, args: String },
-    Unknown { name: String, args: String },
+    Diagnostics {
+        path: String,
+        severity: String,
+    },
+    Mcp {
+        qualifiedName: String,
+        args: String,
+    },
+    Unknown {
+        name: String,
+        args: String,
+    },
 }
 
 /// Which tools a subagent can access.
@@ -1427,7 +1588,8 @@ pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
         "terminalSpawn",
         "terminalSwitch",
         "terminalKill",
-        "terminalList",        "monitor",
+        "terminalList",
+        "monitor",
         "monitorStop",
         "monitorList",
         "scheduleWakeup",
@@ -1449,9 +1611,20 @@ pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
             // of prior shell output is available via `shellHistory` +
             // `readOutput` + `searchOutput`.
             const ALLOWED: &[&str] = &[
-                "readFile", "glob", "grep", "listDir", "structSearch", "diff",
-                "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
-                "shellHistory", "readOutput", "searchOutput", "readTerminal",
+                "readFile",
+                "glob",
+                "grep",
+                "listDir",
+                "structSearch",
+                "diff",
+                "fuzzyFind",
+                "fileOutline",
+                "viewSymbol",
+                "relatedFiles",
+                "shellHistory",
+                "readOutput",
+                "searchOutput",
+                "readTerminal",
                 "terminalList",
             ];
             defs.iter()
@@ -1485,8 +1658,10 @@ pub fn needsRegistry(action: &ToolAction) -> bool {
 pub fn needsJobPlane(action: &ToolAction) -> bool {
     matches!(
         action,
-        ToolAction::Shell { runInBackground: true, .. }
-            | ToolAction::JobOutput { .. }
+        ToolAction::Shell {
+            runInBackground: true,
+            ..
+        } | ToolAction::JobOutput { .. }
             | ToolAction::JobStop { .. }
             | ToolAction::JobList,
     )
@@ -1499,9 +1674,7 @@ pub fn needsJobPlane(action: &ToolAction) -> bool {
 pub fn needsMonitor(action: &ToolAction) -> bool {
     matches!(
         action,
-        ToolAction::Monitor { .. }
-            | ToolAction::MonitorStop { .. }
-            | ToolAction::MonitorList,
+        ToolAction::Monitor { .. } | ToolAction::MonitorStop { .. } | ToolAction::MonitorList,
     )
 }
 
@@ -1536,7 +1709,13 @@ impl ToolAction {
 /// Human-readable summary of what a tool action will do.
 pub fn summarize(action: &ToolAction) -> String {
     match action {
-        ToolAction::Shell { command, explanation, timeout, runInBackground, .. } => {
+        ToolAction::Shell {
+            command,
+            explanation,
+            timeout,
+            runInBackground,
+            ..
+        } => {
             let prefix = if *runInBackground {
                 "Spawn bg".to_string()
             } else {
@@ -1551,7 +1730,12 @@ pub fn summarize(action: &ToolAction) -> String {
                 format!("{prefix}: {command} \u{2014} {explanation}")
             }
         }
-        ToolAction::ReadFile { path, offset, limit, anchor } => {
+        ToolAction::ReadFile {
+            path,
+            offset,
+            limit,
+            anchor,
+        } => {
             if let Some(a) = anchor {
                 format!("Read: {path} (block at line {a})")
             } else {
@@ -1566,9 +1750,17 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::WriteFile { path, content } => {
             format!("Write {} bytes to {path}", content.len())
         }
-        ToolAction::EditFile { path, oldString, replaceAll, .. } => {
+        ToolAction::EditFile {
+            path,
+            oldString,
+            replaceAll,
+            ..
+        } => {
             let preview = if oldString.len() > 40 {
-                format!("{}\u{2026}", &oldString[..oldString.floor_char_boundary(40)])
+                format!(
+                    "{}\u{2026}",
+                    &oldString[..oldString.floor_char_boundary(40)]
+                )
             } else {
                 oldString.clone()
             };
@@ -1581,11 +1773,19 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::MultiEdit { path, edits } => {
             format!("Multi-edit {path}: {} edits", edits.len())
         }
-        ToolAction::CopyFile { src, dest, overwrite } => {
+        ToolAction::CopyFile {
+            src,
+            dest,
+            overwrite,
+        } => {
             let suffix = if *overwrite { " (overwrite)" } else { "" };
             format!("Copy {src} \u{2192} {dest}{suffix}")
         }
-        ToolAction::MoveFile { src, dest, overwrite } => {
+        ToolAction::MoveFile {
+            src,
+            dest,
+            overwrite,
+        } => {
             let suffix = if *overwrite { " (overwrite)" } else { "" };
             format!("Move {src} \u{2192} {dest}{suffix}")
         }
@@ -1601,20 +1801,41 @@ pub fn summarize(action: &ToolAction) -> String {
             Some(t) => format!("List shell history [{t}]"),
             None => "List shell command history".into(),
         },
-        ToolAction::ReadOutput { index, offset, limit, terminal } => {
-            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
+        ToolAction::ReadOutput {
+            index,
+            offset,
+            limit,
+            terminal,
+        } => {
+            let suffix = terminal
+                .as_deref()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default();
             match (offset, limit) {
-                (Some(o), Some(l)) => format!("Read output #{index} (lines {o}..{}){suffix}", o + l - 1),
+                (Some(o), Some(l)) => {
+                    format!("Read output #{index} (lines {o}..{}){suffix}", o + l - 1)
+                }
                 (Some(o), None) => format!("Read output #{index} (from line {o}){suffix}"),
                 _ => format!("Read output #{index}{suffix}"),
             }
         }
-        ToolAction::SearchOutput { index, pattern, terminal, .. } => {
-            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
+        ToolAction::SearchOutput {
+            index,
+            pattern,
+            terminal,
+            ..
+        } => {
+            let suffix = terminal
+                .as_deref()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default();
             format!("Search output #{index} for \"{pattern}\"{suffix}")
         }
         ToolAction::ReadTerminal { lines, terminal } => {
-            let suffix = terminal.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
+            let suffix = terminal
+                .as_deref()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default();
             format!("Read last {lines} terminal lines{suffix}")
         }
         ToolAction::TerminalSpawn { name } => match name {
@@ -1624,13 +1845,19 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::TerminalSwitch { name } => format!("Switch active terminal to '{name}'"),
         ToolAction::TerminalKill { name } => format!("Kill terminal '{name}'"),
         ToolAction::TerminalList => "List terminals".into(),
-        ToolAction::JobOutput { jobId, sinceLine, .. } => match sinceLine {
+        ToolAction::JobOutput {
+            jobId, sinceLine, ..
+        } => match sinceLine {
             Some(n) => format!("jobOutput #{jobId} (since line {n})"),
             None => format!("jobOutput #{jobId}"),
         },
         ToolAction::JobStop { jobId } => format!("jobStop #{jobId}"),
         ToolAction::JobList => "jobList".into(),
-        ToolAction::Monitor { description, command, filter } => {
+        ToolAction::Monitor {
+            description,
+            command,
+            filter,
+        } => {
             let preview = if command.len() > 50 {
                 format!("{}\u{2026}", &command[..command.floor_char_boundary(50)])
             } else {
@@ -1640,7 +1867,10 @@ pub fn summarize(action: &ToolAction) -> String {
         }
         ToolAction::MonitorStop { monitorId } => format!("monitorStop #{monitorId}"),
         ToolAction::MonitorList => "monitorList".into(),
-        ToolAction::ScheduleWakeup { delaySeconds, prompt } => {
+        ToolAction::ScheduleWakeup {
+            delaySeconds,
+            prompt,
+        } => {
             let preview = if prompt.len() > 40 {
                 format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(40)])
             } else {
@@ -1648,7 +1878,11 @@ pub fn summarize(action: &ToolAction) -> String {
             };
             format!("scheduleWakeup {delaySeconds}s: {preview}")
         }
-        ToolAction::CronCreate { spec, prompt, recurring } => {
+        ToolAction::CronCreate {
+            spec,
+            prompt,
+            recurring,
+        } => {
             let preview = if prompt.len() > 40 {
                 format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(40)])
             } else {
@@ -1667,16 +1901,31 @@ pub fn summarize(action: &ToolAction) -> String {
             };
             format!("fileWatch {path}: {preview}")
         }
-        ToolAction::Glob { pattern, path, metadata } => {
+        ToolAction::Glob {
+            pattern,
+            path,
+            metadata,
+        } => {
             let dir = path.as_deref().unwrap_or(".");
             let suffix = if *metadata { " +meta" } else { "" };
             format!("Find files: {pattern} in {dir}{suffix}")
         }
-        ToolAction::Grep { pattern, path, outputMode, .. } => {
+        ToolAction::Grep {
+            pattern,
+            path,
+            outputMode,
+            ..
+        } => {
             let dir = path.as_deref().unwrap_or(".");
             format!("Search ({outputMode}): \"{pattern}\" in {dir}")
         }
-        ToolAction::ListDir { path, depth, offset, limit, metadata } => {
+        ToolAction::ListDir {
+            path,
+            depth,
+            offset,
+            limit,
+            metadata,
+        } => {
             let suffix = if *metadata { " +meta" } else { "" };
             if *offset > 0 {
                 format!("List: {path} (depth {depth}, offset {offset}, limit {limit}){suffix}")
@@ -1684,10 +1933,17 @@ pub fn summarize(action: &ToolAction) -> String {
                 format!("List: {path} (depth {depth}){suffix}")
             }
         }
-        ToolAction::StructSearch { pattern, language, .. } => {
+        ToolAction::StructSearch {
+            pattern, language, ..
+        } => {
             format!("AST search ({language}): \"{pattern}\"")
         }
-        ToolAction::Diff { path, gitRef, pathA, pathB } => {
+        ToolAction::Diff {
+            path,
+            gitRef,
+            pathA,
+            pathB,
+        } => {
             if let (Some(a), Some(b)) = (pathA, pathB) {
                 format!("Diff: {a} vs {b}")
             } else {
@@ -1715,7 +1971,11 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::HistoryFetch { blockId } => format!("Fetch block: {blockId}"),
         ToolAction::HistorySearch { query, .. } => format!("Search history: {query}"),
         ToolAction::Diagnostics { path, .. } => format!("Check diagnostics: {path}"),
-        ToolAction::Task { prompt, agent, runInBackground } => {
+        ToolAction::Task {
+            prompt,
+            agent,
+            runInBackground,
+        } => {
             let agentName = agent.as_deref().unwrap_or("general");
             let preview = if prompt.len() > 60 {
                 format!("{}\u{2026}", &prompt[..prompt.floor_char_boundary(60)])
@@ -1741,7 +2001,12 @@ pub fn summarize(action: &ToolAction) -> String {
 /// or `None` for everything else.
 pub fn diffPreview(action: &ToolAction) -> Option<String> {
     match action {
-        ToolAction::EditFile { path, oldString, newString, .. } => {
+        ToolAction::EditFile {
+            path,
+            oldString,
+            newString,
+            ..
+        } => {
             let diff = similar::TextDiff::configure()
                 .algorithm(similar::Algorithm::Patience)
                 .diff_lines(oldString, newString);
@@ -1761,13 +2026,8 @@ pub fn diffPreview(action: &ToolAction) -> Option<String> {
             if old.is_empty() {
                 // New file — show all lines as additions.
                 let lineCount = content.lines().count();
-                let header = format!(
-                    "--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lineCount} @@"
-                );
-                let additions: String = content
-                    .lines()
-                    .map(|l| format!("+{l}\n"))
-                    .collect();
+                let header = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lineCount} @@");
+                let additions: String = content.lines().map(|l| format!("+{l}\n")).collect();
                 Some(format!("{header}\n{additions}"))
             } else {
                 let diff = similar::TextDiff::configure()
@@ -1823,10 +2083,13 @@ pub fn diffPreview(action: &ToolAction) -> Option<String> {
 /// while the user is reviewing the approval prompt.
 pub fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
     match action {
-        ToolAction::WriteFile { path, content } => {
-            Some((path.clone(), content.clone()))
-        }
-        ToolAction::EditFile { path, oldString, newString, replaceAll } => {
+        ToolAction::WriteFile { path, content } => Some((path.clone(), content.clone())),
+        ToolAction::EditFile {
+            path,
+            oldString,
+            newString,
+            replaceAll,
+        } => {
             let original = std::fs::read_to_string(path).ok()?;
             let result = if *replaceAll {
                 original.replace(oldString, newString)
@@ -1855,7 +2118,10 @@ pub fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
 
 /// Check if a tool action requires transcript access (handled by session, not here).
 pub fn needsTranscript(action: &ToolAction) -> bool {
-    matches!(action, ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. })
+    matches!(
+        action,
+        ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. }
+    )
 }
 
 /// Check if a tool action is an MCP tool (handled by session, not here).
@@ -1886,7 +2152,12 @@ pub async fn execute(
     terminalName: &str,
 ) -> crate::message::Content {
     match action {
-        ToolAction::Shell { command, timeout, runInBackground, .. } => {
+        ToolAction::Shell {
+            command,
+            timeout,
+            runInBackground,
+            ..
+        } => {
             // Background shell calls are routed by the Session via the
             // JobPlane handler. If we got one here, it's a bug.
             if *runInBackground {
@@ -1900,41 +2171,53 @@ pub async fn execute(
             let index = shell.historyLen().saturating_sub(1);
             crate::message::Content::text(truncateOutput(&raw, index, terminalName))
         }
-        ToolAction::ReadFile { path, offset, limit, anchor } => {
-            executeReadFile(path, *offset, *limit, *anchor)
-        }
+        ToolAction::ReadFile {
+            path,
+            offset,
+            limit,
+            anchor,
+        } => executeReadFile(path, *offset, *limit, *anchor),
         ToolAction::WriteFile { path, content } => executeWriteFile(path, content).into(),
-        ToolAction::EditFile { path, oldString, newString, replaceAll } => {
-            executeEditFile(path, oldString, newString, *replaceAll).into()
-        }
+        ToolAction::EditFile {
+            path,
+            oldString,
+            newString,
+            replaceAll,
+        } => executeEditFile(path, oldString, newString, *replaceAll).into(),
         ToolAction::MultiEdit { path, edits } => executeMultiEdit(path, edits).into(),
-        ToolAction::CopyFile { src, dest, overwrite } => {
-            executeCopyFile(src, dest, *overwrite).into()
-        }
-        ToolAction::MoveFile { src, dest, overwrite } => {
-            executeMoveFile(src, dest, *overwrite).into()
-        }
-        ToolAction::DeleteFile { path, recursive } => {
-            executeDeleteFile(path, *recursive).into()
-        }
+        ToolAction::CopyFile {
+            src,
+            dest,
+            overwrite,
+        } => executeCopyFile(src, dest, *overwrite).into(),
+        ToolAction::MoveFile {
+            src,
+            dest,
+            overwrite,
+        } => executeMoveFile(src, dest, *overwrite).into(),
+        ToolAction::DeleteFile { path, recursive } => executeDeleteFile(path, *recursive).into(),
         ToolAction::MakeDirs { path } => executeMakeDirs(path).into(),
         ToolAction::ShellHistory { .. } => executeShellHistory(shell, terminalName).into(),
-        ToolAction::ReadOutput { index, offset, limit, .. } => {
-            executeReadOutput(shell, *index, *offset, *limit, terminalName).into()
-        }
-        ToolAction::SearchOutput { index, pattern, context, .. } => {
-            executeSearchOutput(shell, *index, pattern, *context, terminalName).into()
-        }
+        ToolAction::ReadOutput {
+            index,
+            offset,
+            limit,
+            ..
+        } => executeReadOutput(shell, *index, *offset, *limit, terminalName).into(),
+        ToolAction::SearchOutput {
+            index,
+            pattern,
+            context,
+            ..
+        } => executeSearchOutput(shell, *index, pattern, *context, terminalName).into(),
         ToolAction::ReadTerminal { lines, .. } => shell.readTerminal(*lines).into(),
         // Terminal management is handled by Session (needs ShellRegistry).
         ToolAction::TerminalSpawn { .. }
         | ToolAction::TerminalSwitch { .. }
         | ToolAction::TerminalKill { .. }
-        | ToolAction::TerminalList => {
-            crate::message::Content::text(
-                "Error: terminal tools must be executed through the session.",
-            )
-        }
+        | ToolAction::TerminalList => crate::message::Content::text(
+            "Error: terminal tools must be executed through the session.",
+        ),
         // Job plane and monitor tools are handled by Session (need
         // direct access to JobPlane / MonitorPlane and logTx).
         ToolAction::JobOutput { .. }
@@ -1942,11 +2225,9 @@ pub async fn execute(
         | ToolAction::JobList
         | ToolAction::Monitor { .. }
         | ToolAction::MonitorStop { .. }
-        | ToolAction::MonitorList => {
-            crate::message::Content::text(
-                "Error: job plane tools must be executed through the session.",
-            )
-        }
+        | ToolAction::MonitorList => crate::message::Content::text(
+            "Error: job plane tools must be executed through the session.",
+        ),
         // Wake registry tools are handled by Session (need direct
         // access to WakeRegistry).
         ToolAction::ScheduleWakeup { .. }
@@ -1954,45 +2235,85 @@ pub async fn execute(
         | ToolAction::CronList
         | ToolAction::CronDelete { .. }
         | ToolAction::FileWatch { .. } => {
-            crate::message::Content::text(
-                "Error: wake tools must be executed through the session.",
-            )
+            crate::message::Content::text("Error: wake tools must be executed through the session.")
         }
-        ToolAction::Glob { pattern, path, metadata } => executeGlob(pattern, path.as_deref(), *metadata).await.into(),
+        ToolAction::Glob {
+            pattern,
+            path,
+            metadata,
+        } => executeGlob(pattern, path.as_deref(), *metadata)
+            .await
+            .into(),
         ToolAction::Grep {
-            pattern, path, include, fileType, outputMode,
-            caseSensitive, contextLines, multiline,
-        } => {
-            executeGrep(
-                pattern, path.as_deref(), include.as_deref(), fileType.as_deref(),
-                outputMode, *caseSensitive, *contextLines, *multiline,
-            ).await.into()
+            pattern,
+            path,
+            include,
+            fileType,
+            outputMode,
+            caseSensitive,
+            contextLines,
+            multiline,
+        } => executeGrep(
+            pattern,
+            path.as_deref(),
+            include.as_deref(),
+            fileType.as_deref(),
+            outputMode,
+            *caseSensitive,
+            *contextLines,
+            *multiline,
+        )
+        .await
+        .into(),
+        ToolAction::ListDir {
+            path,
+            depth,
+            offset,
+            limit,
+            metadata,
+        } => executeListDir(path, *depth, *offset, *limit, *metadata).into(),
+        ToolAction::StructSearch {
+            pattern,
+            language,
+            path,
+        } => executeStructSearch(pattern, language, path.as_deref())
+            .await
+            .into(),
+        ToolAction::Diff {
+            path,
+            gitRef,
+            pathA,
+            pathB,
+        } => executeDiff(
+            path.as_deref(),
+            gitRef.as_deref(),
+            pathA.as_deref(),
+            pathB.as_deref(),
+        )
+        .await
+        .into(),
+        ToolAction::FuzzyFind { query, path } => {
+            executeFuzzyFind(query, path.as_deref()).await.into()
         }
-        ToolAction::ListDir { path, depth, offset, limit, metadata } => {
-            executeListDir(path, *depth, *offset, *limit, *metadata).into()
-        }
-        ToolAction::StructSearch { pattern, language, path } => {
-            executeStructSearch(pattern, language, path.as_deref()).await.into()
-        }
-        ToolAction::Diff { path, gitRef, pathA, pathB } => {
-            executeDiff(path.as_deref(), gitRef.as_deref(), pathA.as_deref(), pathB.as_deref()).await.into()
-        }
-        ToolAction::FuzzyFind { query, path } => executeFuzzyFind(query, path.as_deref()).await.into(),
         ToolAction::FileOutline { path } => executeFileOutline(path).await.into(),
         ToolAction::ViewSymbol { file, symbol } => executeViewSymbol(file, symbol).await.into(),
         ToolAction::RelatedFiles { path } => executeRelatedFiles(path).into(),
         // Web tools are handled by session.rs (need ExaClient + cache).
-        ToolAction::WebSearch { .. } | ToolAction::WebFetch { .. } | ToolAction::WebSimilar { .. } => {
+        ToolAction::WebSearch { .. }
+        | ToolAction::WebFetch { .. }
+        | ToolAction::WebSimilar { .. } => {
             crate::message::Content::text("Error: web tools must be executed through the session.")
         }
         // History tools are handled by session.rs (need transcript access).
         ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. } => {
-            crate::message::Content::text("Error: history tools must be executed through the session.")
+            crate::message::Content::text(
+                "Error: history tools must be executed through the session.",
+            )
         }
         // LSP diagnostics are handled by session.rs (need LspManager).
-        ToolAction::Diagnostics { .. } => {
-            crate::message::Content::text("Error: diagnostics tool must be executed through the session.")
-        }
+        ToolAction::Diagnostics { .. } => crate::message::Content::text(
+            "Error: diagnostics tool must be executed through the session.",
+        ),
         // MCP tools are handled by session.rs (need McpManager).
         ToolAction::Mcp { .. } => {
             crate::message::Content::text("Error: MCP tools must be executed through the session.")
@@ -2001,7 +2322,9 @@ pub async fn execute(
         ToolAction::Task { .. } => {
             crate::message::Content::text("Error: task tools must be executed through the session.")
         }
-        ToolAction::Unknown { name, .. } => crate::message::Content::text(format!("Unknown tool: {name}")),
+        ToolAction::Unknown { name, .. } => {
+            crate::message::Content::text(format!("Unknown tool: {name}"))
+        }
     }
 }
 
@@ -2071,14 +2394,16 @@ fn truncateOutput(raw: &str, historyIndex: usize, terminalName: &str) -> String 
     // the start past headEnd so the sections never overlap.
     let midCenter = totalLines / 2;
     let midStart = midCenter.saturating_sub(midLineBudget / 2).max(headEnd);
-    let (middle, midEnd) = emitSlice(
-        &lines, midStart, totalLines, midLineBudget, midByteBudget,
-    );
+    let (middle, midEnd) = emitSlice(&lines, midStart, totalLines, midLineBudget, midByteBudget);
 
     // Tail: last N lines. Clamp past midEnd so they can't overlap.
     let tailStart = totalLines.saturating_sub(tailLineBudget).max(midEnd);
     let (tail, _tailEnd) = emitSlice(
-        &lines, tailStart, totalLines, tailLineBudget, tailByteBudget,
+        &lines,
+        tailStart,
+        totalLines,
+        tailLineBudget,
+        tailByteBudget,
     );
 
     let headElided = midStart.saturating_sub(headEnd);
@@ -2118,7 +2443,9 @@ fn executeReadFile(
             let mut probe = [0u8; 512];
             let probeLen = match file.read(&mut probe) {
                 Ok(n) => n,
-                Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
+                Err(e) => {
+                    return crate::message::Content::text(format!("Failed to read file: {e}"));
+                }
             };
             match classifyFile(&probe[..probeLen]) {
                 FileKind::Image(fmt) => {
@@ -2137,7 +2464,11 @@ fn executeReadFile(
                                 vec![dataUri],
                             );
                         }
-                        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
+                        Err(e) => {
+                            return crate::message::Content::text(format!(
+                                "Failed to read file: {e}"
+                            ));
+                        }
                     }
                 }
                 FileKind::Binary => {
@@ -2167,11 +2498,7 @@ fn executeReadFile(
 
 /// Format text as numbered lines with offset/limit and truncation.
 /// Shared between readFile and readOutput.
-fn formatNumberedLines(
-    content: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> String {
+fn formatNumberedLines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     let startLine = offset.unwrap_or(1).max(1);
     let maxLines = limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
     let totalLines = content.lines().count();
@@ -2305,7 +2632,10 @@ fn executeMultiEdit(path: &str, edits: &[EditOp]) -> String {
     // Validate and apply each edit sequentially against the in-memory copy.
     for (i, edit) in edits.iter().enumerate() {
         if edit.oldString.is_empty() {
-            return format!("Edit {}: old_string cannot be empty. No edits were applied.", i + 1);
+            return format!(
+                "Edit {}: old_string cannot be empty. No edits were applied.",
+                i + 1
+            );
         }
         if edit.oldString == edit.newString {
             return format!(
@@ -2352,9 +2682,7 @@ fn executeCopyFile(src: &str, dest: &str, overwrite: bool) -> String {
         return format!("Source does not exist: {src}");
     }
     if destPath.exists() && !overwrite {
-        return format!(
-            "Destination already exists: {dest}. Set overwrite=true to replace."
-        );
+        return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
     }
     if let Some(parent) = destPath.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2412,9 +2740,7 @@ fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String {
         return format!("Source does not exist: {src}");
     }
     if destPath.exists() && !overwrite {
-        return format!(
-            "Destination already exists: {dest}. Set overwrite=true to replace."
-        );
+        return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
     }
     if let Some(parent) = destPath.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2443,9 +2769,7 @@ fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String {
             };
             match removeResult {
                 Ok(()) => format!("Moved {src} \u{2192} {dest} (cross-device, copy+delete)."),
-                Err(e) => format!(
-                    "Copied {src} \u{2192} {dest} but failed to remove source: {e}"
-                ),
+                Err(e) => format!("Copied {src} \u{2192} {dest} but failed to remove source: {e}"),
             }
         }
     }
@@ -2504,7 +2828,9 @@ fn executeShellHistory(shell: &Shell, terminalName: &str) -> String {
         } else {
             cmd.clone()
         };
-        output.push_str(&format!("[{i}] {cmdPreview}{codeStr}  ({lineCount} lines)\n"));
+        output.push_str(&format!(
+            "[{i}] {cmdPreview}{codeStr}  ({lineCount} lines)\n"
+        ));
     }
 
     output
@@ -2610,7 +2936,7 @@ fn classifyFile(bytes: &[u8]) -> FileKind {
         b"\x7fELF",          // ELF
         b"\xfe\xed\xfa",     // Mach-O
         b"\xcf\xfa\xed\xfe", // Mach-O (reversed)
-        b"%PDF",              // PDF
+        b"%PDF",             // PDF
         b"\x1f\x8b",         // gzip
     ];
     for sig in BINARY_MAGIC {
@@ -2632,11 +2958,7 @@ fn classifyFile(bytes: &[u8]) -> FileKind {
 /// Run an external program, capture stdout+stderr, enforce timeout.
 /// Returns Ok(stdout) on success or Err(message) on failure.
 /// rg exit code 1 ("no matches") is treated as success with empty output.
-async fn runSubprocess(
-    program: &str,
-    args: &[&str],
-    notFoundMsg: &str,
-) -> Result<String, String> {
+async fn runSubprocess(program: &str, args: &[&str], notFoundMsg: &str) -> Result<String, String> {
     use tokio::process::Command;
 
     let result = Command::new(program)
@@ -2664,14 +2986,20 @@ async fn runSubprocess(
                 Ok(stdout)
             } else {
                 let msg = if stderr.is_empty() { &stdout } else { &stderr };
-                Err(format!("{program} failed (exit {}): {}", output.status, msg.trim()))
+                Err(format!(
+                    "{program} failed (exit {}): {}",
+                    output.status,
+                    msg.trim()
+                ))
             }
         }
         Ok(Err(e)) => Err(format!("Failed to run {program}: {e}")),
         Err(_) => {
             // Process is still running but we lost ownership via wait_with_output.
             // The child is dropped here which sends SIGKILL on Unix.
-            Err(format!("{program} timed out after {SUBPROCESS_TIMEOUT_SECS}s."))
+            Err(format!(
+                "{program} timed out after {SUBPROCESS_TIMEOUT_SECS}s."
+            ))
         }
     }
 }
@@ -2680,14 +3008,19 @@ async fn runSubprocess(
 
 async fn executeGlob(pattern: &str, path: Option<&str>, metadata: bool) -> String {
     let mut args = vec![
-        "--files", "--sort", "modified", "--hidden",
-        "--glob", pattern, "--glob", "!.git/",
+        "--files", "--sort", "modified", "--hidden", "--glob", pattern, "--glob", "!.git/",
     ];
     if let Some(p) = path {
         args.push(p);
     }
 
-    match runSubprocess("rg", &args, "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep").await {
+    match runSubprocess(
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
         Ok(stdout) => {
             if stdout.trim().is_empty() {
                 return "No files found.".into();
@@ -2727,7 +3060,9 @@ fn getFileSymbols(path: &str) -> Vec<(usize, String)> {
     let output = std::process::Command::new("sg")
         .args(["scan", "--inline-rules", &rule, "--json=stream", path])
         .output();
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut entries = parseSgEntries(&stdout);
     for (_, sig) in entries.iter_mut() {
@@ -2892,13 +3227,17 @@ async fn executeGrep(
 
     let args: Vec<&str> = argStrings.iter().map(|s| s.as_str()).collect();
 
-    match runSubprocess("rg", &args, "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep").await {
+    match runSubprocess(
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
         Ok(stdout) => {
             if stdout.trim().is_empty() {
                 let scope = path.unwrap_or(".");
-                let mut msg = format!(
-                    "No matches for pattern {pattern:?} in {scope}."
-                );
+                let mut msg = format!("No matches for pattern {pattern:?} in {scope}.");
                 // Surface common foot-guns when a pattern looks suspect.
                 if pattern.ends_with('"') || pattern.ends_with("\\\"") {
                     msg.push_str(
@@ -2934,9 +3273,7 @@ async fn executeGrep(
             };
 
             if total > cap {
-                output.push_str(&format!(
-                    "\n... {total} lines total, showing first {cap}."
-                ));
+                output.push_str(&format!("\n... {total} lines total, showing first {cap}."));
             }
             output
         }
@@ -2956,7 +3293,17 @@ fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize, metadat
     let hardCap = MAX_LISTDIR_ENTRIES.max(offset + limit);
     let mut allEntries = Vec::new();
     let mut count = 0usize;
-    let truncated = listDirRecurse(rootPath, 0, depth, "", &mut allEntries, &mut count, EXCLUDED, hardCap, metadata);
+    let truncated = listDirRecurse(
+        rootPath,
+        0,
+        depth,
+        "",
+        &mut allEntries,
+        &mut count,
+        EXCLUDED,
+        hardCap,
+        metadata,
+    );
     let total = allEntries.len();
 
     if total == 0 {
@@ -3039,8 +3386,15 @@ fn listDirRecurse(
             let childIndent = format!("{indent}  ");
             let childPath = dir.join(name);
             if listDirRecurse(
-                &childPath, currentDepth + 1, maxDepth, &childIndent,
-                output, count, excluded, hardCap, metadata,
+                &childPath,
+                currentDepth + 1,
+                maxDepth,
+                &childIndent,
+                output,
+                count,
+                excluded,
+                hardCap,
+                metadata,
             ) {
                 return true;
             }
@@ -3076,11 +3430,7 @@ fn formatMetadata(path: &std::path::Path) -> Option<String> {
 }
 
 fn formatSize(bytes: u64) -> String {
-    const UNITS: &[(u64, &str)] = &[
-        (1024 * 1024 * 1024, "G"),
-        (1024 * 1024, "M"),
-        (1024, "K"),
-    ];
+    const UNITS: &[(u64, &str)] = &[(1024 * 1024 * 1024, "G"), (1024 * 1024, "M"), (1024, "K")];
     for (threshold, suffix) in UNITS {
         if bytes >= *threshold {
             let value = bytes as f64 / *threshold as f64;
@@ -3398,8 +3748,8 @@ fn indentLevel(line: &str) -> usize {
 // --- Fuzzy find ---
 
 async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
-    use nucleo_matcher::{Matcher, Config};
-    use nucleo_matcher::pattern::{Pattern, CaseMatching, Normalization};
+    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+    use nucleo_matcher::{Config, Matcher};
 
     let mut args = vec!["--files", "--hidden", "--glob", "!.git/"];
     if let Some(p) = path {
@@ -3407,8 +3757,12 @@ async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
     }
 
     let stdout = match runSubprocess(
-        "rg", &args, "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
-    ).await {
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -3433,7 +3787,8 @@ async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
     }
     if matches.len() > MAX_FUZZY_RESULTS {
         output.push_str(&format!(
-            "\n... {} more matches. Refine your query.", matches.len() - MAX_FUZZY_RESULTS
+            "\n... {} more matches. Refine your query.",
+            matches.len() - MAX_FUZZY_RESULTS
         ));
     }
     output
@@ -3449,9 +3804,12 @@ async fn executeFileOutline(path: &str) -> String {
 
     let args = vec!["scan", "--inline-rules", &rule, "--json=stream", path];
     let stdout = match runSubprocess(
-        "sg", &args,
+        "sg",
+        &args,
         "ast-grep (sg) is required for fileOutline. Install: https://ast-grep.github.io",
-    ).await {
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -3469,7 +3827,8 @@ async fn executeFileOutline(path: &str) -> String {
     }
     if entries.len() > MAX_OUTLINE_ENTRIES {
         output.push_str(&format!(
-            "\n... {} more symbols.", entries.len() - MAX_OUTLINE_ENTRIES
+            "\n... {} more symbols.",
+            entries.len() - MAX_OUTLINE_ENTRIES
         ));
     }
     output
@@ -3510,7 +3869,9 @@ async fn executeViewSymbol(file: &str, symbol: &str) -> String {
         let found = false;
         for (idx, line) in currentText.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed.contains(part) && (looksLikeDeclaration(trimmed, part) || looksLikeVariant(trimmed, part)) {
+            if trimmed.contains(part)
+                && (looksLikeDeclaration(trimmed, part) || looksLikeVariant(trimmed, part))
+            {
                 let anchorLine = currentStart + idx;
                 let expanded = expandFromAnchor(&currentText, idx + 1);
                 // Re-anchor the expanded block to the file line numbers.
@@ -3522,7 +3883,10 @@ async fn executeViewSymbol(file: &str, symbol: &str) -> String {
                         let numStr = expandedLine[..tabPos].trim();
                         if let Ok(relLine) = numStr.parse::<usize>() {
                             let absLine = currentStart + relLine - 1;
-                            output.push_str(&format!("{absLine:>6}\t{}\n", &expandedLine[tabPos + 1..]));
+                            output.push_str(&format!(
+                                "{absLine:>6}\t{}\n",
+                                &expandedLine[tabPos + 1..]
+                            ));
                             continue;
                         }
                     }
@@ -3534,7 +3898,9 @@ async fn executeViewSymbol(file: &str, symbol: &str) -> String {
         }
         if !found {
             // Can't narrow further — return what we have of the outer block.
-            return format!("{file}:{currentStart} (found {outerName}, \"{part}\" not found within)\n\n{currentText}");
+            return format!(
+                "{file}:{currentStart} (found {outerName}, \"{part}\" not found within)\n\n{currentText}"
+            );
         }
     }
 
@@ -3551,7 +3917,9 @@ async fn findSymbolRange(content: &str, name: &str, _lang: &str) -> Option<Symbo
     let mut foundLine: Option<usize> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.contains(name) && (looksLikeDeclaration(trimmed, name) || looksLikeVariant(trimmed, name)) {
+        if trimmed.contains(name)
+            && (looksLikeDeclaration(trimmed, name) || looksLikeVariant(trimmed, name))
+        {
             foundLine = Some(idx + 1);
             break;
         }
@@ -3569,7 +3937,10 @@ async fn findSymbolRange(content: &str, name: &str, _lang: &str) -> Option<Symbo
         }
     }
 
-    Some(SymbolRange { startLine: lineNum, text })
+    Some(SymbolRange {
+        startLine: lineNum,
+        text,
+    })
 }
 
 /// Simple single-name symbol lookup (original behavior).
@@ -3603,16 +3974,41 @@ async fn viewSymbolSingle(file: &str, symbol: &str, lang: &str) -> String {
 fn looksLikeDeclaration(line: &str, symbol: &str) -> bool {
     // Check if symbol appears after common declaration keywords.
     let declarationPrefixes = [
-        "fn ", "pub fn ", "async fn ", "pub async fn ",
-        "struct ", "pub struct ", "enum ", "pub enum ",
-        "trait ", "pub trait ", "impl ", "type ", "pub type ",
-        "const ", "pub const ", "static ", "pub static ",
-        "mod ", "pub mod ",
-        "def ", "async def ", "class ",
-        "function ", "export function ", "export default function ",
-        "export const ", "export let ", "export class ",
-        "interface ", "export interface ", "export type ",
-        "func ", "var ", "let ", "const ",
+        "fn ",
+        "pub fn ",
+        "async fn ",
+        "pub async fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "trait ",
+        "pub trait ",
+        "impl ",
+        "type ",
+        "pub type ",
+        "const ",
+        "pub const ",
+        "static ",
+        "pub static ",
+        "mod ",
+        "pub mod ",
+        "def ",
+        "async def ",
+        "class ",
+        "function ",
+        "export function ",
+        "export default function ",
+        "export const ",
+        "export let ",
+        "export class ",
+        "interface ",
+        "export interface ",
+        "export type ",
+        "func ",
+        "var ",
+        "let ",
+        "const ",
     ];
 
     for prefix in &declarationPrefixes {
@@ -3631,8 +4027,10 @@ fn looksLikeVariant(line: &str, name: &str) -> bool {
     // Match patterns like "Grep {", "Grep(", "Grep," (enum variants).
     if let Some(pos) = line.find(name) {
         let afterName = &line[pos + name.len()..].trim_start();
-        if afterName.starts_with('{') || afterName.starts_with('(')
-            || afterName.starts_with(',') || afterName.starts_with(';')
+        if afterName.starts_with('{')
+            || afterName.starts_with('(')
+            || afterName.starts_with(',')
+            || afterName.starts_with(';')
             || afterName.is_empty()
         {
             // Make sure it's at a word boundary (not a substring of a longer name).
@@ -3730,19 +4128,12 @@ fn executeRelatedFiles(path: &str) -> String {
 fn parseImports(content: &str, lang: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let patterns: Vec<&str> = match lang {
-        "rust" => vec![
-            r"^use\s+([\w:]+)",
-            r"^mod\s+(\w+)\s*;",
-        ],
-        "python" => vec![
-            r"^(?:from\s+([\w.]+)\s+)?import\s+([\w.]+)",
-        ],
-        "typescript" | "javascript" | "tsx" | "jsx" => vec![
-            r#"(?:import|require)\s*\(?[^)]*['"]([^'"]+)['"]"#,
-        ],
-        "go" => vec![
-            r#"^\s*"([^"]+)""#,
-        ],
+        "rust" => vec![r"^use\s+([\w:]+)", r"^mod\s+(\w+)\s*;"],
+        "python" => vec![r"^(?:from\s+([\w.]+)\s+)?import\s+([\w.]+)"],
+        "typescript" | "javascript" | "tsx" | "jsx" => {
+            vec![r#"(?:import|require)\s*\(?[^)]*['"]([^'"]+)['"]"#]
+        }
+        "go" => vec![r#"^\s*"([^"]+)""#],
         _ => vec![],
     };
 
@@ -3794,30 +4185,44 @@ fn detectLanguage(path: &str) -> String {
         "lua" => "lua",
         "zig" => "zig",
         _ => ext,
-    }.into()
+    }
+    .into()
 }
 
 /// Tree-sitter node kinds that appear in a file outline for `lang`.
 fn outlineKinds(lang: &str) -> Option<&'static [&'static str]> {
     match lang {
         "rust" => Some(&[
-            "function_item", "struct_item", "enum_item", "trait_item",
-            "impl_item", "mod_item", "type_item", "const_item",
-            "static_item", "macro_definition",
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "impl_item",
+            "mod_item",
+            "type_item",
+            "const_item",
+            "static_item",
+            "macro_definition",
         ]),
-        "python" => Some(&[
-            "function_definition", "class_definition",
-        ]),
+        "python" => Some(&["function_definition", "class_definition"]),
         "typescript" | "tsx" => Some(&[
-            "function_declaration", "class_declaration", "interface_declaration",
-            "type_alias_declaration", "enum_declaration", "method_definition",
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
+            "method_definition",
             "abstract_class_declaration",
         ]),
         "javascript" | "jsx" => Some(&[
-            "function_declaration", "class_declaration", "method_definition",
+            "function_declaration",
+            "class_declaration",
+            "method_definition",
         ]),
         "go" => Some(&[
-            "function_declaration", "method_declaration", "type_declaration",
+            "function_declaration",
+            "method_declaration",
+            "type_declaration",
         ]),
         _ => None,
     }
@@ -3839,9 +4244,8 @@ fn fnKind(lang: &str) -> Option<&'static str> {
 /// Build an ast-grep inline YAML rule matching outline items in `lang`.
 fn outlineRule(lang: &str) -> Option<String> {
     let kinds = outlineKinds(lang)?;
-    let mut yaml = format!(
-        "id: outline\nlanguage: {lang}\nseverity: info\nmessage: outline\nrule:\n  any:\n"
-    );
+    let mut yaml =
+        format!("id: outline\nlanguage: {lang}\nseverity: info\nmessage: outline\nrule:\n  any:\n");
     for k in kinds {
         yaml.push_str(&format!("    - kind: {k}\n"));
     }
@@ -3859,9 +4263,8 @@ fn outlineRule(lang: &str) -> Option<String> {
 fn symbolRule(lang: &str, symbol: &str) -> Option<String> {
     let kinds = outlineKinds(lang)?;
     let escaped = regex::escape(symbol);
-    let mut yaml = format!(
-        "id: symbol\nlanguage: {lang}\nseverity: info\nmessage: symbol\nrule:\n  any:\n",
-    );
+    let mut yaml =
+        format!("id: symbol\nlanguage: {lang}\nseverity: info\nmessage: symbol\nrule:\n  any:\n",);
 
     yaml.push_str("    - all:\n");
     yaml.push_str("        - any:\n");
@@ -3912,8 +4315,8 @@ fn parseSgEntries(stdout: &str) -> Vec<(usize, String)> {
 /// Returns Err with a message listing missing/malformed required fields.
 /// The error message is sent back to the model as the tool result so it can retry.
 pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
-    let args: serde_json::Value = serde_json::from_str(argsJson)
-        .map_err(|e| format!("Malformed JSON arguments: {e}"))?;
+    let args: serde_json::Value =
+        serde_json::from_str(argsJson).map_err(|e| format!("Malformed JSON arguments: {e}"))?;
 
     /// Extract a required string field, or collect its name into `missing`.
     macro_rules! reqStr {
@@ -3964,7 +4367,10 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
             let impact: ShellImpact = args["impact"]
                 .as_str()
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok())
-                .ok_or_else(|| "Missing required field 'impact' (one of: read, minorMod, majorMod, delete).".to_string())?;
+                .ok_or_else(|| {
+                    "Missing required field 'impact' (one of: read, minorMod, majorMod, delete)."
+                        .to_string()
+                })?;
             ToolAction::Shell {
                 command: reqStr!("command"),
                 explanation: reqStr!("explanation"),
@@ -3998,8 +4404,10 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
                 .iter()
                 .map(|e| {
                     Ok(EditOp {
-                        oldString: e["old_string"].as_str()
-                            .ok_or_else(|| "Edit missing 'old_string'.".to_string())?.into(),
+                        oldString: e["old_string"]
+                            .as_str()
+                            .ok_or_else(|| "Edit missing 'old_string'.".to_string())?
+                            .into(),
                         newString: e["new_string"].as_str().unwrap_or("").into(),
                         replaceAll: e["replace_all"].as_bool().unwrap_or(false),
                     })
@@ -4053,14 +4461,12 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         },
         "terminalList" => ToolAction::TerminalList,
         "jobOutput" => ToolAction::JobOutput {
-            jobId: optU64!("jobId")
-                .ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
+            jobId: optU64!("jobId").ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
             sinceLine: optU64!("sinceLine"),
             maxLines: optU64!("maxLines").map(|v| v as usize),
         },
         "jobStop" => ToolAction::JobStop {
-            jobId: optU64!("jobId")
-                .ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
+            jobId: optU64!("jobId").ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
         },
         "jobList" => ToolAction::JobList,
         "monitor" => ToolAction::Monitor {
@@ -4141,12 +4547,16 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         },
         "webSearch" => ToolAction::WebSearch {
             query: reqStr!("query"),
-            allowedDomains: args["allowed_domains"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
-            blockedDomains: args["blocked_domains"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+            allowedDomains: args["allowed_domains"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
+            blockedDomains: args["blocked_domains"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
             maxResults: optU64!("max_results").map(|v| v as usize),
         },
         "webFetch" => ToolAction::WebFetch {
@@ -4156,12 +4566,16 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         },
         "webSimilar" => ToolAction::WebSimilar {
             url: reqStr!("url"),
-            allowedDomains: args["allowed_domains"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
-            blockedDomains: args["blocked_domains"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+            allowedDomains: args["allowed_domains"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
+            blockedDomains: args["blocked_domains"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
             maxResults: optU64!("max_results").map(|v| v as usize),
         },
         "historyFetch" => ToolAction::HistoryFetch {
@@ -4286,13 +4700,10 @@ mod tests {
         let png: &[u8] = &[
             0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
             0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
-            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
-            0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
-            0x44, 0xae, 0x42, 0x60, 0x82,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+            0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63,
+            0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, 0x33, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ];
         std::fs::write(tmp.path(), png).unwrap();
         let result = executeReadFile(tmp.path().to_str().unwrap(), None, None, None);

@@ -101,7 +101,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "layout",
         aliases: &[],
-        description: "Show the resolved layout file path (Ctrl+O opens the panel)",
+        description: "Open layout controls",
     },
 ];
 
@@ -145,8 +145,7 @@ pub enum CommandAction {
     ShowCost,
     /// Open the background jobs / monitors / schedules panel.
     Tasks,
-    /// Show the resolved layout file path. The Ctrl+O panel is the
-    /// interactive entry point; this command is the text fallback.
+    /// Open the same layout controls as Ctrl+O.
     ShowLayout,
 }
 

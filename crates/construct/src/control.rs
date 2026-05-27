@@ -164,7 +164,10 @@ pub enum LogEvent {
     Rewound { targetTurnId: String },
 
     /// An LSP server is not installed but could enhance the experience.
-    LspHint { serverId: String, installHint: String },
+    LspHint {
+        serverId: String,
+        installHint: String,
+    },
 
     /// A subagent has started executing.
     SubagentStarted {
@@ -192,17 +195,21 @@ pub enum LogEvent {
 
     /// A new background job was spawned (phase 2 only fires for `bashSpawn`;
     /// future phases add Subagent and Monitor variants).
-    JobSpawned { id: u64, kind: String, command: String },
+    JobSpawned {
+        id: u64,
+        kind: String,
+        command: String,
+    },
 
     /// A line of output arrived on a task's stdout/stderr. Lines arrive
-    /// in stream order; deck buffers per-task to drive F2 control panel inspect.
+    /// in stream order; deck buffers per-task to drive /tasks panel inspect.
     JobOutput { id: u64, line: String },
 
     /// A task finished on its own. `exitCode` is None if the wait
     /// itself failed (rare — the OS would have to be unhealthy).
     JobComplete { id: u64, exitCode: Option<i32> },
 
-    /// A task was stopped — by `jobStop`, kill from F2 control panel, or an
+    /// A task was stopped — by `jobStop`, kill from the tasks panel, or an
     /// internal error. `reason` is "killed", a spawn error, etc.
     JobStopped { id: u64, reason: String },
 
@@ -239,15 +246,10 @@ pub enum LogEvent {
     /// The monitor's rolling events/sec exceeded its threshold for the
     /// flood-guard window; the backing task is killed and the monitor
     /// transitions to `AutoStopped`.
-    MonitorAutoStopped {
-        id: u64,
-        reason: String,
-    },
+    MonitorAutoStopped { id: u64, reason: String },
 
     /// The monitor was stopped by the agent or user (clean exit).
-    MonitorStopped {
-        id: u64,
-    },
+    MonitorStopped { id: u64 },
 
     /// A coalesced wake batch was injected into the session as a single
     /// synthetic `<wakes count="N">…</wakes>` user-shaped message. One
@@ -256,14 +258,11 @@ pub enum LogEvent {
     /// other path emits it. (Replaces the old per-fire `WakeFired` that
     /// raced through `userInputTx` and produced one model turn per
     /// matching log line.)
-    WakeBatchInjected {
-        count: usize,
-        summary: String,
-    },
+    WakeBatchInjected { count: usize, summary: String },
 
     /// A scheduled wake source (Delay, Cron, FileWatch) was registered
     /// via `scheduleWakeup`/`cronCreate`/`fileWatch`. The deck uses
-    /// this to populate the F2 control panel schedules section. Passive
+    /// this to populate the /tasks schedules section. Passive
     /// sources (MonitorMatch, TaskComplete) also emit this when
     /// their underlying monitor/task is registered.
     WakeRegistered {
@@ -276,9 +275,7 @@ pub enum LogEvent {
     /// `scheduleWakeup` one-shot fire, `monitorStop`) or its scheduler
     /// task exited. After this event, no further `WakeFired` events
     /// will arrive from this id.
-    WakeDisarmed {
-        id: u64,
-    },
+    WakeDisarmed { id: u64 },
 
     /// A new terminal was spawned in the session's shell registry.
     /// `name` is the resolved unique name. `spawnedBy` is User (Ctrl+T,
@@ -324,11 +321,17 @@ pub struct CommandAck {
 
 impl CommandAck {
     pub fn ok(message: impl Into<String>) -> Self {
-        Self { ok: true, message: message.into() }
+        Self {
+            ok: true,
+            message: message.into(),
+        }
     }
 
     pub fn err(message: impl Into<String>) -> Self {
-        Self { ok: false, message: message.into() }
+        Self {
+            ok: false,
+            message: message.into(),
+        }
     }
 }
 
@@ -364,7 +367,9 @@ pub struct PermissionsStatus {
 /// channels aren't debuggable). Print individual fields if needed.
 pub enum TuiRequest {
     /// Get context usage stats for the `/context` panel.
-    ShowContext { reply: oneshot::Sender<ContextState> },
+    ShowContext {
+        reply: oneshot::Sender<ContextState>,
+    },
 
     /// Restore project files to the last checkpoint.
     Undo { reply: oneshot::Sender<CommandAck> },
@@ -411,7 +416,9 @@ pub enum TuiRequest {
     GetLsp { reply: oneshot::Sender<LspStatus> },
 
     /// Snapshot permissions state.
-    GetPermissions { reply: oneshot::Sender<PermissionsStatus> },
+    GetPermissions {
+        reply: oneshot::Sender<PermissionsStatus>,
+    },
 
     /// Persist a new permissions config and apply it in-session.
     SavePermissions {
@@ -452,7 +459,7 @@ pub enum TuiRequest {
         reply: oneshot::Sender<Vec<crate::wakes::WakeSourceInfo>>,
     },
 
-    /// Kill a background job from the F2 control panel panel.
+    /// Kill a background job from the tasks panel.
     KillTask {
         id: u64,
         reply: oneshot::Sender<CommandAck>,

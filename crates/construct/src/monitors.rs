@@ -25,7 +25,7 @@ use regex::Regex;
 use tokio::sync::mpsc;
 
 use crate::control::LogEvent;
-use crate::jobs::{LineCallback, JobId, JobPlane};
+use crate::jobs::{JobId, JobPlane, LineCallback};
 
 /// Monotonically increasing per-session monitor id.
 pub type MonitorId = u64;
@@ -73,7 +73,7 @@ pub struct Monitor {
     /// Id of the backing bash task in [`JobPlane`].
     pub taskId: JobId,
     /// Short human-readable label ("errors in deploy.log"). Shown in
-    /// every notification, F2 control panel row, and the inline MonitorChip.
+    /// every notification, tasks-panel row, and the inline MonitorChip.
     pub description: String,
     pub command: String,
     /// Raw filter pattern for display (compiled regex lives in the
@@ -130,7 +130,7 @@ impl Monitor {
     }
 }
 
-/// Lightweight snapshot for `monitorList` and the F2 control panel panel.
+/// Lightweight snapshot for `monitorList` and the /tasks panel.
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
     pub id: MonitorId,
@@ -154,7 +154,11 @@ pub struct MonitorPlane {
 
 impl MonitorPlane {
     pub fn new() -> Self {
-        Self { monitors: HashMap::new(), order: Vec::new(), nextId: 1 }
+        Self {
+            monitors: HashMap::new(),
+            order: Vec::new(),
+            nextId: 1,
+        }
     }
 
     /// Reserve the next monitor id without registering anything. Used
@@ -212,8 +216,15 @@ impl MonitorPlane {
         wakeCtx: Option<MonitorWakeCtx>,
     ) -> Result<MonitorId> {
         self.registerImpl(
-            id, description, command, filter, autoStopThresholdEps,
-            FLOOD_WINDOW_SECS, tasks, logTx, wakeCtx,
+            id,
+            description,
+            command,
+            filter,
+            autoStopThresholdEps,
+            FLOOD_WINDOW_SECS,
+            tasks,
+            logTx,
+            wakeCtx,
         )
     }
 
@@ -247,9 +258,8 @@ impl MonitorPlane {
         }
         // Compile regex up-front so bad patterns reject at registration
         // time (rather than silently never matching).
-        let compiled: Regex = Regex::new(&filter).map_err(|e| {
-            anyhow::anyhow!("invalid regex filter `{filter}`: {e}")
-        })?;
+        let compiled: Regex = Regex::new(&filter)
+            .map_err(|e| anyhow::anyhow!("invalid regex filter `{filter}`: {e}"))?;
 
         let inner = Arc::new(Mutex::new(MonitorInner {
             state: MonitorState::Running,
@@ -269,8 +279,7 @@ impl MonitorPlane {
         // the registry's batcher from the very first match. Kept behind
         // a Mutex so monitorStop can take() it and unregister the
         // passive source.
-        let wakeCtxSlot: Arc<Mutex<Option<MonitorWakeCtx>>> =
-            Arc::new(Mutex::new(wakeCtx));
+        let wakeCtxSlot: Arc<Mutex<Option<MonitorWakeCtx>>> = Arc::new(Mutex::new(wakeCtx));
 
         // The per-line callback runs on the bash drainer's hot path.
         // Keep it lock-fast and side-effect-only.
@@ -330,10 +339,7 @@ impl MonitorPlane {
                                 .unregisterPassive(ctx.wakeId, &logTxClone);
                         });
                     }
-                    let _ = cbLogTx.try_send(LogEvent::MonitorAutoStopped {
-                        id: cbId,
-                        reason,
-                    });
+                    let _ = cbLogTx.try_send(LogEvent::MonitorAutoStopped { id: cbId, reason });
                     return;
                 }
             } else {
@@ -403,9 +409,9 @@ impl MonitorPlane {
     /// the passive source on monitor stop. Clears the slot — subsequent
     /// matches will no longer route to the batcher until reattached.
     pub fn takeWakeId(&self, id: MonitorId) -> Option<crate::wakes::WakeId> {
-        self.monitors.get(&id).and_then(|m| {
-            m.wakeCtx.lock().unwrap().take().map(|ctx| ctx.wakeId)
-        })
+        self.monitors
+            .get(&id)
+            .and_then(|m| m.wakeCtx.lock().unwrap().take().map(|ctx| ctx.wakeId))
     }
 
     /// Stop a monitor cooperatively. Always kills the backing bash task

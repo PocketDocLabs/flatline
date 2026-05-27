@@ -323,6 +323,7 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
     let mut turnCount: usize = 0;
     let mut lastTurnId = String::new();
     let mut prevBlockLastTurn = String::new();
+    let mut blockStartedByWake = false;
 
     for turn in turns {
         if turn.blockId != currentBlockId {
@@ -344,6 +345,7 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
             userAttachments = None;
             assistantPreview = String::new();
             turnCount = 0;
+            blockStartedByWake = false;
         }
 
         turnCount += 1;
@@ -355,6 +357,15 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
                     userPreview = firstLine(&turn.content, 120);
                     userMessage = turn.content.clone();
                     userAttachments = turn.attachments.clone();
+                }
+            }
+            TurnRole::Wake => {
+                if !blockStartedByWake && userPreview.is_empty() {
+                    blockStartedByWake = true;
+                    let payloads = wakePayloads(&turn.content);
+                    userPreview = wakePreview(&turn.content, &payloads);
+                    userMessage = payloads.join("\n\n");
+                    userAttachments = None;
                 }
             }
             TurnRole::Assistant if assistantPreview.is_empty() => {
@@ -387,6 +398,45 @@ fn firstLine(content: &str, maxLen: usize) -> String {
     truncate(line, maxLen)
 }
 
+fn wakePayloads(content: &str) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut rest = content;
+
+    while let Some(wakeStart) = rest.find("<wake ") {
+        let wake = &rest[wakeStart..];
+        let Some((_, afterOpen)) = wake.split_once('>') else {
+            break;
+        };
+        let Some((payload, afterClose)) = afterOpen.split_once("</wake>") else {
+            break;
+        };
+        let payload = payload.trim();
+        if !payload.is_empty() {
+            payloads.push(payload.to_string());
+        }
+        rest = afterClose;
+    }
+
+    if payloads.is_empty() {
+        payloads.push(firstLine(content, 1000));
+    }
+    payloads
+}
+
+fn wakePreview(content: &str, payloads: &[String]) -> String {
+    let source = content
+        .split_once("source=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(s, _)| s)
+        .unwrap_or("wake");
+    let payloadLine = firstLine(payloads.first().map(String::as_str).unwrap_or(""), 80);
+    if payloadLine.is_empty() {
+        format!("wake \u{00B7} {source}")
+    } else {
+        truncate(&format!("wake \u{00B7} {source}: {payloadLine}"), 120)
+    }
+}
+
 fn truncate(s: &str, maxChars: usize) -> String {
     if s.chars().count() <= maxChars {
         s.to_string()
@@ -407,4 +457,75 @@ fn renderLine(buf: &mut Buffer, x: u16, y: u16, maxWidth: usize, text: &str, sty
         height: 1,
     };
     Paragraph::new(text.to_string()).style(style).render(area, buf);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(id: &str, block: &str, role: TurnRole, parent: Option<&str>, content: &str) -> Turn {
+        Turn {
+            id: id.into(),
+            blockId: block.into(),
+            topicId: "topic-1".into(),
+            role,
+            content: content.into(),
+            ts: 0,
+            parentId: parent.map(str::to_string),
+            tool: None,
+            args: None,
+            toolCallId: None,
+            reasoning: None,
+            attachments: None,
+            cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: construct::transcript::TurnStatus::Completed,
+        }
+    }
+
+    #[test]
+    fn wakeBlockRestoresWakePayloadForEditing() {
+        let wakeContent = "<wakes count=\"1\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nSend the MyHealth message now.\n</wake>\n</wakes>";
+        let turns = vec![
+            turn("u1", "b1", TurnRole::User, None, "probably a spade somewhere"),
+            turn("a1", "b1", TurnRole::Assistant, Some("u1"), "Where were you picturing it?"),
+            turn("w1", "b2", TurnRole::Wake, Some("a1"), wakeContent),
+            turn("a2", "b2", TurnRole::Assistant, Some("w1"), "Good morning. Send it."),
+        ];
+
+        let blocks = buildBlocks(&turns);
+        assert_eq!(blocks.len(), 2);
+        let wakeBlock = &blocks[1];
+        assert_eq!(wakeBlock.rewindTo, "a1");
+        assert_eq!(wakeBlock.userMessage, "Send the MyHealth message now.");
+        assert!(
+            wakeBlock.userPreview.contains("delay#3"),
+            "wake preview should identify the source: {}",
+            wakeBlock.userPreview,
+        );
+    }
+
+    #[test]
+    fn wakeBlockRestoresAllCoalescedWakePayloads() {
+        let wakeContent = "<wakes count=\"2\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nFirst payload.\n</wake>\n<wake source=\"monitor#7\" kind=\"Monitor\" ageSecs=\"0\">\nSecond payload.\n</wake>\n</wakes>";
+        let turns = vec![
+            turn("u1", "b1", TurnRole::User, None, "setup"),
+            turn("a1", "b1", TurnRole::Assistant, Some("u1"), "ready"),
+            turn("w1", "b2", TurnRole::Wake, Some("a1"), wakeContent),
+            turn("a2", "b2", TurnRole::Assistant, Some("w1"), "handled"),
+        ];
+
+        let blocks = buildBlocks(&turns);
+        let wakeBlock = &blocks[1];
+        assert_eq!(wakeBlock.userMessage, "First payload.\n\nSecond payload.");
+        assert!(
+            wakeBlock.userPreview.contains("delay#3"),
+            "preview should identify the first wake source: {}",
+            wakeBlock.userPreview,
+        );
+    }
 }
