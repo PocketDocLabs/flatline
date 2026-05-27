@@ -31,12 +31,12 @@
 //! - `FLATLINE_HEAVY_PROFILE` — override `heavyProfile` selection
 //! - `FLATLINE_LIGHT_PROFILE` — override `lightProfile` selection
 //! - `FLATLINE_UTILITY_PROFILE` — override `utilityProfile` selection
-//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`, `EXA_API_KEY` — API keys
+//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY` — API keys
 //!
 //! # Dependencies
 //! `serde`, `toml`, `dirs`
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +77,9 @@ pub struct Config {
     /// `utilityProfile`, falling back to `lightProfile` / `heavyProfile`.
     pub utility: ModelConfig,
 
+    /// Resolved named model profiles available to the in-app model UI.
+    pub profiles: BTreeMap<String, ModelConfig>,
+
     /// Context usage ratio (0.0–1.0) at which to trigger compaction.
     pub compactRatio: f64,
 
@@ -94,6 +97,14 @@ pub struct Config {
 
     /// Discovered project root (not serialized — derived at load time).
     pub projectRoot: Option<PathBuf>,
+}
+
+/// Which model tier is being edited by the in-app model profile UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    Heavy,
+    Light,
+    Utility,
 }
 
 /// Budget and cost warning settings.
@@ -116,7 +127,8 @@ pub struct WebConfig {
 /// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// API provider: "openrouter", "fireworks", or "deepseek".
+    /// API provider: "openrouter", "fireworks", "deepseek", "openai", or
+    /// "openai-codex".
     pub provider: String,
 
     /// API key.
@@ -228,6 +240,36 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             contextWindow: 128_000,
             supportsAnthropicCache: None,
         },
+        "openai" => ModelConfig {
+            provider: "openai".into(),
+            key: String::new(),
+            model: "gpt-5.4".into(),
+            baseUrl: "https://api.openai.com/v1".into(),
+            reasoning: Some(ReasoningSettings {
+                effort: Some("high".into()),
+                summary: None,
+            }),
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(128_000),
+            contextWindow: 1_050_000,
+            supportsAnthropicCache: Some(false),
+        },
+        "openai-codex" => ModelConfig {
+            provider: "openai-codex".into(),
+            key: String::new(),
+            model: "gpt-5.3-codex".into(),
+            baseUrl: "https://chatgpt.com/backend-api/codex".into(),
+            reasoning: Some(ReasoningSettings {
+                effort: Some("high".into()),
+                summary: Some("auto".into()),
+            }),
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(128_000),
+            contextWindow: 400_000,
+            supportsAnthropicCache: Some(false),
+        },
         // Default to OpenRouter for anything unrecognized.
         _ => ModelConfig {
             provider: "openrouter".into(),
@@ -308,7 +350,7 @@ pub fn configDir() -> PathBuf {
 /// 4. Local (`.flatline/config.local.toml`, gitignored)
 /// 5. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
 ///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`,
-///    `DEEPSEEK_API_KEY`, `EXA_API_KEY`)
+///    `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
     // Explicit-path override: FLATLINE_CONFIG=/path/to/config.toml bypasses
     // user/project/local discovery and loads exactly that file.
@@ -388,6 +430,7 @@ pub fn load() -> Result<Config> {
     applyEnvKey(&mut config.heavy);
     applyEnvKey(&mut config.light);
     applyEnvKey(&mut config.utility);
+    applyEnvKeysToProfiles(&mut config.profiles);
 
     if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
         if !exaKey.is_empty() {
@@ -422,6 +465,7 @@ fn loadExplicit(path: PathBuf) -> Result<Config> {
     applyEnvKey(&mut config.heavy);
     applyEnvKey(&mut config.light);
     applyEnvKey(&mut config.utility);
+    applyEnvKeysToProfiles(&mut config.profiles);
     if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
         if !exaKey.is_empty() {
             config.web.searchKey = exaKey;
@@ -439,6 +483,8 @@ fn applyEnvKey(config: &mut ModelConfig) {
     let envVar = match config.provider.as_str() {
         "fireworks" => "FIREWORKS_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "openai-codex" => return,
         _ => "OPENROUTER_API_KEY",
     };
 
@@ -446,6 +492,12 @@ fn applyEnvKey(config: &mut ModelConfig) {
         if !key.is_empty() {
             config.key = key;
         }
+    }
+}
+
+fn applyEnvKeysToProfiles(profiles: &mut BTreeMap<String, ModelConfig>) {
+    for profile in profiles.values_mut() {
+        applyEnvKey(profile);
     }
 }
 
@@ -685,6 +737,7 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
         "utilityProfile",
         Tier::Utility,
     )?;
+    let profiles = resolveProfiles(&partial.profile, &heavyName, &heavy);
 
     Ok(Config {
         heavyProfile: heavyName,
@@ -693,6 +746,7 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
         heavy,
         light,
         utility,
+        profiles,
         compactRatio: partial.compactRatio.unwrap_or_else(defaultCompactRatio),
         web: resolveWeb(partial.web),
         lsp: partial.lsp.unwrap_or_default(),
@@ -700,6 +754,21 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
         budget: partial.budget.unwrap_or_default(),
         projectRoot: None,
     })
+}
+
+fn resolveProfiles(
+    profiles: &HashMap<String, PartialModelConfig>,
+    fallbackName: &str,
+    fallbackConfig: &ModelConfig,
+) -> BTreeMap<String, ModelConfig> {
+    if profiles.is_empty() {
+        return BTreeMap::from([(fallbackName.to_string(), fallbackConfig.clone())]);
+    }
+
+    profiles
+        .iter()
+        .map(|(name, profile)| (name.clone(), resolveModel(Some(profile.clone()))))
+        .collect()
 }
 
 /// Look up a profile by name and resolve it, applying provider-aware defaults.
@@ -808,9 +877,55 @@ fn defaultConfigToml() -> String {
          provider       = \"deepseek\"\n\
          model          = \"deepseek-v4-flash\"\n\
          contextWindow  = 128000\n\
-         reasoning      = {{ effort = \"disabled\" }}\n",
+         reasoning      = {{ effort = \"disabled\" }}\n\n\
+         [profile.openaiCodex]\n\
+         provider       = \"openai-codex\"\n\
+         model          = \"gpt-5.3-codex\"\n\
+         contextWindow  = 400000\n\
+         reasoning      = {{ effort = \"high\", summary = \"auto\" }}\n\n\
+         [profile.openaiGpt54]\n\
+         provider       = \"openai\"\n\
+         model          = \"gpt-5.4\"\n\
+         contextWindow  = 1050000\n\
+         reasoning      = {{ effort = \"high\" }}\n",
         compact = defaultCompactRatio(),
     )
+}
+
+// ── Model profile persistence ───────────────────────────────────────
+
+/// Persist a model tier selection to `.flatline/config.local.toml`.
+///
+/// Model switching is personal/editor-local state, so the UI writes the
+/// gitignored local config rather than the shared project config.
+pub fn saveModelSelection(projectRoot: &Path, tier: ModelTier, profile: &str) -> Result<()> {
+    let projectDir = projectRoot.join(PROJECT_DIR);
+    let configPath = projectDir.join(LOCAL_CONFIG);
+
+    fs::create_dir_all(&projectDir)
+        .with_context(|| format!("failed to create {}", projectDir.display()))?;
+
+    let existing = if configPath.exists() {
+        fs::read_to_string(&configPath)
+            .with_context(|| format!("failed to read {}", configPath.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+    let key = match tier {
+        ModelTier::Heavy => "heavyProfile",
+        ModelTier::Light => "lightProfile",
+        ModelTier::Utility => "utilityProfile",
+    };
+    doc.insert(key.to_string(), toml::Value::String(profile.to_string()));
+
+    let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
+    fs::write(&configPath, output)
+        .with_context(|| format!("failed to write {}", configPath.display()))?;
+
+    ensureLocalGitignored(&projectDir);
+    Ok(())
 }
 
 // ── Permission persistence ──────────────────────────────────────────
@@ -1095,6 +1210,27 @@ mod tests {
     }
 
     #[test]
+    fn openaiProviderDefaults() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "codex"
+            utilityProfile = "api"
+            [profile.codex]
+            provider = "openai-codex"
+            [profile.api]
+            provider = "openai"
+            "#,
+        ));
+        assert_eq!(cfg.heavy.baseUrl, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(cfg.heavy.model, "gpt-5.3-codex");
+        assert_eq!(cfg.heavy.key, "");
+        assert_eq!(cfg.utility.baseUrl, "https://api.openai.com/v1");
+        assert_eq!(cfg.utility.model, "gpt-5.4");
+        assert!(cfg.profiles.contains_key("codex"));
+        assert!(cfg.profiles.contains_key("api"));
+    }
+
+    #[test]
     fn heavyProfileOverrideWins() {
         let cfg = resolveWithHeavy(
             parseToml(
@@ -1187,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn starterTomlParsesAndExposesDeepseekProfiles() {
+    fn starterTomlParsesAndExposesProviderProfiles() {
         // Guard against escape-brace mistakes in the format! template and
         // confirm the three DeepSeek profiles land in the profile map with
         // their configured reasoning effort.
@@ -1201,6 +1337,8 @@ mod tests {
             "deepseekPro",
             "deepseekFlash",
             "deepseekUtility",
+            "openaiCodex",
+            "openaiGpt54",
         ] {
             assert!(
                 partial.profile.contains_key(name),
@@ -1227,6 +1365,10 @@ mod tests {
             util.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("disabled")
         );
+
+        let codex = partial.profile.get("openaiCodex").unwrap();
+        assert_eq!(codex.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.3-codex"));
     }
 
     /// Hit OpenRouter's public model catalog and `/endpoints` per-model

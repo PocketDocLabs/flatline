@@ -36,6 +36,7 @@ use crate::agent_panel::AgentPanel;
 use crate::fork_picker::{ForkAction, ForkPicker};
 use crate::lsp_panel::{LspPanel, PanelAction as LspPanelAction};
 use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
+use crate::model_panel::{ModelPanel, PanelAction as ModelPanelAction};
 use crate::rewind_picker::{RewindAction, RewindPicker};
 use crate::selection::{self, PanelId, SelectionState};
 use crate::session_picker::{PickerAction, SessionPicker};
@@ -51,6 +52,44 @@ fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
         .permissions
         .clone()
         .unwrap_or_else(Permissions::allowReadOnly)
+}
+
+fn buildModelStatus(config: &construct::config::Config) -> construct::control::ModelStatus {
+    let codexStatus = construct::auth::openAiCodexStatus();
+    let codexConfigured = codexStatus.configured;
+    let profiles = config
+        .profiles
+        .iter()
+        .map(|(name, model)| {
+            let configured = match model.provider.as_str() {
+                "openai-codex" => codexConfigured,
+                _ => !model.key.is_empty(),
+            };
+            construct::control::ModelProfileStatus {
+                name: name.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                contextWindow: model.contextWindow,
+                configured,
+            }
+        })
+        .collect();
+    let configPath = config
+        .projectRoot
+        .as_ref()
+        .map(|root| root.join(".flatline").join("config.local.toml"))
+        .unwrap_or_else(|| construct::config::configDir().join("config.toml"))
+        .display()
+        .to_string();
+
+    construct::control::ModelStatus {
+        heavyProfile: config.heavyProfile.clone(),
+        lightProfile: config.lightProfile.clone(),
+        utilityProfile: config.utilityProfile.clone(),
+        profiles,
+        configPath,
+        openAiCodex: codexStatus,
+    }
 }
 
 /// Which panel has input focus.
@@ -77,6 +116,7 @@ enum DeckUpdate {
     McpStatus(construct::control::McpStatus),
     LspStatus(construct::control::LspStatus),
     PermissionsStatus(construct::control::PermissionsStatus),
+    ModelStatus(construct::control::ModelStatus),
     ContextDisplay(construct::context::ContextState),
     RewindOptions(Vec<construct::transcript::Turn>),
     Forks(Vec<construct::transcript::Fork>),
@@ -411,7 +451,7 @@ pub async fn run() -> Result<()> {
     let mut userBgRx = userBgRx;
     let sessionCancelTx = cancelTx.clone();
     tokio::spawn(async move {
-        let config = match construct::config::load() {
+        let mut config = match construct::config::load() {
             Ok(c) => c,
             Err(e) => {
                 let _ = logTx
@@ -818,6 +858,43 @@ pub async fn run() -> Result<()> {
                                 configPath,
                             });
                         }
+                        Some(TuiRequest::GetModels { reply }) => {
+                            let _ = reply.send(buildModelStatus(&config));
+                        }
+                        Some(TuiRequest::SaveModelSelection { tier, profile, reply }) => {
+                            if !config.profiles.contains_key(&profile) {
+                                let _ = reply.send(construct::control::CommandAck::err(
+                                    format!("Unknown model profile: {profile}"),
+                                ));
+                                continue;
+                            }
+                            if let Some(ref root) = config.projectRoot {
+                                match construct::config::saveModelSelection(root, tier, &profile) {
+                                    Ok(()) => match construct::config::load() {
+                                        Ok(next) => {
+                                            config = next;
+                                            let _ = reply.send(construct::control::CommandAck::ok(
+                                                "Saved model profile. It will be used after /clear or restart.",
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = reply.send(construct::control::CommandAck::err(
+                                                format!("Saved, but failed to reload config: {e}"),
+                                            ));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Failed to save model profile: {e}"),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                let _ = reply.send(construct::control::CommandAck::err(
+                                    "No project root; model profile not persisted.",
+                                ));
+                            }
+                        }
                         Some(TuiRequest::SavePermissions { defaultMode, rules, reply }) => {
                             if let Some(ref root) = config.projectRoot {
                                 match construct::config::savePermissions(
@@ -1027,6 +1104,7 @@ async fn runLoop(
     let mut pendingRewindAttachments: Option<Vec<construct::transcript::TurnAttachment>> = None;
     let mut mcpPanel: Option<McpPanel> = None;
     let mut lspPanel: Option<LspPanel> = None;
+    let mut modelPanel: Option<ModelPanel> = None;
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
     let mut tasksPanel: Option<crate::jobs_panel::JobsPanel> = None;
@@ -1501,6 +1579,11 @@ async fn runLoop(
 
                 // LSP panel overlay.
                 if let Some(ref mut panel) = lspPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
+
+                // Model profile panel overlay.
+                if let Some(ref mut panel) = modelPanel {
                     panel.render(area, frame.buffer_mut());
                 }
 
@@ -2043,6 +2126,9 @@ async fn runLoop(
                 DeckUpdate::LspStatus(status) => {
                     lspPanel = Some(LspPanel::new(status.servers));
                 }
+                DeckUpdate::ModelStatus(status) => {
+                    modelPanel = Some(ModelPanel::new(status));
+                }
                 DeckUpdate::PermissionsStatus(status) => {
                     permissionsPanel = Some(crate::permissions_panel::PermissionsPanel::new(
                         status.defaultMode,
@@ -2209,6 +2295,7 @@ async fn runLoop(
             &mut pendingRewindAttachments,
             &mut mcpPanel,
             &mut lspPanel,
+            &mut modelPanel,
             &mut subagentPanel,
             &mut tasksPanel,
             &mut permissionsPanel,
@@ -2266,6 +2353,7 @@ async fn handleInput(
     pendingRewindAttachments: &mut Option<Vec<construct::transcript::TurnAttachment>>,
     mcpPanel: &mut Option<McpPanel>,
     lspPanel: &mut Option<LspPanel>,
+    modelPanel: &mut Option<ModelPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     tasksPanel: &mut Option<crate::jobs_panel::JobsPanel>,
     permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
@@ -2449,6 +2537,7 @@ async fn handleInput(
                         || forkPicker.is_some()
                         || mcpPanel.is_some()
                         || lspPanel.is_some()
+                        || modelPanel.is_some()
                         || permissionsPanel.is_some()
                         || tasksPanel.is_some()
                         || layoutPanel.is_some()
@@ -2796,6 +2885,28 @@ async fn handleInput(
                             termPane.sendInput(cmdBytes);
                         }
                         LspPanelAction::None => {}
+                    }
+                    break;
+                }
+
+                // Model profile panel intercepts all keys when active.
+                if let Some(panel) = modelPanel {
+                    match panel.handleKey(key) {
+                        ModelPanelAction::Close => {
+                            *modelPanel = None;
+                        }
+                        ModelPanelAction::Save { tier, profile } => {
+                            spawnAckRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SaveModelSelection {
+                                    tier,
+                                    profile,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::None => {}
                     }
                     break;
                 }
@@ -3148,6 +3259,7 @@ async fn handleInput(
                     || forkPicker.is_some()
                     || mcpPanel.is_some()
                     || lspPanel.is_some()
+                    || modelPanel.is_some()
                     || permissionsPanel.is_some()
                     || tasksPanel.is_some()
                     || layoutPanel.is_some()
@@ -4250,6 +4362,15 @@ fn dispatchSlashCommand(
                     let _ = deckUpdateTx
                         .send(DeckUpdate::PermissionsStatus(status))
                         .await;
+                }
+            });
+        }
+        crate::command::CommandAction::Model => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::GetModels { reply: rTx }).await;
+                if let Ok(status) = rRx.await {
+                    let _ = deckUpdateTx.send(DeckUpdate::ModelStatus(status)).await;
                 }
             });
         }

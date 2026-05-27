@@ -81,6 +81,21 @@ export FIREWORKS_API_KEY=...
 export DEEPSEEK_API_KEY=...
 ```
 
+OpenAI API profiles use:
+
+```sh
+export OPENAI_API_KEY=...
+```
+
+ChatGPT/Codex OAuth profiles do not use an API key. Sign in with:
+
+```sh
+cargo run -p deck -- auth login openai-codex
+```
+
+Inside the TUI, use `/model` to inspect configured profiles and save a
+heavy/light/utility profile choice to `.flatline/config.local.toml`.
+
 See [Configuration](configuration.md) for profile examples and config layering.
 
 For practical examples, see [Workflows](workflows.md).

@@ -16,6 +16,14 @@ Other supported provider keys:
 ```sh
 export FIREWORKS_API_KEY=...
 export DEEPSEEK_API_KEY=...
+export OPENAI_API_KEY=...
+```
+
+For `provider = "openai-codex"`, sign in instead of setting a key:
+
+```sh
+flatline auth login openai-codex
+flatline auth status
 ```
 
 Check the active profile names in `~/.config/flatline/config.toml`:

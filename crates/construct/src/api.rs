@@ -11,6 +11,7 @@
 //! # Dependencies
 //! `reqwest`, `tokio`, `serde_json`, `backon`
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, ModelConfig};
 use crate::message::{
-    Message, ReasoningConfig, StreamChunk, StreamEvent, TokenUsage, ToolDef,
+    Content, ContentBlock, Message, ReasoningConfig, StreamChunk, StreamEvent, TokenUsage, ToolDef,
 };
 
 // Emit the "providerOrder not pinned" warning once per process. Cache hit
@@ -60,14 +61,19 @@ pub struct Client {
 impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
-        if config.heavy.key.is_empty() {
-            bail!("API key not set. Set the heavy profile's key in config.toml, or OPENROUTER_API_KEY / FIREWORKS_API_KEY / DEEPSEEK_API_KEY");
+        for (tier, model) in [("heavy", &config.heavy), ("utility", &config.utility)] {
+            if providerRequiresApiKey(model.provider.as_str()) && model.key.is_empty() {
+                bail!(
+                    "API key not set for {tier} profile provider {}. Set the profile's key in config.toml, or the matching env var (OPENROUTER_API_KEY / FIREWORKS_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY). For ChatGPT Pro auth use provider = \"openai-codex\" and run `flatline auth login openai-codex`.",
+                    model.provider,
+                );
+            }
         }
 
-        let heavyHttp = buildHttpClient(&config.heavy)
-            .context("Failed to build heavy HTTP client")?;
-        let utilityHttp = buildHttpClient(&config.utility)
-            .context("Failed to build utility HTTP client")?;
+        let heavyHttp =
+            buildHttpClient(&config.heavy).context("Failed to build heavy HTTP client")?;
+        let utilityHttp =
+            buildHttpClient(&config.utility).context("Failed to build utility HTTP client")?;
 
         Ok(Self {
             heavyHttp,
@@ -89,6 +95,10 @@ impl Client {
         tools: &[ToolDef],
         reasoning: Option<&ReasoningConfig>,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
+        if usesResponsesApi(&self.heavy.provider) {
+            return self.streamResponses(messages, tools, reasoning).await;
+        }
+
         let url = format!("{}/chat/completions", self.heavy.baseUrl);
 
         let mut adaptedMessages = adaptMessages(messages, &self.heavy.provider);
@@ -219,6 +229,10 @@ impl Client {
         messages: &[Message],
         model: Option<&str>,
     ) -> Result<(String, Option<TokenUsage>)> {
+        if usesResponsesApi(&self.utility.provider) {
+            return self.completeResponses(messages, model).await;
+        }
+
         let url = format!("{}/chat/completions", self.utility.baseUrl);
         let modelId = model.unwrap_or(&self.utility.model);
 
@@ -307,10 +321,12 @@ impl Client {
                 completionTokens: u.get("completion_tokens")?.as_u64()? as usize,
                 totalTokens: u.get("total_tokens")?.as_u64()? as usize,
                 cost: u.get("cost").and_then(|c| c.as_f64()),
-                cacheReadTokens: u.get("cache_read_input_tokens")
+                cacheReadTokens: u
+                    .get("cache_read_input_tokens")
                     .and_then(|c| c.as_u64())
                     .unwrap_or(0) as usize,
-                cacheCreationTokens: u.get("cache_creation_input_tokens")
+                cacheCreationTokens: u
+                    .get("cache_creation_input_tokens")
                     .and_then(|c| c.as_u64())
                     .unwrap_or(0) as usize,
             })
@@ -325,6 +341,283 @@ impl Client {
 
         Ok((content, usage))
     }
+
+    async fn streamResponses(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        reasoning: Option<&ReasoningConfig>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let url = format!("{}/responses", self.heavy.baseUrl);
+        let body = buildResponsesBody(&self.heavy, messages, tools, reasoning, true, None)?;
+
+        tracing::debug!(
+            provider = %self.heavy.provider,
+            model = %self.heavy.model,
+            messageCount = messages.len(),
+            toolCount = tools.len(),
+            hasReasoning = reasoning.is_some(),
+            "sending Responses API request"
+        );
+        tracing::trace!(body = %body, "responses request body");
+
+        let http = self.heavyHttp.clone();
+        let cfg = self.heavy.clone();
+        let response = (|| {
+            let http = http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            let cfg = cfg.clone();
+            async move { sendJsonRequest(http, &cfg, &url, &body).await }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(120))
+                .with_max_times(8)
+                .with_jitter(),
+        )
+        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
+        .notify(|err, dur| {
+            tracing::warn!(error = %err, delay = ?dur, "retrying Responses API request");
+        })
+        .await?;
+
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            if let Err(e) = readResponsesStream(response, &tx).await {
+                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
+    async fn completeResponses(
+        &self,
+        messages: &[Message],
+        model: Option<&str>,
+    ) -> Result<(String, Option<TokenUsage>)> {
+        let url = format!("{}/responses", self.utility.baseUrl);
+        let body = buildResponsesBody(&self.utility, messages, &[], None, false, model)?;
+        let http = self.utilityHttp.clone();
+        let cfg = self.utility.clone();
+
+        let response = (|| {
+            let http = http.clone();
+            let cfg = cfg.clone();
+            let url = url.clone();
+            let body = body.clone();
+            async move { sendJsonRequest(http, &cfg, &url, &body).await }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(60))
+                .with_max_times(5)
+                .with_jitter(),
+        )
+        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
+        .notify(|err, dur| {
+            tracing::warn!(error = %err, delay = ?dur, "retrying Responses utility request");
+        })
+        .await?;
+
+        let responseBody: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Responses utility response")?;
+        let content = extractResponsesText(&responseBody);
+        let usage = responseBody.get("usage").and_then(usageFromResponses);
+
+        Ok((content, usage))
+    }
+}
+
+fn providerRequiresApiKey(provider: &str) -> bool {
+    provider != "openai-codex"
+}
+
+fn usesResponsesApi(provider: &str) -> bool {
+    matches!(provider, "openai" | "openai-codex")
+}
+
+async fn sendJsonRequest(
+    http: reqwest::Client,
+    cfg: &ModelConfig,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response> {
+    let mut req = http.post(url).json(body);
+    if cfg.provider == "openai-codex" {
+        let access = crate::auth::codexAccessToken().await?;
+        req = req.bearer_auth(access.accessToken);
+        if let Some(accountId) = access.accountId {
+            req = req.header("ChatGPT-Account-Id", accountId);
+        }
+    }
+
+    let response = req.send().await.context("Failed to send API request")?;
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let errorBody = response.text().await.unwrap_or_default();
+
+    if status.as_u16() == 429 || status.is_server_error() {
+        tracing::warn!(%status, body = %errorBody, "retryable API error");
+        bail!("API error {status}: {errorBody}");
+    }
+
+    tracing::error!(%status, body = %errorBody, "API error (not retryable)");
+    Err(PermanentApiError(format!("API error {status}: {errorBody}")).into())
+}
+
+fn buildResponsesBody(
+    cfg: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDef],
+    reasoning: Option<&ReasoningConfig>,
+    stream: bool,
+    modelOverride: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (instructions, input) = responsesInput(messages);
+    let mut body = serde_json::json!({
+        "model": modelOverride.unwrap_or(&cfg.model),
+        "input": input,
+        "stream": stream,
+        "store": false,
+    });
+
+    if !instructions.is_empty() {
+        body["instructions"] = serde_json::Value::String(instructions);
+    }
+
+    if let Some(max) = cfg.maxTokens {
+        body["max_output_tokens"] = serde_json::json!(max);
+    }
+
+    if !tools.is_empty() {
+        body["tools"] =
+            serde_json::Value::Array(tools.iter().map(responseTool).collect::<Vec<_>>());
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+
+    if let Some(reasoning) = reasoning {
+        let value = serde_json::to_value(reasoning)?;
+        if value.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            body["reasoning"] = value;
+        }
+    } else if let Some(settings) = &cfg.reasoning {
+        let value = serde_json::to_value(ReasoningConfig {
+            effort: settings.effort.clone(),
+            summary: settings.summary.clone(),
+        })?;
+        if value.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            body["reasoning"] = value;
+        }
+    }
+
+    Ok(body)
+}
+
+fn responsesInput(messages: &[Message]) -> (String, Vec<serde_json::Value>) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+
+    for msg in messages {
+        match msg {
+            Message::System { content } => {
+                instructions.push(content.as_str());
+            }
+            Message::User { content } => {
+                input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": responseInputContent(content),
+                }));
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                reasoning: _,
+            } => {
+                if let Some(text) = content {
+                    if !text.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": text,
+                            }],
+                        }));
+                    }
+                }
+
+                if let Some(calls) = tool_calls {
+                    for call in calls {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": &call.id,
+                            "name": &call.function.name,
+                            "arguments": &call.function.arguments,
+                        }));
+                    }
+                }
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": content.textContent(),
+                }));
+            }
+        }
+    }
+
+    (instructions.join("\n\n"), input)
+}
+
+fn responseInputContent(content: &Content) -> Vec<serde_json::Value> {
+    match content {
+        Content::Text(text) => vec![serde_json::json!({
+            "type": "input_text",
+            "text": text,
+        })],
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => serde_json::json!({
+                    "type": "input_text",
+                    "text": text,
+                }),
+                ContentBlock::ImageUrl { image_url } => {
+                    let mut value = serde_json::json!({
+                        "type": "input_image",
+                        "image_url": &image_url.url,
+                    });
+                    if let Some(detail) = &image_url.detail {
+                        value["detail"] = serde_json::Value::String(detail.clone());
+                    }
+                    value
+                }
+            })
+            .collect(),
+    }
+}
+
+fn responseTool(tool: &ToolDef) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "name": &tool.function.name,
+        "description": &tool.function.description,
+        "parameters": &tool.function.parameters,
+    })
 }
 
 /// Inject Anthropic `cache_control: {type: "ephemeral"}` markers onto the
@@ -351,18 +644,21 @@ fn injectCacheControl(messages: &mut serde_json::Value) {
     // content contains the CACHE_BOUNDARY sentinel, split into two blocks
     // with a 1-hour marker on the static prefix. Otherwise fall back to a
     // single 5-minute marker at the tail.
-    if let Some(sys) = arr.iter_mut().find(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("system")
-    }) {
+    if let Some(sys) = arr
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+    {
         if !splitSystemAtBoundary(sys) {
             markContentBlock(sys, Ttl::FiveMin);
         }
     }
 
     // Rolling marker — last user message in the array. Always 5m.
-    if let Some(user) = arr.iter_mut().rev().find(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("user")
-    }) {
+    if let Some(user) = arr
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    {
         markContentBlock(user, Ttl::FiveMin);
     }
 }
@@ -394,9 +690,7 @@ fn splitSystemAtBoundary(msg: &mut serde_json::Value) -> bool {
         // Already blocks-shaped — leave it to markContentBlock.
         return false;
     };
-    let Some((staticPart, dynamicPart)) =
-        text.split_once(crate::prompt::CACHE_BOUNDARY)
-    else {
+    let Some((staticPart, dynamicPart)) = text.split_once(crate::prompt::CACHE_BOUNDARY) else {
         return false;
     };
 
@@ -516,10 +810,9 @@ fn deepseekThinking(effort: &str) -> serde_json::Value {
 fn buildHttpClient(config: &ModelConfig) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, "application/json".parse()?);
-    headers.insert(
-        AUTHORIZATION,
-        format!("Bearer {}", config.key).parse()?,
-    );
+    if config.provider != "openai-codex" && !config.key.is_empty() {
+        headers.insert(AUTHORIZATION, format!("Bearer {}", config.key).parse()?);
+    }
 
     // OpenRouter-specific headers.
     if config.provider == "openrouter" {
@@ -537,10 +830,7 @@ fn buildHttpClient(config: &ModelConfig) -> Result<reqwest::Client> {
 ///
 /// Applies a 2-minute idle timeout — if no bytes arrive for that long,
 /// the stream is treated as stalled and an error is emitted.
-async fn readStream(
-    response: reqwest::Response,
-    tx: &mpsc::Sender<StreamEvent>,
-) -> Result<()> {
+async fn readStream(response: reqwest::Response, tx: &mpsc::Sender<StreamEvent>) -> Result<()> {
     use futures::StreamExt;
 
     const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -600,6 +890,261 @@ async fn readStream(
     }
 
     Ok(())
+}
+
+async fn readResponsesStream(
+    response: reqwest::Response,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let mut state = ResponsesStreamState::default();
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    loop {
+        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk.context("Responses stream read error")?,
+            Ok(None) => break,
+            Err(_) => bail!("Responses stream stalled — no data received for {IDLE_TIMEOUT:?}"),
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(lineEnd) = buffer.find('\n') {
+            let line = buffer[..lineEnd].trim().to_string();
+            buffer = buffer[lineEnd + 1..].to_string();
+
+            if line.is_empty() || line.starts_with(':') || line.starts_with("event: ") {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data.trim() == "[DONE]" {
+                    return Ok(());
+                }
+
+                match serde_json::from_str::<serde_json::Value>(data) {
+                    Ok(value) => {
+                        for event in parseResponsesEvent(&mut state, value) {
+                            if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(data = %data, "failed to parse Responses SSE chunk: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct ResponsesStreamState {
+    calls: HashMap<usize, PendingResponseCall>,
+    emittedArgs: HashSet<usize>,
+}
+
+#[derive(Default)]
+struct PendingResponseCall {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+fn parseResponsesEvent(
+    state: &mut ResponsesStreamState,
+    value: serde_json::Value,
+) -> Vec<StreamEvent> {
+    let Some(eventType) = value.get("type").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+
+    match eventType {
+        "response.output_text.delta" => value
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| vec![StreamEvent::ContentDelta(s.to_string())])
+            .unwrap_or_default(),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => value
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| vec![StreamEvent::ReasoningDelta(s.to_string())])
+            .unwrap_or_default(),
+        "response.output_item.added" | "response.output_item.done" => {
+            parseResponseOutputItem(state, &value)
+        }
+        "response.function_call_arguments.delta" => {
+            let index = value
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            state.emittedArgs.insert(index);
+            value
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .map(|delta| {
+                    vec![StreamEvent::ToolCallDelta {
+                        index,
+                        id: state.calls.get(&index).and_then(|c| c.id.clone()),
+                        name: state.calls.get(&index).and_then(|c| c.name.clone()),
+                        arguments: Some(delta.to_string()),
+                    }]
+                })
+                .unwrap_or_default()
+        }
+        "response.completed" => {
+            let response = value.get("response").unwrap_or(&value);
+            vec![StreamEvent::Done {
+                finishReason: Some("stop".into()),
+                usage: response.get("usage").and_then(usageFromResponses),
+            }]
+        }
+        "response.failed" => {
+            let response = value.get("response").unwrap_or(&value);
+            let msg = response
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("Responses API request failed");
+            vec![StreamEvent::Error(msg.to_string())]
+        }
+        "error" => {
+            let msg = value
+                .get("message")
+                .or_else(|| value.get("error").and_then(|e| e.get("message")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Responses API stream error");
+            vec![StreamEvent::Error(msg.to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parseResponseOutputItem(
+    state: &mut ResponsesStreamState,
+    value: &serde_json::Value,
+) -> Vec<StreamEvent> {
+    let Some(item) = value.get("item") else {
+        return Vec::new();
+    };
+    if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+        return Vec::new();
+    }
+
+    let index = value
+        .get("output_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let name = item
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let entry = state.calls.entry(index).or_default();
+    if id.is_some() {
+        entry.id = id.clone();
+    }
+    if name.is_some() {
+        entry.name = name.clone();
+    }
+
+    let mut events = vec![StreamEvent::ToolCallDelta {
+        index,
+        id,
+        name,
+        arguments: None,
+    }];
+
+    if !state.emittedArgs.contains(&index) {
+        if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+            if !args.is_empty() {
+                state.emittedArgs.insert(index);
+                events.push(StreamEvent::ToolCallDelta {
+                    index,
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    arguments: Some(args.to_string()),
+                });
+            }
+        }
+    }
+
+    events
+}
+
+fn usageFromResponses(usage: &serde_json::Value) -> Option<TokenUsage> {
+    let prompt = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let completion = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or((prompt + completion) as u64) as usize;
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    Some(TokenUsage {
+        promptTokens: prompt,
+        completionTokens: completion,
+        totalTokens: total,
+        cost: usage.get("cost").and_then(|c| c.as_f64()),
+        cacheReadTokens: cached,
+        cacheCreationTokens: 0,
+    })
+}
+
+fn extractResponsesText(response: &serde_json::Value) -> String {
+    if let Some(text) = response.get("output_text").and_then(|v| v.as_str()) {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    if let Some(items) = response.get("output").and_then(|v| v.as_array()) {
+        for item in items {
+            if item.get("type").and_then(|v| v.as_str()) != Some("message") {
+                continue;
+            }
+            let Some(content) = item.get("content").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for block in content {
+                let text = block
+                    .get("text")
+                    .or_else(|| block.get("output_text"))
+                    .and_then(|v| v.as_str());
+                if let Some(text) = text {
+                    out.push_str(text);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// State machine tag for prompt-injected thinking extraction.
@@ -738,7 +1283,10 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     if let Some(error) = chunk.error {
-        let msg = error.message.clone().unwrap_or_else(|| "Unknown error".into());
+        let msg = error
+            .message
+            .clone()
+            .unwrap_or_else(|| "Unknown error".into());
         tracing::error!(
             error = %msg,
             code = ?error.code,
@@ -760,7 +1308,12 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
         let (nestedRead, nestedWrite) = u
             .prompt_tokens_details
             .as_ref()
-            .map(|d| (d.cached_tokens.unwrap_or(0), d.cache_write_tokens.unwrap_or(0)))
+            .map(|d| {
+                (
+                    d.cached_tokens.unwrap_or(0),
+                    d.cache_write_tokens.unwrap_or(0),
+                )
+            })
             .unwrap_or((0, 0));
         let tu = TokenUsage {
             promptTokens: u.prompt_tokens.unwrap_or(0),
@@ -812,7 +1365,10 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
                 if !hadReasoning {
                     if let Some(reasoning) = delta.reasoning_content {
                         if !reasoning.is_empty() {
-                            tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning_content)");
+                            tracing::trace!(
+                                len = reasoning.len(),
+                                "reasoning delta (reasoning_content)"
+                            );
                             events.push(StreamEvent::ReasoningDelta(reasoning));
                             hadReasoning = true;
                         }
@@ -825,7 +1381,10 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
                         for detail in details {
                             if let Some(text) = detail.text {
                                 if !text.is_empty() {
-                                    tracing::trace!(len = text.len(), "reasoning delta (structured)");
+                                    tracing::trace!(
+                                        len = text.len(),
+                                        "reasoning delta (structured)"
+                                    );
                                     events.push(StreamEvent::ReasoningDelta(text));
                                 }
                             }
@@ -877,7 +1436,7 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Content, Message};
+    use crate::message::{Content, FunctionCall, FunctionDef, Message, ToolCall, ToolDef};
 
     fn serializedMessages(msgs: &[Message]) -> serde_json::Value {
         adaptMessages(msgs, "openrouter")
@@ -909,13 +1468,11 @@ mod tests {
 
     #[test]
     fn deepseekRenamesAssistantReasoning() {
-        let msgs = vec![
-            Message::Assistant {
-                content: Some("answer".into()),
-                tool_calls: None,
-                reasoning: Some("ponder".into()),
-            },
-        ];
+        let msgs = vec![Message::Assistant {
+            content: Some("answer".into()),
+            tool_calls: None,
+            reasoning: Some("ponder".into()),
+        }];
         let value = adaptMessages(&msgs, "deepseek");
         let arr = value.as_array().unwrap();
         let assistant = arr[0].as_object().unwrap();
@@ -926,14 +1483,20 @@ mod tests {
     #[test]
     fn injectMarksSystemAndLastUser() {
         let msgs = vec![
-            Message::System { content: "You are flatline.".into() },
-            Message::User { content: Content::Text("hello".into()) },
+            Message::System {
+                content: "You are flatline.".into(),
+            },
+            Message::User {
+                content: Content::Text("hello".into()),
+            },
             Message::Assistant {
                 content: Some("hi".into()),
                 tool_calls: None,
                 reasoning: None,
             },
-            Message::User { content: Content::Text("explain caching".into()) },
+            Message::User {
+                content: Content::Text("explain caching".into()),
+            },
         ];
         let mut value = serializedMessages(&msgs);
         injectCacheControl(&mut value);
@@ -948,10 +1511,13 @@ mod tests {
 
         // First user should NOT have cache_control.
         let firstUser = &arr[1];
-        assert!(firstUser["content"].is_string() || firstUser["content"]
-            .as_array()
-            .map(|a| a.iter().all(|b| b.get("cache_control").is_none()))
-            .unwrap_or(true));
+        assert!(
+            firstUser["content"].is_string()
+                || firstUser["content"]
+                    .as_array()
+                    .map(|a| a.iter().all(|b| b.get("cache_control").is_none()))
+                    .unwrap_or(true)
+        );
 
         // Last user (index 3) should have cache_control on its last block.
         let lastUser = &arr[3];
@@ -965,9 +1531,14 @@ mod tests {
     #[test]
     fn injectIsIdempotentOnAlreadyBlocksContent() {
         let msgs = vec![
-            Message::System { content: "sys".into() },
+            Message::System {
+                content: "sys".into(),
+            },
             Message::User {
-                content: Content::withImages("look at this", vec!["data:image/png;base64,...".into()]),
+                content: Content::withImages(
+                    "look at this",
+                    vec!["data:image/png;base64,...".into()],
+                ),
             },
         ];
         let mut value = serializedMessages(&msgs);
@@ -992,7 +1563,9 @@ mod tests {
 
     #[test]
     fn injectHandlesSystemOnly() {
-        let msgs = vec![Message::System { content: "sys only".into() }];
+        let msgs = vec![Message::System {
+            content: "sys only".into(),
+        }];
         let mut value = serializedMessages(&msgs);
         injectCacheControl(&mut value);
         let arr = value.as_array().unwrap();
@@ -1009,7 +1582,9 @@ mod tests {
         );
         let msgs = vec![
             Message::System { content },
-            Message::User { content: Content::Text("hi".into()) },
+            Message::User {
+                content: Content::Text("hi".into()),
+            },
         ];
         let mut value = serializedMessages(&msgs);
         injectCacheControl(&mut value);
@@ -1031,10 +1606,18 @@ mod tests {
         assert!(blocks[1].get("cache_control").is_none());
 
         // Sentinel itself must not appear in either block's text.
-        assert!(!blocks[0]["text"].as_str().unwrap()
-            .contains(crate::prompt::CACHE_BOUNDARY));
-        assert!(!blocks[1]["text"].as_str().unwrap()
-            .contains(crate::prompt::CACHE_BOUNDARY));
+        assert!(
+            !blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(crate::prompt::CACHE_BOUNDARY)
+        );
+        assert!(
+            !blocks[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains(crate::prompt::CACHE_BOUNDARY)
+        );
     }
 
     #[test]
@@ -1054,14 +1637,135 @@ mod tests {
     }
 
     #[test]
-    fn lastUserTurnAlwaysGets5mEvenWithSplitSystem() {
-        let content = format!(
-            "static\n{}\ndynamic",
-            crate::prompt::CACHE_BOUNDARY,
+    fn responsesBodyConvertsMessagesAndTools() {
+        let cfg = ModelConfig {
+            provider: "openai-codex".into(),
+            key: String::new(),
+            model: "gpt-5.3-codex".into(),
+            baseUrl: "https://chatgpt.com/backend-api/codex".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(123),
+            contextWindow: 400_000,
+            supportsAnthropicCache: Some(false),
+        };
+        let messages = vec![
+            Message::System {
+                content: "system".into(),
+            },
+            Message::User {
+                content: Content::text("hello"),
+            },
+            Message::Assistant {
+                content: Some("sure".into()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    callType: "function".into(),
+                    function: FunctionCall {
+                        name: "shell".into(),
+                        arguments: "{\"cmd\":\"pwd\"}".into(),
+                    },
+                }]),
+                reasoning: None,
+            },
+            Message::Tool {
+                tool_call_id: "call_1".into(),
+                content: Content::text("/tmp"),
+            },
+        ];
+        let tools = vec![ToolDef {
+            defType: "function".into(),
+            function: FunctionDef {
+                name: "shell".into(),
+                description: "Run shell".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }];
+
+        let body = buildResponsesBody(&cfg, &messages, &tools, None, true, None).unwrap();
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(body["max_output_tokens"], 123);
+    }
+
+    #[test]
+    fn responsesEventsProduceToolDeltasAndUsage() {
+        let mut state = ResponsesStreamState::default();
+        let events = parseResponsesEvent(
+            &mut state,
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell"
+                }
+            }),
         );
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                id: Some(id),
+                name: Some(name),
+                arguments: None,
+            } if id == "call_abc" && name == "shell"
+        ));
+
+        let events = parseResponsesEvent(
+            &mut state,
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{\"cmd\""
+            }),
+        );
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                arguments: Some(args),
+                ..
+            } if args == "{\"cmd\""
+        ));
+
+        let events = parseResponsesEvent(
+            &mut state,
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                        "input_tokens_details": { "cached_tokens": 4 }
+                    }
+                }
+            }),
+        );
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Done {
+                usage: Some(usage),
+                ..
+            } if usage.totalTokens == 15 && usage.cacheReadTokens == 4
+        ));
+    }
+
+    #[test]
+    fn lastUserTurnAlwaysGets5mEvenWithSplitSystem() {
+        let content = format!("static\n{}\ndynamic", crate::prompt::CACHE_BOUNDARY,);
         let msgs = vec![
             Message::System { content },
-            Message::User { content: Content::Text("hello".into()) },
+            Message::User {
+                content: Content::Text("hello".into()),
+            },
         ];
         let mut value = serializedMessages(&msgs);
         injectCacheControl(&mut value);

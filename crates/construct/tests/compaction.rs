@@ -23,6 +23,7 @@ use construct::transcript::Transcript;
 /// doesn't reject it.
 fn dummyClient() -> api::Client {
     use construct::config::{BudgetConfig, Config, ModelConfig, WebConfig};
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
     let model = ModelConfig {
@@ -43,7 +44,8 @@ fn dummyClient() -> api::Client {
         utilityProfile: "test".into(),
         heavy: model.clone(),
         light: model.clone(),
-        utility: model,
+        utility: model.clone(),
+        profiles: BTreeMap::from([("test".into(), model)]),
         compactRatio: 0.8,
         web: WebConfig::default(),
         lsp: HashMap::new(),

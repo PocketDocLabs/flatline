@@ -89,6 +89,11 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "View and manage permission rules",
     },
     CommandDef {
+        name: "model",
+        aliases: &["models"],
+        description: "View and switch model profiles",
+    },
+    CommandDef {
         name: "cost",
         aliases: &[],
         description: "Show session and rolling cost breakdown",
@@ -141,6 +146,8 @@ pub enum CommandAction {
     Lsp,
     /// Show permissions panel.
     Permissions,
+    /// Show model profile panel.
+    Model,
     /// Show cost breakdown.
     ShowCost,
     /// Open the background jobs / monitors / schedules panel.
@@ -215,6 +222,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "mcp" => CommandOutput::Action(CommandAction::Mcp),
         "lsp" => CommandOutput::Action(CommandAction::Lsp),
         "permissions" => CommandOutput::Action(CommandAction::Permissions),
+        "model" => CommandOutput::Action(CommandAction::Model),
         "cost" => CommandOutput::Action(CommandAction::ShowCost),
         "tasks" => CommandOutput::Action(CommandAction::Tasks),
         "layout" => CommandOutput::Action(CommandAction::ShowLayout),
@@ -272,6 +280,23 @@ mod tests {
                     None => "None".into(),
                 },
             ),
+        }
+    }
+
+    #[test]
+    fn modelCommandAndAliasReturnModelAction() {
+        for input in ["/model", "/models"] {
+            match tryHandle(input) {
+                Some(CommandOutput::Action(CommandAction::Model)) => {}
+                other => panic!(
+                    "expected CommandAction::Model for {input}, got {:?}",
+                    match other {
+                        Some(CommandOutput::Action(a)) => format!("Action({a:?})"),
+                        Some(CommandOutput::Inline(s)) => format!("Inline({s})"),
+                        None => "None".into(),
+                    },
+                ),
+            }
         }
     }
 

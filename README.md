@@ -31,6 +31,13 @@ not already exist. The default config uses OpenRouter profiles, so set:
 export OPENROUTER_API_KEY=...
 ```
 
+OpenAI API profiles use `OPENAI_API_KEY`. ChatGPT/Codex OAuth profiles use a
+device-code sign-in:
+
+```sh
+cargo run -p deck -- auth login openai-codex
+```
+
 See [Getting Started](docs/getting-started.md) for first-run setup and common
 commands.
 
@@ -55,7 +62,7 @@ Flatline reads layered configuration:
 1. User config: `~/.config/flatline/config.toml`
 2. Project config: `<project-root>/.flatline/config.toml`
 3. Local project overrides: `<project-root>/.flatline/config.local.toml`
-4. Environment variables such as `OPENROUTER_API_KEY`
+4. Environment variables such as `OPENROUTER_API_KEY` and `OPENAI_API_KEY`
 
 MCP servers are configured in `~/.config/flatline/mcp.json` and project
 `.mcp.json` files.

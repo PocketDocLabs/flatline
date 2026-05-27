@@ -66,6 +66,8 @@ Documented provider modes:
 - `openrouter`
 - `fireworks`
 - `deepseek`
+- `openai`
+- `openai-codex`
 
 Provider defaults fill fields such as `baseUrl`, `maxTokens`, and
 `providerOrder`.
@@ -75,7 +77,14 @@ API key environment variables:
 - `OPENROUTER_API_KEY`: used by `openrouter`
 - `FIREWORKS_API_KEY`: used by `fireworks`
 - `DEEPSEEK_API_KEY`: used by `deepseek`
+- `OPENAI_API_KEY`: used by `openai`
 - `EXA_API_KEY`: used by web tools
+
+The `openai-codex` provider uses ChatGPT/Codex OAuth instead of an API key:
+
+```sh
+flatline auth login openai-codex
+```
 
 Profile selection environment variables:
 
@@ -93,6 +102,26 @@ provider = "deepseek"
 model = "deepseek-v4-pro"
 contextWindow = 128000
 reasoning = { effort = "max" }
+```
+
+OpenAI Responses API profile:
+
+```toml
+[profile.openaiGpt54]
+provider = "openai"
+model = "gpt-5.4"
+contextWindow = 1050000
+reasoning = { effort = "high" }
+```
+
+ChatGPT/Codex OAuth profile:
+
+```toml
+[profile.openaiCodex]
+provider = "openai-codex"
+model = "gpt-5.3-codex"
+contextWindow = 400000
+reasoning = { effort = "high", summary = "auto" }
 ```
 
 Profiles can also set:

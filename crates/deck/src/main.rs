@@ -22,6 +22,7 @@ mod layout;
 mod markdown;
 mod lsp_panel;
 mod mcp_panel;
+mod model_panel;
 mod permissions_panel;
 mod rewind_picker;
 mod selection;
@@ -47,6 +48,12 @@ struct Cli {
 enum Commands {
     /// Run a prompt headlessly.
     Exec(ExecArgs),
+
+    /// Manage provider authentication.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
 
     /// Start MCP server.
     McpServe,
@@ -83,6 +90,26 @@ enum Commands {
         /// Include cancelled turns as training targets (default: skip).
         #[arg(long)]
         includeCancelled: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Sign in to ChatGPT/Codex OAuth.
+    Login {
+        /// Provider to authenticate.
+        #[arg(value_parser = ["openai-codex"])]
+        provider: String,
+    },
+
+    /// Show authentication status.
+    Status,
+
+    /// Remove stored ChatGPT/Codex OAuth credentials.
+    Logout {
+        /// Provider to clear.
+        #[arg(value_parser = ["openai-codex"])]
+        provider: String,
     },
 }
 
@@ -213,6 +240,70 @@ fn resolveExecArgs(args: ExecArgs) -> Result<(String, construct::runner::RunConf
     Ok((prompt, config))
 }
 
+async fn runAuthCommand(command: AuthCommands) -> Result<()> {
+    match command {
+        AuthCommands::Login { provider } if provider == "openai-codex" => {
+            let device = construct::auth::requestOpenAiCodexDeviceCode().await?;
+            println!("Open this URL and enter the code:\n");
+            println!("  {}", device.verificationUrl);
+            println!("  code: {}", device.userCode);
+            println!();
+            println!("Waiting for OpenAI sign-in...");
+
+            let auth = construct::auth::completeOpenAiCodexDeviceLogin(device).await?;
+            let who = auth
+                .email
+                .as_deref()
+                .or(auth.accountId.as_deref())
+                .unwrap_or("OpenAI account");
+            if let Some(plan) = auth.planType.as_deref() {
+                println!("Signed in as {who} ({plan}).");
+            } else {
+                println!("Signed in as {who}.");
+            }
+            println!("Credentials saved to {}", construct::auth::authPath().display());
+            Ok(())
+        }
+        AuthCommands::Login { provider } => {
+            anyhow::bail!("unsupported auth provider: {provider}");
+        }
+        AuthCommands::Status => {
+            let status = construct::auth::openAiCodexStatus();
+            println!("openai-codex:");
+            println!("  configured: {}", status.configured);
+            println!("  path: {}", status.storagePath.display());
+            if let Some(email) = status.email.as_deref() {
+                println!("  account: {email}");
+            } else if let Some(accountId) = status.accountId.as_deref() {
+                println!("  account: {accountId}");
+            }
+            if let Some(plan) = status.planType.as_deref() {
+                println!("  plan: {plan}");
+            }
+            if let Some(expiresAt) = status.expiresAt {
+                println!(
+                    "  token: {}",
+                    if status.expired {
+                        "expired"
+                    } else {
+                        "valid"
+                    }
+                );
+                println!("  expiresAt: {expiresAt}");
+            }
+            Ok(())
+        }
+        AuthCommands::Logout { provider } if provider == "openai-codex" => {
+            construct::auth::clearOpenAiCodexAuth()?;
+            println!("Removed openai-codex credentials.");
+            Ok(())
+        }
+        AuthCommands::Logout { provider } => {
+            anyhow::bail!("unsupported auth provider: {provider}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -228,6 +319,18 @@ async fn main() -> Result<()> {
                 .init();
 
             construct::mcp::serve::run().await
+        }
+
+        Some(Commands::Auth { command }) => {
+            let envFilter = tracing_subscriber::EnvFilter::try_from_env("FLATLINE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_env_filter(envFilter)
+                .init();
+
+            runAuthCommand(command).await
         }
 
         Some(Commands::Exec(args)) => {

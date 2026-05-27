@@ -360,6 +360,27 @@ pub struct PermissionsStatus {
     pub configPath: String,
 }
 
+/// One named model profile in the `/model` panel.
+#[derive(Debug, Clone)]
+pub struct ModelProfileStatus {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub contextWindow: usize,
+    pub configured: bool,
+}
+
+/// Snapshot of model profile state for the `/model` panel.
+#[derive(Debug, Clone)]
+pub struct ModelStatus {
+    pub heavyProfile: String,
+    pub lightProfile: String,
+    pub utilityProfile: String,
+    pub profiles: Vec<ModelProfileStatus>,
+    pub configPath: String,
+    pub openAiCodex: crate::auth::OpenAiCodexStatus,
+}
+
 /// Requests from the TUI (or any consumer) to the session. Each variant
 /// carries its reply channel inline.
 ///
@@ -418,6 +439,16 @@ pub enum TuiRequest {
     /// Snapshot permissions state.
     GetPermissions {
         reply: oneshot::Sender<PermissionsStatus>,
+    },
+
+    /// Snapshot model profile state.
+    GetModels { reply: oneshot::Sender<ModelStatus> },
+
+    /// Persist a model profile selection to local project config.
+    SaveModelSelection {
+        tier: crate::config::ModelTier,
+        profile: String,
+        reply: oneshot::Sender<CommandAck>,
     },
 
     /// Persist a new permissions config and apply it in-session.

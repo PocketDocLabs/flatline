@@ -15,6 +15,7 @@
 //! `reqwest`, `tokio`, `serde`, `serde_json`
 
 pub mod api;
+pub mod auth;
 pub mod checkpoint;
 pub mod compaction;
 pub mod control;
