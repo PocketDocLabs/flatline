@@ -774,6 +774,7 @@ impl AgentPanel {
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
         self.queuedMessages.clear();
+        self.clearToolActiveEntries();
         self.textArea.placeholder = "Type a message...";
         self.entries.push(PanelEntry::Cancelled);
     }
@@ -1327,13 +1328,7 @@ impl AgentPanel {
         // Searching from the end (rather than checking only `last`)
         // tolerates other entries that may have been pushed between
         // ToolStarted and ToolResult — e.g. terminal lifecycle notices.
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .rposition(|e| matches!(e, PanelEntry::ToolActive { .. }))
-        {
-            self.entries.remove(pos);
-        }
+        self.removeLatestToolActiveEntry();
         // Commit any in-flight streaming before the tool result.
         self.finalizeStreaming();
         self.entries.push(PanelEntry::ToolResult {
@@ -1354,6 +1349,14 @@ impl AgentPanel {
         }
         self.toolActive = false;
         self.toolStartTime = None;
+        self.removeLatestToolActiveEntry();
+        self.finalizeStreaming();
+        self.markTimelineActivity();
+        self.isStreaming = true;
+        self.thinkingStartTime = Some(Instant::now());
+    }
+
+    fn removeLatestToolActiveEntry(&mut self) {
         if let Some(pos) = self
             .entries
             .iter()
@@ -1361,10 +1364,11 @@ impl AgentPanel {
         {
             self.entries.remove(pos);
         }
-        self.finalizeStreaming();
-        self.markTimelineActivity();
-        self.isStreaming = true;
-        self.thinkingStartTime = Some(Instant::now());
+    }
+
+    fn clearToolActiveEntries(&mut self) {
+        self.entries
+            .retain(|entry| !matches!(entry, PanelEntry::ToolActive { .. }));
     }
 
     fn markTimelineActivity(&mut self) {
@@ -4822,6 +4826,28 @@ mod wrapTests {
                 .iter()
                 .any(|e| matches!(e, PanelEntry::ToolResult { .. }))
         );
+    }
+
+    #[test]
+    fn cancellationRemovesActiveToolRow() {
+        let mut panel = AgentPanel::new();
+        panel.pushUser("run df");
+        panel.toolStarted("shell", "Run (30s): df -h /System/Volumes/Data");
+        assert!(
+            panel
+                .entries
+                .iter()
+                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        );
+
+        panel.finalizeCancelled();
+        assert!(
+            !panel
+                .entries
+                .iter()
+                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        );
+        assert!(matches!(panel.entries.last(), Some(PanelEntry::Cancelled)));
     }
 
     fn snapshotBuffer(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
