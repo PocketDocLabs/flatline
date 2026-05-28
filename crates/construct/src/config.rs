@@ -1137,9 +1137,9 @@ pub fn saveModelProfileContextInScope(
         .profiles
         .get(profileName)
         .with_context(|| format!("unknown model profile: {profileName}"))?;
-    let maxContextWindow = existing
-        .maxContextWindow
-        .or_else(|| crate::model_catalog::knownModelContextWindow(&existing.provider, &existing.model));
+    let maxContextWindow = existing.maxContextWindow.or_else(|| {
+        crate::model_catalog::knownModelContextWindow(&existing.provider, &existing.model)
+    });
     if let Some(max) = maxContextWindow {
         if contextWindow > max {
             bail!("context window {contextWindow} exceeds model max {max}");
@@ -1717,13 +1717,9 @@ mod tests {
         cfg.projectRoot = Some(project.path().to_path_buf());
         cfg.launchDir = project.path().to_path_buf();
 
-        let path = saveModelProfileContextInScope(
-            &cfg,
-            ConfigScope::ProjectLocal,
-            "codex",
-            128_000,
-        )
-        .expect("save model profile context");
+        let path =
+            saveModelProfileContextInScope(&cfg, ConfigScope::ProjectLocal, "codex", 128_000)
+                .expect("save model profile context");
 
         let contents = fs::read_to_string(&path).expect("read saved config");
         assert!(contents.contains("contextWindow = 128000"));
@@ -1746,13 +1742,8 @@ mod tests {
         cfg.projectRoot = Some(project.path().to_path_buf());
         cfg.launchDir = project.path().to_path_buf();
 
-        let err = saveModelProfileContextInScope(
-            &cfg,
-            ConfigScope::ProjectLocal,
-            "codex",
-            300_000,
-        )
-        .expect_err("context above max should fail");
+        let err = saveModelProfileContextInScope(&cfg, ConfigScope::ProjectLocal, "codex", 300_000)
+            .expect_err("context above max should fail");
         assert!(err.to_string().contains("exceeds model max"));
     }
 

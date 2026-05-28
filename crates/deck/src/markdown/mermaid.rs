@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 
-use ascii_dag::graph::{Graph, RenderMode};
 use ascii_dag::LayoutConfig;
+use ascii_dag::graph::{Graph, RenderMode};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
@@ -158,7 +158,12 @@ fn parseStatement(graph: &mut MermaidGraph, stmt: &str) {
     // Edge chains: A --> B --> C or A -->|label| B
     if let Some(chain) = parseEdgeChain(stmt) {
         for segment in &chain {
-            ensureNode(graph, &segment.fromId, &segment.fromLabel, segment.fromShape);
+            ensureNode(
+                graph,
+                &segment.fromId,
+                &segment.fromLabel,
+                segment.fromShape,
+            );
             ensureNode(graph, &segment.toId, &segment.toLabel, segment.toShape);
             graph.edges.push(MermaidEdge {
                 from: segment.fromId.clone(),
@@ -176,12 +181,7 @@ fn parseStatement(graph: &mut MermaidGraph, stmt: &str) {
 }
 
 /// Ensure a node exists in the graph, creating it if needed.
-fn ensureNode(
-    graph: &mut MermaidGraph,
-    id: &str,
-    label: &Option<String>,
-    shape: NodeShape,
-) {
+fn ensureNode(graph: &mut MermaidGraph, id: &str, label: &Option<String>, shape: NodeShape) {
     if graph.nodes.contains_key(id) {
         // Update label/shape if an explicit definition comes after implicit creation.
         if let Some(lbl) = label {
@@ -193,10 +193,9 @@ fn ensureNode(
     }
     let label = label.clone().unwrap_or_else(|| id.to_string());
     graph.nodeOrder.push(id.to_string());
-    graph.nodes.insert(
-        id.to_string(),
-        MermaidNode { label, shape },
-    );
+    graph
+        .nodes
+        .insert(id.to_string(), MermaidNode { label, shape });
 }
 
 // ── Edge chain parsing ─────────────────────────────────────────────────
@@ -212,7 +211,9 @@ struct EdgeSegment {
 }
 
 /// Edge operators in order of longest match first.
-const EDGE_OPS: &[&str] = &["-.->", "==>", "-->", "---", "-..-", "-.-", "~~>", "~~~", "=="];
+const EDGE_OPS: &[&str] = &[
+    "-.->", "==>", "-->", "---", "-..-", "-.-", "~~>", "~~~", "==",
+];
 
 /// Try to parse a statement as an edge chain (A --> B --> C).
 fn parseEdgeChain(stmt: &str) -> Option<Vec<EdgeSegment>> {
@@ -389,11 +390,7 @@ fn renderMermaid(mermaid: &MermaidGraph, availableWidth: usize) -> Vec<Vec<Span<
     let mut dag = Graph::from_edges(&nodeRefs, &[]);
 
     // Collect edge labels so they live long enough for the borrow.
-    let edgeLabels: Vec<Option<String>> = mermaid
-        .edges
-        .iter()
-        .map(|e| e.label.clone())
-        .collect();
+    let edgeLabels: Vec<Option<String>> = mermaid.edges.iter().map(|e| e.label.clone()).collect();
 
     // Add edges.
     for (i, edge) in mermaid.edges.iter().enumerate() {
@@ -444,10 +441,7 @@ fn renderMermaid(mermaid: &MermaidGraph, availableWidth: usize) -> Vec<Vec<Span<
     let lines = &rawLines[..trimmedEnd];
 
     // Trim leading empty lines.
-    let trimmedStart = lines
-        .iter()
-        .position(|l| !l.trim().is_empty())
-        .unwrap_or(0);
+    let trimmedStart = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
     let lines = &lines[trimmedStart..];
 
     // Find minimum leading whitespace across non-empty lines and strip it.
@@ -471,7 +465,11 @@ fn renderMermaid(mermaid: &MermaidGraph, availableWidth: usize) -> Vec<Vec<Span<
         .collect();
 
     // Find the widest line in display columns (not bytes — Unicode box chars are multi-byte).
-    let contentWidth = stripped.iter().map(|l| UnicodeWidthStr::width(l.as_str())).max().unwrap_or(0);
+    let contentWidth = stripped
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(0);
 
     // Center if the diagram fits within the available width.
     let padding = if contentWidth < availableWidth {
@@ -580,7 +578,8 @@ mod tests {
 
     #[test]
     fn rendersWithoutPanic() {
-        let code = "graph TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[End]\n    B -->|No| D[Retry]";
+        let code =
+            "graph TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[End]\n    B -->|No| D[Retry]";
         let result = tryRenderMermaid(code, 80);
         assert!(result.is_some());
         let lines = result.unwrap();
@@ -605,8 +604,10 @@ mod tests {
     fn rendersCyclicGraph() {
         let code = "graph TD\n    A --> B\n    B --> C\n    C --> A";
         let result = tryRenderMermaid(code, 80);
-        assert!(result.is_some(), "cyclic graphs should render via back-edge reversal");
+        assert!(
+            result.is_some(),
+            "cyclic graphs should render via back-edge reversal"
+        );
         assert!(!result.unwrap().is_empty());
     }
-
 }

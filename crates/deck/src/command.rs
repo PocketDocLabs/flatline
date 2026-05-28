@@ -104,6 +104,11 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Show background jobs, monitors, and wake schedules",
     },
     CommandDef {
+        name: "logs",
+        aliases: &["log"],
+        description: "Show developer log history",
+    },
+    CommandDef {
         name: "layout",
         aliases: &[],
         description: "Open layout controls",
@@ -118,8 +123,7 @@ pub fn completions(prefix: &str) -> Vec<&'static CommandDef> {
     COMMANDS
         .iter()
         .filter(|cmd| {
-            cmd.name.starts_with(prefix)
-                || cmd.aliases.iter().any(|a| a.starts_with(prefix))
+            cmd.name.starts_with(prefix) || cmd.aliases.iter().any(|a| a.starts_with(prefix))
         })
         .collect()
 }
@@ -152,6 +156,8 @@ pub enum CommandAction {
     ShowCost,
     /// Open the background jobs / monitors / schedules panel.
     Tasks,
+    /// Open the developer log history panel.
+    Logs,
     /// Open the same layout controls as Ctrl+O.
     ShowLayout,
 }
@@ -179,15 +185,15 @@ pub fn tryHandle(input: &str) -> Option<CommandOutput> {
     let args = parts.next().unwrap_or("").trim();
 
     // Match against registry names and aliases.
-    let matched = COMMANDS.iter().find(|cmd| {
-        cmd.name == name || cmd.aliases.contains(&name)
-    });
+    let matched = COMMANDS
+        .iter()
+        .find(|cmd| cmd.name == name || cmd.aliases.contains(&name));
 
     let result = match matched {
         Some(cmd) => dispatch(cmd.name, args),
-        None => CommandOutput::Inline(
-            format!("Unknown command: /{name}. Type /help for available commands."),
-        ),
+        None => CommandOutput::Inline(format!(
+            "Unknown command: /{name}. Type /help for available commands."
+        )),
     };
 
     Some(result)
@@ -225,6 +231,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "model" => CommandOutput::Action(CommandAction::Model),
         "cost" => CommandOutput::Action(CommandAction::ShowCost),
         "tasks" => CommandOutput::Action(CommandAction::Tasks),
+        "logs" => CommandOutput::Action(CommandAction::Logs),
         "layout" => CommandOutput::Action(CommandAction::ShowLayout),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }
@@ -280,6 +287,23 @@ mod tests {
                     None => "None".into(),
                 },
             ),
+        }
+    }
+
+    #[test]
+    fn logsCommandAndAliasReturnLogsAction() {
+        for input in ["/logs", "/log"] {
+            match tryHandle(input) {
+                Some(CommandOutput::Action(CommandAction::Logs)) => {}
+                other => panic!(
+                    "expected CommandAction::Logs for {input}, got {:?}",
+                    match other {
+                        Some(CommandOutput::Action(a)) => format!("Action({a:?})"),
+                        Some(CommandOutput::Inline(s)) => format!("Inline({s})"),
+                        None => "None".into(),
+                    },
+                ),
+            }
         }
     }
 

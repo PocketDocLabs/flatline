@@ -33,11 +33,7 @@ pub fn formatDiagnostics(
 ) -> String {
     let filtered: Vec<&Diagnostic> = diagnostics
         .iter()
-        .filter(|d| {
-            d.severity
-                .map(|s| s <= minSeverity)
-                .unwrap_or(true)
-        })
+        .filter(|d| d.severity.map(|s| s <= minSeverity).unwrap_or(true))
         .collect();
 
     if filtered.is_empty() {
@@ -117,10 +113,7 @@ fn diagKey(d: &Diagnostic) -> (String, &'static str) {
 /// Uses multiset subtraction on (message, severity) to remove pre-existing
 /// errors. Line numbers are preserved on the surviving diagnostics so the
 /// model sees exactly where the new errors are.
-pub fn diffDiagnostics(
-    baseline: &[Diagnostic],
-    current: &[Diagnostic],
-) -> Vec<Diagnostic> {
+pub fn diffDiagnostics(baseline: &[Diagnostic], current: &[Diagnostic]) -> Vec<Diagnostic> {
     use std::collections::HashMap;
 
     // Count occurrences of each (message, severity) in baseline.

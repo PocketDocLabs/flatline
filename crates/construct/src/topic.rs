@@ -86,11 +86,7 @@ impl TopicTracker {
         utilityModel: &str,
     ) -> Result<EvalResult> {
         let messages = self.prepareClassification(history);
-        let decision = classifyPrepared(
-            messages,
-            client.clone(),
-            utilityModel.to_string(),
-        ).await;
+        let decision = classifyPrepared(messages, client.clone(), utilityModel.to_string()).await;
         Ok(self.applyDecision(decision, blockId))
     }
 
@@ -101,15 +97,22 @@ impl TopicTracker {
     /// to a spawned task via [`classifyPrepared`].
     pub fn prepareClassification(&self, history: &[Message]) -> Vec<Message> {
         // Extract the next user message text for the XML block.
-        let nextMessage = history.iter().rev().find_map(|m| match m {
-            Message::User { content } => Some(content.textContent()),
-            _ => None,
-        }).unwrap_or("");
+        let nextMessage = history
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::User { content } => Some(content.textContent()),
+                _ => None,
+            })
+            .unwrap_or("");
 
         // Clone history without the last user message — it's presented
         // inside the <topic_tracker> block instead to avoid duplication.
         let mut messages: Vec<Message> = history.to_vec();
-        if let Some(pos) = messages.iter().rposition(|m| matches!(m, Message::User { .. })) {
+        if let Some(pos) = messages
+            .iter()
+            .rposition(|m| matches!(m, Message::User { .. }))
+        {
             messages.remove(pos);
         }
         messages.push(Message::User {
@@ -223,10 +226,7 @@ impl TopicTracker {
         if !self.topics[start..].is_empty() {
             ctx.push_str("\n<recent_topics>\n");
             for t in &self.topics[start..] {
-                ctx.push_str(&format!(
-                    "- \"{}\" ({} blocks)\n",
-                    t.label, t.blockCount
-                ));
+                ctx.push_str(&format!("- \"{}\" ({} blocks)\n", t.label, t.blockCount));
             }
             ctx.push_str("</recent_topics>\n\n");
         }
@@ -245,8 +245,10 @@ impl TopicTracker {
             "<next_user_message>\n{nextMessage}\n</next_user_message>\n\n"
         ));
 
-        ctx.push_str("Classify the message in <next_user_message> above. \
-            Respond with a single <topic> tag. Nothing else.");
+        ctx.push_str(
+            "Classify the message in <next_user_message> above. \
+            Respond with a single <topic> tag. Nothing else.",
+        );
         ctx.push_str("\n</topic_tracker>");
         ctx
     }
@@ -357,7 +359,11 @@ fn parseTopicResponse(response: &str) -> TopicDecision {
 fn nextTopicNumFromTopics(topics: &[TopicInfo]) -> usize {
     topics
         .iter()
-        .filter_map(|t| t.topicId.strip_prefix("topic-").and_then(|n| n.parse::<usize>().ok()))
+        .filter_map(|t| {
+            t.topicId
+                .strip_prefix("topic-")
+                .and_then(|n| n.parse::<usize>().ok())
+        })
         .max()
         .map_or(1, |n| n + 1)
 }
@@ -493,10 +499,7 @@ mod tests {
     #[test]
     fn restoreState_nextTopicNum_uses_max_id_not_length() {
         let mut tracker = TopicTracker::new();
-        tracker.restoreState(vec![
-            topic("topic-01", "A"),
-            topic("topic-05", "E"),
-        ]);
+        tracker.restoreState(vec![topic("topic-01", "A"), topic("topic-05", "E")]);
         assert_eq!(
             tracker.nextTopicNum, 6,
             "next must exceed max existing ID so a rewind can't recycle topic-02..topic-05"
@@ -546,10 +549,7 @@ mod tests {
     fn rebuildTopicInfos_skips_empty_topicId_turns() {
         // Pre-classification turns (first send) have empty topicId and
         // must not end up in the rebuilt list at all.
-        let turns = vec![
-            turn("t1", "b_aaa", ""),
-            turn("t2", "b_aaa", ""),
-        ];
+        let turns = vec![turn("t1", "b_aaa", ""), turn("t2", "b_aaa", "")];
         let rebuilt = rebuildTopicInfos(&turns, &[]);
         assert!(rebuilt.is_empty());
     }

@@ -56,9 +56,15 @@ struct VtSize {
 }
 
 impl VtDimensions for VtSize {
-    fn total_lines(&self) -> usize { self.rows }
-    fn screen_lines(&self) -> usize { self.rows }
-    fn columns(&self) -> usize { self.cols }
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
 }
 
 /// Dump a VT grid (scrollback + visible region) as one row per line,
@@ -92,7 +98,10 @@ fn dumpVtGrid(term: &Term<VoidListener>) -> Vec<String> {
 
 /// Construct a fresh headless VT with the standard render dimensions.
 fn newRenderVt() -> (Term<VoidListener>, Processor) {
-    let size = VtSize { cols: VT_RENDER_COLS, rows: VT_RENDER_ROWS };
+    let size = VtSize {
+        cols: VT_RENDER_COLS,
+        rows: VT_RENDER_ROWS,
+    };
     let mut config = VtConfig::default();
     config.scrolling_history = VT_SCROLLBACK_LINES;
     let term = Term::new(config, &size, VoidListener);
@@ -131,7 +140,10 @@ impl ShellVt {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
-        let size = VtSize { cols: cols as usize, rows: rows as usize };
+        let size = VtSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
         self.term.resize(size);
     }
 
@@ -221,12 +233,7 @@ impl Shell {
     }
 
     /// Search a command's output for a pattern, returning matching lines with context.
-    pub fn searchOutput(
-        &self,
-        index: usize,
-        pattern: &str,
-        contextLines: usize,
-    ) -> Option<String> {
+    pub fn searchOutput(&self, index: usize, pattern: &str, contextLines: usize) -> Option<String> {
         let history = self.history.lock().unwrap();
         let record = history.get(index)?;
 
@@ -248,7 +255,9 @@ impl Shell {
         }
 
         if matchIndices.is_empty() {
-            return Some(format!("No matches for \"{pattern}\" in command {index} output."));
+            return Some(format!(
+                "No matches for \"{pattern}\" in command {index} output."
+            ));
         }
 
         // Build context windows around matches, merging overlaps.
@@ -343,9 +352,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     // Inject OSC 133 shell integration for command boundary tracking.
     injectShellIntegration(&shellBin, &mut cmd)?;
 
-    slave
-        .spawn_command(cmd)
-        .context("Failed to spawn shell")?;
+    slave.spawn_command(cmd).context("Failed to spawn shell")?;
 
     // Drop the slave side — master owns the connection now.
     drop(slave);
@@ -821,7 +828,9 @@ fn extractResult(buffer: &[u8], uuid: &str) -> ExtractedResult {
     };
 
     // Command output ends at the END marker, if present.
-    let contentEnd = endPos.filter(|&p| p >= contentStart).unwrap_or(buffer.len());
+    let contentEnd = endPos
+        .filter(|&p| p >= contentStart)
+        .unwrap_or(buffer.len());
 
     // Feed command output bytes through the VT emulator.
     let rendered = renderCommandOutput(&buffer[contentStart..contentEnd]);
@@ -871,7 +880,9 @@ fn rfindBytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     let limit = haystack.len() - needle.len();
-    (0..=limit).rev().find(|&i| &haystack[i..i + needle.len()] == needle)
+    (0..=limit)
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// Strip ANSI escape sequences from text.
@@ -927,13 +938,12 @@ fn stripAnsi(input: &str) -> String {
 /// that source the originals and add precmd/preexec hooks.
 /// For bash: uses --rcfile pointing to a wrapper that sources .bashrc first.
 fn injectShellIntegration(shell: &str, cmd: &mut CommandBuilder) -> Result<()> {
-    let integrationDir =
-        std::env::temp_dir().join(format!("flatline-si-{}", std::process::id()));
+    let integrationDir = std::env::temp_dir().join(format!("flatline-si-{}", std::process::id()));
     std::fs::create_dir_all(&integrationDir)?;
 
     if shell.ends_with("zsh") {
-        let originalZdotdir = std::env::var("ZDOTDIR")
-            .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default());
+        let originalZdotdir =
+            std::env::var("ZDOTDIR").unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default());
 
         // Forward all zsh init files to originals.
         for file in &[".zshenv", ".zprofile", ".zlogin"] {

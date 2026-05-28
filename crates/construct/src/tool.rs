@@ -1436,9 +1436,8 @@ pub enum ToolAction {
     JobList,
     /// Register a line-streamed monitor backed by a bash task. Lines
     /// matching the regex `filter` emit `MonitorEvent`s, bump the
-    /// monitor's counter, and (once the wake plane lands) wake the
-    /// agent with a synthetic `<wake>` message. Floods auto-stop the
-    /// task.
+    /// monitor's counter, and wake the agent with a synthetic wake event.
+    /// Floods auto-stop the task.
     Monitor {
         description: String,
         command: String,

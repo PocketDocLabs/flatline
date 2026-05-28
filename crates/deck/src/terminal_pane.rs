@@ -32,7 +32,7 @@ use crate::terminal::{Terminal as EmbeddedTerminal, TerminalState};
 
 /// Fill character for an active tab marker.
 const ACTIVE_GLYPH: &str = "\u{25C9}"; // ◉
-const IDLE_GLYPH: &str = "\u{25CB}";   // ○
+const IDLE_GLYPH: &str = "\u{25CB}"; // ○
 
 /// Per-terminal state held inside the pane.
 pub struct TerminalEntry {
@@ -84,10 +84,7 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn newWithMain(io: ShellIo, cols: u16, rows: u16) -> Self {
         let mut entries = HashMap::new();
-        entries.insert(
-            "main".into(),
-            TerminalEntry::new("main", io, cols, rows),
-        );
+        entries.insert("main".into(), TerminalEntry::new("main", io, cols, rows));
         Self {
             entries,
             order: vec!["main".into()],
@@ -105,7 +102,8 @@ impl TerminalPane {
         if !self.entries.contains_key(&name) {
             self.order.push(name.clone());
         }
-        self.entries.insert(name.clone(), TerminalEntry::new(name, io, cols, rows));
+        self.entries
+            .insert(name.clone(), TerminalEntry::new(name, io, cols, rows));
     }
 
     /// Remove a terminal. If the active tab is removed, focus falls back
@@ -254,8 +252,7 @@ impl TerminalPane {
     /// the same dimensions (the entire pane area).
     pub fn resizeAll(&mut self, cols: u16, rows: u16) {
         for entry in self.entries.values_mut() {
-            if entry.state.columns() != cols as usize
-                || entry.state.screenLines() != rows as usize
+            if entry.state.columns() != cols as usize || entry.state.screenLines() != rows as usize
             {
                 entry.state.resize(cols, rows);
                 let _ = entry.io.resizeTx.try_send((cols, rows));
@@ -266,12 +263,7 @@ impl TerminalPane {
     /// Render the tab strip at `area` (typically the first row of the
     /// terminal pane). Returns the row height used (always 1 in phase 1).
     /// Records click-hit rects into `self.lastTabRects` and `self.lastPlusRect`.
-    pub fn renderTabBar(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        focused: bool,
-    ) -> u16 {
+    pub fn renderTabBar(&mut self, area: Rect, buf: &mut Buffer, focused: bool) -> u16 {
         if area.height == 0 || area.width == 0 {
             return 0;
         }
@@ -297,7 +289,7 @@ impl TerminalPane {
             let glyph = if isActive {
                 ACTIVE_GLYPH
             } else if entry.unread {
-                "\u{2299}"  // ⊙ unread events
+                "\u{2299}" // ⊙ unread events
             } else {
                 IDLE_GLYPH
             };
@@ -312,7 +304,12 @@ impl TerminalPane {
             buf.set_span(x, yRow, &span, w);
             self.lastTabRects.push((
                 name.clone(),
-                Rect { x, y: yRow, width: w, height: 1 },
+                Rect {
+                    x,
+                    y: yRow,
+                    width: w,
+                    height: 1,
+                },
             ));
 
             // Tab separator (skip after the last tab — replaced by [+]).
@@ -328,10 +325,17 @@ impl TerminalPane {
         if x + plusW <= area.x + area.width {
             let plusSpan = Span::styled(
                 plusLabel,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             );
             buf.set_span(x, yRow, &plusSpan, plusW);
-            self.lastPlusRect = Rect { x, y: yRow, width: plusW, height: 1 };
+            self.lastPlusRect = Rect {
+                x,
+                y: yRow,
+                width: plusW,
+                height: 1,
+            };
         }
 
         1
@@ -351,12 +355,7 @@ impl TerminalPane {
             entry.state.resize(area.width, area.height);
             let _ = entry.io.resizeTx.try_send((area.width, area.height));
         }
-        ratatui::widgets::StatefulWidget::render(
-            EmbeddedTerminal,
-            area,
-            buf,
-            &mut entry.state,
-        );
+        ratatui::widgets::StatefulWidget::render(EmbeddedTerminal, area, buf, &mut entry.state);
     }
 
     /// Hit-test a click on the tab strip.
@@ -377,6 +376,8 @@ impl TerminalPane {
         if self.lastPlusRect.contains((col, row).into()) {
             return true;
         }
-        self.lastTabRects.iter().any(|(_, r)| r.contains((col, row).into()))
+        self.lastTabRects
+            .iter()
+            .any(|(_, r)| r.contains((col, row).into()))
     }
 }

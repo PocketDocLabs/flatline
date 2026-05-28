@@ -178,8 +178,12 @@ impl LspPanel {
 
     /// Render as a centered popup overlay.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let popupWidth = (area.width * 7 / 10).max(50).min(area.width.saturating_sub(4));
-        let popupHeight = (area.height * 7 / 10).max(14).min(area.height.saturating_sub(2));
+        let popupWidth = (area.width * 7 / 10)
+            .max(50)
+            .min(area.width.saturating_sub(4));
+        let popupHeight = (area.height * 7 / 10)
+            .max(14)
+            .min(area.height.saturating_sub(2));
         let popupX = area.x + (area.width.saturating_sub(popupWidth)) / 2;
         let popupY = area.y + (area.height.saturating_sub(popupHeight)) / 2;
 
@@ -255,9 +259,20 @@ impl LspPanel {
 
             // Line 1: marker + name + extensions + status (right-aligned).
             let marker = if sel { "\u{25B8} " } else { "  " };
-            let relevanceTag = if row.relevant { "\u{2605}\u{FE0E}" } else { " " };
+            let relevanceTag = if row.relevant {
+                "\u{2605}\u{FE0E}"
+            } else {
+                " "
+            };
             let namePart = format!("{marker}{relevanceTag} {}", row.id);
-            line(buf, inner.x, *y, w, &truncateStr(&namePart, w), style(FG_PRIMARY, bg));
+            line(
+                buf,
+                inner.x,
+                *y,
+                w,
+                &truncateStr(&namePart, w),
+                style(FG_PRIMARY, bg),
+            );
 
             // Relevance star color.
             if row.relevant {
@@ -270,7 +285,14 @@ impl LspPanel {
             // Right-aligned status.
             let statusLen = row.statusLabel.chars().count();
             let rightX = inner.x + inner.width.saturating_sub(statusLen as u16 + 1);
-            line(buf, rightX, *y, statusLen + 1, &row.statusLabel, style(row.statusColor, bg));
+            line(
+                buf,
+                rightX,
+                *y,
+                statusLen + 1,
+                &row.statusLabel,
+                style(row.statusColor, bg),
+            );
 
             // Line 2: extensions + install hint (if not installed).
             let line2 = if row.installable {
@@ -279,14 +301,24 @@ impl LspPanel {
                 format!("    {}", row.extensions)
             };
             let line2Color = if row.installable { FG_ACCENT } else { FG_DIM };
-            line(buf, inner.x, *y + 1, w, &truncateStr(&line2, w), style(line2Color, bg));
+            line(
+                buf,
+                inner.x,
+                *y + 1,
+                w,
+                &truncateStr(&line2, w),
+                style(line2Color, bg),
+            );
 
             *y += 2;
         }
 
         // Scroll indicator.
         if self.rows.len() > visibleCount {
-            let remaining = self.rows.len().saturating_sub(self.scrollOffset + visibleCount);
+            let remaining = self
+                .rows
+                .len()
+                .saturating_sub(self.scrollOffset + visibleCount);
             if remaining > 0 {
                 let more = format!("  \u{22EE} {remaining} more");
                 line(buf, inner.x, *y, w, &more, style(FG_MUTED, BG));
@@ -370,17 +402,15 @@ fn scanProjectExtensions(projectDir: &std::path::Path) -> std::collections::Hash
 // -- Utility functions --------------------------------------------------------
 
 fn line(buf: &mut Buffer, x: u16, y: u16, maxWidth: usize, text: &str, s: Style) {
-    Paragraph::new(text.to_string())
-        .style(s)
-        .render(
-            Rect {
-                x,
-                y,
-                width: maxWidth as u16,
-                height: 1,
-            },
-            buf,
-        );
+    Paragraph::new(text.to_string()).style(s).render(
+        Rect {
+            x,
+            y,
+            width: maxWidth as u16,
+            height: 1,
+        },
+        buf,
+    );
 }
 
 fn fillRect(buf: &mut Buffer, area: Rect, s: Style) {

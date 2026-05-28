@@ -254,7 +254,10 @@ mod tests {
         // last one should be treated as the close.
         let input = "I should remember to write </scratchpad> at the end</scratch>final";
         let r = recoverScratchpadClose(input).unwrap();
-        assert_eq!(r.reasoning, "I should remember to write </scratchpad> at the end");
+        assert_eq!(
+            r.reasoning,
+            "I should remember to write </scratchpad> at the end"
+        );
         assert_eq!(r.content, "final");
         assert_eq!(r.matchedTag, "</scratch>");
     }

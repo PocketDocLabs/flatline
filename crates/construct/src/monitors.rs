@@ -6,8 +6,8 @@
 //! regex is mandatory at the schema layer, so unfiltered floods cannot
 //! reach the guard by construction.
 //!
-//! Wakes (sub-phase B) consume the same `MonitorEvent` stream and fire
-//! a synthetic `<wake>` message to the model on each match.
+//! Wakes consume the same match path and inject a `TurnRole::Wake`
+//! transcript event into model context on each match.
 //!
 //! # Public API
 //! - [`MonitorPlane`] — registry of monitors keyed by [`MonitorId`]
@@ -25,7 +25,7 @@ use regex::Regex;
 use tokio::sync::mpsc;
 
 use crate::control::LogEvent;
-use crate::jobs::{JobId, JobPlane, LineCallback};
+use crate::jobs::{ExitCallback, JobId, JobPlane, LineCallback};
 
 /// Monotonically increasing per-session monitor id.
 pub type MonitorId = u64;
@@ -42,8 +42,8 @@ pub const DEFAULT_AUTOSTOP_EPS: f64 = 500.0;
 pub const FLOOD_WINDOW_SECS: f64 = 5.0;
 
 /// Lifecycle state of a monitor (mirrors but is independent of the
-/// underlying [`crate::jobs::JobState`] — a task can be `Completed`
-/// while the monitor is still `Running` until explicitly stopped).
+/// underlying [`crate::jobs::JobState`]; natural backing-task exit is
+/// mirrored into `Stopped` by the exit callback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MonitorState {
     Running,
@@ -368,6 +368,34 @@ impl MonitorPlane {
             }
         });
 
+        // Mirror the backing bash task's terminal state into the monitor.
+        // Explicit monitorStop/auto-stop mark the monitor terminal first, so
+        // this path only handles natural command exit or a direct job kill of
+        // the backing task.
+        let exitInner = inner.clone();
+        let exitWakeCtxSlot = wakeCtxSlot.clone();
+        let exitLogTx = logTx.clone();
+        let exitId = id;
+        let onExit: ExitCallback = Box::new(move |_taskId, _state| {
+            {
+                let mut g = exitInner.lock().unwrap();
+                if g.state.isTerminal() {
+                    return;
+                }
+                g.state = MonitorState::Stopped;
+            }
+            if let Some(ctx) = exitWakeCtxSlot.lock().unwrap().take() {
+                let logTxClone = exitLogTx.clone();
+                tokio::spawn(async move {
+                    ctx.registry
+                        .lock()
+                        .await
+                        .unregisterPassive(ctx.wakeId, &logTxClone);
+                });
+            }
+            let _ = exitLogTx.try_send(LogEvent::MonitorStopped { id: exitId });
+        });
+
         // Spawn the backing bash task with the callback in place. The
         // callback can now consult `backingTaskIdSlot` to kill the task
         // when the flood guard trips.
@@ -376,6 +404,7 @@ impl MonitorPlane {
             command.clone(),
             filter.clone(),
             callback,
+            onExit,
             logTx.clone(),
         )?;
         *backingTaskIdSlot.lock().unwrap() = Some(taskId);
@@ -700,6 +729,84 @@ mod tests {
         // died — but the wake source is gone.
         let info = plane.lookup(monitorId).unwrap().info();
         assert!(matches!(info.state, MonitorState::AutoStopped(_)));
+
+        drop(plane);
+        drop(tasks);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn naturalExitUnregistersPassiveWakeSource() {
+        // A finite monitor command can legitimately exit after emitting its
+        // watched line. That should terminalize the monitor and remove its
+        // passive wake source; otherwise /tasks shows a phantom armed source
+        // forever.
+        use crate::wakes::WakeRegistry;
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (regArc, mut batchRx) = WakeRegistry::new();
+        let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
+        let mut plane = MonitorPlane::new();
+        let monitorId = plane.reserveMonitorId();
+
+        let (wakeId, fireTx) = {
+            let mut g = regArc.lock().await;
+            let wid = g.registerMonitor(monitorId, &tx);
+            (wid, g.fireSender())
+        };
+        let wakeCtx = MonitorWakeCtx {
+            wakeId,
+            registry: regArc.clone(),
+            fireTx,
+        };
+
+        plane
+            .registerImpl(
+                monitorId,
+                "one shot".into(),
+                "echo HIT".into(),
+                "HIT".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                FLOOD_WINDOW_SECS,
+                &tasks,
+                tx.clone(),
+                Some(wakeCtx),
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut sawStopped = false;
+        loop {
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, LogEvent::MonitorStopped { id } if id == monitorId) {
+                    sawStopped = true;
+                }
+            }
+            let state = plane.lookup(monitorId).unwrap().state();
+            let wakeCount = regArc.lock().await.len();
+            if matches!(state, MonitorState::Stopped) && wakeCount == 0 && sawStopped {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "finite monitor did not stop cleanly (state {state:?}, wakeCount {wakeCount}, sawStopped {sawStopped})"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let batch = tokio::time::timeout(
+            crate::wakes::WAKE_BATCH_WINDOW + std::time::Duration::from_millis(300),
+            batchRx.recv(),
+        )
+        .await
+        .expect("monitor match wake batch did not arrive")
+        .expect("batch channel closed");
+        assert_eq!(batch.fires.len(), 1);
+        assert!(matches!(
+            batch.fires[0].kind,
+            crate::control::WakeKind::MonitorMatch
+        ));
 
         drop(plane);
         drop(tasks);

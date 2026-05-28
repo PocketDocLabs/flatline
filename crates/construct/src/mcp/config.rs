@@ -158,7 +158,11 @@ pub fn interpolateEnv(input: &str) -> String {
                 tracing::debug!(var = %varName, "env var not set, using empty string");
                 String::new()
             });
-            result = format!("{}{value}{}", &result[..start], &result[afterPrefix + end + 1..]);
+            result = format!(
+                "{}{value}{}",
+                &result[..start],
+                &result[afterPrefix + end + 1..]
+            );
         } else {
             // Malformed pattern — stop processing.
             break;
@@ -168,9 +172,7 @@ pub fn interpolateEnv(input: &str) -> String {
 }
 
 /// Validate all server names in a config map.
-pub fn validateServerNames(
-    servers: &HashMap<String, ServerConfig>,
-) -> Result<(), String> {
+pub fn validateServerNames(servers: &HashMap<String, ServerConfig>) -> Result<(), String> {
     for name in servers.keys() {
         validateServerName(name)?;
     }
@@ -186,9 +188,7 @@ pub fn validateServerNames(
 ///
 /// Flatline extensions (`enabled`, `enabledTools`, etc.) are supported inline
 /// and ignored by other tools.
-pub fn loadMcpJson(
-    path: &Path,
-) -> Result<HashMap<String, ServerConfig>, anyhow::Error> {
+pub fn loadMcpJson(path: &Path) -> Result<HashMap<String, ServerConfig>, anyhow::Error> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -323,18 +323,13 @@ pub fn loadMcpServers(
     let mut merged = mergeConfigs(userServers, projectServers);
 
     if !merged.is_empty() {
-        tracing::debug!(
-            count = merged.len(),
-            "loaded MCP servers from .mcp.json"
-        );
+        tracing::debug!(count = merged.len(), "loaded MCP servers from .mcp.json");
     }
 
     // Validate and remove invalid names.
     if let Err(e) = validateServerNames(&merged) {
         tracing::error!("invalid MCP server name: {e}");
-        merged.retain(|name, _| {
-            crate::mcp::schema::validateServerName(name).is_ok()
-        });
+        merged.retain(|name, _| crate::mcp::schema::validateServerName(name).is_ok());
     }
 
     Ok(merged)
@@ -403,7 +398,10 @@ mod tests {
         let servers = parseMcpJson(json).unwrap();
         let config = &servers["test"];
         assert_eq!(config.command.as_deref(), Some("npx"));
-        assert_eq!(config.args, vec!["-y", "@modelcontextprotocol/server-everything"]);
+        assert_eq!(
+            config.args,
+            vec!["-y", "@modelcontextprotocol/server-everything"]
+        );
         assert!(config.url.is_none());
         assert!(matches!(config.transport(), TransportType::Stdio { .. }));
     }
@@ -470,8 +468,14 @@ mod tests {
         assert_eq!(config.startupTimeout, 30);
         assert_eq!(config.toolTimeout, 60);
         assert_eq!(config.maxOutputTokens, 50_000);
-        assert_eq!(config.enabledTools.as_deref(), Some(&["tool1".to_string(), "tool2".to_string()][..]));
-        assert_eq!(config.disabledTools.as_deref(), Some(&["tool3".to_string()][..]));
+        assert_eq!(
+            config.enabledTools.as_deref(),
+            Some(&["tool1".to_string(), "tool2".to_string()][..])
+        );
+        assert_eq!(
+            config.disabledTools.as_deref(),
+            Some(&["tool3".to_string()][..])
+        );
     }
 
     #[test]
@@ -489,7 +493,10 @@ mod tests {
         let config = &servers["s"];
         assert_eq!(config.command.as_deref(), Some("{env:MY_CMD}"));
         assert_eq!(config.args, vec!["--key", "{env:API_KEY}"]);
-        assert_eq!(config.env.get("TOKEN").map(|s| s.as_str()), Some("{env:SECRET}"));
+        assert_eq!(
+            config.env.get("TOKEN").map(|s| s.as_str()),
+            Some("{env:SECRET}")
+        );
     }
 
     #[test]
@@ -499,10 +506,7 @@ mod tests {
 
     #[test]
     fn convertEnvSyntaxMultiple() {
-        assert_eq!(
-            convertEnvSyntax("${A}-${B}"),
-            "{env:A}-{env:B}"
-        );
+        assert_eq!(convertEnvSyntax("${A}-${B}"), "{env:A}-{env:B}");
     }
 
     #[test]
@@ -524,12 +528,8 @@ mod tests {
 
     #[test]
     fn mergeConfigsOverrides() {
-        let user = parseMcpJson(
-            r#"{ "mcpServers": { "s": { "command": "old" } } }"#,
-        ).unwrap();
-        let project = parseMcpJson(
-            r#"{ "mcpServers": { "s": { "command": "new" } } }"#,
-        ).unwrap();
+        let user = parseMcpJson(r#"{ "mcpServers": { "s": { "command": "old" } } }"#).unwrap();
+        let project = parseMcpJson(r#"{ "mcpServers": { "s": { "command": "new" } } }"#).unwrap();
 
         let merged = mergeConfigs(user, project);
         assert_eq!(merged["s"].command.as_deref(), Some("new"));
@@ -537,12 +537,8 @@ mod tests {
 
     #[test]
     fn mergeConfigsAddsNew() {
-        let user = parseMcpJson(
-            r#"{ "mcpServers": { "a": { "command": "cmd-a" } } }"#,
-        ).unwrap();
-        let project = parseMcpJson(
-            r#"{ "mcpServers": { "b": { "command": "cmd-b" } } }"#,
-        ).unwrap();
+        let user = parseMcpJson(r#"{ "mcpServers": { "a": { "command": "cmd-a" } } }"#).unwrap();
+        let project = parseMcpJson(r#"{ "mcpServers": { "b": { "command": "cmd-b" } } }"#).unwrap();
 
         let merged = mergeConfigs(user, project);
         assert_eq!(merged.len(), 2);

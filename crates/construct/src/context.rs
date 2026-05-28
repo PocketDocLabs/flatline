@@ -123,12 +123,12 @@ fn filterOpsForChain(
                 CompactionOp::BlockCompact { blockId, .. } => {
                     activeBlockIds.contains(blockId.as_str())
                 }
-                CompactionOp::TopicCompact { sourceBlockIds, .. } => {
-                    sourceBlockIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
-                }
-                CompactionOp::FullCompact { sourceIds, .. } => {
-                    sourceIds.iter().all(|id| activeBlockIds.contains(id.as_str()))
-                }
+                CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds
+                    .iter()
+                    .all(|id| activeBlockIds.contains(id.as_str())),
+                CompactionOp::FullCompact { sourceIds, .. } => sourceIds
+                    .iter()
+                    .all(|id| activeBlockIds.contains(id.as_str())),
             }
         })
         .collect()
@@ -209,18 +209,28 @@ fn applyOps<'a>(turns: &'a [&'a Turn], ops: &[CompactionOp]) -> Vec<TransformedT
                     removedCallIds.insert(id.clone());
                 }
             }
-            CompactionOp::MiddleOut { targetIds, threshold, .. } => {
+            CompactionOp::MiddleOut {
+                targetIds,
+                threshold,
+                ..
+            } => {
                 for id in targetIds {
                     middleOutCallIds.insert(id.clone(), *threshold);
                 }
             }
-            CompactionOp::BlockCompact { blockId, summary, .. } => {
+            CompactionOp::BlockCompact {
+                blockId, summary, ..
+            } => {
                 s2SummarizedBlocks.insert(blockId.clone());
                 blockSummaries.insert(blockId.clone(), summary.clone());
                 summaryKinds.insert(blockId.clone(), SummaryKind::Block);
                 summaryBlockIds.insert(blockId.clone(), vec![blockId.clone()]);
             }
-            CompactionOp::TopicCompact { sourceBlockIds, summary, .. } => {
+            CompactionOp::TopicCompact {
+                sourceBlockIds,
+                summary,
+                ..
+            } => {
                 if let Some(first) = sourceBlockIds.first() {
                     blockSummaries.insert(first.clone(), summary.clone());
                     summaryKinds.insert(first.clone(), SummaryKind::Topic);
@@ -230,7 +240,9 @@ fn applyOps<'a>(turns: &'a [&'a Turn], ops: &[CompactionOp]) -> Vec<TransformedT
                     summarizedBlocks.insert(bid.clone());
                 }
             }
-            CompactionOp::FullCompact { sourceIds, summary, .. } => {
+            CompactionOp::FullCompact {
+                sourceIds, summary, ..
+            } => {
                 // Clear stale S3 summaries for blocks this S4 now covers.
                 for bid in sourceIds {
                     blockSummaries.remove(bid.as_str());
@@ -260,8 +272,11 @@ fn applyOps<'a>(turns: &'a [&'a Turn], ops: &[CompactionOp]) -> Vec<TransformedT
         if summarizedBlocks.contains(bid.as_str()) {
             if !emittedSummaries.contains(bid.as_str()) {
                 if let Some(summary) = blockSummaries.get(bid.as_str()) {
-                    let kind = *summaryKinds.get(bid.as_str()).unwrap_or(&SummaryKind::Topic);
-                    let blockIds = summaryBlockIds.get(bid.as_str())
+                    let kind = *summaryKinds
+                        .get(bid.as_str())
+                        .unwrap_or(&SummaryKind::Topic);
+                    let blockIds = summaryBlockIds
+                        .get(bid.as_str())
                         .cloned()
                         .unwrap_or_else(|| vec![bid.clone()]);
                     result.push(TransformedTurn::Summary {
@@ -344,14 +359,21 @@ fn assembleMessages(turns: &[TransformedTurn]) -> Vec<Message> {
 
     for tt in turns {
         match tt {
-            TransformedTurn::Summary { content, blockId, kind, sourceBlockIds } => {
+            TransformedTurn::Summary {
+                content,
+                blockId,
+                kind,
+                sourceBlockIds,
+            } => {
                 flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                 let wrapped = match kind {
                     SummaryKind::Block => formatBlockSummary(content, blockId),
                     SummaryKind::Topic => formatTopicSummary(content, sourceBlockIds),
                     SummaryKind::Full => formatFullBriefing(content, sourceBlockIds),
                 };
-                history.push(Message::User { content: wrapped.into() });
+                history.push(Message::User {
+                    content: wrapped.into(),
+                });
             }
             TransformedTurn::Original(turn) | TransformedTurn::Replaced { turn, .. } => {
                 let content = match tt {
@@ -365,7 +387,9 @@ fn assembleMessages(turns: &[TransformedTurn]) -> Vec<Message> {
                         // into the Assistant message when tool calls flush.
                         let callId = turn.toolCallId.clone().unwrap_or_default();
                         let toolName = turn.tool.clone().unwrap_or_default();
-                        let argsStr = turn.args.as_ref()
+                        let argsStr = turn
+                            .args
+                            .as_ref()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "{}".to_string());
 
@@ -397,7 +421,9 @@ fn assembleMessages(turns: &[TransformedTurn]) -> Vec<Message> {
                         // distinction only matters for transcript display.
                         flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
                         let msgContent = rebuildContent(&content, &turn.attachments);
-                        history.push(Message::User { content: msgContent });
+                        history.push(Message::User {
+                            content: msgContent,
+                        });
                     }
                     TurnRole::ToolResult => {
                         flushPending(&mut history, &mut pendingAssistant, &mut pendingCalls);
@@ -427,9 +453,10 @@ fn rebuildContent(
 ) -> crate::message::Content {
     match attachments {
         Some(atts) if !atts.is_empty() => {
-            let imageUris: Vec<String> = atts.iter().map(|a| {
-                format!("data:{};base64,{}", a.mimeType, a.data)
-            }).collect();
+            let imageUris: Vec<String> = atts
+                .iter()
+                .map(|a| format!("data:{};base64,{}", a.mimeType, a.data))
+                .collect();
             crate::message::Content::withImages(text, imageUris)
         }
         _ => crate::message::Content::text(text),
@@ -487,11 +514,7 @@ pub struct Zones {
 /// the S2 zone. The remaining 40% is the raw zone (untouched).
 ///
 /// The system message (index 0) is excluded from zones — it's never compacted.
-pub fn calculateZones(
-    history: &[Message],
-    _contextWindow: usize,
-    _compactRatio: f64,
-) -> Zones {
+pub fn calculateZones(history: &[Message], _contextWindow: usize, _compactRatio: f64) -> Zones {
     if history.len() <= 1 {
         return Zones {
             s3Zone: Vec::new(),
@@ -500,10 +523,7 @@ pub fn calculateZones(
     }
 
     // Calculate total character count (excluding system message).
-    let charCounts: Vec<usize> = history
-        .iter()
-        .map(|m| messageCharCount(m))
-        .collect();
+    let charCounts: Vec<usize> = history.iter().map(|m| messageCharCount(m)).collect();
 
     let totalChars: usize = charCounts[1..].iter().sum();
     if totalChars == 0 {
@@ -540,10 +560,17 @@ fn messageCharCount(msg: &Message) -> usize {
     match msg {
         Message::System { content } => content.len(),
         Message::User { content } => content.charCount(),
-        Message::Assistant { content, tool_calls, .. } => {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
             let textLen = content.as_ref().map_or(0, |c| c.len());
             let callsLen = tool_calls.as_ref().map_or(0, |calls| {
-                calls.iter().map(|c| c.function.arguments.len() + c.function.name.len()).sum()
+                calls
+                    .iter()
+                    .map(|c| c.function.arguments.len() + c.function.name.len())
+                    .sum()
             });
             textLen + callsLen
         }
@@ -629,7 +656,10 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
             s4: None,
             s3: None,
             s2: None,
-            raw: RawLayer { turns: 0, estimatedTokens: 0 },
+            raw: RawLayer {
+                turns: 0,
+                estimatedTokens: 0,
+            },
         };
     }
 
@@ -643,7 +673,10 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
                 s4: None,
                 s3: None,
                 s2: None,
-                raw: RawLayer { turns: 0, estimatedTokens: 0 },
+                raw: RawLayer {
+                    turns: 0,
+                    estimatedTokens: 0,
+                },
             };
         }
     };
@@ -658,7 +691,8 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
     // Count unique blocks in the chain (each block = one user-visible turn).
     let allBlockIds: Vec<&str> = {
         let mut seen = HashSet::new();
-        chain.iter()
+        chain
+            .iter()
             .filter(|t| seen.insert(t.blockId.as_str()))
             .map(|t| t.blockId.as_str())
             .collect()
@@ -693,8 +727,13 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
     // Second pass: classify S3 and S2, count S4 topics.
     for op in &filteredOps {
         match op {
-            CompactionOp::TopicCompact { sourceBlockIds, topicLabel, .. } => {
-                let coveredByS4 = sourceBlockIds.iter()
+            CompactionOp::TopicCompact {
+                sourceBlockIds,
+                topicLabel,
+                ..
+            } => {
+                let coveredByS4 = sourceBlockIds
+                    .iter()
                     .all(|id| s4Blocks.contains(id.as_str()));
                 if coveredByS4 {
                     s4CoveredTopicLabels.insert(topicLabel.clone());
@@ -707,9 +746,7 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
             }
             CompactionOp::BlockCompact { blockId, .. } => {
                 // Only count if not already covered by S3 or S4.
-                if !s4Blocks.contains(blockId.as_str())
-                    && !s3Blocks.contains(blockId.as_str())
-                {
+                if !s4Blocks.contains(blockId.as_str()) && !s3Blocks.contains(blockId.as_str()) {
                     s2Blocks.insert(blockId.as_str());
                 }
             }
@@ -720,20 +757,22 @@ pub fn buildState(input: &BuildStateInput) -> ContextState {
     let s4TopicsMerged = s4CoveredTopicLabels.len();
 
     // Count turns (blocks) per layer.
-    let s4TurnCount = allBlockIds.iter()
+    let s4TurnCount = allBlockIds
+        .iter()
         .filter(|bid| s4Blocks.contains(**bid))
         .count();
-    let s3TurnCount = allBlockIds.iter()
+    let s3TurnCount = allBlockIds
+        .iter()
         .filter(|bid| s3Blocks.contains(**bid))
         .count();
-    let s2TurnCount = allBlockIds.iter()
+    let s2TurnCount = allBlockIds
+        .iter()
         .filter(|bid| s2Blocks.contains(**bid))
         .count();
-    let rawTurnCount = allBlockIds.iter()
+    let rawTurnCount = allBlockIds
+        .iter()
         .filter(|bid| {
-            !s4Blocks.contains(**bid)
-                && !s3Blocks.contains(**bid)
-                && !s2Blocks.contains(**bid)
+            !s4Blocks.contains(**bid) && !s3Blocks.contains(**bid) && !s2Blocks.contains(**bid)
         })
         .count();
 
@@ -906,7 +945,10 @@ fn formatTopicSummary(content: &str, sourceBlockIds: &[String]) -> String {
 
 /// Wrap an S4 handoff briefing in `<session_briefing>` XML.
 fn formatFullBriefing(content: &str, sourceBlockIds: &[String]) -> String {
-    let first = sourceBlockIds.first().map(|s| s.as_str()).unwrap_or("b_00000000");
+    let first = sourceBlockIds
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("b_00000000");
     let last = sourceBlockIds.last().map(|s| s.as_str()).unwrap_or(first);
     format!(
         "<session_briefing>\n\
@@ -956,16 +998,33 @@ mod tests {
         /// Record a user message, chaining to the current head.
         /// Mirrors session.rs:658 — `recordUser(msg, headTurnId)`.
         fn user(&mut self, content: &str) {
-            let id = self.transcript
+            let id = self
+                .transcript
                 .recordUser(content, self.headTurnId.as_deref(), None)
                 .unwrap();
             self.headTurnId = Some(id);
         }
 
         /// Record a user message with image attachments.
-        fn userWithImages(&mut self, content: &str, attachments: Vec<crate::transcript::TurnAttachment>) {
-            let id = self.transcript
+        fn userWithImages(
+            &mut self,
+            content: &str,
+            attachments: Vec<crate::transcript::TurnAttachment>,
+        ) {
+            let id = self
+                .transcript
                 .recordUser(content, self.headTurnId.as_deref(), Some(attachments))
+                .unwrap();
+            self.headTurnId = Some(id);
+        }
+
+        /// Record a wake event. Wake turns are not authored user messages in
+        /// the transcript, but reconstruct feeds their exact envelope back to
+        /// the model as user-shaped context.
+        fn wake(&mut self, content: &str) {
+            let id = self
+                .transcript
+                .recordWake(content, self.headTurnId.as_deref())
                 .unwrap();
             self.headTurnId = Some(id);
         }
@@ -977,25 +1036,22 @@ mod tests {
                 reasoning,
                 ..Default::default()
             };
-            let id = self.transcript
-                .recordAssistant(content, meta)
-                .unwrap();
+            let id = self.transcript.recordAssistant(content, meta).unwrap();
             self.headTurnId = Some(id);
         }
 
         /// Record a tool call.
         /// Mirrors session.rs:752-764.
         fn toolCall(&mut self, callId: &str, name: &str, args: serde_json::Value) {
-            let id = self.transcript
-                .recordToolCall(callId, name, &args)
-                .unwrap();
+            let id = self.transcript.recordToolCall(callId, name, &args).unwrap();
             self.headTurnId = Some(id);
         }
 
         /// Record a tool result.
         /// Mirrors session.rs:2084-2093 (pushToolResult).
         fn toolResult(&mut self, callId: &str, content: &str) {
-            let id = self.transcript
+            let id = self
+                .transcript
                 .recordToolResult(callId, content, None)
                 .unwrap();
             self.headTurnId = Some(id);
@@ -1026,7 +1082,11 @@ mod tests {
                 Message::User { content } => {
                     println!("  [{i}] User: {}", truncate(content.textContent(), 60));
                 }
-                Message::Assistant { content, tool_calls, reasoning } => {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                } => {
                     println!(
                         "  [{i}] Assistant: content={:?} tool_calls={} reasoning={}",
                         content.as_deref().map(|c| truncate(c, 40)),
@@ -1034,21 +1094,35 @@ mod tests {
                         reasoning.is_some(),
                     );
                 }
-                Message::Tool { tool_call_id, content } => {
-                    println!("  [{i}] Tool({tool_call_id}): {}", truncate(content.textContent(), 50));
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    println!(
+                        "  [{i}] Tool({tool_call_id}): {}",
+                        truncate(content.textContent(), 50)
+                    );
                 }
             }
         }
     }
 
     fn truncate(s: &str, max: usize) -> String {
-        if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            format!("{}...", &s[..max])
+        }
     }
 
     /// Assert a message is `Assistant` and return (content, toolCallCount, hasReasoning).
     fn assertAssistant(msg: &Message) -> (Option<&str>, usize, bool) {
         match msg {
-            Message::Assistant { content, tool_calls, reasoning } => (
+            Message::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } => (
                 content.as_deref(),
                 tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
                 reasoning.is_some(),
@@ -1060,7 +1134,10 @@ mod tests {
     /// Assert a message is `Tool` and return (callId, content text).
     fn assertTool(msg: &Message) -> (&str, &str) {
         match msg {
-            Message::Tool { tool_call_id, content } => (tool_call_id, content.textContent()),
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => (tool_call_id, content.textContent()),
             other => panic!("expected Tool, got {other:?}"),
         }
     }
@@ -1089,6 +1166,29 @@ mod tests {
         let (content, calls, _) = assertAssistant(&msgs[1]);
         assert_eq!(content, Some("Hi there!"));
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn wake_turn_reconstructs_as_exact_user_shaped_context() {
+        let mut s = TestSession::new();
+        s.user("before");
+        s.assistant("ready", None);
+        let envelope = "<wakes count=\"1\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nSend the MyHealth message.\n</wake>\n</wakes>";
+        s.wake(envelope);
+        s.assistant("handled", None);
+
+        let msgs = s.reconstruct();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(assertUser(&msgs[0]), "before");
+        assert_eq!(assertUser(&msgs[2]), envelope);
+        let turns = s.transcript.loadAll().unwrap();
+        assert!(matches!(
+            turns
+                .iter()
+                .find(|t| t.content == envelope)
+                .map(|t| &t.role),
+            Some(crate::transcript::TurnRole::Wake)
+        ));
     }
 
     #[test]
@@ -1130,7 +1230,11 @@ mod tests {
     fn single_tool_call() {
         let mut s = TestSession::new();
         s.user("Read /tmp/foo.txt");
-        s.toolCall("c01", "readFile", serde_json::json!({"path": "/tmp/foo.txt"}));
+        s.toolCall(
+            "c01",
+            "readFile",
+            serde_json::json!({"path": "/tmp/foo.txt"}),
+        );
         s.toolResult("c01", "file contents here");
 
         let msgs = s.reconstruct();
@@ -1167,16 +1271,23 @@ mod tests {
     fn tool_call_args_preserved() {
         let mut s = TestSession::new();
         s.user("Do it");
-        s.toolCall("c20", "editFile", serde_json::json!({
-            "path": "/tmp/x.rs",
-            "oldText": "fn foo()",
-            "newText": "fn bar()",
-        }));
+        s.toolCall(
+            "c20",
+            "editFile",
+            serde_json::json!({
+                "path": "/tmp/x.rs",
+                "oldText": "fn foo()",
+                "newText": "fn bar()",
+            }),
+        );
         s.toolResult("c20", "ok");
 
         let msgs = s.reconstruct();
         match &msgs[1] {
-            Message::Assistant { tool_calls: Some(calls), .. } => {
+            Message::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } => {
                 let args: serde_json::Value =
                     serde_json::from_str(&calls[0].function.arguments).unwrap();
                 assert_eq!(args["path"], "/tmp/x.rs");
@@ -1204,7 +1315,11 @@ mod tests {
         s.toolResult("c30", "fn main() { bug() }");
         // Round 2: model responds briefly, then edits.
         s.assistant("I see the bug, fixing it.", None);
-        s.toolCall("c31", "editFile", serde_json::json!({"path": "main.rs", "old": "bug()", "new": "fix()"}));
+        s.toolCall(
+            "c31",
+            "editFile",
+            serde_json::json!({"path": "main.rs", "old": "bug()", "new": "fix()"}),
+        );
         s.toolResult("c31", "ok");
         // Round 3: model responds.
         s.assistant("Fixed. The bug() call was replaced with fix().", None);
@@ -1229,12 +1344,22 @@ mod tests {
         assert_eq!(calls, 1, "text and tool_calls should be merged");
 
         let (content, calls, _) = assertAssistant(&msgs[5]);
-        assert_eq!(content, Some("Fixed. The bug() call was replaced with fix()."));
+        assert_eq!(
+            content,
+            Some("Fixed. The bug() call was replaced with fix().")
+        );
         assert_eq!(calls, 0);
 
-        let toolMsgs: Vec<_> = msgs.iter().filter_map(|m| {
-            if let Message::Tool { tool_call_id, .. } = m { Some(tool_call_id.as_str()) } else { None }
-        }).collect();
+        let toolMsgs: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| {
+                if let Message::Tool { tool_call_id, .. } = m {
+                    Some(tool_call_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(toolMsgs, vec!["c30", "c31"]);
     }
 
@@ -1250,7 +1375,11 @@ mod tests {
         let mut s = TestSession::new();
         s.user("Do something");
         s.assistant("Let me check that file.", None);
-        s.toolCall("c40", "readFile", serde_json::json!({"path": "/tmp/bar.txt"}));
+        s.toolCall(
+            "c40",
+            "readFile",
+            serde_json::json!({"path": "/tmp/bar.txt"}),
+        );
         s.toolResult("c40", "bar contents");
 
         let msgs = s.reconstruct();
@@ -1272,14 +1401,25 @@ mod tests {
     fn content_plus_reasoning_plus_tool_calls_merged() {
         let mut s = TestSession::new();
         s.user("Think about it, then act");
-        s.assistant("I'll read the config.", Some("Need to check config before proceeding"));
-        s.toolCall("c50", "readFile", serde_json::json!({"path": "config.toml"}));
+        s.assistant(
+            "I'll read the config.",
+            Some("Need to check config before proceeding"),
+        );
+        s.toolCall(
+            "c50",
+            "readFile",
+            serde_json::json!({"path": "config.toml"}),
+        );
         s.toolResult("c50", "[settings]\nfoo = true");
 
         let msgs = s.reconstruct();
         dump("content_plus_reasoning_plus_tool_calls_merged", &msgs);
 
-        assert_eq!(msgs.len(), 3, "User + Assistant(content+reasoning+tool_calls) + Tool");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "User + Assistant(content+reasoning+tool_calls) + Tool"
+        );
 
         let (content, calls, hasReasoning) = assertAssistant(&msgs[1]);
         assert_eq!(content, Some("I'll read the config."));
@@ -1337,9 +1477,16 @@ mod tests {
         let msgs = s.reconstruct();
         dump("three_block_chain", &msgs);
 
-        let userMsgs: Vec<&str> = msgs.iter().filter_map(|m| {
-            if let Message::User { content } = m { Some(content.textContent()) } else { None }
-        }).collect();
+        let userMsgs: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content.textContent())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(userMsgs, vec!["Step 1", "Step 2", "Step 3"]);
     }
 
@@ -1392,7 +1539,11 @@ mod tests {
         s.toolResult("c91", "b");
 
         // Round 3: edit.
-        s.toolCall("c92", "editFile", serde_json::json!({"path": "/a", "old": "a", "new": "aa"}));
+        s.toolCall(
+            "c92",
+            "editFile",
+            serde_json::json!({"path": "/a", "old": "a", "new": "aa"}),
+        );
         s.toolResult("c92", "ok");
 
         // Round 4: shell.
@@ -1410,14 +1561,28 @@ mod tests {
         //
         // BUT: consecutive ToolCall turns without an intervening non-ToolCall
         // turn get grouped. Let's verify what actually happens.
-        let toolMsgs: Vec<&str> = msgs.iter().filter_map(|m| {
-            if let Message::Tool { tool_call_id, .. } = m { Some(tool_call_id.as_str()) } else { None }
-        }).collect();
-        assert_eq!(toolMsgs, vec!["c90", "c91", "c92", "c93"],
-            "all 4 tool results should be present");
+        let toolMsgs: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| {
+                if let Message::Tool { tool_call_id, .. } = m {
+                    Some(tool_call_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            toolMsgs,
+            vec!["c90", "c91", "c92", "c93"],
+            "all 4 tool results should be present"
+        );
 
         // Verify the final assistant text is present.
-        if let Some(lastAssist) = msgs.iter().rev().find(|m| matches!(m, Message::Assistant { .. })) {
+        if let Some(lastAssist) = msgs
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::Assistant { .. }))
+        {
             let (content, calls, _) = assertAssistant(lastAssist);
             assert_eq!(content, Some("All done."));
             assert_eq!(calls, 0);
@@ -1442,14 +1607,21 @@ mod tests {
 
         let afterTurn = s.headTurnId.clone().unwrap();
         let mut log = s.compactionLog();
-        log.recordMiddleOut(vec!["c100".into()], &afterTurn, 200).unwrap();
+        log.recordMiddleOut(vec!["c100".into()], &afterTurn, 200)
+            .unwrap();
         drop(log);
 
         let msgs = s.reconstruct();
 
         let (_, body) = assertTool(&msgs[2]);
-        assert!(body.len() < bigContent.len(), "tool result should be truncated");
-        assert!(body.contains("bytes truncated"), "should contain truncation marker");
+        assert!(
+            body.len() < bigContent.len(),
+            "tool result should be truncated"
+        );
+        assert!(
+            body.contains("bytes truncated"),
+            "should contain truncation marker"
+        );
     }
 
     /// FileDedup removes duplicate tool call + result pairs.
@@ -1465,16 +1637,28 @@ mod tests {
 
         let afterTurn = s.headTurnId.clone().unwrap();
         let mut log = s.compactionLog();
-        log.recordFileDedup(vec!["c110".into()], &afterTurn).unwrap();
+        log.recordFileDedup(vec!["c110".into()], &afterTurn)
+            .unwrap();
         drop(log);
 
         let msgs = s.reconstruct();
         dump("file_dedup", &msgs);
 
-        let toolIds: Vec<&str> = msgs.iter().filter_map(|m| {
-            if let Message::Tool { tool_call_id, .. } = m { Some(tool_call_id.as_str()) } else { None }
-        }).collect();
-        assert_eq!(toolIds, vec!["c111"], "only second read should survive dedup");
+        let toolIds: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| {
+                if let Message::Tool { tool_call_id, .. } = m {
+                    Some(tool_call_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            toolIds,
+            vec!["c111"],
+            "only second read should survive dedup"
+        );
     }
 
     /// S2 BlockCompact replaces assistant/tool turns with a summary.
@@ -1487,7 +1671,8 @@ mod tests {
         s.assistant("Listed files.", None);
 
         let turns = s.transcript.loadAll().unwrap();
-        let blockId = turns.iter()
+        let blockId = turns
+            .iter()
             .find(|t| t.content == "First task")
             .map(|t| t.blockId.clone())
             .unwrap();
@@ -1498,7 +1683,13 @@ mod tests {
 
         let afterTurn = s.headTurnId.clone().unwrap();
         let mut log = s.compactionLog();
-        log.recordBlockCompact(&blockId, "User listed files, found file1 and file2.", vec![], &afterTurn).unwrap();
+        log.recordBlockCompact(
+            &blockId,
+            "User listed files, found file1 and file2.",
+            vec![],
+            &afterTurn,
+        )
+        .unwrap();
         drop(log);
 
         let msgs = s.reconstruct();
@@ -1511,10 +1702,94 @@ mod tests {
                 false
             }
         });
-        assert!(hasCompressed, "should contain a compressed_content summary message");
+        assert!(
+            hasCompressed,
+            "should contain a compressed_content summary message"
+        );
 
-        let toolCount = msgs.iter().filter(|m| matches!(m, Message::Tool { .. })).count();
-        assert_eq!(toolCount, 0, "compacted block's tool results should be gone");
+        let toolCount = msgs
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count();
+        assert_eq!(
+            toolCount, 0,
+            "compacted block's tool results should be gone"
+        );
+    }
+
+    /// Repeated S4 records are an append-only history, but reconstruct should
+    /// expose only the latest active S4 briefing when it supersedes earlier
+    /// S4 source blocks.
+    #[test]
+    fn full_compact_replay_uses_latest_s4_frontier() {
+        let mut s = TestSession::new();
+        s.user("First task");
+        s.assistant("Done one.", None);
+        s.user("Second task");
+        s.assistant("Done two.", None);
+        s.user("Third task");
+        s.assistant("Done three.", None);
+        s.user("Fourth task");
+        s.assistant("Done four.", None);
+
+        let turns = s.transcript.loadAll().unwrap();
+        let blockIds: Vec<String> = turns
+            .iter()
+            .filter(|t| matches!(t.role, crate::transcript::TurnRole::User))
+            .map(|t| t.blockId.clone())
+            .collect();
+        let afterTurn = s.headTurnId.clone().unwrap();
+
+        let mut log = s.compactionLog();
+        log.recordFullCompact(
+            "OLD_S4_BRIEFING",
+            vec![blockIds[0].clone(), blockIds[1].clone()],
+            &afterTurn,
+        )
+        .unwrap();
+        log.recordFullCompact(
+            "LATEST_S4_BRIEFING",
+            vec![
+                blockIds[0].clone(),
+                blockIds[1].clone(),
+                blockIds[2].clone(),
+            ],
+            &afterTurn,
+        )
+        .unwrap();
+        drop(log);
+
+        let msgs = s.reconstruct();
+        let text = msgs
+            .iter()
+            .map(|m| match m {
+                Message::User { content } | Message::Tool { content, .. } => {
+                    content.textContent().to_string()
+                }
+                Message::Assistant { content, .. } => content.clone().unwrap_or_default(),
+                Message::System { content } => content.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !text.contains("OLD_S4_BRIEFING"),
+            "superseded S4 briefing must not remain active"
+        );
+        assert_eq!(
+            text.matches("LATEST_S4_BRIEFING").count(),
+            1,
+            "latest S4 frontier should appear exactly once"
+        );
+        assert_eq!(
+            text.matches("<session_briefing>").count(),
+            1,
+            "only one S4 summary should be active"
+        );
+        assert!(
+            text.contains("Fourth task") && text.contains("Done four."),
+            "recent raw blocks outside S4 must remain intact"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1543,24 +1818,42 @@ mod tests {
 
         // Record a middle-out compaction whose afterTurn is the LATER head.
         let mut log = s.compactionLog();
-        log.recordMiddleOut(vec!["c200".into()], &laterHead, 200).unwrap();
+        log.recordMiddleOut(vec!["c200".into()], &laterHead, 200)
+            .unwrap();
         drop(log);
 
         // Reconstructing from the later head should see the truncation
         // (op is on the active chain at that point).
         let log = s.compactionLog();
         let lateMsgs = reconstruct(&s.transcript, &log, &laterHead).unwrap();
-        let lateToolBody = lateMsgs.iter().find_map(|m| {
-            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
-        }).unwrap();
-        assert!(lateToolBody.contains("bytes truncated"), "later head sees truncation");
+        let lateToolBody = lateMsgs
+            .iter()
+            .find_map(|m| {
+                if let Message::Tool { content, .. } = m {
+                    Some(content.textContent().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            lateToolBody.contains("bytes truncated"),
+            "later head sees truncation"
+        );
 
         // Reconstructing from the EARLIER head must NOT see the truncation
         // — the op was recorded after a turn that isn't on this branch.
         let earlyMsgs = reconstruct(&s.transcript, &log, &rewindTarget).unwrap();
-        let earlyToolBody = earlyMsgs.iter().find_map(|m| {
-            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
-        }).unwrap();
+        let earlyToolBody = earlyMsgs
+            .iter()
+            .find_map(|m| {
+                if let Message::Tool { content, .. } = m {
+                    Some(content.textContent().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert!(
             !earlyToolBody.contains("bytes truncated"),
             "rewound head must not see compaction recorded after the rewind point"
@@ -1578,7 +1871,11 @@ mod tests {
         s.toolResult("c210", "file1\nfile2");
         s.assistant("Listed.", None);
         let rewindTarget = s.headTurnId.clone().unwrap();
-        let block1Id = s.transcript.loadAll().unwrap().iter()
+        let block1Id = s
+            .transcript
+            .loadAll()
+            .unwrap()
+            .iter()
             .find(|t| t.content == "Task one")
             .map(|t| t.blockId.clone())
             .unwrap();
@@ -1589,7 +1886,8 @@ mod tests {
         let laterHead = s.headTurnId.clone().unwrap();
 
         let mut log = s.compactionLog();
-        log.recordBlockCompact(&block1Id, "block 1 summary", vec![], &laterHead).unwrap();
+        log.recordBlockCompact(&block1Id, "block 1 summary", vec![], &laterHead)
+            .unwrap();
         drop(log);
 
         // From the rewound head, no S2 summary should appear.
@@ -1598,7 +1896,9 @@ mod tests {
         let hasCompressed = msgs.iter().any(|m| {
             if let Message::User { content } = m {
                 content.textContent().contains("<compressed_content>")
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             !hasCompressed,
@@ -1620,14 +1920,25 @@ mod tests {
         // afterTurn = a value that isn't any real turn id (simulates
         // legacy block-id semantics from before the schema migration).
         let mut log = s.compactionLog();
-        log.recordMiddleOut(vec!["c220".into()], "b_legacy_unknown", 200).unwrap();
+        log.recordMiddleOut(vec!["c220".into()], "b_legacy_unknown", 200)
+            .unwrap();
         drop(log);
 
         let msgs = s.reconstruct();
-        let toolBody = msgs.iter().find_map(|m| {
-            if let Message::Tool { content, .. } = m { Some(content.textContent().to_string()) } else { None }
-        }).unwrap();
-        assert!(toolBody.contains("bytes truncated"), "legacy afterTurn should still apply");
+        let toolBody = msgs
+            .iter()
+            .find_map(|m| {
+                if let Message::Tool { content, .. } = m {
+                    Some(content.textContent().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            toolBody.contains("bytes truncated"),
+            "legacy afterTurn should still apply"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1639,12 +1950,13 @@ mod tests {
         let mut s = TestSession::new();
 
         // Turn 1: user sends message with image.
-        s.userWithImages("look at this screenshot", vec![
-            crate::transcript::TurnAttachment {
+        s.userWithImages(
+            "look at this screenshot",
+            vec![crate::transcript::TurnAttachment {
                 mimeType: "image/png".into(),
                 data: "iVBORw0KGgo=".into(),
-            },
-        ]);
+            }],
+        );
         s.assistant("I can see the screenshot.", None);
         let turn1Head = s.headTurnId.clone().unwrap();
 
@@ -1661,10 +1973,16 @@ mod tests {
 
         assert_eq!(msgs.len(), 2, "User + Assistant");
         if let Message::User { content } = &msgs[0] {
-            assert!(content.hasImages(), "rewound user message should have images");
+            assert!(
+                content.hasImages(),
+                "rewound user message should have images"
+            );
             let uris = content.imageUris();
             assert_eq!(uris.len(), 1);
-            assert!(uris[0].contains("iVBORw0KGgo="), "should contain original base64 data");
+            assert!(
+                uris[0].contains("iVBORw0KGgo="),
+                "should contain original base64 data"
+            );
         } else {
             panic!("expected User message");
         }
@@ -1674,12 +1992,13 @@ mod tests {
     fn imageAttachmentsReconstructedInFullChain() {
         let mut s = TestSession::new();
 
-        s.userWithImages("check this", vec![
-            crate::transcript::TurnAttachment {
+        s.userWithImages(
+            "check this",
+            vec![crate::transcript::TurnAttachment {
                 mimeType: "image/jpeg".into(),
                 data: "/9j/4AAQ".into(),
-            },
-        ]);
+            }],
+        );
         s.assistant("I see the image.", None);
         s.user("thanks");
         s.assistant("No problem.", None);
@@ -1696,7 +2015,10 @@ mod tests {
 
         // Second user message should NOT have images.
         if let Message::User { content } = &msgs[2] {
-            assert!(!content.hasImages(), "second user message should not have images");
+            assert!(
+                !content.hasImages(),
+                "second user message should not have images"
+            );
         } else {
             panic!("expected User message at index 2");
         }

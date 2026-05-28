@@ -17,10 +17,12 @@ mod command;
 mod export;
 mod fork_picker;
 mod history;
+mod jobs_panel;
 #[allow(dead_code)]
 mod layout;
-mod markdown;
+mod log_panel;
 mod lsp_panel;
+mod markdown;
 mod mcp_panel;
 mod model_panel;
 mod permissions_panel;
@@ -28,17 +30,21 @@ mod rewind_picker;
 mod selection;
 mod session_picker;
 mod subagent_panel;
-mod jobs_panel;
 mod terminal;
 mod terminal_pane;
 mod text_area;
 mod throbber;
+mod toast;
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "flatline", version, about = "General-purpose agentic terminal tool")]
+#[command(
+    name = "flatline",
+    version,
+    about = "General-purpose agentic terminal tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -212,7 +218,8 @@ fn resolveExecArgs(args: ExecArgs) -> Result<(String, construct::runner::RunConf
             .map_err(|e| anyhow::anyhow!("failed to read system prompt file: {e}"))?;
         Some(construct::runner::SystemPromptOverride::Replace(content))
     } else {
-        args.appendSystemPrompt.map(construct::runner::SystemPromptOverride::Append)
+        args.appendSystemPrompt
+            .map(construct::runner::SystemPromptOverride::Append)
     };
 
     // Filter empty strings from tools (handles `--tools ""`).
@@ -261,7 +268,10 @@ async fn runAuthCommand(command: AuthCommands) -> Result<()> {
             } else {
                 println!("Signed in as {who}.");
             }
-            println!("Credentials saved to {}", construct::auth::authPath().display());
+            println!(
+                "Credentials saved to {}",
+                construct::auth::authPath().display()
+            );
             Ok(())
         }
         AuthCommands::Login { provider } => {
@@ -283,11 +293,7 @@ async fn runAuthCommand(command: AuthCommands) -> Result<()> {
             if let Some(expiresAt) = status.expiresAt {
                 println!(
                     "  token: {}",
-                    if status.expired {
-                        "expired"
-                    } else {
-                        "valid"
-                    }
+                    if status.expired { "expired" } else { "valid" }
                 );
                 println!("  expiresAt: {expiresAt}");
             }
@@ -359,9 +365,7 @@ async fn main() -> Result<()> {
 
             match outputMode.as_str() {
                 "json" => {
-                    let result = construct::runner::run(
-                        &config, &prompt, &runConfig,
-                    ).await?;
+                    let result = construct::runner::run(&config, &prompt, &runConfig).await?;
                     let out = serde_json::json!({
                         "sessionId": result.sessionId,
                         "content": result.content,
@@ -374,9 +378,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 "events" => {
-                    let (handle, mut eventRx) = construct::runner::runStreaming(
-                        &config, &prompt, &runConfig,
-                    ).await?;
+                    let (handle, mut eventRx) =
+                        construct::runner::runStreaming(&config, &prompt, &runConfig).await?;
                     while let Some(event) = eventRx.recv().await {
                         let line = formatEventJson(&event);
                         println!("{line}");
@@ -385,9 +388,8 @@ async fn main() -> Result<()> {
                 }
                 _ => {
                     use std::io::Write;
-                    let (handle, mut logRx) = construct::runner::runStreaming(
-                        &config, &prompt, &runConfig,
-                    ).await?;
+                    let (handle, mut logRx) =
+                        construct::runner::runStreaming(&config, &prompt, &runConfig).await?;
                     while let Some(event) = logRx.recv().await {
                         use construct::control::LogEvent;
                         match event {
@@ -566,7 +568,11 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::CompactionStarted { stage } => serde_json::json!({
             "type": "compactionStarted", "stage": stage,
         }),
-        LogEvent::CompactionComplete { stage, reduction, markerBlock } => serde_json::json!({
+        LogEvent::CompactionComplete {
+            stage,
+            reduction,
+            markerBlock,
+        } => serde_json::json!({
             "type": "compactionComplete", "stage": stage,
             "reduction": reduction, "markerBlock": markerBlock,
         }),
@@ -582,10 +588,17 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::Rewound { targetTurnId } => serde_json::json!({
             "type": "rewound", "targetTurnId": targetTurnId,
         }),
-        LogEvent::LspHint { serverId, installHint } => serde_json::json!({
+        LogEvent::LspHint {
+            serverId,
+            installHint,
+        } => serde_json::json!({
             "type": "lspHint", "serverId": serverId, "installHint": installHint,
         }),
-        LogEvent::SubagentStarted { sessionId, agentType, prompt } => serde_json::json!({
+        LogEvent::SubagentStarted {
+            sessionId,
+            agentType,
+            prompt,
+        } => serde_json::json!({
             "type": "subagentStarted", "sessionId": sessionId,
             "agentType": agentType, "prompt": prompt,
         }),
@@ -596,17 +609,29 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::SubagentShellOutput { sessionId, .. } => serde_json::json!({
             "type": "subagentShellOutput", "sessionId": sessionId,
         }),
-        LogEvent::SubagentComplete { sessionId, agentType, content, turns } => serde_json::json!({
+        LogEvent::SubagentComplete {
+            sessionId,
+            agentType,
+            content,
+            turns,
+        } => serde_json::json!({
             "type": "subagentComplete", "sessionId": sessionId,
             "agentType": agentType, "content": content, "turns": turns,
         }),
-        LogEvent::Retrying { attempt, maxAttempts } => serde_json::json!({
+        LogEvent::Retrying {
+            attempt,
+            maxAttempts,
+        } => serde_json::json!({
             "type": "retrying", "attempt": attempt, "maxAttempts": maxAttempts,
         }),
         LogEvent::BudgetWarning { sessionCost, limit } => serde_json::json!({
             "type": "budgetWarning", "sessionCost": sessionCost, "limit": limit,
         }),
-        LogEvent::ScratchpadRecovered { matchedTag, snippet, recoveredChars } => serde_json::json!({
+        LogEvent::ScratchpadRecovered {
+            matchedTag,
+            snippet,
+            recoveredChars,
+        } => serde_json::json!({
             "type": "scratchpadRecovered",
             "matchedTag": matchedTag,
             "snippet": snippet,
@@ -625,13 +650,21 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
             "type": "taskStopped", "id": id, "reason": reason,
         }),
         LogEvent::MonitorRegistered {
-            id, taskId, description, command, filter,
+            id,
+            taskId,
+            description,
+            command,
+            filter,
         } => serde_json::json!({
             "type": "monitorRegistered",
             "id": id, "taskId": taskId,
             "description": description, "command": command, "filter": filter,
         }),
-        LogEvent::MonitorEvent { id, line, eventCount } => serde_json::json!({
+        LogEvent::MonitorEvent {
+            id,
+            line,
+            eventCount,
+        } => serde_json::json!({
             "type": "monitorEvent", "id": id, "line": line, "eventCount": eventCount,
         }),
         LogEvent::MonitorAutoStopped { id, reason } => serde_json::json!({
@@ -656,13 +689,23 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::WakeBatchInjected { count, summary } => serde_json::json!({
             "type": "wakeBatchInjected", "count": count, "summary": summary,
         }),
-        LogEvent::WakeRegistered { id, kind, summary } => serde_json::json!({
-            "type": "wakeRegistered", "id": id, "kind": kind.asStr(), "summary": summary,
+        LogEvent::WakeRegistered {
+            id,
+            kind,
+            summary,
+            prompt,
+            nextFireAt: _,
+        } => serde_json::json!({
+            "type": "wakeRegistered", "id": id, "kind": kind.asStr(), "summary": summary, "prompt": prompt,
         }),
         LogEvent::WakeDisarmed { id } => serde_json::json!({
             "type": "wakeDisarmed", "id": id,
         }),
-        LogEvent::AutoBgWarning { command, elapsedSecs, userTriggered } => serde_json::json!({
+        LogEvent::AutoBgWarning {
+            command,
+            elapsedSecs,
+            userTriggered,
+        } => serde_json::json!({
             "type": "autoBgWarning",
             "command": command,
             "elapsedSecs": elapsedSecs,

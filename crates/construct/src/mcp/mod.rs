@@ -35,7 +35,7 @@ pub mod serve;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinSet;
 
 use crate::message::ToolDef;
@@ -184,19 +184,12 @@ impl McpManager {
     ///
     /// Resolves the qualified name to server + original tool name,
     /// calls the tool, and applies output limits.
-    pub async fn routeToolCall(
-        &self,
-        qualifiedName: &str,
-        argsJson: &str,
-    ) -> String {
+    pub async fn routeToolCall(&self, qualifiedName: &str, argsJson: &str) -> String {
         // Resolve from registry.
         let (serverName, originalName) = {
             let reg = self.registry.read().await;
             match reg.resolve(qualifiedName) {
-                Some(entry) => (
-                    entry.serverName.clone(),
-                    entry.originalName.clone(),
-                ),
+                Some(entry) => (entry.serverName.clone(), entry.originalName.clone()),
                 None => {
                     return format!(
                         "Unknown MCP tool \"{qualifiedName}\". \
@@ -210,9 +203,7 @@ impl McpManager {
         let conn = match self.connections.get(&serverName) {
             Some(c) => c,
             None => {
-                return format!(
-                    "MCP server \"{serverName}\" is not connected."
-                );
+                return format!("MCP server \"{serverName}\" is not connected.");
             }
         };
 
@@ -227,9 +218,7 @@ impl McpManager {
             match serde_json::from_str(argsJson) {
                 Ok(serde_json::Value::Object(m)) => Some(m),
                 Ok(_) => {
-                    return format!(
-                        "MCP tool arguments must be a JSON object, got: {argsJson}"
-                    );
+                    return format!("MCP tool arguments must be a JSON object, got: {argsJson}");
                 }
                 Err(e) => {
                     return format!("Failed to parse MCP tool arguments: {e}");
@@ -292,8 +281,7 @@ impl McpManager {
         let mut joinSet = JoinSet::new();
 
         // Take ownership of all connections.
-        let connections: Vec<(String, ServerConnection)> =
-            self.connections.drain().collect();
+        let connections: Vec<(String, ServerConnection)> = self.connections.drain().collect();
 
         for (name, mut conn) in connections {
             joinSet.spawn(async move {
@@ -303,12 +291,9 @@ impl McpManager {
         }
 
         // Wait for all shutdowns with a global timeout.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                while joinSet.join_next().await.is_some() {}
-            },
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while joinSet.join_next().await.is_some() {}
+        })
         .await;
 
         // Clear registry.

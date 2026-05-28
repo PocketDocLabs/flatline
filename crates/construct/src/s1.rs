@@ -113,8 +113,7 @@ fn dedupFileReads(
                 if call.function.name != "readFile" {
                     continue;
                 }
-                let Ok(args) =
-                    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
                 else {
                     continue;
                 };
@@ -127,7 +126,10 @@ fn dedupFileReads(
                 }
                 if let Some(path) = args["path"].as_str() {
                     let norm = normalizePath(path);
-                    readsByPath.entry(norm).or_default().push((call.id.clone(), i));
+                    readsByPath
+                        .entry(norm)
+                        .or_default()
+                        .push((call.id.clone(), i));
                 }
             }
         }
@@ -352,10 +354,17 @@ fn messageLen(msg: &Message) -> usize {
     match msg {
         Message::System { content } => content.len(),
         Message::User { content } => content.charCount(),
-        Message::Assistant { content, tool_calls, .. } => {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
             let textLen = content.as_ref().map_or(0, |c| c.len());
             let callsLen = tool_calls.as_ref().map_or(0, |calls| {
-                calls.iter().map(|c| c.function.arguments.len() + c.function.name.len()).sum()
+                calls
+                    .iter()
+                    .map(|c| c.function.arguments.len() + c.function.name.len())
+                    .sum()
             });
             textLen + callsLen
         }

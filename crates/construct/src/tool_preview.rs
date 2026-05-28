@@ -19,16 +19,8 @@ pub fn previewForTool(name: &str, args: &str) -> Option<String> {
             let cmd = findClosedStringField(args, "command")?;
             Some(truncate(&cmd, PREVIEW_LIMIT))
         }
-        "readFile"
-        | "writeFile"
-        | "editFile"
-        | "multiEdit"
-        | "listDir"
-        | "deleteFile"
-        | "makeDirs"
-        | "fileOutline"
-        | "relatedFiles"
-        | "diagnostics" => {
+        "readFile" | "writeFile" | "editFile" | "multiEdit" | "listDir" | "deleteFile"
+        | "makeDirs" | "fileOutline" | "relatedFiles" | "diagnostics" => {
             let path = findClosedStringField(args, "path")?;
             Some(truncate(&path, PREVIEW_LIMIT))
         }
@@ -68,9 +60,7 @@ pub fn previewForTool(name: &str, args: &str) -> Option<String> {
         "viewSymbol" => {
             let sym = findClosedStringField(args, "symbol")?;
             match findClosedStringField(args, "file") {
-                Some(f) if !f.is_empty() => {
-                    Some(truncate(&format!("{sym} in {f}"), PREVIEW_LIMIT))
-                }
+                Some(f) if !f.is_empty() => Some(truncate(&format!("{sym} in {f}"), PREVIEW_LIMIT)),
                 _ => Some(truncate(&sym, PREVIEW_LIMIT)),
             }
         }
@@ -95,8 +85,9 @@ pub fn previewForTool(name: &str, args: &str) -> Option<String> {
             let p = findClosedStringField(args, "pattern")?;
             Some(truncate(&format!("\"{p}\""), PREVIEW_LIMIT))
         }
-        "diff" => findClosedStringField(args, "path")
-            .or_else(|| findClosedStringField(args, "file1")),
+        "diff" => {
+            findClosedStringField(args, "path").or_else(|| findClosedStringField(args, "file1"))
+        }
         _ => None,
     }
 }
@@ -170,10 +161,7 @@ pub fn findClosedStringField(partial: &str, key: &str) -> Option<String> {
                 i += 1;
             }
             b'"' => {
-                if expectingKey
-                    && depth == 1
-                    && bytes[i..].starts_with(needleBytes)
-                {
+                if expectingKey && depth == 1 && bytes[i..].starts_with(needleBytes) {
                     return readColonStringValue(bytes, i + needleBytes.len());
                 }
                 inString = true;
@@ -323,15 +311,13 @@ mod tests {
     #[test]
     fn handlesUnicodeEscape() {
         let args = r#"{"label": "aéb"}"#;
-        assert_eq!(
-            findClosedStringField(args, "label").as_deref(),
-            Some("aéb"),
-        );
+        assert_eq!(findClosedStringField(args, "label").as_deref(), Some("aéb"),);
     }
 
     #[test]
     fn previewShellCommand() {
-        let args = r#"{"command": "cargo check --all-targets", "explanation": "x", "impact": "read"}"#;
+        let args =
+            r#"{"command": "cargo check --all-targets", "explanation": "x", "impact": "read"}"#;
         assert_eq!(
             previewForTool("shell", args).as_deref(),
             Some("cargo check --all-targets"),

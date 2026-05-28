@@ -28,8 +28,7 @@ use crate::shells::ShellRegistry;
 /// Build a registry seeded with `main` plus a black-hole drainer for
 /// every PTY's output and any future-spawned IO channels. Headless mode
 /// has nothing to render; we just keep the channels alive.
-fn headlessRegistry()
--> anyhow::Result<std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>> {
+fn headlessRegistry() -> anyhow::Result<std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>> {
     use crate::shells::SpawnedBy;
     let (ioTx, mut ioRx) = mpsc::channel::<(String, shell::ShellIo, SpawnedBy)>(8);
     let (registry, mainIo) = ShellRegistry::newWithMain(120, 40, ioTx)?;
@@ -250,7 +249,10 @@ pub async fn runStreaming(
     config: &Config,
     prompt: &str,
     runConfig: &RunConfig,
-) -> Result<(tokio::task::JoinHandle<Result<RunResult>>, mpsc::Receiver<LogEvent>)> {
+) -> Result<(
+    tokio::task::JoinHandle<Result<RunResult>>,
+    mpsc::Receiver<LogEvent>,
+)> {
     let agentShells = headlessRegistry()?;
 
     let permissions = Permissions::allowAll();
@@ -297,7 +299,14 @@ pub async fn runStreaming(
         let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
         let sendResult = session
-            .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx)
+            .send(
+                &input,
+                &logTx,
+                &sessionRequestTx,
+                &mut cancelRx,
+                &mut steerRx,
+                &mut userBgRx,
+            )
             .await;
 
         // Shut down background LSP/MCP cleanly so their senders drop before
@@ -339,71 +348,78 @@ pub fn runSession<'a>(
     _maxTurns: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RunResult>> + Send + 'a>> {
     Box::pin(async move {
-    let (logTx, mut logRx) = mpsc::channel::<LogEvent>(256);
-    let (sessionRequestTx, sessionRequestRx) = mpsc::channel::<SessionRequest>(16);
-    let (_cancelTx, cancelRx) = watch::channel(false);
-    let mut cancelRx = cancelRx;
+        let (logTx, mut logRx) = mpsc::channel::<LogEvent>(256);
+        let (sessionRequestTx, sessionRequestRx) = mpsc::channel::<SessionRequest>(16);
+        let (_cancelTx, cancelRx) = watch::channel(false);
+        let mut cancelRx = cancelRx;
 
-    let sessionId = session.sessionId().to_string();
+        let sessionId = session.sessionId().to_string();
 
-    // Headless: auto-deny any permit request.
-    let _permitAutoDeny = spawnPermitAutoDeny(sessionRequestRx);
+        // Headless: auto-deny any permit request.
+        let _permitAutoDeny = spawnPermitAutoDeny(sessionRequestRx);
 
-    // Spawn log drain in background. session.send() emits events as it runs,
-    // so we need to consume them concurrently to avoid blocking on a full channel.
-    let drainHandle = tokio::spawn(async move {
-        let mut content = String::new();
-        let mut turns: usize = 0;
-        while let Some(event) = logRx.recv().await {
-            match event {
-                LogEvent::ContentDelta(text) => content.push_str(&text),
-                LogEvent::TurnComplete => turns += 1,
-                LogEvent::ToolStarted { name, summary } => {
-                    tracing::info!(tool = %name, summary = %summary, "tool started");
+        // Spawn log drain in background. session.send() emits events as it runs,
+        // so we need to consume them concurrently to avoid blocking on a full channel.
+        let drainHandle = tokio::spawn(async move {
+            let mut content = String::new();
+            let mut turns: usize = 0;
+            while let Some(event) = logRx.recv().await {
+                match event {
+                    LogEvent::ContentDelta(text) => content.push_str(&text),
+                    LogEvent::TurnComplete => turns += 1,
+                    LogEvent::ToolStarted { name, summary } => {
+                        tracing::info!(tool = %name, summary = %summary, "tool started");
+                    }
+                    LogEvent::ToolAutoApproved { name, summary } => {
+                        tracing::info!(tool = %name, summary = %summary, "tool auto-approved");
+                    }
+                    LogEvent::ToolResult { name, .. } => {
+                        tracing::debug!(tool = %name, "tool result received");
+                    }
+                    LogEvent::Error(msg) => tracing::error!("session error: {msg}"),
+                    _ => {}
                 }
-                LogEvent::ToolAutoApproved { name, summary } => {
-                    tracing::info!(tool = %name, summary = %summary, "tool auto-approved");
-                }
-                LogEvent::ToolResult { name, .. } => {
-                    tracing::debug!(tool = %name, "tool result received");
-                }
-                LogEvent::Error(msg) => tracing::error!("session error: {msg}"),
-                _ => {}
             }
-        }
-        (content, turns)
-    });
+            (content, turns)
+        });
 
-    // Run the agentic turn loop.
-    let input = crate::session::UserInput::from(prompt.to_string());
-    // Headless runners don't support mid-turn steering.
-    let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
-    let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
+        // Run the agentic turn loop.
+        let input = crate::session::UserInput::from(prompt.to_string());
+        // Headless runners don't support mid-turn steering.
+        let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+        let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
-    let sendResult = session
-        .send(&input, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx)
-        .await;
+        let sendResult = session
+            .send(
+                &input,
+                &logTx,
+                &sessionRequestTx,
+                &mut cancelRx,
+                &mut steerRx,
+                &mut userBgRx,
+            )
+            .await;
 
-    // Shut down background LSP/MCP cleanly so their senders drop before
-    // the tokio runtime unwinds (async-lsp panics if servers outlive the
-    // runtime shutdown).
-    session.shutdownLsp().await;
-    session.shutdownMcp().await;
+        // Shut down background LSP/MCP cleanly so their senders drop before
+        // the tokio runtime unwinds (async-lsp panics if servers outlive the
+        // runtime shutdown).
+        session.shutdownLsp().await;
+        session.shutdownMcp().await;
 
-    // Drop senders so drain tasks exit.
-    drop(logTx);
-    drop(sessionRequestTx);
+        // Drop senders so drain tasks exit.
+        drop(logTx);
+        drop(sessionRequestTx);
 
-    let (content, turns) = drainHandle.await?;
+        let (content, turns) = drainHandle.await?;
 
-    // Propagate errors from the turn loop.
-    sendResult?;
+        // Propagate errors from the turn loop.
+        sendResult?;
 
-    Ok(RunResult {
-        content,
-        sessionId,
-        turns,
-        maxTurnsHit: false,
-    })
+        Ok(RunResult {
+            content,
+            sessionId,
+            turns,
+            maxTurnsHit: false,
+        })
     })
 }

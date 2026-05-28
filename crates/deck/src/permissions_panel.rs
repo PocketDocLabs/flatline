@@ -84,7 +84,10 @@ impl PermissionsPanel {
     }
 
     fn editable(&self) -> bool {
-        matches!(self.source, PermissionsSource::Project | PermissionsSource::Local)
+        matches!(
+            self.source,
+            PermissionsSource::Project | PermissionsSource::Local
+        )
     }
 
     fn dirty(&self) -> bool {
@@ -155,8 +158,12 @@ impl PermissionsPanel {
 
     /// Render as a centered popup overlay.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let popupWidth = (area.width * 7 / 10).max(50).min(area.width.saturating_sub(4));
-        let popupHeight = (area.height * 7 / 10).max(14).min(area.height.saturating_sub(2));
+        let popupWidth = (area.width * 7 / 10)
+            .max(50)
+            .min(area.width.saturating_sub(4));
+        let popupHeight = (area.height * 7 / 10)
+            .max(14)
+            .min(area.height.saturating_sub(2));
         let popupX = area.x + (area.width.saturating_sub(popupWidth)) / 2;
         let popupY = area.y + (area.height.saturating_sub(popupHeight)) / 2;
 
@@ -190,7 +197,14 @@ impl PermissionsPanel {
         self.renderHeader(buf, inner.x, w, &mut y);
 
         if self.rules.is_empty() {
-            line(buf, inner.x + 2, y, w - 2, "No rules configured.", style(FG_DIM, BG));
+            line(
+                buf,
+                inner.x + 2,
+                y,
+                w - 2,
+                "No rules configured.",
+                style(FG_DIM, BG),
+            );
         } else {
             self.renderRuleList(buf, inner, w, &mut y);
         }
@@ -207,7 +221,14 @@ impl PermissionsPanel {
             PermissionsSource::Local => &self.configPath,
         };
         let sourceLine = format!(" Source: {sourceLabel}");
-        line(buf, x, *y, w, &truncateStr(&sourceLine, w), style(FG_DIM, BG));
+        line(
+            buf,
+            x,
+            *y,
+            w,
+            &truncateStr(&sourceLine, w),
+            style(FG_DIM, BG),
+        );
         *y += 1;
 
         // Default mode.
@@ -259,7 +280,12 @@ impl PermissionsPanel {
             if sel {
                 fillRect(
                     buf,
-                    Rect { x: inner.x, y: *y, width: inner.width, height: 1 },
+                    Rect {
+                        x: inner.x,
+                        y: *y,
+                        width: inner.width,
+                        height: 1,
+                    },
                     style(FG_PRIMARY, bg),
                 );
             }
@@ -283,10 +309,7 @@ impl PermissionsPanel {
             let toolPadded = format!("{:width$}", rule.tool, width = toolColWidth);
 
             // Pattern.
-            let pattern = rule
-                .pattern
-                .as_deref()
-                .unwrap_or("*");
+            let pattern = rule.pattern.as_deref().unwrap_or("*");
 
             let rowText = format!("{marker}{icon}{toolPadded}  {pattern}");
             let rowStyle = if deleted {
@@ -335,8 +358,7 @@ impl PermissionsPanel {
         // Key hints (context-sensitive).
         let hints = if self.editable() {
             if self.dirty() {
-                "\u{2191}\u{2193}: select  [x] delete  [t] toggle  [s] save  Esc: close"
-                    .to_string()
+                "\u{2191}\u{2193}: select  [x] delete  [t] toggle  [s] save  Esc: close".to_string()
             } else {
                 "\u{2191}\u{2193}: select  [x] delete  [t] toggle  Esc: close".to_string()
             }
@@ -366,7 +388,12 @@ impl PermissionsPanel {
 // -- Utility functions --------------------------------------------------------
 
 fn line(buf: &mut Buffer, x: u16, y: u16, maxWidth: usize, text: &str, s: Style) {
-    let area = Rect { x, y, width: maxWidth as u16, height: 1 };
+    let area = Rect {
+        x,
+        y,
+        width: maxWidth as u16,
+        height: 1,
+    };
     Paragraph::new(text.to_string()).style(s).render(area, buf);
 }
 

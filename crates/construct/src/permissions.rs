@@ -28,13 +28,28 @@ use serde::{Deserialize, Serialize};
 /// [`Permissions::check`] only auto-approves shell calls explicitly
 /// marked with `impact: read` when these read-only tool rules are enabled.
 const READ_ONLY_TOOLS: &[&str] = &[
-    "readFile", "glob", "grep", "listDir", "structSearch", "diff",
-    "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
-    "shellHistory", "readOutput", "searchOutput", "readTerminal",
+    "readFile",
+    "glob",
+    "grep",
+    "listDir",
+    "structSearch",
+    "diff",
+    "fuzzyFind",
+    "fileOutline",
+    "viewSymbol",
+    "relatedFiles",
+    "shellHistory",
+    "readOutput",
+    "searchOutput",
+    "readTerminal",
     "terminalList",
-    "jobOutput", "jobList",
+    "jobOutput",
+    "jobList",
     "monitorList",
-    "webSearch", "webFetch", "webSimilar", "diagnostics",
+    "webSearch",
+    "webFetch",
+    "webSimilar",
+    "diagnostics",
 ];
 
 /// Response from the supervisor (TUI or parent agent) to a permission prompt.
@@ -67,8 +82,7 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
         | ToolAction::ViewSymbol { file: path, .. }
         | ToolAction::RelatedFiles { path } => pathPatterns(path),
 
-        ToolAction::CopyFile { dest, .. }
-        | ToolAction::MoveFile { dest, .. } => pathPatterns(dest),
+        ToolAction::CopyFile { dest, .. } | ToolAction::MoveFile { dest, .. } => pathPatterns(dest),
 
         ToolAction::Glob { path, .. } => {
             if let Some(p) = path {
@@ -286,7 +300,8 @@ fn shellPatterns(command: &str) -> Vec<String> {
     let subcommand = tokens.get(1).and_then(|t| {
         let first = t.chars().next()?;
         if first.is_alphabetic()
-            && t.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            && t.chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
         {
             Some(*t)
         } else {
@@ -423,7 +438,11 @@ impl Permissions {
     pub fn allowAll() -> Self {
         Self {
             defaultMode: PermitMode::Deny,
-            rules: vec![Rule { tool: "*".into(), pattern: None, allow: true }],
+            rules: vec![Rule {
+                tool: "*".into(),
+                pattern: None,
+                allow: true,
+            }],
             source: PermissionsSource::BuiltIn,
         }
     }
@@ -434,7 +453,11 @@ impl Permissions {
             defaultMode: PermitMode::Ask,
             rules: READ_ONLY_TOOLS
                 .iter()
-                .map(|&tool| Rule { tool: tool.into(), pattern: None, allow: true })
+                .map(|&tool| Rule {
+                    tool: tool.into(),
+                    pattern: None,
+                    allow: true,
+                })
                 .collect(),
             source: PermissionsSource::BuiltIn,
         }
@@ -583,7 +606,10 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::HistorySearch { query, .. } => ("historySearch", query),
         ToolAction::Task { prompt, .. } => ("task", prompt),
         ToolAction::Diagnostics { path, .. } => ("diagnostics", path),
-        ToolAction::Mcp { qualifiedName, args } => (qualifiedName, args),
+        ToolAction::Mcp {
+            qualifiedName,
+            args,
+        } => (qualifiedName, args),
         ToolAction::Unknown { name, args } => (name, args),
     }
 }
@@ -769,10 +795,7 @@ mod tests {
     fn terminalListAutoApprovedUnderReadOnly() {
         // Inventory is harmless — terminalList should be auto-approved.
         let perms = Permissions::allowReadOnly();
-        assert_eq!(
-            perms.check(&ToolAction::TerminalList),
-            Verdict::Allow,
-        );
+        assert_eq!(perms.check(&ToolAction::TerminalList), Verdict::Allow,);
     }
 
     #[test]
@@ -797,10 +820,7 @@ mod tests {
             terminal: None,
             runInBackground: false,
         };
-        assert_eq!(
-            normalizeRulePattern(&action, "shell"),
-            Some("shell".into()),
-        );
+        assert_eq!(normalizeRulePattern(&action, "shell"), Some("shell".into()),);
 
         // A normal substring also stays as-is.
         assert_eq!(
@@ -822,10 +842,7 @@ mod tests {
             terminal: None,
             runInBackground: true,
         };
-        assert_eq!(
-            normalizeRulePattern(&action, "shell"),
-            Some("shell".into()),
-        );
+        assert_eq!(normalizeRulePattern(&action, "shell"), Some("shell".into()),);
     }
 
     #[test]
@@ -865,11 +882,15 @@ mod tests {
             ShellImpact::MinorMod,
         ));
         assert!(matches!(
-            toolImpact(&ToolAction::TerminalSwitch { name: "main".into() }),
+            toolImpact(&ToolAction::TerminalSwitch {
+                name: "main".into()
+            }),
             ShellImpact::MinorMod,
         ));
         assert!(matches!(
-            toolImpact(&ToolAction::TerminalKill { name: "build".into() }),
+            toolImpact(&ToolAction::TerminalKill {
+                name: "build".into()
+            }),
             ShellImpact::Delete,
         ));
         // Inventory is genuinely read-only.
@@ -893,10 +914,7 @@ mod tests {
             terminal: None,
             runInBackground: true,
         };
-        assert_eq!(
-            toolExplanation(&action),
-            Some("build the release binary"),
-        );
+        assert_eq!(toolExplanation(&action), Some("build the release binary"),);
         // Empty explanation still reports None so the UI doesn't render
         // an empty section.
         let empty = ToolAction::Shell {

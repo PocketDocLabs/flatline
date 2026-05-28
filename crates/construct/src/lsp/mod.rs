@@ -50,15 +50,9 @@ pub struct LspHint {
 
 impl LspManager {
     /// Create a new manager with resolved server definitions.
-    pub fn new(
-        userConfig: &LspConfig,
-        projectConfig: &LspConfig,
-    ) -> Self {
+    pub fn new(userConfig: &LspConfig, projectConfig: &LspConfig) -> Self {
         let serverDefs = resolveServers(userConfig, projectConfig);
-        tracing::debug!(
-            serverCount = serverDefs.len(),
-            "LSP manager initialized"
-        );
+        tracing::debug!(serverCount = serverDefs.len(), "LSP manager initialized");
         Self {
             connections: HashMap::new(),
             serverDefs,
@@ -111,10 +105,7 @@ impl LspManager {
                     continue;
                 }
 
-                let projectRoot = self.findProjectRoot(
-                    &projectDir.to_string_lossy(),
-                    &serverId,
-                );
+                let projectRoot = self.findProjectRoot(&projectDir.to_string_lossy(), &serverId);
                 let connKey = format!("{serverId}:{}", projectRoot.display());
 
                 if self.connections.contains_key(&connKey) {
@@ -195,8 +186,7 @@ impl LspManager {
                             tracing::info!(server = %serverId, "marking unavailable: {e}");
                             self.unavailable.insert(serverId.clone());
                             if !self.hintedServers.contains(&serverId) {
-                                if let Some(def) =
-                                    self.serverDefs.iter().find(|d| d.id == serverId)
+                                if let Some(def) = self.serverDefs.iter().find(|d| d.id == serverId)
                                 {
                                     if !def.installHint.is_empty() {
                                         self.hintedServers.insert(serverId.clone());
@@ -319,9 +309,10 @@ impl LspManager {
         let defs = self.findServersForExtension(&ext);
         defs.iter().any(|(id, _)| {
             !self.unavailable.contains(id)
-                && self.connections.values().any(|c| {
-                    c.config().id == *id && *c.state() == ConnectionState::Ready
-                })
+                && self
+                    .connections
+                    .values()
+                    .any(|c| c.config().id == *id && *c.state() == ConnectionState::Ready)
         })
     }
 
@@ -365,9 +356,8 @@ impl LspManager {
         // Check if any connection already has diagnostics for this file.
         let existing = self.collectExistingDiagnostics(path);
         if !existing.is_empty() {
-            let formatted = diagnostics::formatDiagnostics(
-                path, &existing, DiagnosticSeverity::ERROR,
-            );
+            let formatted =
+                diagnostics::formatDiagnostics(path, &existing, DiagnosticSeverity::ERROR);
             return (formatted, None);
         }
 
@@ -382,7 +372,11 @@ impl LspManager {
     }
 
     /// Collect diagnostics from all matching connections, waiting for results.
-    async fn collectDiagnostics(&self, path: &str, timeout: Duration) -> Vec<async_lsp::lsp_types::Diagnostic> {
+    async fn collectDiagnostics(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Vec<async_lsp::lsp_types::Diagnostic> {
         let ext = match fileExtension(path) {
             Some(e) => e,
             None => return Vec::new(),
@@ -529,7 +523,9 @@ impl LspManager {
         let filePath = std::path::Path::new(path);
 
         if filePath.is_dir() {
-            return self.getDiagnosticsForDirectory(path, minSeverity, timeout).await;
+            return self
+                .getDiagnosticsForDirectory(path, minSeverity, timeout)
+                .await;
         }
 
         if !self.hasActiveServer(path) {
@@ -694,9 +690,7 @@ impl LspManager {
             dir = d.parent().map(|p| p.to_path_buf());
         }
 
-        bestMatch.unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        })
+        bestMatch.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 }
 

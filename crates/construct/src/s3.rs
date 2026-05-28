@@ -67,7 +67,11 @@ pub async fn run(
 ) -> Result<S3Result> {
     let turns = transcript.loadAll()?;
     if turns.is_empty() || topics.is_empty() {
-        return Ok(S3Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S3Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     let ops = compactionLog.loadAll()?;
@@ -80,15 +84,17 @@ pub async fn run(
             eligibleCount = 0,
             "S3: no eligible topics found"
         );
-        return Ok(S3Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S3Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     // Fire parallel compaction calls.
     let futures: Vec<_> = eligible
         .iter()
-        .map(|topic| {
-            compactTopic(topic, &blockContent, client, utilityModel)
-        })
+        .map(|topic| compactTopic(topic, &blockContent, client, utilityModel))
         .collect();
 
     let results: Vec<Result<(String, Option<f64>)>> = join_all(futures).await;
@@ -111,10 +117,7 @@ pub async fn run(
                     .iter()
                     .filter_map(|bid| blockContent.get(bid))
                     .map(|b| {
-                        b.agentTurns
-                            .iter()
-                            .map(|t| t.content.len())
-                            .sum::<usize>()
+                        b.agentTurns.iter().map(|t| t.content.len()).sum::<usize>()
                             + b.userMessage.len()
                     })
                     .sum();
@@ -147,8 +150,16 @@ pub async fn run(
     }
 
     let didWork = !compacted.is_empty();
-    let cost = if totalCost > 0.0 { Some(totalCost) } else { None };
-    Ok(S3Result { didWork, compacted, cost })
+    let cost = if totalCost > 0.0 {
+        Some(totalCost)
+    } else {
+        None
+    };
+    Ok(S3Result {
+        didWork,
+        compacted,
+        cost,
+    })
 }
 
 /// Resolve which topics are eligible for S3 compaction.
@@ -192,7 +203,13 @@ fn resolveEligible(
     let superseded = crate::compaction::supersededBlocks(ops);
     let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, &superseded, 0.30);
 
-    findEligibleTopics(topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted)
+    findEligibleTopics(
+        topics,
+        &topicBlockMap,
+        &zone,
+        &compactedSizes,
+        &alreadyCompacted,
+    )
 }
 
 /// An eligible topic ready for compaction.
@@ -225,10 +242,13 @@ fn groupTurnsByBlock(turns: &[Turn]) -> HashMap<String, BlockTurns> {
     for turn in turns {
         if !map.contains_key(&turn.blockId) {
             order.push(turn.blockId.clone());
-            map.insert(turn.blockId.clone(), BlockTurns {
-                userMessage: String::new(),
-                agentTurns: Vec::new(),
-            });
+            map.insert(
+                turn.blockId.clone(),
+                BlockTurns {
+                    userMessage: String::new(),
+                    agentTurns: Vec::new(),
+                },
+            );
         }
 
         let block = map.get_mut(&turn.blockId).unwrap();
@@ -360,10 +380,8 @@ fn buildTopicBlockMap(activeTurns: &[Turn], topics: &[TopicInfo]) -> HashMap<Str
         }
     }
 
-    let startToTopic: HashMap<&str, &TopicInfo> = topics
-        .iter()
-        .map(|t| (t.startBlock.as_str(), t))
-        .collect();
+    let startToTopic: HashMap<&str, &TopicInfo> =
+        topics.iter().map(|t| (t.startBlock.as_str(), t)).collect();
 
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     let mut currentTopic: Option<&TopicInfo> = None;
@@ -439,10 +457,16 @@ async fn compactTopic(
                 }
                 TurnRole::ToolCall => {
                     let name = turn.toolName.as_deref().unwrap_or("unknown");
-                    let argStr = turn.toolArgs.as_ref()
+                    let argStr = turn
+                        .toolArgs
+                        .as_ref()
                         .map(|v| {
                             let s = v.to_string();
-                            if s.len() > 500 { format!("{}...", &s[..s.floor_char_boundary(500)]) } else { s }
+                            if s.len() > 500 {
+                                format!("{}...", &s[..s.floor_char_boundary(500)])
+                            } else {
+                                s
+                            }
                         })
                         .unwrap_or_else(|| "{}".to_string());
                     exchangeParts.push(format!(
@@ -564,7 +588,14 @@ mod tests {
     use crate::transcript::TurnStatus;
     use std::collections::HashMap;
 
-    fn makeTurn(id: &str, blockId: &str, topicId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+    fn makeTurn(
+        id: &str,
+        blockId: &str,
+        topicId: &str,
+        role: TurnRole,
+        content: &str,
+        parentId: Option<&str>,
+    ) -> Turn {
         Turn {
             id: id.to_string(),
             blockId: blockId.to_string(),
@@ -598,7 +629,14 @@ mod tests {
             // b_aaa: classifier hadn't run yet → stamped with previous
             // (empty) id, but topics[] says topic-01 starts here.
             makeTurn("t1", "b_aaa", "", TurnRole::User, "a", None),
-            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, "b", Some("t1")),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "topic-01",
+                TurnRole::Assistant,
+                "b",
+                Some("t1"),
+            ),
             // b_bbb: still topic-01.
             makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, "c", Some("t2")),
             // b_ccc: user turn carries the STALE topic-01 id; classifier
@@ -607,16 +645,28 @@ mod tests {
             makeTurn("t5", "b_ddd", "topic-02", TurnRole::User, "e", Some("t4")),
         ];
         let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "First".into(), startBlock: "b_aaa".into(), blockCount: 2 },
-            TopicInfo { topicId: "topic-02".into(), label: "Second".into(), startBlock: "b_ccc".into(), blockCount: 2 },
+            TopicInfo {
+                topicId: "topic-01".into(),
+                label: "First".into(),
+                startBlock: "b_aaa".into(),
+                blockCount: 2,
+            },
+            TopicInfo {
+                topicId: "topic-02".into(),
+                label: "Second".into(),
+                startBlock: "b_ccc".into(),
+                blockCount: 2,
+            },
         ];
         let map = buildTopicBlockMap(&turns, &topics);
         assert_eq!(
-            map["topic-01"], vec!["b_aaa", "b_bbb"],
+            map["topic-01"],
+            vec!["b_aaa", "b_bbb"],
             "topic-01 should NOT include b_ccc despite its stale stamp"
         );
         assert_eq!(
-            map["topic-02"], vec!["b_ccc", "b_ddd"],
+            map["topic-02"],
+            vec!["b_ccc", "b_ddd"],
             "topic-02 owns b_ccc because topics[].startBlock says so"
         );
     }
@@ -625,13 +675,62 @@ mod tests {
     fn zoneBlocks_returns_oldest_30_percent() {
         let turns = vec![
             makeTurn("t1", "b_aaa", "", TurnRole::User, &"x".repeat(50), None),
-            makeTurn("t2", "b_aaa", "", TurnRole::Assistant, &"y".repeat(50), Some("t1")),
-            makeTurn("t3", "b_bbb", "", TurnRole::User, &"x".repeat(50), Some("t2")),
-            makeTurn("t4", "b_bbb", "", TurnRole::Assistant, &"y".repeat(50), Some("t3")),
-            makeTurn("t5", "b_ccc", "", TurnRole::User, &"x".repeat(50), Some("t4")),
-            makeTurn("t6", "b_ccc", "", TurnRole::Assistant, &"y".repeat(50), Some("t5")),
-            makeTurn("t7", "b_ddd", "", TurnRole::User, &"x".repeat(50), Some("t6")),
-            makeTurn("t8", "b_ddd", "", TurnRole::Assistant, &"y".repeat(50), Some("t7")),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(50),
+                Some("t1"),
+            ),
+            makeTurn(
+                "t3",
+                "b_bbb",
+                "",
+                TurnRole::User,
+                &"x".repeat(50),
+                Some("t2"),
+            ),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(50),
+                Some("t3"),
+            ),
+            makeTurn(
+                "t5",
+                "b_ccc",
+                "",
+                TurnRole::User,
+                &"x".repeat(50),
+                Some("t4"),
+            ),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(50),
+                Some("t5"),
+            ),
+            makeTurn(
+                "t7",
+                "b_ddd",
+                "",
+                TurnRole::User,
+                &"x".repeat(50),
+                Some("t6"),
+            ),
+            makeTurn(
+                "t8",
+                "b_ddd",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(50),
+                Some("t7"),
+            ),
         ];
 
         let compactedSizes = HashMap::new();
@@ -648,13 +747,62 @@ mod tests {
         // Zone should include blocks aaa (10) + bbb (10) + ccc (200 pushes past 126).
         let turns = vec![
             makeTurn("t1", "b_aaa", "", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_aaa", "", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
-            makeTurn("t3", "b_bbb", "", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_bbb", "", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
-            makeTurn("t5", "b_ccc", "", TurnRole::User, &"x".repeat(100), Some("t4")),
-            makeTurn("t6", "b_ccc", "", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
-            makeTurn("t7", "b_ddd", "", TurnRole::User, &"x".repeat(100), Some("t6")),
-            makeTurn("t8", "b_ddd", "", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t1"),
+            ),
+            makeTurn(
+                "t3",
+                "b_bbb",
+                "",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t2"),
+            ),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t3"),
+            ),
+            makeTurn(
+                "t5",
+                "b_ccc",
+                "",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t4"),
+            ),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t5"),
+            ),
+            makeTurn(
+                "t7",
+                "b_ddd",
+                "",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t6"),
+            ),
+            makeTurn(
+                "t8",
+                "b_ddd",
+                "",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t7"),
+            ),
         ];
 
         let mut compactedSizes = HashMap::new();
@@ -667,26 +815,95 @@ mod tests {
         // With compacted sizes: 30% of 420 = 126 → aaa(10)+bbb(10)+ccc(200) fills it.
         assert!(zone.contains("b_aaa"), "compacted block should be in zone");
         assert!(zone.contains("b_bbb"), "compacted block should be in zone");
-        assert!(zone.contains("b_ccc"), "uncompacted block should now be reachable");
+        assert!(
+            zone.contains("b_ccc"),
+            "uncompacted block should now be reachable"
+        );
         assert!(!zone.contains("b_ddd"), "last block should not be in zone");
     }
 
     #[test]
     fn findEligibleTopics_finds_multi_block_s2d_topic_in_zone() {
         let turns = vec![
-            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
-            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
-            makeTurn("t5", "b_ccc", "topic-02", TurnRole::User, &"x".repeat(100), Some("t4")),
-            makeTurn("t6", "b_ccc", "topic-02", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
-            makeTurn("t7", "b_ddd", "topic-02", TurnRole::User, &"x".repeat(100), Some("t6")),
-            makeTurn("t8", "b_ddd", "topic-02", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+            makeTurn(
+                "t1",
+                "b_aaa",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                None,
+            ),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t1"),
+            ),
+            makeTurn(
+                "t3",
+                "b_bbb",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t2"),
+            ),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t3"),
+            ),
+            makeTurn(
+                "t5",
+                "b_ccc",
+                "topic-02",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t4"),
+            ),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                "topic-02",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t5"),
+            ),
+            makeTurn(
+                "t7",
+                "b_ddd",
+                "topic-02",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t6"),
+            ),
+            makeTurn(
+                "t8",
+                "b_ddd",
+                "topic-02",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t7"),
+            ),
         ];
 
         let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "First".into(), startBlock: "b_aaa".into(), blockCount: 2 },
-            TopicInfo { topicId: "topic-02".into(), label: "Second".into(), startBlock: "b_ccc".into(), blockCount: 2 },
+            TopicInfo {
+                topicId: "topic-01".into(),
+                label: "First".into(),
+                startBlock: "b_aaa".into(),
+                blockCount: 2,
+            },
+            TopicInfo {
+                topicId: "topic-02".into(),
+                label: "Second".into(),
+                startBlock: "b_ccc".into(),
+                blockCount: 2,
+            },
         ];
 
         let topicBlockMap = buildTopicBlockMap(&turns, &topics);
@@ -698,29 +915,95 @@ mod tests {
         let alreadyCompacted: HashSet<String> = HashSet::new();
 
         let eligible = findEligibleTopics(
-            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+            &topics,
+            &topicBlockMap,
+            &zone,
+            &compactedSizes,
+            &alreadyCompacted,
         );
 
-        assert!(!eligible.is_empty(), "should find at least one eligible topic");
+        assert!(
+            !eligible.is_empty(),
+            "should find at least one eligible topic"
+        );
         assert_eq!(eligible[0].topicId, "topic-01");
     }
 
     #[test]
     fn findEligibleTopics_allows_partial_topic_compaction() {
         let turns = vec![
-            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
-            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
-            makeTurn("t5", "b_ccc", "topic-01", TurnRole::User, &"x".repeat(100), Some("t4")),
-            makeTurn("t6", "b_ccc", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
-            makeTurn("t7", "b_ddd", "topic-01", TurnRole::User, &"x".repeat(100), Some("t6")),
-            makeTurn("t8", "b_ddd", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+            makeTurn(
+                "t1",
+                "b_aaa",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                None,
+            ),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t1"),
+            ),
+            makeTurn(
+                "t3",
+                "b_bbb",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t2"),
+            ),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t3"),
+            ),
+            makeTurn(
+                "t5",
+                "b_ccc",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t4"),
+            ),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t5"),
+            ),
+            makeTurn(
+                "t7",
+                "b_ddd",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t6"),
+            ),
+            makeTurn(
+                "t8",
+                "b_ddd",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t7"),
+            ),
         ];
 
-        let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "Big Topic".into(), startBlock: "b_aaa".into(), blockCount: 4 },
-        ];
+        let topics = vec![TopicInfo {
+            topicId: "topic-01".into(),
+            label: "Big Topic".into(),
+            startBlock: "b_aaa".into(),
+            blockCount: 4,
+        }];
 
         let topicBlockMap = buildTopicBlockMap(&turns, &topics);
         // Only first 2 blocks S2'd.
@@ -731,11 +1014,19 @@ mod tests {
         let alreadyCompacted: HashSet<String> = HashSet::new();
 
         let eligible = findEligibleTopics(
-            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+            &topics,
+            &topicBlockMap,
+            &zone,
+            &compactedSizes,
+            &alreadyCompacted,
         );
 
         assert_eq!(eligible.len(), 1, "topic-01 should be eligible (partial)");
-        assert_eq!(eligible[0].blockIds.len(), 2, "only the 2 in-zone S2'd blocks");
+        assert_eq!(
+            eligible[0].blockIds.len(),
+            2,
+            "only the 2 in-zone S2'd blocks"
+        );
         assert_eq!(eligible[0].blockIds, vec!["b_aaa", "b_bbb"]);
     }
 
@@ -747,30 +1038,112 @@ mod tests {
     #[test]
     fn findEligibleTopics_continues_partial_topic() {
         let mut turns = vec![
-            makeTurn("t1", "b_aaa", "topic-01", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_aaa", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t1")),
-            makeTurn("t3", "b_bbb", "topic-01", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_bbb", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t3")),
-            makeTurn("t5", "b_ccc", "topic-01", TurnRole::User, &"x".repeat(100), Some("t4")),
-            makeTurn("t6", "b_ccc", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t5")),
-            makeTurn("t7", "b_ddd", "topic-01", TurnRole::User, &"x".repeat(100), Some("t6")),
-            makeTurn("t8", "b_ddd", "topic-01", TurnRole::Assistant, &"y".repeat(100), Some("t7")),
+            makeTurn(
+                "t1",
+                "b_aaa",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                None,
+            ),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t1"),
+            ),
+            makeTurn(
+                "t3",
+                "b_bbb",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t2"),
+            ),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t3"),
+            ),
+            makeTurn(
+                "t5",
+                "b_ccc",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t4"),
+            ),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t5"),
+            ),
+            makeTurn(
+                "t7",
+                "b_ddd",
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some("t6"),
+            ),
+            makeTurn(
+                "t8",
+                "b_ddd",
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some("t7"),
+            ),
         ];
         // Fresh tail to push the zone past b_ddd.
         let mut nextId = 9;
         let mut prev = "t8".to_string();
         for i in 0..8 {
             let bid = format!("b_fresh_{i:02}");
-            let uid = format!("t{nextId}"); nextId += 1;
-            let aid = format!("t{nextId}"); nextId += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(100), Some(&prev)));
-            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(100), Some(&uid)));
+            let uid = format!("t{nextId}");
+            nextId += 1;
+            let aid = format!("t{nextId}");
+            nextId += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-02",
+                TurnRole::User,
+                &"x".repeat(100),
+                Some(&prev),
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-02",
+                TurnRole::Assistant,
+                &"y".repeat(100),
+                Some(&uid),
+            ));
             prev = aid;
         }
 
         let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "Big Topic".into(), startBlock: "b_aaa".into(), blockCount: 4 },
-            TopicInfo { topicId: "topic-02".into(), label: "Fresh".into(), startBlock: "b_fresh_00".into(), blockCount: 8 },
+            TopicInfo {
+                topicId: "topic-01".into(),
+                label: "Big Topic".into(),
+                startBlock: "b_aaa".into(),
+                blockCount: 4,
+            },
+            TopicInfo {
+                topicId: "topic-02".into(),
+                label: "Fresh".into(),
+                startBlock: "b_fresh_00".into(),
+                blockCount: 8,
+            },
         ];
 
         let topicBlockMap = buildTopicBlockMap(&turns, &topics);
@@ -787,11 +1160,16 @@ mod tests {
         alreadyCompacted.insert("b_bbb".into());
 
         let eligible = findEligibleTopics(
-            &topics, &topicBlockMap, &zone, &compactedSizes, &alreadyCompacted,
+            &topics,
+            &topicBlockMap,
+            &zone,
+            &compactedSizes,
+            &alreadyCompacted,
         );
 
         assert_eq!(
-            eligible.len(), 1,
+            eligible.len(),
+            1,
             "topic-01 remains eligible for the uncompacted tail"
         );
         assert!(
@@ -864,10 +1242,26 @@ mod tests {
         let mut s4BlockIds = Vec::new();
         for i in 0..20 {
             let bid = format!("b_s4_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-01", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-01", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             s4BlockIds.push(bid);
         }
@@ -877,19 +1271,51 @@ mod tests {
         let mut t3Ids = Vec::new();
         for i in 0..3 {
             let bid = format!("b_t2_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-02",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-02",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             t2Ids.push(bid);
         }
         for i in 0..3 {
             let bid = format!("b_t3_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-03", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-03", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-03",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-03",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             t3Ids.push(bid);
         }
@@ -897,25 +1323,64 @@ mod tests {
         // 4 raw blocks (topic-04).
         for i in 0..4 {
             let bid = format!("b_raw_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-04", TurnRole::User, &"x".repeat(500), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-04", TurnRole::Assistant, &"y".repeat(500), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-04",
+                TurnRole::User,
+                &"x".repeat(500),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-04",
+                TurnRole::Assistant,
+                &"y".repeat(500),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
         }
 
         let headTurnId = turns.last().unwrap().id.clone();
-        let allBlockIds: Vec<String> = s4BlockIds.iter()
-            .chain(t2Ids.iter()).chain(t3Ids.iter())
-            .cloned().collect();
+        let allBlockIds: Vec<String> = s4BlockIds
+            .iter()
+            .chain(t2Ids.iter())
+            .chain(t3Ids.iter())
+            .cloned()
+            .collect();
 
         let ops = makeOps(&allBlockIds, "Old Topic", &s4BlockIds, &s4BlockIds);
 
         let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "Old".into(), startBlock: s4BlockIds[0].clone(), blockCount: 20 },
-            TopicInfo { topicId: "topic-02".into(), label: "Middle A".into(), startBlock: t2Ids[0].clone(), blockCount: 3 },
-            TopicInfo { topicId: "topic-03".into(), label: "Middle B".into(), startBlock: t3Ids[0].clone(), blockCount: 3 },
-            TopicInfo { topicId: "topic-04".into(), label: "Recent".into(), startBlock: "b_raw_000".into(), blockCount: 4 },
+            TopicInfo {
+                topicId: "topic-01".into(),
+                label: "Old".into(),
+                startBlock: s4BlockIds[0].clone(),
+                blockCount: 20,
+            },
+            TopicInfo {
+                topicId: "topic-02".into(),
+                label: "Middle A".into(),
+                startBlock: t2Ids[0].clone(),
+                blockCount: 3,
+            },
+            TopicInfo {
+                topicId: "topic-03".into(),
+                label: "Middle B".into(),
+                startBlock: t3Ids[0].clone(),
+                blockCount: 3,
+            },
+            TopicInfo {
+                topicId: "topic-04".into(),
+                label: "Recent".into(),
+                startBlock: "b_raw_000".into(),
+                blockCount: 4,
+            },
         ];
 
         let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);
@@ -936,10 +1401,26 @@ mod tests {
         let mut s4Ids = Vec::new();
         for i in 0..40 {
             let bid = format!("b_s4_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-01", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-01", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-01",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-01",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             s4Ids.push(bid);
         }
@@ -948,44 +1429,115 @@ mod tests {
         let mut t3Ids = Vec::new();
         for i in 0..10 {
             let bid = format!("b_t2_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-02", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-02", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-02",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-02",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             t2Ids.push(bid);
         }
         for i in 0..10 {
             let bid = format!("b_t3_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-03", TurnRole::User, &"x".repeat(2000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-03", TurnRole::Assistant, &"y".repeat(2000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-03",
+                TurnRole::User,
+                &"x".repeat(2000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-03",
+                TurnRole::Assistant,
+                &"y".repeat(2000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
             t3Ids.push(bid);
         }
 
         for i in 0..10 {
             let bid = format!("b_raw_{i:03}");
-            let uid = format!("t{turnNum}"); turnNum += 1;
-            let aid = format!("t{turnNum}"); turnNum += 1;
-            turns.push(makeTurn(&uid, &bid, "topic-04", TurnRole::User, &"x".repeat(1000), parentId));
-            turns.push(makeTurn(&aid, &bid, "topic-04", TurnRole::Assistant, &"y".repeat(1000), Some(&uid)));
+            let uid = format!("t{turnNum}");
+            turnNum += 1;
+            let aid = format!("t{turnNum}");
+            turnNum += 1;
+            turns.push(makeTurn(
+                &uid,
+                &bid,
+                "topic-04",
+                TurnRole::User,
+                &"x".repeat(1000),
+                parentId,
+            ));
+            turns.push(makeTurn(
+                &aid,
+                &bid,
+                "topic-04",
+                TurnRole::Assistant,
+                &"y".repeat(1000),
+                Some(&uid),
+            ));
             parentId = Some(Box::leak(aid.into_boxed_str()));
         }
 
         let headTurnId = turns.last().unwrap().id.clone();
-        let allS2Ids: Vec<String> = s4Ids.iter()
-            .chain(t2Ids.iter()).chain(t3Ids.iter())
-            .cloned().collect();
+        let allS2Ids: Vec<String> = s4Ids
+            .iter()
+            .chain(t2Ids.iter())
+            .chain(t3Ids.iter())
+            .cloned()
+            .collect();
 
         let ops = makeOps(&allS2Ids, "Old Topic", &s4Ids, &s4Ids);
 
         let topics = vec![
-            TopicInfo { topicId: "topic-01".into(), label: "Old".into(), startBlock: s4Ids[0].clone(), blockCount: 40 },
-            TopicInfo { topicId: "topic-02".into(), label: "Middle A".into(), startBlock: t2Ids[0].clone(), blockCount: 10 },
-            TopicInfo { topicId: "topic-03".into(), label: "Middle B".into(), startBlock: t3Ids[0].clone(), blockCount: 10 },
-            TopicInfo { topicId: "topic-04".into(), label: "Recent".into(), startBlock: "b_raw_000".into(), blockCount: 10 },
+            TopicInfo {
+                topicId: "topic-01".into(),
+                label: "Old".into(),
+                startBlock: s4Ids[0].clone(),
+                blockCount: 40,
+            },
+            TopicInfo {
+                topicId: "topic-02".into(),
+                label: "Middle A".into(),
+                startBlock: t2Ids[0].clone(),
+                blockCount: 10,
+            },
+            TopicInfo {
+                topicId: "topic-03".into(),
+                label: "Middle B".into(),
+                startBlock: t3Ids[0].clone(),
+                blockCount: 10,
+            },
+            TopicInfo {
+                topicId: "topic-04".into(),
+                label: "Recent".into(),
+                startBlock: "b_raw_000".into(),
+                blockCount: 10,
+            },
         ];
 
         let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);

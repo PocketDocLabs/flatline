@@ -121,15 +121,13 @@ impl ShellRegistry {
     /// the harness on `ioTx`. Fails (and rolls back the spawn) if the
     /// harness channel is full or closed — an invisible PTY is a bug
     /// in the making.
-    pub async fn spawn(
-        &mut self,
-        name: Option<String>,
-        spawnedBy: SpawnedBy,
-    ) -> Result<String> {
+    pub async fn spawn(&mut self, name: Option<String>, spawnedBy: SpawnedBy) -> Result<String> {
         let name = match name {
             Some(n) => {
                 if !isValidName(&n) {
-                    bail!("invalid terminal name '{n}' — letters, digits, dashes, underscores only");
+                    bail!(
+                        "invalid terminal name '{n}' — letters, digits, dashes, underscores only"
+                    );
                 }
                 if self.shells.contains_key(&n) {
                     bail!("terminal '{n}' already exists");
@@ -324,21 +322,33 @@ mod tests {
     #[tokio::test]
     async fn spawnDuplicateRejected() {
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("build".into()), SpawnedBy::Agent).await.unwrap();
-        assert!(reg.spawn(Some("build".into()), SpawnedBy::Agent).await.is_err());
+        reg.spawn(Some("build".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
+        assert!(
+            reg.spawn(Some("build".into()), SpawnedBy::Agent)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn invalidNameRejected() {
         let (mut reg, _mainIo) = fixture();
-        assert!(reg.spawn(Some("with space".into()), SpawnedBy::Agent).await.is_err());
+        assert!(
+            reg.spawn(Some("with space".into()), SpawnedBy::Agent)
+                .await
+                .is_err()
+        );
         assert!(reg.spawn(Some("".into()), SpawnedBy::Agent).await.is_err());
     }
 
     #[tokio::test]
     async fn killRemovesShell() {
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("build".into()), SpawnedBy::Agent).await.unwrap();
+        reg.spawn(Some("build".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
         reg.kill("build").unwrap();
         assert!(!reg.contains("build"));
         assert_eq!(reg.len(), 1);
@@ -359,8 +369,11 @@ mod tests {
         // `activeForAgent` would fall back to the literal "main" name
         // and the deck would panic looking it up.
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("term2".into()), SpawnedBy::Agent).await.unwrap();
-        reg.kill(MAIN_NAME).expect("kill main when term2 still alive");
+        reg.spawn(Some("term2".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
+        reg.kill(MAIN_NAME)
+            .expect("kill main when term2 still alive");
         assert_eq!(reg.len(), 1);
         assert!(reg.kill("term2").is_err(), "must refuse to kill last shell");
         assert_eq!(reg.len(), 1);
@@ -370,7 +383,9 @@ mod tests {
     #[tokio::test]
     async fn killActiveFallsBack() {
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("build".into()), SpawnedBy::Agent).await.unwrap();
+        reg.spawn(Some("build".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
         reg.setActiveForAgent("build").unwrap();
         reg.kill("build").unwrap();
         assert_eq!(reg.activeForAgent(), MAIN_NAME);
@@ -379,7 +394,9 @@ mod tests {
     #[tokio::test]
     async fn shellForResolvesActive() {
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("build".into()), SpawnedBy::Agent).await.unwrap();
+        reg.spawn(Some("build".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
         reg.setActiveForAgent("build").unwrap();
         assert!(reg.shellFor(None).is_some());
         assert!(reg.shellFor(Some("main")).is_some());
@@ -389,8 +406,12 @@ mod tests {
     #[tokio::test]
     async fn listIsInsertionOrdered() {
         let (mut reg, _mainIo) = fixture();
-        reg.spawn(Some("build".into()), SpawnedBy::Agent).await.unwrap();
-        reg.spawn(Some("logs".into()), SpawnedBy::User).await.unwrap();
+        reg.spawn(Some("build".into()), SpawnedBy::Agent)
+            .await
+            .unwrap();
+        reg.spawn(Some("logs".into()), SpawnedBy::User)
+            .await
+            .unwrap();
         let names: Vec<String> = reg.list().into_iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["main", "build", "logs"]);
     }

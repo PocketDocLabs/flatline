@@ -252,7 +252,10 @@ impl SelectionState {
             PanelId::Agent => self.agentContentRect,
             PanelId::Input => self.inputContentRect,
         };
-        (col.min(rect.width.saturating_sub(1)), row.min(rect.height.saturating_sub(1)))
+        (
+            col.min(rect.width.saturating_sub(1)),
+            row.min(rect.height.saturating_sub(1)),
+        )
     }
 }
 
@@ -350,11 +353,7 @@ pub fn findLineBounds(buf: &Buffer, area: Rect, screenRow: u16) -> (u16, u16) {
             endCol = col + 1;
         }
     }
-    if endCol > 0 {
-        (0, area.width)
-    } else {
-        (0, 0)
-    }
+    if endCol > 0 { (0, area.width) } else { (0, 0) }
 }
 
 /// Whether a screen row in the Buffer is entirely whitespace.

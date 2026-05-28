@@ -2,8 +2,8 @@
 
 //! Background-job status panel — interactive popup overlay.
 //!
-//! Lists every task spawned by `shell(runInBackground: true)` — running
-//! and complete.
+//! Lists unfinished tasks spawned by `shell(runInBackground: true)` by default,
+//! with an in-panel toggle for completed/stopped rows.
 //! Each row shows id, command preview, age, state, line count. `k` kills
 //! the selected task; `Enter` opens an inspect popup that streams the
 //! task's stdout/stderr tail with scrolling and autoscroll.
@@ -98,9 +98,11 @@ enum Mode {
 pub struct JobsPanel {
     jobs: Vec<JobInfo>,
     wakes: Vec<construct::wakes::WakeSourceInfo>,
+    /// Selected visible row. Hidden finished jobs are never selectable.
     selected: usize,
     scrollOffset: usize,
     lastVisibleCount: usize,
+    showFinished: bool,
     mode: Mode,
 }
 
@@ -112,6 +114,7 @@ impl JobsPanel {
             selected: 0,
             scrollOffset: 0,
             lastVisibleCount: 0,
+            showFinished: false,
             mode: Mode::List,
         }
     }
@@ -127,15 +130,18 @@ impl JobsPanel {
     /// JobPlane), the inspector falls back to the list view rather than
     /// continuing to show a frozen snapshot.
     pub fn refresh(&mut self, jobs: Vec<JobInfo>) {
-        let prevId = self.jobs.get(self.selected).map(|t| t.id);
+        let prevId = self.selectedJob().map(|t| t.id);
         self.jobs = jobs;
         if let Some(id) = prevId {
-            if let Some(pos) = self.jobs.iter().position(|t| t.id == id) {
+            if let Some(pos) = self
+                .visibleJobIndexes()
+                .iter()
+                .position(|idx| self.jobs[*idx].id == id)
+            {
                 self.selected = pos;
-            } else if self.selected >= self.jobs.len() {
-                self.selected = self.jobs.len().saturating_sub(1);
             }
         }
+        self.clampSelection();
         if let Mode::Inspect(state) = &self.mode {
             let inspectedId = state.id;
             if !self.jobs.iter().any(|t| t.id == inspectedId) {
@@ -258,13 +264,16 @@ impl JobsPanel {
                 }
                 PanelAction::None
             }
+            KeyCode::Char('f') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggleFinished();
+                PanelAction::None
+            }
             KeyCode::Enter => self
-                .jobs
-                .get(self.selected)
+                .selectedJob()
                 .map(|t| PanelAction::Inspect(t.id))
                 .unwrap_or(PanelAction::None),
             KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(t) = self.jobs.get(self.selected) {
+                if let Some(t) = self.selectedJob() {
                     if matches!(t.state, JobState::Running) {
                         return PanelAction::Kill(t.id);
                     }
@@ -394,7 +403,8 @@ impl JobsPanel {
     }
 
     fn moveDown(&mut self) {
-        if self.selected + 1 < self.jobs.len() {
+        let visibleLen = self.visibleJobIndexes().len();
+        if self.selected + 1 < visibleLen {
             self.selected += 1;
             // `lastVisibleCount` is 0 before the first render and could be
             // 0 again on tiny viewports — saturate so `count - 1` doesn't
@@ -403,6 +413,57 @@ impl JobsPanel {
             if self.selected >= self.scrollOffset + visible {
                 self.scrollOffset = self.selected.saturating_sub(visible - 1);
             }
+        }
+    }
+
+    fn toggleFinished(&mut self) {
+        let prevId = self.selectedJob().map(|t| t.id);
+        self.showFinished = !self.showFinished;
+        if let Some(id) = prevId {
+            if let Some(pos) = self
+                .visibleJobIndexes()
+                .iter()
+                .position(|idx| self.jobs[*idx].id == id)
+            {
+                self.selected = pos;
+            }
+        }
+        self.clampSelection();
+    }
+
+    fn selectedJob(&self) -> Option<&JobInfo> {
+        let indexes = self.visibleJobIndexes();
+        indexes
+            .get(self.selected)
+            .and_then(|idx| self.jobs.get(*idx))
+    }
+
+    fn visibleJobIndexes(&self) -> Vec<usize> {
+        self.jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, job)| {
+                if self.showFinished || !job.state.isTerminal() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn clampSelection(&mut self) {
+        let visibleLen = self.visibleJobIndexes().len();
+        if visibleLen == 0 {
+            self.selected = 0;
+            self.scrollOffset = 0;
+            return;
+        }
+        if self.selected >= visibleLen {
+            self.selected = visibleLen - 1;
+        }
+        if self.scrollOffset >= visibleLen {
+            self.scrollOffset = visibleLen.saturating_sub(1);
         }
     }
 
@@ -432,16 +493,13 @@ impl JobsPanel {
             return;
         }
 
-        let runningCount = self
-            .jobs
-            .iter()
-            .filter(|t| matches!(t.state, JobState::Running))
-            .count();
+        let unfinishedCount = self.jobs.iter().filter(|t| !t.state.isTerminal()).count();
+        let finishedCount = self.jobs.iter().filter(|t| t.state.isTerminal()).count();
         let header = format!(
-            " {} job{} \u{00B7} {} running \u{00B7} {} schedule{} ",
-            self.jobs.len(),
-            if self.jobs.len() == 1 { "" } else { "s" },
-            runningCount,
+            " {} unfinished \u{00B7} {} finished {} \u{00B7} {} schedule{} ",
+            unfinishedCount,
+            finishedCount,
+            if self.showFinished { "shown" } else { "hidden" },
             self.wakes.len(),
             if self.wakes.len() == 1 { "" } else { "s" },
         );
@@ -454,7 +512,12 @@ impl JobsPanel {
 
         let sepY = inner.y + 1;
         for x in inner.x..inner.x + inner.width {
-            buf.set_span(x, sepY, &Span::styled("\u{2500}", Style::default().fg(FG_MUTED)), 1);
+            buf.set_span(
+                x,
+                sepY,
+                &Span::styled("\u{2500}", Style::default().fg(FG_MUTED)),
+                1,
+            );
         }
 
         // Split the body vertically: jobs on top, schedules below. Give
@@ -462,7 +525,9 @@ impl JobsPanel {
         // remainder. If wakes is empty, schedules collapses to a single
         // dim line so the section is discoverable.
         let bodyHeight = inner.height.saturating_sub(3);
-        let scheduleSectionRows = if self.wakes.is_empty() { 2u16 } else {
+        let scheduleSectionRows = if self.wakes.is_empty() {
+            2u16
+        } else {
             (self.wakes.len() as u16 + 1).min(bodyHeight.saturating_sub(3))
         };
         let jobsHeight = bodyHeight.saturating_sub(scheduleSectionRows);
@@ -473,23 +538,29 @@ impl JobsPanel {
             height: jobsHeight,
         };
         self.lastVisibleCount = rowsArea.height as usize;
+        let visibleIndexes = self.visibleJobIndexes();
 
-        if self.jobs.is_empty() {
-            let msg = Span::styled(
-                "  no jobs \u{2014} call shell with runInBackground: true to start one",
-                Style::default().fg(FG_DIM),
-            );
+        if visibleIndexes.is_empty() {
+            let message = if self.jobs.is_empty() {
+                "  no jobs \u{2014} call shell with runInBackground: true to start one"
+            } else if self.showFinished {
+                "  no jobs"
+            } else {
+                "  no unfinished jobs \u{2014} press f to show finished"
+            };
+            let msg = Span::styled(message, Style::default().fg(FG_DIM));
             buf.set_span(rowsArea.x, rowsArea.y, &msg, rowsArea.width);
         } else {
-            for (i, task) in self
-                .jobs
+            for (visibleIdx, jobIdx) in visibleIndexes
                 .iter()
+                .copied()
                 .enumerate()
                 .skip(self.scrollOffset)
                 .take(rowsArea.height as usize)
             {
-                let row = rowsArea.y + (i - self.scrollOffset) as u16;
-                let isSelected = i == self.selected;
+                let task = &self.jobs[jobIdx];
+                let row = rowsArea.y + (visibleIdx - self.scrollOffset) as u16;
+                let isSelected = visibleIdx == self.selected;
                 Self::renderRow(buf, row, rowsArea.x, rowsArea.width, task, isSelected);
             }
         }
@@ -517,14 +588,26 @@ impl JobsPanel {
                 inner.width.saturating_sub(2),
             );
         } else {
-            for (i, wake) in self.wakes.iter().enumerate().take(scheduleSectionRows.saturating_sub(1) as usize) {
+            for (i, wake) in self
+                .wakes
+                .iter()
+                .enumerate()
+                .take(scheduleSectionRows.saturating_sub(1) as usize)
+            {
                 let row = schedY + 1 + i as u16;
                 Self::renderWakeRow(buf, row, inner.x, inner.width, wake);
             }
         }
 
         let hintY = inner.y + inner.height.saturating_sub(1);
-        let hint = " \u{2191}\u{2193} select  \u{21B5} inspect  k kill  q/Esc close ";
+        let finishedHint = if self.showFinished {
+            "f hide finished"
+        } else {
+            "f show finished"
+        };
+        let hint = format!(
+            " \u{2191}\u{2193} select  \u{21B5} inspect  k kill  {finishedHint}  q/Esc close "
+        );
         buf.set_span(
             inner.x,
             hintY,
@@ -554,7 +637,10 @@ impl JobsPanel {
             .filter(|p| !p.is_empty())
             .map(|p| {
                 if p.len() > 30 {
-                    format!(" \u{2014} {}\u{2026}", &p[..p.char_indices().nth(30).map(|(i, _)| i).unwrap_or(p.len())])
+                    format!(
+                        " \u{2014} {}\u{2026}",
+                        &p[..p.char_indices().nth(30).map(|(i, _)| i).unwrap_or(p.len())]
+                    )
                 } else {
                     format!(" \u{2014} {p}")
                 }
@@ -576,14 +662,7 @@ impl JobsPanel {
         );
     }
 
-    fn renderRow(
-        buf: &mut Buffer,
-        y: u16,
-        x: u16,
-        width: u16,
-        task: &JobInfo,
-        isSelected: bool,
-    ) {
+    fn renderRow(buf: &mut Buffer, y: u16, x: u16, width: u16, task: &JobInfo, isSelected: bool) {
         let bg = if isSelected { BG_SELECTED } else { BG };
         let rowStyle = Style::default().fg(FG_PRIMARY).bg(bg);
 
@@ -598,10 +677,9 @@ impl JobsPanel {
                 ("\u{2299}", Style::default().fg(FG_ACCENT).bg(bg))
             }
             (_, JobState::Running) => ("\u{25F4}", Style::default().fg(FG_RUNNING).bg(bg)),
-            (_, JobState::Completed { exitCode: 0 }) => (
-                "\u{2713}",
-                Style::default().fg(FG_OK).bg(bg),
-            ),
+            (_, JobState::Completed { exitCode: 0 }) => {
+                ("\u{2713}", Style::default().fg(FG_OK).bg(bg))
+            }
             (_, JobState::Completed { .. }) => ("\u{2717}", Style::default().fg(FG_ERR).bg(bg)),
             (_, JobState::Killed) => ("\u{2717}", Style::default().fg(FG_DIM).bg(bg)),
             (_, JobState::Errored(_)) => ("\u{2717}", Style::default().fg(FG_ERR).bg(bg)),
@@ -622,21 +700,24 @@ impl JobsPanel {
 
         let cmdMax = width.saturating_sub(40) as usize;
         let cmdPreview = if task.command.len() > cmdMax && cmdMax > 4 {
-            format!("{}\u{2026}", &task.command[..task.command.floor_char_boundary(cmdMax - 1)])
+            format!(
+                "{}\u{2026}",
+                &task.command[..task.command.floor_char_boundary(cmdMax - 1)]
+            )
         } else {
             task.command.clone()
         };
 
         let spans: Vec<Span> = vec![
             Span::styled(format!(" {glyph} "), glyphStyle),
-            Span::styled(format!("#{:<4}", task.id), Style::default().fg(FG_DIM).bg(bg)),
+            Span::styled(
+                format!("#{:<4}", task.id),
+                Style::default().fg(FG_DIM).bg(bg),
+            ),
             Span::styled(" ", rowStyle),
             Span::styled(cmdPreview, rowStyle),
         ];
-        let leftWidth: u16 = spans
-            .iter()
-            .map(|s| s.content.chars().count() as u16)
-            .sum();
+        let leftWidth: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
 
         let rightText = format!("{stateLabel}  {ageStr} ");
         let rightWidth = rightText.chars().count() as u16;
@@ -755,7 +836,12 @@ impl JobsPanel {
         // Separator.
         let sepY = inner.y + 2;
         for x in inner.x..inner.x + inner.width {
-            buf.set_span(x, sepY, &Span::styled("\u{2500}", Style::default().fg(FG_MUTED)), 1);
+            buf.set_span(
+                x,
+                sepY,
+                &Span::styled("\u{2500}", Style::default().fg(FG_MUTED)),
+                1,
+            );
         }
 
         // Output rows.
@@ -776,10 +862,7 @@ impl JobsPanel {
         }
 
         if state.lines.is_empty() {
-            let msg = Span::styled(
-                "  (no output yet)",
-                Style::default().fg(FG_DIM),
-            );
+            let msg = Span::styled("  (no output yet)", Style::default().fg(FG_DIM));
             buf.set_span(rowsArea.x, rowsArea.y, &msg, rowsArea.width);
         } else {
             let lineMax = rowsArea.width as usize;
@@ -849,5 +932,91 @@ fn centerRect(area: Rect, width: u16, height: u16) -> Rect {
     let h = height.min(area.height.saturating_sub(2));
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn job(id: JobId, state: JobState) -> JobInfo {
+        let now = Instant::now();
+        JobInfo {
+            id,
+            kind: JobKind::Bash,
+            command: format!("echo job-{id}"),
+            completedAt: state.isTerminal().then_some(now + Duration::from_millis(1)),
+            state,
+            spawnedAt: now,
+            totalLines: 0,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn defaultsToUnfinishedJobsOnly() {
+        let panel = JobsPanel::new(vec![
+            job(1, JobState::Completed { exitCode: 0 }),
+            job(2, JobState::Running),
+            job(3, JobState::Killed),
+        ]);
+
+        let visible: Vec<JobId> = panel
+            .visibleJobIndexes()
+            .iter()
+            .map(|idx| panel.jobs[*idx].id)
+            .collect();
+        assert_eq!(visible, vec![2]);
+    }
+
+    #[test]
+    fn toggleFinishedShowsAllRowsAndEnterUsesVisibleSelection() {
+        let mut panel = JobsPanel::new(vec![
+            job(1, JobState::Completed { exitCode: 0 }),
+            job(2, JobState::Running),
+            job(3, JobState::Killed),
+        ]);
+
+        match panel.handleKey(key(KeyCode::Enter)) {
+            PanelAction::Inspect(id) => assert_eq!(id, 2),
+            _ => panic!("expected visible running job to inspect"),
+        }
+
+        panel.handleKey(key(KeyCode::Char('f')));
+        let visible: Vec<JobId> = panel
+            .visibleJobIndexes()
+            .iter()
+            .map(|idx| panel.jobs[*idx].id)
+            .collect();
+        assert_eq!(visible, vec![1, 2, 3]);
+
+        // Selection preserves job #2 across the toggle, so Enter still
+        // targets the same row after completed jobs become visible.
+        match panel.handleKey(key(KeyCode::Enter)) {
+            PanelAction::Inspect(id) => assert_eq!(id, 2),
+            _ => panic!("expected preserved visible job to inspect"),
+        }
+    }
+
+    #[test]
+    fn refreshClampsWhenSelectedJobBecomesHidden() {
+        let mut panel = JobsPanel::new(vec![job(1, JobState::Running), job(2, JobState::Running)]);
+        panel.handleKey(key(KeyCode::Down));
+        assert_eq!(panel.selectedJob().map(|j| j.id), Some(2));
+
+        panel.refresh(vec![
+            job(1, JobState::Running),
+            job(2, JobState::Completed { exitCode: 0 }),
+        ]);
+        assert_eq!(panel.selectedJob().map(|j| j.id), Some(1));
+    }
 }

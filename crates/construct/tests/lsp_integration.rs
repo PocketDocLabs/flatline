@@ -71,7 +71,10 @@ async fn rustAnalyzerDiagnostics() {
 
     // Check server started.
     let statuses = mgr.allServerStatuses();
-    let activeCount = statuses.iter().filter(|s| matches!(s.status, construct::lsp::ServerAvailability::Active)).count();
+    let activeCount = statuses
+        .iter()
+        .filter(|s| matches!(s.status, construct::lsp::ServerAvailability::Active))
+        .count();
     assert!(activeCount > 0, "no active servers");
     eprintln!("server statuses: {statuses:?}");
 
@@ -103,13 +106,14 @@ async fn missingServerHint() {
     let mut mgr = LspManager::new(&userConfig, &projectConfig);
 
     // Touch a Python file — ty is likely not installed.
-    let hint = mgr
-        .touchFile("/tmp/fakefile.py", "x: int = 'hello'")
-        .await;
+    let hint = mgr.touchFile("/tmp/fakefile.py", "x: int = 'hello'").await;
 
     // Should either connect or hint.
     let statuses = mgr.allServerStatuses();
-    let notInstalled = statuses.iter().filter(|s| matches!(s.status, construct::lsp::ServerAvailability::NotInstalled)).count();
+    let notInstalled = statuses
+        .iter()
+        .filter(|s| matches!(s.status, construct::lsp::ServerAvailability::NotInstalled))
+        .count();
 
     eprintln!("statuses: {statuses:?}");
 

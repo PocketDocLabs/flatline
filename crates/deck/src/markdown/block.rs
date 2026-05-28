@@ -13,9 +13,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::RenderedBlock;
 use super::highlight;
 use super::table;
-use super::RenderedBlock;
 
 /// Column alignment for table cells.
 #[derive(Debug, Clone, Copy)]

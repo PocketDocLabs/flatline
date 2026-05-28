@@ -89,22 +89,42 @@ fn test_s1_dedup_and_middle_out() {
     // Build a history with duplicate file reads and a long tool result.
     let longContent = "x".repeat(5000);
     let mut history = vec![
-        Message::System { content: "system".into() },
+        Message::System {
+            content: "system".into(),
+        },
         // Block 1: first readFile.
-        Message::User { content: Content::text("read foo") },
+        Message::User {
+            content: Content::text("read foo"),
+        },
         readFileCall("tc_1", "/tmp/foo.rs"),
         toolResult("tc_1", "fn main() {}"),
-        Message::Assistant { content: Some("got it".into()), tool_calls: None, reasoning: None },
+        Message::Assistant {
+            content: Some("got it".into()),
+            tool_calls: None,
+            reasoning: None,
+        },
         // Block 2: second readFile (same path → dedup target).
-        Message::User { content: Content::text("read foo again") },
+        Message::User {
+            content: Content::text("read foo again"),
+        },
         readFileCall("tc_2", "/tmp/foo.rs"),
         toolResult("tc_2", "fn main() {}"),
-        Message::Assistant { content: Some("ok".into()), tool_calls: None, reasoning: None },
+        Message::Assistant {
+            content: Some("ok".into()),
+            tool_calls: None,
+            reasoning: None,
+        },
         // Block 3: long tool result (middle-out target).
-        Message::User { content: Content::text("run it") },
+        Message::User {
+            content: Content::text("run it"),
+        },
         readFileCall("tc_3", "/tmp/big.log"),
         toolResult("tc_3", &longContent),
-        Message::Assistant { content: Some("done".into()), tool_calls: None, reasoning: None },
+        Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: None,
+            reasoning: None,
+        },
     ];
 
     let blockHints: HashMap<String, String> = HashMap::new();
@@ -133,22 +153,52 @@ async fn test_s2_eligible_blocks() {
 
     // Record 3 exchange blocks with tool calls.
     let t1 = transcript.recordUser("first question", None, None).unwrap();
-    transcript.recordAssistant("thinking about it...", Default::default()).unwrap();
-    transcript.recordToolCall("tc_a", "shell", &serde_json::json!({"command": "ls"})).unwrap();
-    transcript.recordToolResult("tc_a", "file1.rs\nfile2.rs", None).unwrap();
-    transcript.recordAssistant("here are the files", Default::default()).unwrap();
+    transcript
+        .recordAssistant("thinking about it...", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall("tc_a", "shell", &serde_json::json!({"command": "ls"}))
+        .unwrap();
+    transcript
+        .recordToolResult("tc_a", "file1.rs\nfile2.rs", None)
+        .unwrap();
+    transcript
+        .recordAssistant("here are the files", Default::default())
+        .unwrap();
 
-    let t2 = transcript.recordUser("second question", Some(&t1), None).unwrap();
-    transcript.recordAssistant("let me check...", Default::default()).unwrap();
-    transcript.recordToolCall("tc_b", "readFile", &serde_json::json!({"path": "/tmp/foo.rs"})).unwrap();
-    transcript.recordToolResult("tc_b", &"y".repeat(2000), None).unwrap();
-    transcript.recordAssistant("read it", Default::default()).unwrap();
+    let t2 = transcript
+        .recordUser("second question", Some(&t1), None)
+        .unwrap();
+    transcript
+        .recordAssistant("let me check...", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall(
+            "tc_b",
+            "readFile",
+            &serde_json::json!({"path": "/tmp/foo.rs"}),
+        )
+        .unwrap();
+    transcript
+        .recordToolResult("tc_b", &"y".repeat(2000), None)
+        .unwrap();
+    transcript
+        .recordAssistant("read it", Default::default())
+        .unwrap();
 
-    let _t3 = transcript.recordUser("third question", Some(&t2), None).unwrap();
-    transcript.recordAssistant("sure thing", Default::default()).unwrap();
-    transcript.recordToolCall("tc_c", "shell", &serde_json::json!({"command": "echo hi"})).unwrap();
+    let _t3 = transcript
+        .recordUser("third question", Some(&t2), None)
+        .unwrap();
+    transcript
+        .recordAssistant("sure thing", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall("tc_c", "shell", &serde_json::json!({"command": "echo hi"}))
+        .unwrap();
     let headTurn = transcript.recordToolResult("tc_c", "hi", None).unwrap();
-    transcript.recordAssistant("done", Default::default()).unwrap();
+    transcript
+        .recordAssistant("done", Default::default())
+        .unwrap();
 
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
@@ -163,7 +213,8 @@ async fn test_s2_eligible_blocks() {
         "test-model",
         200_000,
         0.8,
-    ).await;
+    )
+    .await;
 
     // S2 will either find blocks and fail the API call (returning didWork=false
     // with warnings), or succeed if somehow the API works. Either way, no panic.
@@ -180,30 +231,74 @@ async fn test_s3_finds_and_compacts_topics() {
     // Record 4 exchange blocks across 2 topics.
     // topic-01: blocks 1-2, topic-02: blocks 3-4.
     transcript.setTopicId("topic-01");
-    let t1 = transcript.recordUser("topic one start", None, None).unwrap();
-    transcript.recordAssistant("working on topic one", Default::default()).unwrap();
-    transcript.recordToolCall("tc_1", "shell", &serde_json::json!({"command": "ls"})).unwrap();
-    transcript.recordToolResult("tc_1", "output1", None).unwrap();
-    transcript.recordAssistant("done with block 1", Default::default()).unwrap();
+    let t1 = transcript
+        .recordUser("topic one start", None, None)
+        .unwrap();
+    transcript
+        .recordAssistant("working on topic one", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall("tc_1", "shell", &serde_json::json!({"command": "ls"}))
+        .unwrap();
+    transcript
+        .recordToolResult("tc_1", "output1", None)
+        .unwrap();
+    transcript
+        .recordAssistant("done with block 1", Default::default())
+        .unwrap();
 
-    let t2 = transcript.recordUser("still topic one", Some(&t1), None).unwrap();
-    transcript.recordAssistant("continuing", Default::default()).unwrap();
-    transcript.recordToolCall("tc_2", "readFile", &serde_json::json!({"path": "/a.rs"})).unwrap();
-    transcript.recordToolResult("tc_2", "content of a.rs", None).unwrap();
-    transcript.recordAssistant("read it", Default::default()).unwrap();
+    let t2 = transcript
+        .recordUser("still topic one", Some(&t1), None)
+        .unwrap();
+    transcript
+        .recordAssistant("continuing", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall("tc_2", "readFile", &serde_json::json!({"path": "/a.rs"}))
+        .unwrap();
+    transcript
+        .recordToolResult("tc_2", "content of a.rs", None)
+        .unwrap();
+    transcript
+        .recordAssistant("read it", Default::default())
+        .unwrap();
 
     transcript.setTopicId("topic-02");
-    let t3 = transcript.recordUser("new topic here", Some(&t2), None).unwrap();
-    transcript.recordAssistant("switching gears", Default::default()).unwrap();
-    transcript.recordToolCall("tc_3", "shell", &serde_json::json!({"command": "cargo build"})).unwrap();
-    transcript.recordToolResult("tc_3", "Compiling...", None).unwrap();
-    transcript.recordAssistant("built", Default::default()).unwrap();
+    let t3 = transcript
+        .recordUser("new topic here", Some(&t2), None)
+        .unwrap();
+    transcript
+        .recordAssistant("switching gears", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall(
+            "tc_3",
+            "shell",
+            &serde_json::json!({"command": "cargo build"}),
+        )
+        .unwrap();
+    transcript
+        .recordToolResult("tc_3", "Compiling...", None)
+        .unwrap();
+    transcript
+        .recordAssistant("built", Default::default())
+        .unwrap();
 
-    let _t4 = transcript.recordUser("more topic two", Some(&t3), None).unwrap();
-    transcript.recordAssistant("sure", Default::default()).unwrap();
-    transcript.recordToolCall("tc_4", "readFile", &serde_json::json!({"path": "/b.rs"})).unwrap();
-    let headTurn = transcript.recordToolResult("tc_4", "content of b.rs", None).unwrap();
-    transcript.recordAssistant("got b.rs", Default::default()).unwrap();
+    let _t4 = transcript
+        .recordUser("more topic two", Some(&t3), None)
+        .unwrap();
+    transcript
+        .recordAssistant("sure", Default::default())
+        .unwrap();
+    transcript
+        .recordToolCall("tc_4", "readFile", &serde_json::json!({"path": "/b.rs"}))
+        .unwrap();
+    let headTurn = transcript
+        .recordToolResult("tc_4", "content of b.rs", None)
+        .unwrap();
+    transcript
+        .recordAssistant("got b.rs", Default::default())
+        .unwrap();
 
     // Grab the actual block IDs from the recorded turns.
     let allTurns = transcript.loadAll().unwrap();
@@ -259,7 +354,9 @@ async fn test_s3_finds_and_compacts_topics() {
         "test-model",
         200_000,
         0.8,
-    ).await.expect("S3 should not error");
+    )
+    .await
+    .expect("S3 should not error");
 
     // S3 should find eligible topics and attempt compaction. With a bogus
     // API key the LLM call fails, so didWork=false, but the pipeline ran
@@ -284,7 +381,9 @@ async fn test_s4_merges_topic_summaries() {
     // Minimal transcript so s4 can compute the protected band.
     let mut transcript = Transcript::createAt(dir.path(), "test_s4").unwrap();
     let _ = transcript.recordUser("kickoff", None, None).unwrap();
-    let head = transcript.recordAssistant("ack", Default::default()).unwrap();
+    let head = transcript
+        .recordAssistant("ack", Default::default())
+        .unwrap();
 
     // Pre-populate compaction log with TopicCompact ops (simulating S3 output).
     let mut compactionLog = CompactionLog::open(dir.path()).unwrap();

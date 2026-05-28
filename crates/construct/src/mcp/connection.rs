@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use rmcp::ServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
-    Prompt, ReadResourceRequestParams, ReadResourceResult, Resource, Tool,
+    CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
+    ReadResourceRequestParams, ReadResourceResult, Resource, Tool,
 };
 use rmcp::service::{DynService, RoleClient, RunningService};
 use tokio::process::Command;
@@ -186,13 +186,10 @@ impl ServerConnection {
             });
         }
 
-        let service = tokio::time::timeout(
-            timeout,
-            handler.into_dyn().serve(transport),
-        )
-        .await
-        .map_err(|_| format!("startup timed out after {timeout:?}"))?
-        .map_err(|e| format!("initialization failed: {e}"))?;
+        let service = tokio::time::timeout(timeout, handler.into_dyn().serve(transport))
+            .await
+            .map_err(|_| format!("startup timed out after {timeout:?}"))?
+            .map_err(|e| format!("initialization failed: {e}"))?;
 
         self.service = Some(service);
         Ok(())
@@ -222,13 +219,10 @@ impl ServerConnection {
                 config,
             );
 
-        let service = tokio::time::timeout(
-            timeout,
-            handler.into_dyn().serve(transport),
-        )
-        .await
-        .map_err(|_| format!("startup timed out after {timeout:?}"))?
-        .map_err(|e| format!("initialization failed: {e}"))?;
+        let service = tokio::time::timeout(timeout, handler.into_dyn().serve(transport))
+            .await
+            .map_err(|_| format!("startup timed out after {timeout:?}"))?
+            .map_err(|e| format!("initialization failed: {e}"))?;
 
         self.service = Some(service);
         Ok(())
@@ -257,7 +251,10 @@ impl ServerConnection {
         let service = self.requireConnected()?;
 
         if !self.toolFilter.allows(toolName) {
-            return Err(format!("tool \"{toolName}\" is disabled for server \"{}\"", self.name));
+            return Err(format!(
+                "tool \"{toolName}\" is disabled for server \"{}\"",
+                self.name
+            ));
         }
 
         let timeout = Duration::from_secs(self.config.toolTimeout);
@@ -328,10 +325,7 @@ impl ServerConnection {
         self.state = ConnectionState::ShuttingDown;
         if let Some(mut service) = self.service.take() {
             let name = self.name.clone();
-            match service
-                .close_with_timeout(Duration::from_secs(5))
-                .await
-            {
+            match service.close_with_timeout(Duration::from_secs(5)).await {
                 Ok(_) => {
                     tracing::debug!(server = %name, "MCP server disconnected gracefully");
                 }

@@ -38,9 +38,7 @@ pub fn qualifyName(serverName: &str, toolName: &str) -> String {
     let prefixLen = MCP_PREFIX.len() + DELIMITER.len() + server.len() + DELIMITER.len();
     let available = MAX_QUALIFIED_LEN - prefixLen - 1 - 11; // 1 for underscore separator
     let truncatedTool = &tool[..available.min(tool.len())];
-    format!(
-        "{MCP_PREFIX}{DELIMITER}{server}{DELIMITER}{truncatedTool}_{hashSuffix}"
-    )
+    format!("{MCP_PREFIX}{DELIMITER}{server}{DELIMITER}{truncatedTool}_{hashSuffix}")
 }
 
 /// Split a qualified name back into `(serverName, toolName)`.
@@ -142,7 +140,10 @@ pub fn sanitizeJsonSchema(schema: &mut Value) {
             "object"
         } else if obj.contains_key("items") || obj.contains_key("prefixItems") {
             "array"
-        } else if obj.contains_key("enum") || obj.contains_key("const") || obj.contains_key("format") {
+        } else if obj.contains_key("enum")
+            || obj.contains_key("const")
+            || obj.contains_key("format")
+        {
             "string"
         } else if obj.contains_key("minimum")
             || obj.contains_key("maximum")
@@ -223,12 +224,18 @@ mod tests {
 
     #[test]
     fn qualifyNameBasic() {
-        assert_eq!(qualifyName("github", "search_repos"), "mcp__github__search_repos");
+        assert_eq!(
+            qualifyName("github", "search_repos"),
+            "mcp__github__search_repos"
+        );
     }
 
     #[test]
     fn qualifyNameSanitizes() {
-        assert_eq!(qualifyName("my.server", "do/thing"), "mcp__my_server__do_thing");
+        assert_eq!(
+            qualifyName("my.server", "do/thing"),
+            "mcp__my_server__do_thing"
+        );
     }
 
     #[test]

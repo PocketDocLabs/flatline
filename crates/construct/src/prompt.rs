@@ -44,19 +44,13 @@ pub enum DomainModule {
 ///     interface: How the agent is being driven.
 ///     domains: Task-specific skill sets to include.
 ///     promptThinking: Whether to include prompt-injected thinking instructions.
-pub fn build(
-    interface: InterfaceMode,
-    domains: &[DomainModule],
-    promptThinking: bool,
-) -> String {
+pub fn build(interface: InterfaceMode, domains: &[DomainModule], promptThinking: bool) -> String {
     // Static region — byte-stable across processes in the same profile.
     let mut staticParts = Vec::with_capacity(3 + domains.len());
     let mut persona = basePersona();
     if promptThinking {
-        if let (Some(start), Some(end)) = (
-            persona.find("<thinking>"),
-            persona.find("</thinking>"),
-        ) {
+        if let (Some(start), Some(end)) = (persona.find("<thinking>"), persona.find("</thinking>"))
+        {
             let endTag = end + "</thinking>".len();
             persona.replace_range(start..endTag, &thinkingPromptWithScratchpad());
         }
@@ -125,9 +119,7 @@ fn runtimeBlock() -> String {
         format!("{y}-{:02}-{:02}", m + 1, remaining + 1)
     };
 
-    format!(
-        "<runtime>\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}\n</runtime>"
-    )
+    format!("<runtime>\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}\n</runtime>")
 }
 
 fn basePersona() -> String {
@@ -381,7 +373,7 @@ pub fn mcpSection(servers: &[McpServerInfo], searchMode: bool) -> String {
     if searchMode {
         section.push_str(
             "\nMCP tool definitions are deferred to save context. Use `mcpToolSearch` \
-             to discover available MCP tools before calling them.\n"
+             to discover available MCP tools before calling them.\n",
         );
     }
 
@@ -526,7 +518,16 @@ mod tests {
     #[test]
     fn xmlTagsAreBalanced() {
         let prompt = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], false);
-        for tag in ["identity", "communication", "thinking", "acting", "tools", "style", "interface", "domain"] {
+        for tag in [
+            "identity",
+            "communication",
+            "thinking",
+            "acting",
+            "tools",
+            "style",
+            "interface",
+            "domain",
+        ] {
             let opens = prompt.matches(&format!("<{tag}")).count();
             let closes = prompt.matches(&format!("</{tag}>")).count();
             assert_eq!(opens, closes, "unbalanced <{tag}> tags");
@@ -551,10 +552,14 @@ mod tests {
         // are the very values that would break cross-instance caching.
         let prompt = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], false);
         let (staticPart, dynamicPart) = prompt.split_once(CACHE_BOUNDARY).unwrap();
-        assert!(!staticPart.contains("Working directory:"),
-            "cwd leaked into the static (cacheable) region");
-        assert!(!staticPart.contains("Date:"),
-            "date leaked into the static (cacheable) region");
+        assert!(
+            !staticPart.contains("Working directory:"),
+            "cwd leaked into the static (cacheable) region"
+        );
+        assert!(
+            !staticPart.contains("Date:"),
+            "date leaked into the static (cacheable) region"
+        );
         assert!(dynamicPart.contains("Working directory:"));
         assert!(dynamicPart.contains("Date:"));
     }
@@ -569,7 +574,10 @@ mod tests {
         for _ in 0..50 {
             let p = build(InterfaceMode::SharedTerminal, &[DomainModule::Swe], true);
             let (nextStatic, _) = p.split_once(CACHE_BOUNDARY).unwrap();
-            assert_eq!(firstStatic, nextStatic, "static region drifted between calls");
+            assert_eq!(
+                firstStatic, nextStatic,
+                "static region drifted between calls"
+            );
         }
     }
 }

@@ -76,15 +76,10 @@ impl ToolRegistry {
                 continue;
             }
 
-            let description = tool
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_string();
+            let description = tool.description.as_deref().unwrap_or("").to_string();
 
             // Convert input_schema to a Value and sanitize it.
-            let mut schema =
-                serde_json::to_value(&*tool.input_schema).unwrap_or_default();
+            let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
             sanitizeJsonSchema(&mut schema);
 
             let entry = RegistryEntry {
@@ -161,10 +156,7 @@ impl ToolRegistry {
             return self
                 .tools
                 .values()
-                .filter(|e| {
-                    serverFilter
-                        .map_or(true, |s| e.serverName == s)
-                })
+                .filter(|e| serverFilter.map_or(true, |s| e.serverName == s))
                 .map(|e| SearchResult {
                     qualifiedName: e.qualifiedName.clone(),
                     serverName: e.serverName.clone(),
@@ -179,10 +171,7 @@ impl ToolRegistry {
         let mut results: Vec<SearchResult> = self
             .tools
             .values()
-            .filter(|e| {
-                serverFilter
-                    .map_or(true, |s| e.serverName == s)
-            })
+            .filter(|e| serverFilter.map_or(true, |s| e.serverName == s))
             .filter_map(|e| {
                 let score = scoreMatch(&queryTerms, e);
                 if score > 0 {
@@ -291,10 +280,7 @@ fn summarizeParams(schema: &serde_json::Value) -> String {
     let params: Vec<String> = props
         .iter()
         .map(|(name, def)| {
-            let typeName = def
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("any");
+            let typeName = def.get("type").and_then(|v| v.as_str()).unwrap_or("any");
             let marker = if required.contains(name.as_str()) {
                 ""
             } else {
@@ -354,10 +340,13 @@ mod tests {
     #[test]
     fn searchMatchesName() {
         let mut reg = ToolRegistry::new();
-        reg.registerServer("github", vec![
-            makeTool("search_repos", "Search GitHub repos"),
-            makeTool("create_issue", "Create a new issue"),
-        ]);
+        reg.registerServer(
+            "github",
+            vec![
+                makeTool("search_repos", "Search GitHub repos"),
+                makeTool("create_issue", "Create a new issue"),
+            ],
+        );
 
         let results = reg.search("search", None);
         assert!(!results.is_empty());
@@ -413,13 +402,11 @@ mod tests {
         // byte-stable across processes (otherwise HashMap iteration would
         // scramble it differently every run).
         let mut reg = ToolRegistry::new();
-        reg.registerServer("zeta", vec![
-            makeTool("charlie", "Tool C"),
-            makeTool("alpha", "Tool A"),
-        ]);
-        reg.registerServer("alpha", vec![
-            makeTool("bravo", "Tool B"),
-        ]);
+        reg.registerServer(
+            "zeta",
+            vec![makeTool("charlie", "Tool C"), makeTool("alpha", "Tool A")],
+        );
+        reg.registerServer("alpha", vec![makeTool("bravo", "Tool B")]);
 
         let defs = reg.toolDefs(1_000_000);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();

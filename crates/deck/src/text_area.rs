@@ -172,7 +172,9 @@ impl TextArea {
             match lastSpace {
                 Some(pos) => {
                     let after = &trimmed[pos..];
-                    pos + after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len())
+                    pos + after
+                        .find(|c: char| !c.is_whitespace())
+                        .unwrap_or(after.len())
                 }
                 None => 0,
             }
@@ -218,8 +220,6 @@ impl TextArea {
             self.insertStr(&buf);
         }
     }
-
-
 
     /// Submit: take the text and reset. Returns None if empty.
     pub fn submit(&mut self) -> Option<String> {
@@ -277,7 +277,9 @@ impl TextArea {
             self.cursorPos = match lastSpace {
                 Some(pos) => {
                     let after = &trimmed[pos..];
-                    pos + after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len())
+                    pos + after
+                        .find(|c: char| !c.is_whitespace())
+                        .unwrap_or(after.len())
                 }
                 None => 0,
             };
@@ -341,9 +343,7 @@ impl TextArea {
     /// Move cursor down one logical line (preserving column offset).
     pub fn moveDown(&mut self) {
         let (lineStart, col) = self.currentLineAndCol();
-        let lineEnd = self.text[lineStart..]
-            .find('\n')
-            .map(|p| lineStart + p);
+        let lineEnd = self.text[lineStart..].find('\n').map(|p| lineStart + p);
         let Some(lineEnd) = lineEnd else { return };
         let nextLineStart = lineEnd + 1;
         let nextLineEnd = self.text[nextLineStart..]
@@ -363,7 +363,8 @@ impl TextArea {
     /// `localRow` is relative to the input area top.
     pub fn mouseDown(&mut self, contentCol: u16, localRow: u16, contentWidth: u16) {
         let visualLine = localRow as usize + self.scroll as usize;
-        let offset = self.visualToByteOffset(contentCol as usize, visualLine, contentWidth as usize);
+        let offset =
+            self.visualToByteOffset(contentCol as usize, visualLine, contentWidth as usize);
         self.cursorPos = offset;
         self.selAnchor = Some(offset);
         self.selEnd = Some(offset);
@@ -372,7 +373,8 @@ impl TextArea {
     /// Handle mouse drag. Extends selection from anchor to current position.
     pub fn mouseDrag(&mut self, contentCol: u16, localRow: u16, contentWidth: u16) {
         let visualLine = localRow as usize + self.scroll as usize;
-        let offset = self.visualToByteOffset(contentCol as usize, visualLine, contentWidth as usize);
+        let offset =
+            self.visualToByteOffset(contentCol as usize, visualLine, contentWidth as usize);
         self.selEnd = Some(offset);
         self.cursorPos = offset;
     }
@@ -415,14 +417,8 @@ impl TextArea {
         if self.text.is_empty() {
             // Ghost text — cursor overlays the placeholder.
             let line = Line::from(vec![
-                Span::styled(
-                    "\u{203A} ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    self.placeholder,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("\u{203A} ", Style::default().fg(Color::DarkGray)),
+                Span::styled(self.placeholder, Style::default().fg(Color::DarkGray)),
             ]);
             Paragraph::new(line).render(area, buf);
             if focused {
@@ -552,8 +548,8 @@ impl TextArea {
         match self.pasteRegion {
             Some((start, end)) => {
                 let pasteContent = &self.text[start..end];
-                let lineCount = pasteContent.lines().count()
-                    + if pasteContent.ends_with('\n') { 1 } else { 0 };
+                let lineCount =
+                    pasteContent.lines().count() + if pasteContent.ends_with('\n') { 1 } else { 0 };
                 let charCount = pasteContent.len();
                 let placeholder = if lineCount > 1 {
                     format!("[{lineCount} lines, {charCount} chars pasted]")
@@ -562,8 +558,7 @@ impl TextArea {
                 };
                 let phLen = placeholder.len();
 
-                let mut display =
-                    String::with_capacity(self.text.len() - (end - start) + phLen);
+                let mut display = String::with_capacity(self.text.len() - (end - start) + phLen);
                 display.push_str(&self.text[..start]);
                 display.push_str(&placeholder);
                 display.push_str(&self.text[end..]);
@@ -657,7 +652,12 @@ impl TextArea {
     }
 
     /// Map a visual (contentCol, visualLine) back to a byte offset.
-    fn visualToByteOffset(&self, contentCol: usize, visualLine: usize, contentWidth: usize) -> usize {
+    fn visualToByteOffset(
+        &self,
+        contentCol: usize,
+        visualLine: usize,
+        contentWidth: usize,
+    ) -> usize {
         let w = contentWidth.max(1);
         let mut vLine = 0;
 
@@ -753,7 +753,6 @@ impl TextArea {
 
         lines
     }
-
 }
 
 /// Build spans for a single wrapped segment, handling cursor and paste placeholder styling.
@@ -865,8 +864,7 @@ fn cursorSplitSpans(
     let before = &text[..localCursor];
     let (cursorChar, afterStart) = if localCursor < text.len() {
         // Find next grapheme boundary.
-        let mut gc =
-            unicode_segmentation::GraphemeCursor::new(localCursor, text.len(), true);
+        let mut gc = unicode_segmentation::GraphemeCursor::new(localCursor, text.len(), true);
         let next = gc
             .next_boundary(text, 0)
             .ok()

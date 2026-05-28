@@ -34,6 +34,7 @@ use construct::shells::{ShellRegistry, SpawnedBy};
 
 use crate::agent_panel::AgentPanel;
 use crate::fork_picker::{ForkAction, ForkPicker};
+use crate::log_panel::{DeveloperLog, LogLevel, LogPanel};
 use crate::lsp_panel::{LspPanel, PanelAction as LspPanelAction};
 use crate::mcp_panel::{McpPanel, PanelAction as McpPanelAction};
 use crate::model_panel::{ModelPanel, PanelAction as ModelPanelAction};
@@ -42,6 +43,7 @@ use crate::selection::{self, PanelId, SelectionState};
 use crate::session_picker::{PickerAction, SessionPicker};
 use crate::terminal::TerminalState;
 use crate::terminal_pane::TerminalPane;
+use crate::toast::ToastCenter;
 
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
@@ -197,7 +199,9 @@ fn refreshTasksPanel(
     let listDeckTx = deckUpdateTx.clone();
     tokio::spawn(async move {
         let (rTx, rRx) = oneshot::channel();
-        let _ = listRequestTx.send(TuiRequest::ListJobs { reply: rTx }).await;
+        let _ = listRequestTx
+            .send(TuiRequest::ListJobs { reply: rTx })
+            .await;
         if let Ok(list) = rRx.await {
             let _ = listDeckTx.send(DeckUpdate::TasksList(list)).await;
         }
@@ -207,7 +211,9 @@ fn refreshTasksPanel(
     let wakesDeckTx = deckUpdateTx.clone();
     tokio::spawn(async move {
         let (rTx, rRx) = oneshot::channel();
-        let _ = wakesRequestTx.send(TuiRequest::ListWakes { reply: rTx }).await;
+        let _ = wakesRequestTx
+            .send(TuiRequest::ListWakes { reply: rTx })
+            .await;
         if let Ok(list) = rRx.await {
             let _ = wakesDeckTx.send(DeckUpdate::WakesList(list)).await;
         }
@@ -244,9 +250,32 @@ fn spawnInspectorFetch(
         // pagination window has been superseded by a newer page key.
         let snap = rRx.await.ok().flatten();
         let _ = deckUpdateTx
-            .send(DeckUpdate::TaskOutputRefresh { id, sinceLine, snap })
+            .send(DeckUpdate::TaskOutputRefresh {
+                id,
+                sinceLine,
+                snap,
+            })
             .await;
     });
+}
+
+fn pushOperationalLog(
+    developerLog: &mut DeveloperLog,
+    toastCenter: &mut ToastCenter,
+    logPanel: &mut Option<LogPanel>,
+    level: LogLevel,
+    source: impl Into<String>,
+    title: impl Into<String>,
+    detail: Option<String>,
+    showToast: bool,
+) {
+    let record = developerLog.push(level, source, title, detail);
+    if showToast {
+        toastCenter.push(&record);
+    }
+    if let Some(panel) = logPanel.as_mut() {
+        panel.refresh(developerLog.snapshot());
+    }
 }
 
 /// Axis lock for trackpad scroll — prevents diagonal scrolling.
@@ -422,33 +451,31 @@ pub async fn run() -> Result<()> {
         // Channel for the registry to deliver newly-spawned ShellIos to deck.
         // Tuple carries (name, io, spawnedBy) so the deck can auto-switch
         // to user-initiated tabs without coordinating with LogEvent ordering.
-        let (shellIoTx, shellIoRx) =
-            mpsc::channel::<(String, ShellIo, SpawnedBy)>(8);
-        let (shells, mainIo) =
-            ShellRegistry::newWithMain(termCols, termRows, shellIoTx)?;
+        let (shellIoTx, shellIoRx) = mpsc::channel::<(String, ShellIo, SpawnedBy)>(8);
+        let (shells, mainIo) = ShellRegistry::newWithMain(termCols, termRows, shellIoTx)?;
         let shells = std::sync::Arc::new(tokio::sync::Mutex::new(shells));
         let termPane = TerminalPane::newWithMain(mainIo, termCols, termRows);
         Ok((terminal, shells, shellIoRx, termPane, termCols, termRows))
     })();
 
-    let (mut terminal, shells, mut shellIoRx, mut termPane, _termCols, _termRows) = match setupResult
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                crossterm::cursor::SetCursorStyle::DefaultUserShape,
-                crossterm::event::PopKeyboardEnhancementFlags,
-                crossterm::event::DisableMouseCapture,
-                crossterm::event::DisableFocusChange,
-                crossterm::event::DisableBracketedPaste,
-                LeaveAlternateScreen,
-            );
-            resetTerminalTitle();
-            return Err(e);
-        }
-    };
+    let (mut terminal, shells, mut shellIoRx, mut termPane, _termCols, _termRows) =
+        match setupResult {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(
+                    io::stdout(),
+                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
+                    crossterm::event::PopKeyboardEnhancementFlags,
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::DisableFocusChange,
+                    crossterm::event::DisableBracketedPaste,
+                    LeaveAlternateScreen,
+                );
+                resetTerminalTitle();
+                return Err(e);
+            }
+        };
 
     let contextWindow = config.heavy.contextWindow;
     let cachingEnabled = config.heavy.cachingActive();
@@ -648,14 +675,18 @@ pub async fn run() -> Result<()> {
                     TuiRequest::KillTask { id, reply } => {
                         let result = plane.lock().unwrap().stop(id);
                         let ack = match result {
-                            Ok(()) => construct::control::CommandAck::ok(format!(
-                                "Killing task #{id}."
-                            )),
+                            Ok(()) => {
+                                construct::control::CommandAck::ok(format!("Killing task #{id}."))
+                            }
                             Err(e) => construct::control::CommandAck::err(e.to_string()),
                         };
                         let _ = reply.send(ack);
                     }
-                    TuiRequest::GetTaskOutput { id, sinceLine, reply } => {
+                    TuiRequest::GetTaskOutput {
+                        id,
+                        sinceLine,
+                        reply,
+                    } => {
                         let snap = plane.lock().unwrap().output(id, sinceLine, 500).ok();
                         let _ = reply.send(snap);
                     }
@@ -1357,7 +1388,10 @@ async fn runLoop(
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
     let mut tasksPanel: Option<crate::jobs_panel::JobsPanel> = None;
+    let mut logPanel: Option<LogPanel> = None;
     let mut layoutPanel: Option<crate::layout::control_panel::ControlPanel> = None;
+    let mut developerLog = DeveloperLog::new(1000);
+    let mut toastCenter = ToastCenter::new();
     // Status-bar chips: each frame the draw closure refills this with the
     // chips it rendered and their on-screen x range, so mouse + keyboard
     // handlers between frames can hit-test / navigate them.
@@ -1409,10 +1443,16 @@ async fn runLoop(
             Some(disc) => match disc.result {
                 Ok(layout) => (layout, Some(disc.path)),
                 Err(msg) => {
-                    agentPanel.pushNotice(&format!(
-                        "\u{26A0}\u{FE0E} layout file {} ignored: {msg}",
-                        disc.path.display(),
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "layout",
+                        "layout file ignored",
+                        Some(format!("{}: {msg}", disc.path.display())),
+                        true,
+                    );
                     (crate::layout::Layout::defaultPhase1(), Some(disc.path))
                 }
             },
@@ -1508,8 +1548,18 @@ async fn runLoop(
                 // Tab strip occupies the first row of the inner area.
                 let (tabBarRect, termInner) = if termBlockInner.height > 1 {
                     (
-                        Rect { x: termBlockInner.x, y: termBlockInner.y, width: termBlockInner.width, height: 1 },
-                        Rect { x: termBlockInner.x, y: termBlockInner.y + 1, width: termBlockInner.width, height: termBlockInner.height - 1 },
+                        Rect {
+                            x: termBlockInner.x,
+                            y: termBlockInner.y,
+                            width: termBlockInner.width,
+                            height: 1,
+                        },
+                        Rect {
+                            x: termBlockInner.x,
+                            y: termBlockInner.y + 1,
+                            width: termBlockInner.width,
+                            height: termBlockInner.height - 1,
+                        },
                     )
                 } else {
                     (Rect::default(), termBlockInner)
@@ -1517,7 +1567,11 @@ async fn runLoop(
 
                 frame.render_widget(termBlock, outerTermArea);
                 if tabBarRect.height > 0 {
-                    termPane.renderTabBar(tabBarRect, frame.buffer_mut(), *focus == Focus::Terminal);
+                    termPane.renderTabBar(
+                        tabBarRect,
+                        frame.buffer_mut(),
+                        *focus == Focus::Terminal,
+                    );
                 }
                 termPane.renderActive(termInner, frame.buffer_mut());
 
@@ -1758,7 +1812,10 @@ async fn runLoop(
                         if statusFocus == Some(i) {
                             rightSpans.push(Span::styled(
                                 text.clone(),
-                                Style::default().bg(barFg).fg(barBg).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .bg(barFg)
+                                    .fg(barBg)
+                                    .add_modifier(Modifier::BOLD),
                             ));
                         } else {
                             rightSpans.push(Span::raw(text.clone()));
@@ -1773,7 +1830,8 @@ async fn runLoop(
                             rightSpans.push(Span::raw("  "));
                             cursorOff += 2;
                         }
-                        let cacheLen: usize = cacheSpans.iter().map(|s| s.content.chars().count()).sum();
+                        let cacheLen: usize =
+                            cacheSpans.iter().map(|s| s.content.chars().count()).sum();
                         rightSpans.extend(cacheSpans);
                         rightSpans.push(Span::raw(" cache"));
                         cursorOff += cacheLen + " cache".chars().count();
@@ -1795,6 +1853,10 @@ async fn runLoop(
                 let statusBar =
                     Paragraph::new(Line::from(spans)).style(Style::default().bg(barBg).fg(barFg));
                 frame.render_widget(statusBar, vChunks[1]);
+
+                // Ephemeral notifications float over the base panes only:
+                // no layout shift, and modal overlays still get priority.
+                toastCenter.render(area, frame.buffer_mut());
 
                 // Session picker overlay.
                 if let Some(ref mut picker) = sessionPicker {
@@ -1818,6 +1880,11 @@ async fn runLoop(
 
                 // Tasks panel overlay.
                 if let Some(ref mut panel) = tasksPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
+
+                // Developer log overlay.
+                if let Some(ref mut panel) = logPanel {
                     panel.render(area, frame.buffer_mut());
                 }
 
@@ -1884,7 +1951,7 @@ async fn runLoop(
                 LogEvent::ReasoningDelta(text) => agentPanel.appendReasoning(&text),
                 LogEvent::ToolResult { name, output } => {
                     // Task tool results are handled by SubagentComplete — don't double-render.
-                    if name != "task" {
+                    if name != "task" && !agentPanel.finishWakeToolResult(&name, &output) {
                         agentPanel.pushToolResult(&name, &output);
                     }
                 }
@@ -1903,7 +1970,9 @@ async fn runLoop(
                     agentPanel.toolCallPreview(index, &preview);
                 }
                 LogEvent::ToolAutoApproved { name, summary } => {
-                    agentPanel.toolApproved(&format!("{name}: {summary}"));
+                    if !crate::agent_panel::isWakeToolName(&name) {
+                        agentPanel.toolApproved(&format!("{name}: {summary}"));
+                    }
                 }
                 LogEvent::ToolDenied { name } => {
                     agentPanel.toolDenied(&name);
@@ -1947,11 +2016,16 @@ async fn runLoop(
                     serverId,
                     installHint,
                 } => {
-                    let msg = format!(
-                        "\u{2699}\u{FE0E} {} not found \u{2014} `{}`",
-                        serverId, installHint,
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "lsp",
+                        format!("{serverId} not found"),
+                        Some(format!("install hint: {installHint}")),
+                        true,
                     );
-                    agentPanel.pushCommandResult(&msg);
                 }
                 LogEvent::TokenUpdate {
                     contextTokens,
@@ -1970,8 +2044,28 @@ async fn runLoop(
                     maxAttempts,
                 } => {
                     agentPanel.showRetrying(attempt, maxAttempts);
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "api",
+                        format!("retrying request ({attempt}/{maxAttempts})"),
+                        None,
+                        true,
+                    );
                 }
                 LogEvent::Error(msg) => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Error,
+                        "agent",
+                        "turn error",
+                        Some(msg.clone()),
+                        true,
+                    );
                     agentPanel.pushError(&msg);
                     // A fatal error ends the turn — stop the throbber so the
                     // user isn't misled into thinking the model is still
@@ -1983,15 +2077,33 @@ async fn runLoop(
                     sessionCost: sc,
                     limit,
                 } => {
-                    let msg = format!(
-                        "\u{26A0}\u{FE0E} Session cost ({}) exceeded limit ({})",
-                        construct::cost::formatCost(sc),
-                        construct::cost::formatCost(limit),
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "cost",
+                        "session cost limit exceeded",
+                        Some(format!(
+                            "{} spent, {} limit",
+                            construct::cost::formatCost(sc),
+                            construct::cost::formatCost(limit),
+                        )),
+                        true,
                     );
-                    agentPanel.pushCommandResult(&msg);
                 }
                 LogEvent::CompactionStarted { stage } => {
                     tracing::info!(stage = %stage, "compaction started");
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "context",
+                        format!("compaction started: {stage}"),
+                        None,
+                        false,
+                    );
                 }
                 LogEvent::CompactionComplete {
                     stage,
@@ -1999,11 +2111,31 @@ async fn runLoop(
                     markerBlock,
                 } => {
                     tracing::info!(stage = %stage, reduction = %reduction, "compaction complete");
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Success,
+                        "context",
+                        format!("compaction complete: {stage}"),
+                        Some(format!("reduction: {reduction}")),
+                        false,
+                    );
                     if let Some(blockIdx) = markerBlock {
                         agentPanel.pushCompactionMarker(&stage, blockIdx);
                     }
                 }
                 LogEvent::Cleared => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "session",
+                        "session cleared",
+                        None,
+                        true,
+                    );
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     currentTopic = None;
@@ -2020,6 +2152,16 @@ async fn runLoop(
                     writeTerminalTitle(TITLE_IDLE_GLYPH, None);
                 }
                 LogEvent::Rewound { targetTurnId } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "session",
+                        "conversation rewound",
+                        Some(format!("target turn: {targetTurnId}")),
+                        true,
+                    );
                     rewindPicker = None;
                     forkPicker = None;
                     agentPanel.clearDisplay();
@@ -2045,6 +2187,16 @@ async fn runLoop(
                     tracing::info!(target = %targetTurnId, "conversation rewound");
                 }
                 LogEvent::SessionRestored { turns, markers } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "session",
+                        "session restored",
+                        Some(format!("{} turns, {} markers", turns.len(), markers.len())),
+                        true,
+                    );
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     // Resumed session has a fresh JobPlane.
@@ -2064,44 +2216,62 @@ async fn runLoop(
                     prompt,
                 } => {
                     tracing::info!(agent = %agentType, "subagent started");
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "subagent",
+                        format!("{agentType} started"),
+                        Some(format!("{sessionId}: {prompt}")),
+                        false,
+                    );
                     agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
                 }
-                LogEvent::SubagentEvent { sessionId, event } => {
-                    match *event {
-                        LogEvent::ToolAutoApproved {
-                            ref name,
-                            ref summary,
-                        } => {
-                            agentPanel.subagentToolLine(&sessionId, name, summary);
-                        }
-                        LogEvent::ToolStarted {
-                            ref name,
-                            ref summary,
-                        } => {
-                            agentPanel.subagentToolLine(&sessionId, name, summary);
-                        }
-                        LogEvent::ToolResult {
-                            ref name,
-                            ref output,
-                        } => {
-                            let brief = if output.len() > 60 {
-                                format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
-                            } else {
-                                output.clone()
-                            };
-                            agentPanel.subagentToolLine(&sessionId, name, &brief);
-                            agentPanel.subagentToolResult(&sessionId, name, output);
-                        }
-                        LogEvent::ContentDelta(ref text) => {
-                            agentPanel.subagentContent(&sessionId, text);
-                        }
-                        LogEvent::Error(ref msg) => {
-                            agentPanel.subagentToolLine(&sessionId, "error", msg);
-                        }
-                        _ => {}
+                LogEvent::SubagentEvent { sessionId, event } => match *event {
+                    LogEvent::ToolAutoApproved {
+                        ref name,
+                        ref summary,
+                    } => {
+                        agentPanel.subagentToolLine(&sessionId, name, summary);
                     }
-                }
+                    LogEvent::ToolStarted {
+                        ref name,
+                        ref summary,
+                    } => {
+                        agentPanel.subagentToolLine(&sessionId, name, summary);
+                    }
+                    LogEvent::ToolResult {
+                        ref name,
+                        ref output,
+                    } => {
+                        let brief = if output.len() > 60 {
+                            format!("{}\u{2026}", &output[..output.floor_char_boundary(60)])
+                        } else {
+                            output.clone()
+                        };
+                        agentPanel.subagentToolLine(&sessionId, name, &brief);
+                        agentPanel.subagentToolResult(&sessionId, name, output);
+                    }
+                    LogEvent::ContentDelta(ref text) => {
+                        agentPanel.subagentContent(&sessionId, text);
+                    }
+                    LogEvent::Error(ref msg) => {
+                        agentPanel.subagentToolLine(&sessionId, "error", msg);
+                    }
+                    _ => {}
+                },
                 LogEvent::SubagentShellOutput { sessionId, data } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Debug,
+                        "subagent",
+                        format!("{sessionId} shell output"),
+                        Some(format!("{} bytes", data.len())),
+                        false,
+                    );
                     agentPanel.feedSubagentShell(&sessionId, &data);
                 }
                 LogEvent::SubagentComplete {
@@ -2111,6 +2281,16 @@ async fn runLoop(
                     content,
                 } => {
                     tracing::info!(agent = %agentType, turns = turns, "subagent completed");
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Success,
+                        "subagent",
+                        format!("{agentType} completed"),
+                        Some(format!("{sessionId}: {turns} turns")),
+                        false,
+                    );
                     agentPanel.subagentComplete(&sessionId, &agentType, turns, &content);
                 }
                 LogEvent::ScratchpadRecovered {
@@ -2118,36 +2298,61 @@ async fn runLoop(
                     snippet,
                     recoveredChars,
                 } => {
-                    let msg = format!(
-                        "\u{26A0}\u{FE0E} scratchpad close recovered (`{}`, {} chars): \"{}\"",
-                        matchedTag, recoveredChars, snippet,
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "parser",
+                        "scratchpad close recovered",
+                        Some(format!(
+                            "`{matchedTag}`, {recoveredChars} chars: \"{snippet}\""
+                        )),
+                        true,
                     );
-                    agentPanel.pushCommandResult(&msg);
                 }
-                LogEvent::JobSpawned { id, kind: _, command } => {
+                LogEvent::JobSpawned {
+                    id,
+                    kind: _,
+                    command,
+                } => {
                     taskRunningCount += 1;
-                    agentPanel.pushNotice(&format!(
-                        "\u{25F4} task #{id} spawned: {command}"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "task",
+                        format!("task #{id} spawned"),
+                        Some(command),
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
-                LogEvent::JobOutput { id, line: _ } => {
+                LogEvent::JobOutput { id, line } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Debug,
+                        "task",
+                        format!("task #{id} output"),
+                        Some(line),
+                        false,
+                    );
                     // Stream into the inspector if it's currently open on
                     // this task. Coalesce: keep at most one fetch in
                     // flight; if another line arrives mid-flight, mark
                     // dirty and refire when the in-flight one returns.
-                    let openOnThis = tasksPanel
-                        .as_ref()
-                        .and_then(|p| p.inspectorTaskId())
-                        == Some(id);
+                    let openOnThis =
+                        tasksPanel.as_ref().and_then(|p| p.inspectorTaskId()) == Some(id);
                     if openOnThis {
                         if inspectorInFlight {
                             inspectorDirty = true;
                         } else {
                             inspectorInFlight = true;
-                            let sinceLine = tasksPanel
-                                .as_ref()
-                                .and_then(|p| p.inspectorSinceLine());
+                            let sinceLine =
+                                tasksPanel.as_ref().and_then(|p| p.inspectorSinceLine());
                             spawnInspectorFetch(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
@@ -2166,10 +2371,19 @@ async fn runLoop(
                     if tasksPanel.is_none() {
                         unreadCompletedTaskIds.insert(id);
                     }
-                    let code = exitCode.map(|c| format!("exit {c}")).unwrap_or_else(|| "—".into());
-                    agentPanel.pushNotice(&format!(
-                        "\u{2713} task #{id} completed ({code})"
-                    ));
+                    let code = exitCode
+                        .map(|c| format!("exit {c}"))
+                        .unwrap_or_else(|| "—".into());
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Success,
+                        "task",
+                        format!("task #{id} completed"),
+                        Some(code),
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
                 LogEvent::JobStopped { id, reason } => {
@@ -2179,19 +2393,52 @@ async fn runLoop(
                     if tasksPanel.is_none() {
                         unreadCompletedTaskIds.insert(id);
                     }
-                    agentPanel.pushNotice(&format!(
-                        "\u{2717} task #{id} stopped: {reason}"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "task",
+                        format!("task #{id} stopped"),
+                        Some(reason),
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
-                LogEvent::MonitorRegistered { id, description, filter, .. } => {
+                LogEvent::MonitorRegistered {
+                    id,
+                    description,
+                    filter,
+                    ..
+                } => {
                     monitorActiveCount += 1;
-                    agentPanel.pushNotice(&format!(
-                        "\u{2299} monitor #{id} \"{description}\" \u{00B7} /{filter}/"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "monitor",
+                        format!("monitor #{id} registered"),
+                        Some(format!("{description} · /{filter}/")),
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
-                LogEvent::MonitorEvent { id: _, line: _, eventCount: _ } => {
+                LogEvent::MonitorEvent {
+                    id,
+                    line,
+                    eventCount,
+                } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Debug,
+                        "monitor",
+                        format!("monitor #{id} matched ({eventCount})"),
+                        Some(line),
+                        false,
+                    );
                     // Per-line monitor events are noisy by design. The
                     // counter and last-event time update via the periodic
                     // /tasks refresh; we don't push a notice per line
@@ -2203,18 +2450,32 @@ async fn runLoop(
                     if monitorActiveCount > 0 {
                         monitorActiveCount -= 1;
                     }
-                    agentPanel.pushNotice(&format!(
-                        "\u{2717}\u{FE0E} monitor #{id} auto-stopped: {reason}"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "monitor",
+                        format!("monitor #{id} auto-stopped"),
+                        Some(reason),
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
                 LogEvent::MonitorStopped { id } => {
                     if monitorActiveCount > 0 {
                         monitorActiveCount -= 1;
                     }
-                    agentPanel.pushNotice(&format!(
-                        "\u{2718}\u{FE0E} monitor #{id} stopped"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "monitor",
+                        format!("monitor #{id} stopped"),
+                        None,
+                        true,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
                 LogEvent::TerminalSpawned { name, spawnedBy } => {
@@ -2223,10 +2484,28 @@ async fn runLoop(
                         TerminalSpawnedBy::User => "user",
                         TerminalSpawnedBy::Agent => "agent",
                     };
-                    agentPanel
-                        .pushNotice(&format!("\u{2295} terminal '{name}' spawned by {by}"));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "terminal",
+                        format!("terminal '{name}' spawned"),
+                        Some(format!("spawned by {by}")),
+                        true,
+                    );
                 }
                 LogEvent::TerminalClosed { name } => {
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "terminal",
+                        format!("terminal '{name}' closed"),
+                        None,
+                        false,
+                    );
                     // Just drop the tab. The textual confirmation is
                     // either the ToolResult (agent-initiated kill) or
                     // the user already saw the tab disappear.
@@ -2235,14 +2514,28 @@ async fn runLoop(
                 LogEvent::TerminalActiveForAgent { name } => {
                     // Agent's default target changed; deck doesn't follow
                     // the agent's focus, but we surface the change.
-                    agentPanel.pushNotice(&format!(
-                        "\u{2192} agent target terminal: '{name}'"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "terminal",
+                        "agent target terminal changed",
+                        Some(name),
+                        true,
+                    );
                 }
                 LogEvent::TerminalRenamed { from, to } => {
-                    agentPanel.pushNotice(&format!(
-                        "\u{2192} terminal renamed: '{from}' -> '{to}'"
-                    ));
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "terminal",
+                        "terminal renamed",
+                        Some(format!("{from} -> {to}")),
+                        true,
+                    );
                 }
                 LogEvent::WakeBatchInjected { count, summary } => {
                     // The session task formatted, recorded, and started
@@ -2251,14 +2544,29 @@ async fn runLoop(
                     // payload preview; multi-fire batches collapse to
                     // a counter so a noisy stampede doesn't flood the
                     // panel with one chip per match.
+                    agentPanel.wakeFiredSource(&summary);
+                    agentPanel.pushWakeTurn(&summary);
                     let chip = if count > 1 {
-                        format!("\u{2299} {count} wakes \u{00B7} {summary}")
+                        format!("{count} wakes")
                     } else {
-                        format!("\u{2299} {summary}")
+                        "wake injected".to_string()
                     };
-                    agentPanel.pushNotice(&chip);
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Info,
+                        "wake",
+                        chip,
+                        Some(summary),
+                        true,
+                    );
                 }
-                LogEvent::AutoBgWarning { command, elapsedSecs, userTriggered } => {
+                LogEvent::AutoBgWarning {
+                    command,
+                    elapsedSecs,
+                    userTriggered,
+                } => {
                     // The framework auto-respawned the command as a real
                     // bg job. The corresponding LogEvent::JobSpawned will
                     // fire separately with the new job id — no need to
@@ -2269,24 +2577,57 @@ async fn runLoop(
                         command.clone()
                     };
                     let notice = if userTriggered {
-                        format!(
-                            "\u{29D6}\u{FE0E} shell auto-bg'd (Ctrl+B): {preview}"
-                        )
+                        "shell moved to background (Ctrl+B)".to_string()
                     } else {
-                        format!(
-                            "\u{29D6}\u{FE0E} shell auto-bg'd ({elapsedSecs}s elapsed): {preview}"
-                        )
+                        format!("shell moved to background ({elapsedSecs}s elapsed)")
                     };
-                    agentPanel.pushNotice(&notice);
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "shell",
+                        notice,
+                        Some(preview),
+                        true,
+                    );
                 }
-                LogEvent::WakeRegistered { .. } => {
+                LogEvent::WakeRegistered {
+                    id,
+                    kind,
+                    summary,
+                    prompt,
+                    nextFireAt,
+                } => {
                     wakeSourceCount += 1;
+                    agentPanel.wakeRegistered(id, kind, summary.clone(), prompt, nextFireAt);
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Debug,
+                        "wake",
+                        format!("wake #{id} registered"),
+                        Some(format!("{} · {summary}", kind.asStr())),
+                        false,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
-                LogEvent::WakeDisarmed { .. } => {
+                LogEvent::WakeDisarmed { id } => {
                     if wakeSourceCount > 0 {
                         wakeSourceCount -= 1;
                     }
+                    agentPanel.wakeDisarmed(id);
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Debug,
+                        "wake",
+                        format!("wake #{id} disarmed"),
+                        None,
+                        false,
+                    );
                     refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
                 }
             }
@@ -2344,9 +2685,7 @@ async fn runLoop(
                         if let Some(sid) = subagentSid {
                             agentPanel.selectSubagentBySessionId(&sid);
                             if agentPanel.activeSubagents.len() > 1 && subagentPanel.is_none() {
-                                subagentPanel = Some(
-                                    crate::subagent_panel::SubagentPanel::live(),
-                                );
+                                subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                             }
                         }
                     } else {
@@ -2436,7 +2775,11 @@ async fn runLoop(
                         needsRedraw = true;
                     }
                 }
-                DeckUpdate::TaskOutputRefresh { id, sinceLine, snap } => {
+                DeckUpdate::TaskOutputRefresh {
+                    id,
+                    sinceLine,
+                    snap,
+                } => {
                     if let Some(ref mut panel) = tasksPanel {
                         if let Some(snap) = snap {
                             // Tagged-fetch race guard: if the user paged
@@ -2462,15 +2805,12 @@ async fn runLoop(
                     inspectorInFlight = false;
                     if inspectorDirty {
                         inspectorDirty = false;
-                        let stillOpen = tasksPanel
-                            .as_ref()
-                            .and_then(|p| p.inspectorTaskId())
-                            == Some(id);
+                        let stillOpen =
+                            tasksPanel.as_ref().and_then(|p| p.inspectorTaskId()) == Some(id);
                         if stillOpen {
                             inspectorInFlight = true;
-                            let sinceLine = tasksPanel
-                                .as_ref()
-                                .and_then(|p| p.inspectorSinceLine());
+                            let sinceLine =
+                                tasksPanel.as_ref().and_then(|p| p.inspectorSinceLine());
                             spawnInspectorFetch(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
@@ -2499,6 +2839,9 @@ async fn runLoop(
         if agentPanel.tickThrobber() {
             needsRedraw = true;
         }
+        if agentPanel.tickWakeSchedules() {
+            needsRedraw = true;
+        }
 
         // Tick animated title spinner while a turn is active. While an unseen
         // indicator is showing (envelope/warning for off-focus events), suppress
@@ -2518,6 +2861,10 @@ async fn runLoop(
 
         // Advance character reveal buffer.
         if agentPanel.tickReveal() {
+            needsRedraw = true;
+        }
+
+        if toastCenter.tick() {
             needsRedraw = true;
         }
 
@@ -2552,7 +2899,10 @@ async fn runLoop(
             &mut modelPanel,
             &mut subagentPanel,
             &mut tasksPanel,
+            &mut logPanel,
             &mut permissionsPanel,
+            &mut developerLog,
+            &mut toastCenter,
             &mut pendingPermitReply,
             &projectDir,
             &mut lastQuitPress,
@@ -2610,7 +2960,10 @@ async fn handleInput(
     modelPanel: &mut Option<ModelPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     tasksPanel: &mut Option<crate::jobs_panel::JobsPanel>,
+    logPanel: &mut Option<LogPanel>,
     permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
+    developerLog: &mut DeveloperLog,
+    toastCenter: &mut ToastCenter,
     pendingPermitReply: &mut Option<oneshot::Sender<construct::permissions::PermitResponse>>,
     projectDir: &str,
     lastQuitPress: &mut Option<Instant>,
@@ -2643,7 +2996,8 @@ async fn handleInput(
                 // looking. The permit indicator only clears if the permit is
                 // actually resolved; an unanswered permit should stay flagged.
                 let permitStillPending = pendingPermitReply.is_some();
-                let cleared = if *unseenWorkPending || (*unseenPermitPending && !permitStillPending) {
+                let cleared = if *unseenWorkPending || (*unseenPermitPending && !permitStillPending)
+                {
                     *unseenWorkPending = false;
                     if !permitStillPending {
                         *unseenPermitPending = false;
@@ -2714,12 +3068,10 @@ async fn handleInput(
                     if layoutPanel.is_some() {
                         *layoutPanel = None;
                     } else {
-                        *layoutPanel = Some(
-                            crate::layout::control_panel::ControlPanel::new(
-                                sessionLayout.clone(),
-                                activePresetName.clone(),
-                            ),
-                        );
+                        *layoutPanel = Some(crate::layout::control_panel::ControlPanel::new(
+                            sessionLayout.clone(),
+                            activePresetName.clone(),
+                        ));
                     }
                     break;
                 }
@@ -2794,6 +3146,7 @@ async fn handleInput(
                         || modelPanel.is_some()
                         || permissionsPanel.is_some()
                         || tasksPanel.is_some()
+                        || logPanel.is_some()
                         || layoutPanel.is_some()
                     {
                         // Let the overlay handle Tab (falls through to overlay dispatch below).
@@ -2852,39 +3205,35 @@ async fn handleInput(
                         // Shift+A: always allow (persist to project config).
                         // An empty pattern would persist `keyArg.contains("")`
                         // — i.e. allow-all for the tool — so guard against it.
-                        KeyCode::Char('A') => {
-                            match agentPanel.selectedPattern() {
-                                Some(pattern) => {
-                                    agentPanel.approvePending();
-                                    sendPermit!(PermitResponse::AlwaysAllow { pattern });
-                                }
-                                None => {
-                                    agentPanel.pushNotice(
+                        KeyCode::Char('A') => match agentPanel.selectedPattern() {
+                            Some(pattern) => {
+                                agentPanel.approvePending();
+                                sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                            }
+                            None => {
+                                agentPanel.pushNotice(
                                         "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
                                          type one in the custom field first, or press y to allow once.",
                                     );
-                                }
                             }
-                        }
+                        },
                         KeyCode::Char('n') => {
                             agentPanel.denyPending();
                             sendPermit!(PermitResponse::Deny);
                         }
                         // Shift+D: always deny (persist to project config).
-                        KeyCode::Char('D') => {
-                            match agentPanel.selectedPattern() {
-                                Some(pattern) => {
-                                    agentPanel.denyPending();
-                                    sendPermit!(PermitResponse::AlwaysDeny { pattern });
-                                }
-                                None => {
-                                    agentPanel.pushNotice(
+                        KeyCode::Char('D') => match agentPanel.selectedPattern() {
+                            Some(pattern) => {
+                                agentPanel.denyPending();
+                                sendPermit!(PermitResponse::AlwaysDeny { pattern });
+                            }
+                            None => {
+                                agentPanel.pushNotice(
                                         "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
                                          type one in the custom field first, or press n to deny once.",
                                     );
-                                }
                             }
-                        }
+                        },
                         // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             agentPanel.prevPattern();
@@ -2993,6 +3342,18 @@ async fn handleInput(
                     break;
                 }
 
+                // Developer log panel intercepts all keys when active.
+                if let Some(panel) = logPanel.as_mut() {
+                    use crate::log_panel::PanelAction;
+                    match panel.handleKey(key) {
+                        PanelAction::Close => {
+                            *logPanel = None;
+                        }
+                        PanelAction::None => {}
+                    }
+                    break;
+                }
+
                 // Rewind picker intercepts all keys when active.
                 if let Some(picker) = rewindPicker {
                     match picker.handleKey(key) {
@@ -3004,7 +3365,7 @@ async fn handleInput(
                             userMessage,
                             attachments,
                         } => {
-                            *pendingRewindMessage = Some(userMessage);
+                            *pendingRewindMessage = userMessage;
                             *pendingRewindAttachments = attachments;
                             spawnAckRequest(
                                 requestTx.clone(),
@@ -3021,7 +3382,7 @@ async fn handleInput(
                             userMessage,
                             attachments,
                         } => {
-                            *pendingRewindMessage = Some(userMessage);
+                            *pendingRewindMessage = userMessage;
                             *pendingRewindAttachments = attachments;
                             spawnAckRequest(
                                 requestTx.clone(),
@@ -3082,36 +3443,52 @@ async fn handleInput(
                         LayoutAction::Save => {
                             let path = sessionLayoutPath.clone().unwrap_or_else(|| {
                                 // No discovered file — save to ~/.config/flatline/layout.toml.
-                                crate::layout::discovery::configFallbackPath().unwrap_or_else(|| {
-                                    std::path::PathBuf::from(".flatline").join("layout.toml")
-                                })
+                                crate::layout::discovery::configFallbackPath().unwrap_or_else(
+                                    || std::path::PathBuf::from(".flatline").join("layout.toml"),
+                                )
                             });
                             match crate::layout::discovery::writeLayout(&path, sessionLayout) {
                                 Ok(()) => {
                                     *sessionLayoutPath = Some(path.clone());
                                     panel.confirmSaved();
-                                    agentPanel.pushNotice(&format!(
-                                        "\u{2713} layout saved: {}",
-                                        path.display(),
-                                    ));
+                                    pushOperationalLog(
+                                        developerLog,
+                                        toastCenter,
+                                        logPanel,
+                                        LogLevel::Success,
+                                        "layout",
+                                        "layout saved",
+                                        Some(path.display().to_string()),
+                                        true,
+                                    );
                                 }
                                 Err(e) => {
-                                    agentPanel.pushNotice(&format!(
-                                        "\u{26A0}\u{FE0E} layout save failed: {e}"
-                                    ));
+                                    pushOperationalLog(
+                                        developerLog,
+                                        toastCenter,
+                                        logPanel,
+                                        LogLevel::Error,
+                                        "layout",
+                                        "layout save failed",
+                                        Some(e.to_string()),
+                                        true,
+                                    );
                                 }
                             }
                         }
                         LayoutAction::Reset => {
                             let cwd = std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                            let (resetLayout, resetPath) = match crate::layout::discovery::discoverLayout(&cwd) {
-                                Some(d) => match d.result {
-                                    Ok(l) => (l, Some(d.path)),
-                                    Err(_) => (crate::layout::Layout::defaultPhase1(), Some(d.path)),
-                                },
-                                None => (crate::layout::Layout::defaultPhase1(), None),
-                            };
+                            let (resetLayout, resetPath) =
+                                match crate::layout::discovery::discoverLayout(&cwd) {
+                                    Some(d) => match d.result {
+                                        Ok(l) => (l, Some(d.path)),
+                                        Err(_) => {
+                                            (crate::layout::Layout::defaultPhase1(), Some(d.path))
+                                        }
+                                    },
+                                    None => (crate::layout::Layout::defaultPhase1(), None),
+                                };
                             let name = crate::layout::control_panel::matchPresetName(&resetLayout);
                             *sessionLayout = resetLayout.clone();
                             *sessionLayoutPath = resetPath;
@@ -3149,7 +3526,11 @@ async fn handleInput(
                         ModelPanelAction::Close => {
                             *modelPanel = None;
                         }
-                        ModelPanelAction::Save { scope, tier, profile } => {
+                        ModelPanelAction::Save {
+                            scope,
+                            tier,
+                            profile,
+                        } => {
                             spawnSilentSettingsRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
@@ -3180,7 +3561,11 @@ async fn handleInput(
                                     .await;
                             });
                         }
-                        ModelPanelAction::SaveDiscoveredModel { scope, profile, model } => {
+                        ModelPanelAction::SaveDiscoveredModel {
+                            scope,
+                            profile,
+                            model,
+                        } => {
                             spawnSilentSettingsRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
@@ -3496,6 +3881,13 @@ async fn handleInput(
                                                         );
                                                     }
                                                 }
+                                                crate::command::CommandOutput::Action(
+                                                    crate::command::CommandAction::Logs,
+                                                ) => {
+                                                    *logPanel = Some(LogPanel::new(
+                                                        developerLog.snapshot(),
+                                                    ));
+                                                }
                                                 crate::command::CommandOutput::Action(action) => {
                                                     dispatchSlashCommand(
                                                         action,
@@ -3627,6 +4019,7 @@ async fn handleInput(
                     || modelPanel.is_some()
                     || permissionsPanel.is_some()
                     || tasksPanel.is_some()
+                    || logPanel.is_some()
                     || layoutPanel.is_some()
                 {
                     break;
@@ -4617,13 +5010,9 @@ fn openStatusChipPanel(
         StatusChipKind::Context => {
             tokio::spawn(async move {
                 let (rTx, rRx) = oneshot::channel();
-                let _ = requestTx
-                    .send(TuiRequest::ShowContext { reply: rTx })
-                    .await;
+                let _ = requestTx.send(TuiRequest::ShowContext { reply: rTx }).await;
                 if let Ok(state) = rRx.await {
-                    let _ = deckUpdateTx
-                        .send(DeckUpdate::ContextDisplay(state))
-                        .await;
+                    let _ = deckUpdateTx.send(DeckUpdate::ContextDisplay(state)).await;
                 }
             });
         }
@@ -4773,6 +5162,9 @@ fn dispatchSlashCommand(
             // chip — fetch jobs + wakes and let the TasksList /
             // WakesList handlers create the panel.
             openStatusChipPanel(StatusChipKind::Jobs, &requestTx, &deckUpdateTx);
+        }
+        crate::command::CommandAction::Logs => {
+            tracing::warn!("/logs reached dispatchSlashCommand — should have been handled inline");
         }
         crate::command::CommandAction::ShowLayout => {
             // /layout reads the local sessionLayoutPath at the input

@@ -206,11 +206,8 @@ impl LspConnection {
         };
 
         let timeout = Duration::from_secs(self.config.startupTimeout);
-        let initResult = tokio::time::timeout(
-            timeout,
-            serverSocket.request::<Initialize>(initParams),
-        )
-        .await;
+        let initResult =
+            tokio::time::timeout(timeout, serverSocket.request::<Initialize>(initParams)).await;
 
         match initResult {
             Ok(Ok(_caps)) => {
@@ -385,10 +382,7 @@ impl LspConnection {
                 }
             }
 
-            diagnostics
-                .get(&uri)
-                .map(|d| d.clone())
-                .unwrap_or_default()
+            diagnostics.get(&uri).map(|d| d.clone()).unwrap_or_default()
         })
         .await;
 

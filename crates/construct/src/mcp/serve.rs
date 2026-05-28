@@ -16,16 +16,10 @@
 //! `rmcp` (server, transport-io), `tokio`
 
 use rmcp::{
-    ErrorData as McpError,
-    ServerHandler,
-    ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
+    handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
-    schemars,
-    tool, tool_handler, tool_router,
-    handler::server::{
-        tool::ToolRouter,
-        wrapper::Parameters,
-    },
+    schemars, tool, tool_handler, tool_router,
 };
 
 use serde::Deserialize;
@@ -98,7 +92,9 @@ impl FlatlineServer {
         }
     }
 
-    #[tool(description = "Execute a shell command and return its output. Output is truncated at 2000 lines / 100KB.")]
+    #[tool(
+        description = "Execute a shell command and return its output. Output is truncated at 2000 lines / 100KB."
+    )]
     async fn shell(
         &self,
         Parameters(params): Parameters<ShellParams>,
@@ -138,9 +134,9 @@ impl FlatlineServer {
         &self,
         Parameters(params): Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, McpError> {
-        let content = tokio::fs::read_to_string(&params.path).await.map_err(|e| {
-            McpError::invalid_params(format!("Failed to read file: {e}"), None)
-        })?;
+        let content = tokio::fs::read_to_string(&params.path)
+            .await
+            .map_err(|e| McpError::invalid_params(format!("Failed to read file: {e}"), None))?;
 
         let offset = params.offset.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(2000) as usize;
@@ -170,7 +166,9 @@ impl FlatlineServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Write content to a file, creating it if needed. Overwrites the entire file.")]
+    #[tool(
+        description = "Write content to a file, creating it if needed. Overwrites the entire file."
+    )]
     async fn writeFile(
         &self,
         Parameters(params): Parameters<WriteFileParams>,
@@ -182,9 +180,9 @@ impl FlatlineServer {
             })?;
         }
 
-        tokio::fs::write(&params.path, &params.content).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to write file: {e}"), None)
-        })?;
+        tokio::fs::write(&params.path, &params.content)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to write file: {e}"), None))?;
 
         let path = &params.path;
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -193,7 +191,9 @@ impl FlatlineServer {
         ))]))
     }
 
-    #[tool(description = "Search file contents using ripgrep. Returns matching file paths or content lines.")]
+    #[tool(
+        description = "Search file contents using ripgrep. Returns matching file paths or content lines."
+    )]
     async fn grep(
         &self,
         Parameters(params): Parameters<GrepParams>,
@@ -211,9 +211,10 @@ impl FlatlineServer {
 
         cmd.arg(&params.pattern).arg(searchPath);
 
-        let output = cmd.output().await.map_err(|e| {
-            McpError::internal_error(format!("Failed to run ripgrep: {e}"), None)
-        })?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to run ripgrep: {e}"), None))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -245,9 +246,10 @@ impl FlatlineServer {
             .arg(&params.pattern)
             .arg(searchPath);
 
-        let output = cmd.output().await.map_err(|e| {
-            McpError::internal_error(format!("Failed to run ripgrep: {e}"), None)
-        })?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to run ripgrep: {e}"), None))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -308,18 +310,14 @@ impl FlatlineServer {
 #[tool_handler(router = self.toolRouter)]
 impl ServerHandler for FlatlineServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_protocol_version(ProtocolVersion::V_2025_03_26)
-        .with_server_info(Implementation::new("flatline", env!("CARGO_PKG_VERSION")))
-        .with_instructions(
-            "Flatline is a general-purpose agent tool. Use the available tools to \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_03_26)
+            .with_server_info(Implementation::new("flatline", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Flatline is a general-purpose agent tool. Use the available tools to \
              execute shell commands, read/write files, search code, and explore \
              directory structures.",
-        )
+            )
     }
 }
 
@@ -332,13 +330,17 @@ pub async fn run() -> anyhow::Result<()> {
     let server = FlatlineServer::new();
     let transport = rmcp::transport::io::stdio();
 
-    let service = server.serve(transport).await
+    let service = server
+        .serve(transport)
+        .await
         .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
 
     tracing::info!("flatline MCP server running");
 
     // Wait until the service shuts down.
-    service.waiting().await
+    service
+        .waiting()
+        .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
 
     tracing::info!("flatline MCP server stopped");

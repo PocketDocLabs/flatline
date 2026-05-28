@@ -208,12 +208,28 @@ pub fn renderCodeBlock(
         let showArrow = i == arrowRow;
 
         // Left border.
-        let leftChar = if hasLeftOverflow && showArrow { "\u{25C2}" } else { "\u{2502}" };
-        let leftStyle = if hasLeftOverflow && showArrow { arrowStyle } else { borderStyle };
+        let leftChar = if hasLeftOverflow && showArrow {
+            "\u{25C2}"
+        } else {
+            "\u{2502}"
+        };
+        let leftStyle = if hasLeftOverflow && showArrow {
+            arrowStyle
+        } else {
+            borderStyle
+        };
 
         // Right border.
-        let rightChar = if hasRightOverflow && showArrow { "\u{25B8}" } else { "\u{2502}" };
-        let rightStyle = if hasRightOverflow && showArrow { arrowStyle } else { borderStyle };
+        let rightChar = if hasRightOverflow && showArrow {
+            "\u{25B8}"
+        } else {
+            "\u{2502}"
+        };
+        let rightStyle = if hasRightOverflow && showArrow {
+            arrowStyle
+        } else {
+            borderStyle
+        };
 
         // Build the line as a single fixed-width string so Wrap cannot break it.
         // Collect styled segments, then pad to innerWidth and append the right border.
@@ -231,7 +247,11 @@ pub fn renderCodeBlock(
 
         // Left border range.
         let leftEnd = leftChar.len();
-        ranges.push(StyledRange { start: 0, end: leftEnd, style: leftStyle });
+        ranges.push(StyledRange {
+            start: 0,
+            end: leftEnd,
+            style: leftStyle,
+        });
 
         for span in &scrolled {
             let start = buf.len();
@@ -240,7 +260,9 @@ pub fn renderCodeBlock(
                 if g == "\t" {
                     let tabW = 4usize.saturating_sub(bufWidth % 4);
                     for _ in 0..tabW {
-                        if bufWidth >= innerWidth { break; }
+                        if bufWidth >= innerWidth {
+                            break;
+                        }
                         buf.push(' ');
                         bufWidth += 1;
                     }
@@ -258,7 +280,11 @@ pub fn renderCodeBlock(
             }
             let end = buf.len();
             if end > start {
-                ranges.push(StyledRange { start, end, style: span.style });
+                ranges.push(StyledRange {
+                    start,
+                    end,
+                    style: span.style,
+                });
             }
         }
 
@@ -274,7 +300,11 @@ pub fn renderCodeBlock(
 
         // Padding + right border share the right style.
         if buf.len() > padStart {
-            ranges.push(StyledRange { start: padStart, end: buf.len(), style: rightStyle });
+            ranges.push(StyledRange {
+                start: padStart,
+                end: buf.len(),
+                style: rightStyle,
+            });
         }
 
         // Convert to spans.
@@ -314,9 +344,7 @@ pub fn renderCodeBlock(
         };
         let thumbEnd = (thumbPos + thumbLen).min(trackLen);
 
-        let mut bottomSpans: Vec<Span<'static>> = vec![
-            Span::styled("\u{2570}", borderStyle),
-        ];
+        let mut bottomSpans: Vec<Span<'static>> = vec![Span::styled("\u{2570}", borderStyle)];
         // Pre-thumb track.
         let preTrack: String = (0..thumbPos).map(|_| '\u{2500}').collect();
         let postTrack: String = (thumbEnd..trackLen).map(|_| '\u{2500}').collect();
@@ -334,10 +362,7 @@ pub fn renderCodeBlock(
         bottomSpans.push(Span::styled("\u{256F}", borderStyle));
         lines.push(Line::from(bottomSpans));
     } else {
-        let bottomRule = format!(
-            "\u{2570}{}\u{256F}",
-            "\u{2500}".repeat(innerWidth)
-        );
+        let bottomRule = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(innerWidth));
         lines.push(Line::from(Span::styled(bottomRule, borderStyle)));
     }
 
@@ -392,7 +417,8 @@ fn parseDiff(code: &str) -> (Option<String>, Vec<DiffHunk>) {
             } else if let Some(content) = line.strip_prefix('-') {
                 hunk.lines.push((DiffLineKind::Delete, content.to_string()));
             } else if let Some(content) = line.strip_prefix(' ') {
-                hunk.lines.push((DiffLineKind::Context, content.to_string()));
+                hunk.lines
+                    .push((DiffLineKind::Context, content.to_string()));
             } else if line.starts_with('\\') {
                 // Skip "\ No newline at end of file" markers.
             } else {
@@ -453,7 +479,12 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
         // Fallback: render as plain text.
         return code
             .lines()
-            .map(|l| vec![Span::styled(l.to_string(), Style::default().fg(Color::DarkGray))])
+            .map(|l| {
+                vec![Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )]
+            })
             .collect();
     }
 
@@ -468,8 +499,14 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
             let mut newLn = hunk.newStart;
             for (kind, _) in &hunk.lines {
                 match kind {
-                    DiffLineKind::Insert => { max = max.max(newLn); newLn += 1; }
-                    DiffLineKind::Delete => { max = max.max(oldLn); oldLn += 1; }
+                    DiffLineKind::Insert => {
+                        max = max.max(newLn);
+                        newLn += 1;
+                    }
+                    DiffLineKind::Delete => {
+                        max = max.max(oldLn);
+                        oldLn += 1;
+                    }
                     DiffLineKind::Context => {
                         max = max.max(oldLn).max(newLn);
                         oldLn += 1;
@@ -481,10 +518,18 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
         }
         max
     };
-    let gutterWidth = if maxLineNum == 0 { 1 } else { maxLineNum.to_string().len() };
+    let gutterWidth = if maxLineNum == 0 {
+        1
+    } else {
+        maxLineNum.to_string().len()
+    };
 
-    let gutterStyle = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
-    let spacerStyle = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    let gutterStyle = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let spacerStyle = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
 
     let mut output: Vec<Vec<Span<'static>>> = Vec::new();
 
@@ -499,7 +544,8 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
         }
 
         // Syntax-highlight the hunk content as a single block.
-        let hunkCode: String = hunk.lines
+        let hunkCode: String = hunk
+            .lines
             .iter()
             .map(|(_, content)| format!("{content}\n"))
             .collect();
@@ -526,18 +572,9 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
 
             // Sign span.
             let (signChar, signStyle) = match kind {
-                DiffLineKind::Insert => (
-                    "+",
-                    Style::default().fg(Color::Green).bg(DIFF_ADD_BG),
-                ),
-                DiffLineKind::Delete => (
-                    "-",
-                    Style::default().fg(Color::Red).bg(DIFF_DEL_BG),
-                ),
-                DiffLineKind::Context => (
-                    " ",
-                    Style::default(),
-                ),
+                DiffLineKind::Insert => ("+", Style::default().fg(Color::Green).bg(DIFF_ADD_BG)),
+                DiffLineKind::Delete => ("-", Style::default().fg(Color::Red).bg(DIFF_DEL_BG)),
+                DiffLineKind::Context => (" ", Style::default()),
             };
 
             // Content spans — syntax-highlighted with diff background overlay.
@@ -547,9 +584,9 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
                     .map(|sp| {
                         let style = match kind {
                             DiffLineKind::Insert => sp.style.bg(DIFF_ADD_BG),
-                            DiffLineKind::Delete => sp.style
-                                .bg(DIFF_DEL_BG)
-                                .add_modifier(Modifier::DIM),
+                            DiffLineKind::Delete => {
+                                sp.style.bg(DIFF_DEL_BG).add_modifier(Modifier::DIM)
+                            }
                             DiffLineKind::Context => sp.style,
                         };
                         Span::styled(sp.content.to_string(), style)
@@ -558,7 +595,9 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
             } else {
                 let style = match kind {
                     DiffLineKind::Insert => Style::default().fg(Color::Green).bg(DIFF_ADD_BG),
-                    DiffLineKind::Delete => Style::default().fg(Color::Red).bg(DIFF_DEL_BG)
+                    DiffLineKind::Delete => Style::default()
+                        .fg(Color::Red)
+                        .bg(DIFF_DEL_BG)
                         .add_modifier(Modifier::DIM),
                     DiffLineKind::Context => Style::default().fg(Color::DarkGray),
                 };
@@ -576,7 +615,10 @@ pub fn diffLines(code: &str) -> Vec<Vec<Span<'static>>> {
             match kind {
                 DiffLineKind::Insert => newLn += 1,
                 DiffLineKind::Delete => oldLn += 1,
-                DiffLineKind::Context => { oldLn += 1; newLn += 1; }
+                DiffLineKind::Context => {
+                    oldLn += 1;
+                    newLn += 1;
+                }
             }
         }
     }
@@ -603,14 +645,12 @@ fn syntectLines(codeLines: &[&str], lang: Option<&str>) -> Vec<Vec<Span<'static>
 
     codeLines
         .iter()
-        .map(|line| {
-            match h.highlight_line(line, ss) {
-                Ok(ranges) => ranges
-                    .into_iter()
-                    .map(|(style, text)| Span::styled(text.to_string(), syntectToRatatui(style)))
-                    .collect(),
-                Err(_) => vec![Span::raw(line.to_string())],
-            }
+        .map(|line| match h.highlight_line(line, ss) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(style, text)| Span::styled(text.to_string(), syntectToRatatui(style)))
+                .collect(),
+            Err(_) => vec![Span::raw(line.to_string())],
         })
         .collect()
 }
@@ -654,11 +694,7 @@ fn scrollAndTruncateSpans(
 
 /// Convert a syntect Style to a ratatui Style.
 fn syntectToRatatui(s: SyntectStyle) -> Style {
-    let mut style = Style::default().fg(Color::Rgb(
-        s.foreground.r,
-        s.foreground.g,
-        s.foreground.b,
-    ));
+    let mut style = Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b));
     if s.font_style.contains(FontStyle::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
     }

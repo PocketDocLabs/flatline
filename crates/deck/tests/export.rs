@@ -38,22 +38,44 @@ fn writeLinearFixture(dir: &Path, sessionId: &str) {
         "forks": [],
         "totalCost": 0.0,
     });
-    fs::write(session.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    fs::write(
+        session.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
 
     // Blobs (contents match the hashes referenced in the snapshot).
     let sysText = "You are a helpful assistant.";
     let sysHash = sha1(sysText.as_bytes());
-    fs::write(session.join("snapshots/blobs/sp").join(format!("{sysHash}.txt")), sysText).unwrap();
+    fs::write(
+        session
+            .join("snapshots/blobs/sp")
+            .join(format!("{sysHash}.txt")),
+        sysText,
+    )
+    .unwrap();
 
     let tools = serde_json::json!([]);
     let toolsText = serde_json::to_string(&tools).unwrap();
     let toolsHash = sha1(toolsText.as_bytes());
-    fs::write(session.join("snapshots/blobs/tl").join(format!("{toolsHash}.json")), &toolsText).unwrap();
+    fs::write(
+        session
+            .join("snapshots/blobs/tl")
+            .join(format!("{toolsHash}.json")),
+        &toolsText,
+    )
+    .unwrap();
 
     let userMsg = serde_json::json!({ "role": "user", "content": "hello" });
     let userText = serde_json::to_string(&userMsg).unwrap();
     let userHash = sha1(userText.as_bytes());
-    fs::write(session.join("snapshots/blobs/ms").join(format!("{userHash}.json")), &userText).unwrap();
+    fs::write(
+        session
+            .join("snapshots/blobs/ms")
+            .join(format!("{userHash}.json")),
+        &userText,
+    )
+    .unwrap();
 
     // Snapshot index with one entry. The snapshot hash itself isn't validated
     // by export, so we fabricate a stable one.

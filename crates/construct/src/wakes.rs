@@ -11,10 +11,10 @@
 //!   either a `shell(runInBackground)` bash job or a
 //!   `task(runInBackground)` subagent
 //!
-//! Each wake source emits [`crate::control::LogEvent::WakeFired`] when
-//! it triggers. The deck consumer turns that event into a synthetic
-//! `<wake source="..." kind="...">payload</wake>` user message that
-//! drives the next agent turn.
+//! Wake fires are coalesced into [`WakeBatch`] values. The session
+//! records each batch as a `TurnRole::Wake` transcript event, injects it
+//! into model context, and emits `LogEvent::WakeBatchInjected` for deck
+//! display.
 //!
 //! # Lifecycle
 //! - [`WakeRegistry::armDelay`], [`WakeRegistry::armCron`], etc. register
@@ -22,8 +22,7 @@
 //!   internal tokio task that schedules the fire(s); the task drops
 //!   cleanly when the source is disarmed.
 //! - MonitorMatch and TaskComplete have no scheduler — they're
-//!   fired by `MonitorPlane` / `JobPlane` at the appropriate moment via
-//!   [`WakeRegistry::fireMonitorMatch`] and [`WakeRegistry::fireTaskComplete`].
+//!   enqueued by `MonitorPlane` / `JobPlane` at the appropriate moment.
 //! - [`WakeRegistry::disarm`] cancels the source's scheduler (if any)
 //!   and removes it from the registry.
 //!
@@ -159,6 +158,9 @@ pub struct WakeRegistry {
     fireTx: mpsc::UnboundedSender<WakeFire>,
     /// Cancel handle for the batcher task — flipped on `disarmAll`.
     batcherCancelTx: watch::Sender<bool>,
+    /// True after `disarmAll`. The batcher checks this just before send so
+    /// an already-queued fire cannot leak from an old session into a new one.
+    closed: bool,
 }
 
 impl WakeRegistry {
@@ -176,6 +178,7 @@ impl WakeRegistry {
             nextId: 1,
             fireTx,
             batcherCancelTx: cancelTx,
+            closed: false,
         };
         let arc = Arc::new(Mutex::new(reg));
         tokio::spawn(batcherActor(fireRx, batchTx, cancelRx, arc.clone()));
@@ -207,6 +210,7 @@ impl WakeRegistry {
     /// session. Without the batcher kill the actor would keep the
     /// registry Arc alive (it holds a clone) and outlive the swap.
     pub fn disarmAll(&mut self) {
+        self.closed = true;
         for (_, src) in self.sources.drain() {
             if let Some(tx) = src.cancelTx {
                 let _ = tx.send(true);
@@ -234,8 +238,8 @@ impl WakeRegistry {
     }
 
     /// Arm a one-shot delay. Returns the new wake id. The internal
-    /// scheduler task fires `LogEvent::WakeFired` after `duration` and
-    /// then removes the source from the registry (one-shot).
+    /// scheduler task enqueues a wake after `duration` and then removes
+    /// the source from the registry (one-shot).
     pub fn armDelay(
         registryArc: &Arc<Mutex<WakeRegistry>>,
         duration: Duration,
@@ -247,6 +251,7 @@ impl WakeRegistry {
         g.nextId += 1;
         let fireAt = Instant::now() + duration;
         let summary = formatDuration(duration);
+        let promptForEvent = prompt.clone();
         let (cancelTx, cancelRx) = watch::channel(false);
         let registryArc2 = registryArc.clone();
         tokio::spawn(delayScheduler(
@@ -277,6 +282,8 @@ impl WakeRegistry {
             id,
             kind: ControlWakeKind::Delay,
             summary,
+            prompt: Some(promptForEvent),
+            nextFireAt: Some(fireAt),
         });
         id
     }
@@ -300,12 +307,18 @@ impl WakeRegistry {
         };
         let schedule = cron::Schedule::from_str(&normalized)
             .map_err(|e| anyhow::anyhow!("invalid cron spec `{spec}`: {e}"))?;
+        let nextFireAt = schedule
+            .upcoming(chrono::Local)
+            .next()
+            .and_then(|dt| (dt - chrono::Local::now()).to_std().ok())
+            .map(|delta| Instant::now() + delta);
         let mut g = registryArc.blocking_lock();
         let id = g.nextId;
         g.nextId += 1;
         let (cancelTx, cancelRx) = watch::channel(false);
         let registryArc2 = registryArc.clone();
         let summary = format!("cron: {spec}{}", if recurring { "" } else { " (one-shot)" });
+        let promptForEvent = prompt.clone();
         tokio::spawn(cronScheduler(
             id,
             schedule,
@@ -335,6 +348,8 @@ impl WakeRegistry {
             id,
             kind: ControlWakeKind::Cron,
             summary,
+            prompt: Some(promptForEvent),
+            nextFireAt,
         });
         Ok(id)
     }
@@ -381,6 +396,7 @@ impl WakeRegistry {
             logTx.clone(),
             registryArc2,
         ));
+        let promptForEvent = prompt.clone();
         let info = WakeSourceInfo {
             id,
             kind: ControlWakeKind::FileWatch,
@@ -401,6 +417,8 @@ impl WakeRegistry {
             id,
             kind: ControlWakeKind::FileWatch,
             summary,
+            prompt: Some(promptForEvent),
+            nextFireAt: None,
         });
         Ok(id)
     }
@@ -432,6 +450,8 @@ impl WakeRegistry {
             id,
             kind: ControlWakeKind::MonitorMatch,
             summary,
+            prompt: None,
+            nextFireAt: None,
         });
         id
     }
@@ -463,6 +483,8 @@ impl WakeRegistry {
             id,
             kind: ControlWakeKind::TaskComplete,
             summary,
+            prompt: None,
+            nextFireAt: None,
         });
         id
     }
@@ -474,18 +496,22 @@ impl WakeRegistry {
     /// the queued fire is drained, so concurrent stampedes don't race
     /// on the counter under the registry lock.
     pub fn enqueueFire(&self, id: WakeId, source: String, payload: String) -> bool {
+        if self.closed {
+            return false;
+        }
         let Some(src) = self.sources.get(&id) else {
             return false;
         };
         let kind = src.info.kind;
-        let _ = self.fireTx.send(WakeFire {
-            wakeId: id,
-            source,
-            kind,
-            payload,
-            firedAt: Instant::now(),
-        });
-        true
+        self.fireTx
+            .send(WakeFire {
+                wakeId: id,
+                source,
+                kind,
+                payload,
+                firedAt: Instant::now(),
+            })
+            .is_ok()
     }
 
     /// Sync-callable handle for the per-line monitor callback. The
@@ -552,12 +578,18 @@ async fn batcherActor(
                 },
             }
         }
+        if cancelled {
+            return;
+        }
         if !batch.is_empty() {
             // Bump per-source counters in one critical section, then
             // hand the batch off. The lock is held only across the
             // counter updates — no awaits while held.
             {
                 let mut g = registry.lock().await;
+                if g.closed {
+                    return;
+                }
                 for f in &batch {
                     if let Some(src) = g.sources.get_mut(&f.wakeId) {
                         src.info.firesSoFar += 1;
@@ -570,9 +602,6 @@ async fn batcherActor(
                     closedAt: Instant::now(),
                 })
                 .await;
-        }
-        if cancelled {
-            return;
         }
     }
 }
@@ -814,6 +843,34 @@ mod tests {
             assert_eq!(f.payload, format!("line {i}"));
             assert!(matches!(f.kind, ControlWakeKind::MonitorMatch));
         }
+    }
+
+    #[tokio::test]
+    async fn disarmAllDropsLateCallbackFire() {
+        // `/clear` and resume swap the registry after calling disarmAll.
+        // Monitor callbacks hold a fire sender clone, so a line that arrives
+        // just after disarmAll can still hit the old batcher. The closed
+        // registry must drop that fire instead of injecting it.
+        let (reg, tx, _rx, mut batchRx) = buildTestRegistry();
+        let id = reg.lock().await.registerMonitor(7, &tx);
+        let fireTx = reg.lock().await.fireSender();
+        reg.lock().await.disarmAll();
+        let _ = fireTx.send(WakeFire {
+            wakeId: id,
+            source: "monitor#7".into(),
+            kind: ControlWakeKind::MonitorMatch,
+            payload: "line after clear".into(),
+            firedAt: Instant::now(),
+        });
+        let received = tokio::time::timeout(
+            WAKE_BATCH_WINDOW + Duration::from_millis(200),
+            batchRx.recv(),
+        )
+        .await;
+        assert!(
+            matches!(received, Err(_) | Ok(None)),
+            "closed registry must not emit fires from stale callback senders",
+        );
     }
 
     #[test]

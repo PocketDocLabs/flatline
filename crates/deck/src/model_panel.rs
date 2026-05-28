@@ -52,9 +52,17 @@ enum ThinkingMode {
 }
 
 enum ProfileEdit {
-    Create { text: String, sourceProfile: String },
-    Rename { original: String, text: String },
-    Delete { profile: String },
+    Create {
+        text: String,
+        sourceProfile: String,
+    },
+    Rename {
+        original: String,
+        text: String,
+    },
+    Delete {
+        profile: String,
+    },
     Context {
         profile: String,
         text: String,
@@ -954,7 +962,8 @@ impl ModelPanel {
         match thinkingMode(profile) {
             ThinkingMode::Off => {
                 let Some(effort) = firstProviderEffort(profile) else {
-                    self.notice = Some("Provider thinking is unavailable for this model".to_string());
+                    self.notice =
+                        Some("Provider thinking is unavailable for this model".to_string());
                     return PanelAction::None;
                 };
                 profile.promptThinking = false;
@@ -991,8 +1000,10 @@ impl ModelPanel {
             self.notice = Some("No profile selected".to_string());
             return PanelAction::None;
         };
-        profile.reasoningSummary =
-            cycleOptionalValue(profile.reasoningSummary.as_deref(), reasoningSummaryChoices());
+        profile.reasoningSummary = cycleOptionalValue(
+            profile.reasoningSummary.as_deref(),
+            reasoningSummaryChoices(),
+        );
         self.saveThinkingForSelected()
     }
 
@@ -1363,9 +1374,11 @@ impl ModelPanel {
             columns.name = columns.name.max(profile.name.chars().count());
             columns.provider = columns.provider.max(profile.provider.chars().count());
             columns.model = columns.model.max(profile.model.chars().count());
-            columns.context = columns
-                .context
-                .max(profileContextLabel(profile.contextWindow, profile.maxContextWindow).chars().count());
+            columns.context = columns.context.max(
+                profileContextLabel(profile.contextWindow, profile.maxContextWindow)
+                    .chars()
+                    .count(),
+            );
         }
 
         let min = ProfileColumns {
@@ -1589,8 +1602,18 @@ impl ModelPanel {
             return;
         };
 
-        let title = format!(" Profile: {}   {} / {}", profile.name, profile.provider, profile.model);
-        line(buf, inner.x, *y, w, &truncateStr(&title, w), style(FG_PRIMARY, BG));
+        let title = format!(
+            " Profile: {}   {} / {}",
+            profile.name, profile.provider, profile.model
+        );
+        line(
+            buf,
+            inner.x,
+            *y,
+            w,
+            &truncateStr(&title, w),
+            style(FG_PRIMARY, BG),
+        );
         *y += 1;
 
         let labelWidth = configLabelWidth();
@@ -1625,9 +1648,12 @@ impl ModelPanel {
         let mut width = " Profile: ".chars().count();
         for profile in &self.status.profiles {
             width = width.max(
-                format!(" Profile: {}   {} / {}", profile.name, profile.provider, profile.model)
-                    .chars()
-                    .count(),
+                format!(
+                    " Profile: {}   {} / {}",
+                    profile.name, profile.provider, profile.model
+                )
+                .chars()
+                .count(),
             );
             for &field in configFields() {
                 width = width.max(
@@ -1835,10 +1861,17 @@ fn firstProviderEffort(profile: &construct::control::ModelProfileStatus) -> Opti
     if profile.reasoningEfforts.is_empty() {
         None
     } else if let Some(effort) = &profile.reasoningEffort
-        && profile.reasoningEfforts.iter().any(|candidate| candidate == effort)
+        && profile
+            .reasoningEfforts
+            .iter()
+            .any(|candidate| candidate == effort)
     {
         Some(effort.clone())
-    } else if profile.reasoningEfforts.iter().any(|effort| effort == "medium") {
+    } else if profile
+        .reasoningEfforts
+        .iter()
+        .any(|effort| effort == "medium")
+    {
         Some("medium".to_string())
     } else {
         profile.reasoningEfforts.first().cloned()

@@ -27,8 +27,8 @@
 //! # Dependencies
 //! `ratatui`
 
-pub mod discovery;
 pub mod control_panel;
+pub mod discovery;
 
 use ratatui::layout::{Constraint, Direction, Layout as RatLayout, Rect};
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,13 @@ impl Layout {
     /// Used by discovery to reject hand-written layout files that
     /// would render as invisible panes.
     pub fn isCanonicalPhase1(&self) -> bool {
-        let Layout::Split { orient: Orient::Horizontal, ratio, a, b } = self else {
+        let Layout::Split {
+            orient: Orient::Horizontal,
+            ratio,
+            a,
+            b,
+        } = self
+        else {
             return false;
         };
         if !(0.05..=0.95).contains(ratio) {
@@ -137,7 +143,12 @@ impl Layout {
 
     fn computeInto(&self, area: Rect, out: &mut Vec<SplitArea>) {
         match self {
-            Layout::Split { orient, ratio, a, b } => {
+            Layout::Split {
+                orient,
+                ratio,
+                a,
+                b,
+            } => {
                 let pct = (*ratio * 100.0).clamp(5.0, 95.0) as u16;
                 let direction = match orient {
                     Orient::Horizontal => Direction::Horizontal,
@@ -230,9 +241,10 @@ impl Layout {
     /// Returns true if the terminal was present and removed.
     pub fn removeTerminal(&mut self, name: &str) -> bool {
         if let Some(tabs) = self.findTerminalTabsContainer() {
-            if let Some(pos) = tabs.iter().position(|c| {
-                matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name)
-            }) {
+            if let Some(pos) = tabs
+                .iter()
+                .position(|c| matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name))
+            {
                 tabs.remove(pos);
                 return true;
             }
@@ -244,9 +256,10 @@ impl Layout {
     /// Returns true on success.
     pub fn setActiveTerminal(&mut self, name: &str) -> bool {
         if let Some((children, activeRef)) = self.findTerminalTabsParts() {
-            if let Some(pos) = children.iter().position(|c| {
-                matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name)
-            }) {
+            if let Some(pos) = children
+                .iter()
+                .position(|c| matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name))
+            {
                 *activeRef = pos;
                 return true;
             }
@@ -269,7 +282,10 @@ impl Layout {
     fn findTerminalTabsContainer(&mut self) -> Option<&mut Vec<Layout>> {
         match self {
             Layout::Tabs { children, .. } => {
-                if children.iter().any(|c| matches!(c, Layout::Window(WindowId::Terminal(_)))) {
+                if children
+                    .iter()
+                    .any(|c| matches!(c, Layout::Window(WindowId::Terminal(_))))
+                {
                     Some(children)
                 } else {
                     None
@@ -288,7 +304,10 @@ impl Layout {
     fn findTerminalTabsParts(&mut self) -> Option<(&mut Vec<Layout>, &mut usize)> {
         match self {
             Layout::Tabs { children, active } => {
-                if children.iter().any(|c| matches!(c, Layout::Window(WindowId::Terminal(_)))) {
+                if children
+                    .iter()
+                    .any(|c| matches!(c, Layout::Window(WindowId::Terminal(_))))
+                {
                     Some((children, active))
                 } else {
                     None
@@ -307,15 +326,18 @@ impl Layout {
     fn findTerminalTabsPartsRef(&self) -> Option<(&Vec<Layout>, usize)> {
         match self {
             Layout::Tabs { children, active } => {
-                if children.iter().any(|c| matches!(c, Layout::Window(WindowId::Terminal(_)))) {
+                if children
+                    .iter()
+                    .any(|c| matches!(c, Layout::Window(WindowId::Terminal(_))))
+                {
                     Some((children, *active))
                 } else {
                     None
                 }
             }
-            Layout::Split { a, b, .. } => {
-                a.findTerminalTabsPartsRef().or_else(|| b.findTerminalTabsPartsRef())
-            }
+            Layout::Split { a, b, .. } => a
+                .findTerminalTabsPartsRef()
+                .or_else(|| b.findTerminalTabsPartsRef()),
             Layout::Window(_) => None,
         }
     }
@@ -326,7 +348,12 @@ mod tests {
     use super::*;
 
     fn rect(w: u16, h: u16) -> Rect {
-        Rect { x: 0, y: 0, width: w, height: h }
+        Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }
     }
 
     #[test]
@@ -378,8 +405,20 @@ mod tests {
         // across a range of realistic terminal sizes.
         use ratatui::layout::{Constraint, Direction, Layout as RatLayout};
 
-        for (w, h) in [(80, 24), (100, 30), (132, 50), (200, 75), (40, 20), (300, 100)] {
-            let area = Rect { x: 0, y: 0, width: w, height: h };
+        for (w, h) in [
+            (80, 24),
+            (100, 30),
+            (132, 50),
+            (200, 75),
+            (40, 20),
+            (300, 100),
+        ] {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            };
             let legacy = RatLayout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -414,7 +453,7 @@ mod tests {
     #[test]
     fn duplicateAddIgnored() {
         let mut layout = Layout::defaultPhase1();
-        layout.addTerminal("main");  // already present
+        layout.addTerminal("main"); // already present
         let areas = layout.computeAreas(rect(100, 30));
         let active = &areas[0];
         // Still just one main entry.

@@ -106,7 +106,8 @@ impl TerminalState {
             if let Some(m) = findOsc133(&data[offset..]) {
                 // Process bytes before the marker.
                 if m.offset > 0 {
-                    self.processor.advance(&mut self.term, &data[offset..offset + m.offset]);
+                    self.processor
+                        .advance(&mut self.term, &data[offset..offset + m.offset]);
                 }
                 // Record the marker at the current cursor position.
                 self.handleOsc133(m.kind);

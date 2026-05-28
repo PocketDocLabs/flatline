@@ -32,7 +32,6 @@ const FG_MUTED: Color = Color::Rgb(70, 70, 90);
 const FG_ACCENT: Color = Color::Cyan;
 const FG_BORDER: Color = Color::Magenta;
 
-
 // -- Data structs -------------------------------------------------------------
 
 struct ServerRow {
@@ -176,9 +175,7 @@ impl McpPanel {
                 if self.expanded {
                     self.expanded = false;
                     self.toolScroll = 0;
-                } else if !self.servers.is_empty()
-                    && self.servers[self.selected].toolCount > 0
-                {
+                } else if !self.servers.is_empty() && self.servers[self.selected].toolCount > 0 {
                     self.expanded = true;
                     self.toolScroll = 0;
                 }
@@ -190,8 +187,12 @@ impl McpPanel {
 
     /// Render as a centered popup overlay.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let popupWidth = (area.width * 7 / 10).max(50).min(area.width.saturating_sub(4));
-        let popupHeight = (area.height * 7 / 10).max(14).min(area.height.saturating_sub(2));
+        let popupWidth = (area.width * 7 / 10)
+            .max(50)
+            .min(area.width.saturating_sub(4));
+        let popupHeight = (area.height * 7 / 10)
+            .max(14)
+            .min(area.height.saturating_sub(2));
         let popupX = area.x + (area.width.saturating_sub(popupWidth)) / 2;
         let popupY = area.y + (area.height.saturating_sub(popupHeight)) / 2;
 
@@ -242,7 +243,14 @@ impl McpPanel {
         let dim = style(FG_DIM, BG);
         let accent = style(FG_ACCENT, BG);
 
-        line(buf, inner.x + 1, *y, w - 2, "No MCP servers configured.", dim);
+        line(
+            buf,
+            inner.x + 1,
+            *y,
+            w - 2,
+            "No MCP servers configured.",
+            dim,
+        );
         *y += 2;
 
         let hint = format!("Add servers to {}:", self.configPath);
@@ -332,7 +340,15 @@ impl McpPanel {
             // Line 1: marker + state icon + name + right-aligned tool count.
             let marker = if sel { "\u{25B8} " } else { "  " };
             let (icon, iconColor) = stateIndicator(&server.state);
-            let toolLabel = format!("{} {}", server.toolCount, if server.toolCount == 1 { "tool" } else { "tools" });
+            let toolLabel = format!(
+                "{} {}",
+                server.toolCount,
+                if server.toolCount == 1 {
+                    "tool"
+                } else {
+                    "tools"
+                }
+            );
             let nameSection = format!("{marker}{icon} {}", server.name);
 
             // Render name on left, tool count on right.
@@ -403,7 +419,14 @@ impl McpPanel {
             " \u{25C6} {}  \u{2014}  {} tools",
             server.name, server.toolCount
         );
-        line(buf, inner.x, *y, w, &truncateStr(&header, w), style(FG_PRIMARY, BG));
+        line(
+            buf,
+            inner.x,
+            *y,
+            w,
+            &truncateStr(&header, w),
+            style(FG_PRIMARY, BG),
+        );
         *y += 1;
 
         // Separator.
@@ -417,7 +440,14 @@ impl McpPanel {
         let available = maxY.saturating_sub(*y) as usize;
 
         if server.tools.is_empty() {
-            line(buf, inner.x + 2, *y, w - 2, "No tools registered.", style(FG_DIM, BG));
+            line(
+                buf,
+                inner.x + 2,
+                *y,
+                w - 2,
+                "No tools registered.",
+                style(FG_DIM, BG),
+            );
             return;
         }
 
@@ -534,7 +564,11 @@ impl McpPanel {
         let mut count = 0;
         let mut used = 0u16;
         for i in self.scrollOffset..self.servers.len() {
-            let rowH: u16 = if self.servers[i].error.is_some() { 3 } else { 2 };
+            let rowH: u16 = if self.servers[i].error.is_some() {
+                3
+            } else {
+                2
+            };
             if used + rowH > available {
                 break;
             }

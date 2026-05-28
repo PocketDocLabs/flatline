@@ -270,12 +270,14 @@ pub enum LogEvent {
         id: u64,
         kind: WakeKind,
         summary: String,
+        prompt: Option<String>,
+        nextFireAt: Option<std::time::Instant>,
     },
 
     /// A wake source was disarmed — either explicitly (`cronDelete`,
     /// `scheduleWakeup` one-shot fire, `monitorStop`) or its scheduler
-    /// task exited. After this event, no further `WakeFired` events
-    /// will arrive from this id.
+    /// task exited. After this event, newly arriving fires from this id
+    /// are ignored; any already-closed batch may still be delivered.
     WakeDisarmed { id: u64 },
 
     /// A new terminal was spawned in the session's shell registry.

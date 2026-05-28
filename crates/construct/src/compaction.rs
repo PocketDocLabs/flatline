@@ -87,7 +87,10 @@ impl CompactionOp {
 pub fn compactedBlockSizes(ops: &[CompactionOp]) -> HashMap<String, usize> {
     let mut map = HashMap::new();
     for op in ops {
-        if let CompactionOp::BlockCompact { blockId, summary, .. } = op {
+        if let CompactionOp::BlockCompact {
+            blockId, summary, ..
+        } = op
+        {
             map.insert(blockId.clone(), summary.len());
         }
     }
@@ -311,11 +314,10 @@ impl CompactionLog {
             if line.trim().is_empty() {
                 continue;
             }
-            let op: CompactionOp = serde_json::from_str(line)
-                .with_context(|| "parse compaction log entry")?;
+            let op: CompactionOp =
+                serde_json::from_str(line).with_context(|| "parse compaction log entry")?;
             ops.push(op);
         }
         Ok(ops)
     }
-
 }

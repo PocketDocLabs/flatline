@@ -15,8 +15,8 @@
 //! # Dependencies
 //! `ratatui`
 
-use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 
 // Canvas dimensions in dots.
 const COLS: usize = 8;
@@ -58,59 +58,29 @@ fn eyeFrame(t: u32) -> Grid {
         0..=3 => shape(EYE_IDX),
         // Ticks 4-5: look left (pupil shifts left).
         4..=5 => bitsToGrid([
-            0b00000000,
-            0b00011000,
-            0b01111110,
-            0b11011111,
-            0b11001111,
-            0b01111110,
-            0b00011000,
+            0b00000000, 0b00011000, 0b01111110, 0b11011111, 0b11001111, 0b01111110, 0b00011000,
             0b00000000,
         ]),
         // Ticks 6-7: look right (pupil shifts right).
         6..=7 => bitsToGrid([
-            0b00000000,
-            0b00011000,
-            0b01111110,
-            0b11111011,
-            0b11110011,
-            0b01111110,
-            0b00011000,
+            0b00000000, 0b00011000, 0b01111110, 0b11111011, 0b11110011, 0b01111110, 0b00011000,
             0b00000000,
         ]),
         // Ticks 8-9: center again.
         8..=9 => shape(EYE_IDX),
         // Tick 10: half-closed.
         10 => bitsToGrid([
-            0b00000000,
-            0b00000000,
-            0b00111100,
-            0b01111110,
-            0b01111110,
-            0b00111100,
-            0b00000000,
+            0b00000000, 0b00000000, 0b00111100, 0b01111110, 0b01111110, 0b00111100, 0b00000000,
             0b00000000,
         ]),
         // Tick 11: closed.
         11 => bitsToGrid([
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01111110,
-            0b01111110,
-            0b00000000,
-            0b00000000,
+            0b00000000, 0b00000000, 0b00000000, 0b01111110, 0b01111110, 0b00000000, 0b00000000,
             0b00000000,
         ]),
         // Tick 12: half-open.
         12 => bitsToGrid([
-            0b00000000,
-            0b00000000,
-            0b00111100,
-            0b01111110,
-            0b01111110,
-            0b00111100,
-            0b00000000,
+            0b00000000, 0b00000000, 0b00111100, 0b01111110, 0b01111110, 0b00111100, 0b00000000,
             0b00000000,
         ]),
         // Ticks 13+: open again.
@@ -122,46 +92,22 @@ fn shape(idx: usize) -> Grid {
     match idx {
         // Heart.
         0 => bitsToGrid([
-            0b01100110,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b01111110,
-            0b00111100,
-            0b00011000,
+            0b01100110, 0b11111111, 0b11111111, 0b11111111, 0b01111110, 0b00111100, 0b00011000,
             0b00000000,
         ]),
         // Eye (almond with asymmetric pupil).
         1 => bitsToGrid([
-            0b00000000,
-            0b00011000,
-            0b01111110,
-            0b11101111,
-            0b11100111,
-            0b01111110,
-            0b00011000,
+            0b00000000, 0b00011000, 0b01111110, 0b11101111, 0b11100111, 0b01111110, 0b00011000,
             0b00000000,
         ]),
         // Lightning bolt.
         2 => bitsToGrid([
-            0b00001100,
-            0b00011000,
-            0b00110000,
-            0b01111110,
-            0b00001100,
-            0b00011000,
-            0b00110000,
+            0b00001100, 0b00011000, 0b00110000, 0b01111110, 0b00001100, 0b00011000, 0b00110000,
             0b01100000,
         ]),
         // Heartbeat (EKG waveform, vertical trace).
         _ => bitsToGrid([
-            0b00010000,
-            0b00010000,
-            0b00010100,
-            0b01010100,
-            0b10101011,
-            0b00001000,
-            0b00001000,
+            0b00010000, 0b00010000, 0b00010100, 0b01010100, 0b10101011, 0b00001000, 0b00001000,
             0b00001000,
         ]),
     }
@@ -243,7 +189,8 @@ impl Throbber {
         self.phase = match self.phase {
             Phase::Blob => {
                 if self.ticksUntilShape == 0 {
-                    self.shapeIdx = self.forcedShape
+                    self.shapeIdx = self
+                        .forcedShape
                         .take()
                         .unwrap_or_else(|| (self.seed as usize / 7) % SHAPE_COUNT);
                     Phase::Forming(0)
@@ -260,7 +207,11 @@ impl Throbber {
                 }
             }
             Phase::Holding(t) => {
-                let maxHold = if self.shapeIdx == EYE_IDX { EYE_HOLD_TICKS } else { HOLD_TICKS };
+                let maxHold = if self.shapeIdx == EYE_IDX {
+                    EYE_HOLD_TICKS
+                } else {
+                    HOLD_TICKS
+                };
                 if t >= maxHold {
                     // Inject the shape into the GoL grid.
                     self.grid = shape(self.shapeIdx);
@@ -334,13 +285,13 @@ impl Throbber {
         let mut next = stepGol(&self.grid);
 
         // Lerp thresholds between normal (len=0) and permissive (len=1).
-        let coreRadius = 1.5 + leniency * 1.0;        // 1.5 → 2.5
-        let coreThreshold = 0.0 - leniency * 0.3;     // 0.0 → -0.3
-        let midRadius = 2.5 + leniency * 0.5;          // 2.5 → 3.0
-        let midThreshold = 0.6 - leniency * 0.1;       // 0.6 → 0.5
-        let edgeStart = 3.5 + leniency * 0.5;          // 3.5 → 4.0
-        let edgeThreshold = -0.3 + leniency * 0.3;     // -0.3 → 0.0
-        let killDist = 4.5 + leniency * 0.5;           // 4.5 → 5.0
+        let coreRadius = 1.5 + leniency * 1.0; // 1.5 → 2.5
+        let coreThreshold = 0.0 - leniency * 0.3; // 0.0 → -0.3
+        let midRadius = 2.5 + leniency * 0.5; // 2.5 → 3.0
+        let midThreshold = 0.6 - leniency * 0.1; // 0.6 → 0.5
+        let edgeStart = 3.5 + leniency * 0.5; // 3.5 → 4.0
+        let edgeThreshold = -0.3 + leniency * 0.3; // -0.3 → 0.0
+        let killDist = 4.5 + leniency * 0.5; // 4.5 → 5.0
 
         for row in 0..ROWS {
             for col in 0..COLS {
@@ -428,10 +379,15 @@ fn golNeighbors(grid: &Grid, row: usize, col: usize) -> u8 {
     let mut count = 0u8;
     for dr in [-1i32, 0, 1] {
         for dc in [-1i32, 0, 1] {
-            if dr == 0 && dc == 0 { continue; }
+            if dr == 0 && dc == 0 {
+                continue;
+            }
             let r = row as i32 + dr;
             let c = col as i32 + dc;
-            if r >= 0 && r < ROWS as i32 && c >= 0 && c < COLS as i32
+            if r >= 0
+                && r < ROWS as i32
+                && c >= 0
+                && c < COLS as i32
                 && grid[r as usize][c as usize]
             {
                 count += 1;

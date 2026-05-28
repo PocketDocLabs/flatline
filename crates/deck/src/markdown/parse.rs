@@ -23,9 +23,8 @@ use super::block::{Alignment, MdBlock, StyledSegment};
 /// Returns:
 ///     Vec<MdBlock>: Ordered sequence of parsed blocks.
 pub fn parse(text: &str) -> Vec<MdBlock> {
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let parser = pulldown_cmark::Parser::new_ext(text, options);
     let mut state = ParseState::new();
 
@@ -313,7 +312,10 @@ impl ParseState {
                 }
             }
 
-            Event::End(TagEnd::Emphasis) | Event::End(TagEnd::Strong) | Event::End(TagEnd::Strikethrough) | Event::End(TagEnd::Link) => {
+            Event::End(TagEnd::Emphasis)
+            | Event::End(TagEnd::Strong)
+            | Event::End(TagEnd::Strikethrough)
+            | Event::End(TagEnd::Link) => {
                 self.styleStack.pop();
             }
 
@@ -323,10 +325,14 @@ impl ParseState {
                     code.push_str(&text);
                 } else if self.table.is_some() {
                     let style = self.currentStyle();
-                    self.table.as_mut().unwrap().currentCell.push(StyledSegment {
-                        text: text.to_string(),
-                        style,
-                    });
+                    self.table
+                        .as_mut()
+                        .unwrap()
+                        .currentCell
+                        .push(StyledSegment {
+                            text: text.to_string(),
+                            style,
+                        });
                 } else {
                     self.pushText(&text);
                 }
@@ -352,10 +358,14 @@ impl ParseState {
                     // Ignored in code blocks.
                 } else if self.table.is_some() {
                     let style = self.currentStyle();
-                    self.table.as_mut().unwrap().currentCell.push(StyledSegment {
-                        text: " ".to_string(),
-                        style,
-                    });
+                    self.table
+                        .as_mut()
+                        .unwrap()
+                        .currentCell
+                        .push(StyledSegment {
+                            text: " ".to_string(),
+                            style,
+                        });
                 } else {
                     self.pushText(" ");
                 }

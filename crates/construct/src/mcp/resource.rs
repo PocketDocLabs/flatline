@@ -193,15 +193,16 @@ mod tests {
     #[test]
     fn resourceManagerBasics() {
         let mut mgr = ResourceManager::new();
-        mgr.registerServer("github", vec![
-            ResourceInfo {
+        mgr.registerServer(
+            "github",
+            vec![ResourceInfo {
                 serverName: "github".into(),
                 uri: "repos/flatline".into(),
                 name: "flatline repo".into(),
                 description: "Main repo".into(),
                 mimeType: None,
-            },
-        ]);
+            }],
+        );
 
         assert_eq!(mgr.totalCount(), 1);
         assert_eq!(mgr.serverResources("github").len(), 1);

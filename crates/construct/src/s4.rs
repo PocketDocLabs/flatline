@@ -8,8 +8,8 @@
 //! set even after repeated S4 firings.
 //!
 //! Sources fed into S4:
-//! - Prior S4 briefings (already deep; merged so we don't carry
-//!   ever-growing chains of `<prior_briefing>` blocks).
+//! - The latest active S4 briefing, if one exists. Older S4 ops are
+//!   historical log entries already consumed by that frontier.
 //! - S3 topic summaries whose sourceBlocks are entirely outside the
 //!   protected band and not already covered by a later S4.
 //! - Orphan S2 block summaries whose blocks were never lifted into an
@@ -67,18 +67,128 @@ pub async fn run(
 
     let allTurns = transcript.loadAll()?;
     let activeTurns = crate::transcript::walkBranchTurns(&allTurns, headTurnId);
-    let protectedBand = computeProtectedBand(&activeTurns, &ops, DEFAULT_PROTECTED_RATIO);
-
-    // Blocks already absorbed by any S4 op — those S3/S2 ops are
-    // redundant when the S4 briefing they fed into is being
-    // recompressed below.
-    let s4Covered: HashSet<String> = ops
-        .iter()
-        .flat_map(|op| match op {
-            CompactionOp::FullCompact { sourceIds, .. } => sourceIds.clone(),
-            _ => Vec::new(),
-        })
+    let activeBlockIds: HashSet<&str> = activeTurns.iter().map(|t| t.blockId.as_str()).collect();
+    let activeTurnIds: HashSet<&str> = activeTurns.iter().map(|t| t.id.as_str()).collect();
+    let knownTurnIds: HashSet<&str> = allTurns.iter().map(|t| t.id.as_str()).collect();
+    let activeOps: Vec<CompactionOp> = ops
+        .into_iter()
+        .filter(|op| opAppliesToActiveBranch(op, &activeBlockIds, &activeTurnIds, &knownTurnIds))
         .collect();
+
+    let protectedBand = computeProtectedBand(&activeTurns, &activeOps, DEFAULT_PROTECTED_RATIO);
+
+    let plan = buildRecompactPlan(&activeOps, &protectedBand);
+
+    if plan.sections.is_empty() {
+        return Ok(S4Result {
+            didWork: false,
+            summary: String::new(),
+            sourceBlockIds: Vec::new(),
+            cost: None,
+        });
+    }
+
+    let mixedContent = plan.sections.join("\n\n");
+    let sourceBlockIds = plan.sourceBlockIds;
+    let sectionCount = plan.sections.len();
+    let sourceCount = sourceBlockIds.len();
+    let inputChars = mixedContent.len();
+
+    let userPrompt = format!(
+        "<compact_this>\n\
+         {mixedContent}\n\
+         </compact_this>\n\n\
+         Write the handoff briefing wrapped in \
+         <compacted_monolithic_string> tags. No preamble."
+    );
+
+    tracing::info!(
+        sectionCount,
+        sourceBlocks = sourceCount,
+        inputChars,
+        protectedBlocks = protectedBand.len(),
+        "S4: recompressing older layers"
+    );
+
+    let messages = vec![
+        Message::System {
+            content: DEEP_RECOMPACT_SYSTEM.to_string(),
+        },
+        Message::User {
+            content: userPrompt.into(),
+        },
+    ];
+
+    let (response, usage) = client
+        .complete(&messages, Some(utilityModel))
+        .await
+        .context("S4 utility model call failed")?;
+
+    let cost = usage.and_then(|u| u.cost);
+    let summary = extractCompactedString(&response);
+
+    // Reduction gate: a "summary" longer than what we fed in is not
+    // useful — drop it so the tracker treats S4 as exhausted instead
+    // of growing context and re-firing.
+    if summary.len() >= inputChars {
+        tracing::warn!(
+            inputChars,
+            outputChars = summary.len(),
+            "S4: model output did not reduce — discarding"
+        );
+        return Ok(S4Result {
+            didWork: false,
+            summary: String::new(),
+            sourceBlockIds: Vec::new(),
+            cost,
+        });
+    }
+
+    tracing::info!(
+        outputChars = summary.len(),
+        cost = ?cost,
+        "S4: briefing produced"
+    );
+
+    Ok(S4Result {
+        didWork: true,
+        summary,
+        sourceBlockIds,
+        cost,
+    })
+}
+
+/// A prepared S4 compactor input.
+struct RecompactPlan {
+    sections: Vec<String>,
+    sourceBlockIds: Vec<String>,
+}
+
+/// Select active S4/S3/S2 summary inputs for the next S4 pass.
+///
+/// There may be many historical `FullCompact` entries in the append-only
+/// log, but only the newest active one is the current S4 frontier. Feeding
+/// older S4 briefings alongside the frontier duplicates already-consumed
+/// history and invites summary drift.
+fn buildRecompactPlan(ops: &[CompactionOp], protectedBand: &HashSet<String>) -> RecompactPlan {
+    let latestS4 = ops.iter().rev().find_map(|op| match op {
+        CompactionOp::FullCompact {
+            summary, sourceIds, ..
+        } => {
+            if sourceIds.iter().any(|bid| protectedBand.contains(bid)) {
+                None
+            } else {
+                Some((summary.as_str(), sourceIds.as_slice()))
+            }
+        }
+        _ => None,
+    });
+
+    // Blocks absorbed by the active S4 frontier. Earlier S4 entries and
+    // the S2/S3 summaries that fed them are dead inputs.
+    let s4Covered: HashSet<String> = latestS4
+        .map(|(_, sourceIds)| sourceIds.iter().cloned().collect())
+        .unwrap_or_default();
 
     // Blocks already absorbed by S3.
     let s3Covered: HashSet<String> = ops
@@ -93,7 +203,20 @@ pub async fn run(
     let mut allSourceBlockIds: Vec<String> = Vec::new();
     let mut seenBlocks: HashSet<String> = HashSet::new();
 
-    for op in &ops {
+    if let Some((summary, sourceIds)) = latestS4 {
+        sections.push(format!(
+            "<prior_briefing>\n\
+             {summary}\n\
+             </prior_briefing>"
+        ));
+        for bid in sourceIds {
+            if seenBlocks.insert(bid.clone()) {
+                allSourceBlockIds.push(bid.clone());
+            }
+        }
+    }
+
+    for op in ops {
         match op {
             CompactionOp::TopicCompact {
                 topicLabel,
@@ -141,106 +264,48 @@ pub async fn run(
                     allSourceBlockIds.push(blockId.clone());
                 }
             }
-            CompactionOp::FullCompact {
-                summary,
-                sourceIds,
-                ..
-            } => {
-                // Prior briefings are always older than the recent
-                // band by construction — they were produced from old
-                // S3/S4 content. We still gate them: if any covered
-                // block sits in the protected band (shouldn't happen,
-                // but defensively), skip.
-                if sourceIds.iter().any(|bid| protectedBand.contains(bid)) {
-                    continue;
-                }
-                sections.push(format!(
-                    "<prior_briefing>\n\
-                     {summary}\n\
-                     </prior_briefing>"
-                ));
-                for bid in sourceIds {
-                    if seenBlocks.insert(bid.clone()) {
-                        allSourceBlockIds.push(bid.clone());
-                    }
-                }
+            CompactionOp::FullCompact { .. } => {
+                // Only the latest active S4 frontier is carried above.
+                // Earlier S4 entries are historical and already consumed
+                // by that frontier.
             }
             _ => {}
         }
     }
 
-    if sections.is_empty() {
-        return Ok(S4Result {
-            didWork: false,
-            summary: String::new(),
-            sourceBlockIds: Vec::new(),
-            cost: None,
-        });
-    }
-
-    let mixedContent = sections.join("\n\n");
-    let userPrompt = format!(
-        "<compact_this>\n\
-         {mixedContent}\n\
-         </compact_this>\n\n\
-         Write the handoff briefing wrapped in \
-         <compacted_monolithic_string> tags. No preamble."
-    );
-
-    tracing::info!(
-        sectionCount = sections.len(),
-        sourceBlocks = allSourceBlockIds.len(),
-        inputChars = mixedContent.len(),
-        protectedBlocks = protectedBand.len(),
-        "S4: recompressing older layers"
-    );
-
-    let messages = vec![
-        Message::System {
-            content: DEEP_RECOMPACT_SYSTEM.to_string(),
-        },
-        Message::User {
-            content: userPrompt.into(),
-        },
-    ];
-
-    let (response, usage) = client
-        .complete(&messages, Some(utilityModel))
-        .await
-        .context("S4 utility model call failed")?;
-
-    let cost = usage.and_then(|u| u.cost);
-    let summary = extractCompactedString(&response);
-
-    // Reduction gate: a "summary" longer than what we fed in is not
-    // useful — drop it so the tracker treats S4 as exhausted instead
-    // of growing context and re-firing.
-    if summary.len() >= mixedContent.len() {
-        tracing::warn!(
-            inputChars = mixedContent.len(),
-            outputChars = summary.len(),
-            "S4: model output did not reduce — discarding"
-        );
-        return Ok(S4Result {
-            didWork: false,
-            summary: String::new(),
-            sourceBlockIds: Vec::new(),
-            cost,
-        });
-    }
-
-    tracing::info!(
-        outputChars = summary.len(),
-        cost = ?cost,
-        "S4: briefing produced"
-    );
-
-    Ok(S4Result {
-        didWork: true,
-        summary,
+    RecompactPlan {
+        sections,
         sourceBlockIds: allSourceBlockIds,
-        cost,
-    })
+    }
+}
+
+/// Does a compaction op belong to the current active branch?
+///
+/// This mirrors replay filtering in `context.rs`: if `afterTurn` is a
+/// real turn id from another branch, the op is from a rewound-away future
+/// and must not influence a new S4 run. Unknown `afterTurn` values are
+/// treated as legacy block ids and allowed for backward compatibility.
+fn opAppliesToActiveBranch(
+    op: &CompactionOp,
+    activeBlockIds: &HashSet<&str>,
+    activeTurnIds: &HashSet<&str>,
+    knownTurnIds: &HashSet<&str>,
+) -> bool {
+    let afterTurn = op.afterTurn();
+    if knownTurnIds.contains(afterTurn) && !activeTurnIds.contains(afterTurn) {
+        return false;
+    }
+
+    match op {
+        CompactionOp::FileDedup { .. } | CompactionOp::MiddleOut { .. } => true,
+        CompactionOp::BlockCompact { blockId, .. } => activeBlockIds.contains(blockId.as_str()),
+        CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds
+            .iter()
+            .all(|id| activeBlockIds.contains(id.as_str())),
+        CompactionOp::FullCompact { sourceIds, .. } => sourceIds
+            .iter()
+            .all(|id| activeBlockIds.contains(id.as_str())),
+    }
 }
 
 /// Compute the set of block IDs in the protected recent band.
@@ -307,7 +372,13 @@ mod tests {
     use super::*;
     use crate::transcript::{Turn, TurnRole, TurnStatus};
 
-    fn makeTurn(id: &str, blockId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+    fn makeTurn(
+        id: &str,
+        blockId: &str,
+        role: TurnRole,
+        content: &str,
+        parentId: Option<&str>,
+    ) -> Turn {
         Turn {
             id: id.to_string(),
             blockId: blockId.to_string(),
@@ -390,8 +461,89 @@ mod tests {
         assert!(!band.contains("b_old2"));
         assert!(!band.contains("b_old3"));
     }
-}
 
+    #[test]
+    fn recompact_plan_uses_only_latest_s4_frontier() {
+        let ops = vec![
+            CompactionOp::TopicCompact {
+                stage: "s3".into(),
+                topicLabel: "First Topic".into(),
+                summary: "topic one summary".into(),
+                sourceBlockIds: vec!["b_a".into(), "b_b".into()],
+                afterTurn: "t2".into(),
+                ts: 0,
+            },
+            CompactionOp::FullCompact {
+                stage: "s4".into(),
+                summary: "OLD_S4".into(),
+                sourceIds: vec!["b_a".into(), "b_b".into()],
+                afterTurn: "t3".into(),
+                ts: 0,
+            },
+            CompactionOp::TopicCompact {
+                stage: "s3".into(),
+                topicLabel: "Second Topic".into(),
+                summary: "topic two summary".into(),
+                sourceBlockIds: vec!["b_c".into()],
+                afterTurn: "t4".into(),
+                ts: 0,
+            },
+            CompactionOp::FullCompact {
+                stage: "s4".into(),
+                summary: "LATEST_S4".into(),
+                sourceIds: vec!["b_a".into(), "b_b".into(), "b_c".into()],
+                afterTurn: "t5".into(),
+                ts: 0,
+            },
+            CompactionOp::TopicCompact {
+                stage: "s3".into(),
+                topicLabel: "Fresh Topic".into(),
+                summary: "fresh topic summary".into(),
+                sourceBlockIds: vec!["b_d".into(), "b_e".into()],
+                afterTurn: "t6".into(),
+                ts: 0,
+            },
+            CompactionOp::BlockCompact {
+                stage: "s2".into(),
+                blockId: "b_f".into(),
+                summary: "orphan block summary".into(),
+                sourceIds: vec![],
+                afterTurn: "t7".into(),
+                ts: 0,
+            },
+        ];
+
+        let plan = buildRecompactPlan(&ops, &HashSet::new());
+        let input = plan.sections.join("\n\n");
+
+        assert!(
+            !input.contains("OLD_S4"),
+            "earlier S4 briefings are historical once a later S4 consumed them"
+        );
+        assert_eq!(
+            input.matches("LATEST_S4").count(),
+            1,
+            "the active S4 frontier should be fed exactly once"
+        );
+        assert!(input.contains("fresh topic summary"));
+        assert!(input.contains("orphan block summary"));
+        assert!(
+            !input.contains("topic one summary") && !input.contains("topic two summary"),
+            "summaries already covered by the latest S4 must not be fed again"
+        );
+        assert_eq!(
+            plan.sourceBlockIds,
+            vec![
+                "b_a".to_string(),
+                "b_b".to_string(),
+                "b_c".to_string(),
+                "b_d".to_string(),
+                "b_e".to_string(),
+                "b_f".to_string(),
+            ]
+        );
+    }
+}
 
 /// Extract content from `<compacted_monolithic_string>` tags.
 fn extractCompactedString(response: &str) -> String {

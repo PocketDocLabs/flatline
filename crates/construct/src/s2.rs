@@ -63,14 +63,22 @@ pub async fn run(
 ) -> Result<S2Result> {
     let allTurns = transcript.loadAll()?;
     if allTurns.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S2Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     // Walk the active branch only — dead branches from rewinds
     // must not consume the char budget.
     let turns = crate::transcript::walkBranchTurns(&allTurns, headTurnId);
     if turns.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S2Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     // Build compacted sizes map and zone from shared infrastructure.
@@ -82,7 +90,11 @@ pub async fn run(
     // Group turns by blockId, preserving order.
     let blocks = groupByBlock(&turns);
     if blocks.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S2Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     // Filter to eligible blocks: in zone, not already compacted, has agent content.
@@ -101,7 +113,11 @@ pub async fn run(
     }
 
     if eligible.is_empty() {
-        return Ok(S2Result { didWork: false, compacted: Vec::new(), cost: None });
+        return Ok(S2Result {
+            didWork: false,
+            compacted: Vec::new(),
+            cost: None,
+        });
     }
 
     // Build and fire parallel compaction calls.
@@ -160,8 +176,16 @@ pub async fn run(
     }
 
     let didWork = !compacted.is_empty();
-    let cost = if totalCost > 0.0 { Some(totalCost) } else { None };
-    Ok(S2Result { didWork, compacted, cost })
+    let cost = if totalCost > 0.0 {
+        Some(totalCost)
+    } else {
+        None
+    };
+    Ok(S2Result {
+        didWork,
+        compacted,
+        cost,
+    })
 }
 
 /// A block of turns grouped by blockId.
@@ -299,10 +323,16 @@ async fn compactBlock(
             TurnRole::ToolCall => {
                 // ToolCall turns have the tool name + args — format as agent action.
                 let name = turn.toolName.as_deref().unwrap_or("unknown");
-                let argStr = turn.toolArgs.as_ref()
+                let argStr = turn
+                    .toolArgs
+                    .as_ref()
                     .map(|v| {
                         let s = v.to_string();
-                        if s.len() > 500 { format!("{}...", &s[..s.floor_char_boundary(500)]) } else { s }
+                        if s.len() > 500 {
+                            format!("{}...", &s[..s.floor_char_boundary(500)])
+                        } else {
+                            s
+                        }
                     })
                     .unwrap_or_else(|| "{}".to_string());
                 compactParts.push(format!(
@@ -547,7 +577,13 @@ mod tests {
     use crate::transcript::TurnStatus;
     use std::collections::HashMap;
 
-    fn makeTurn(id: &str, blockId: &str, role: TurnRole, content: &str, parentId: Option<&str>) -> Turn {
+    fn makeTurn(
+        id: &str,
+        blockId: &str,
+        role: TurnRole,
+        content: &str,
+        parentId: Option<&str>,
+    ) -> Turn {
         Turn {
             id: id.to_string(),
             blockId: blockId.to_string(),
@@ -597,11 +633,29 @@ mod tests {
         // With summary sizes: cumChars hits 100 before block 3 → block 3 eligible.
         let turns = vec![
             makeTurn("t1", "b_aaa", TurnRole::User, &"x".repeat(500), None),
-            makeTurn("t2", "b_aaa", TurnRole::Assistant, &"y".repeat(500), Some("t1")),
+            makeTurn(
+                "t2",
+                "b_aaa",
+                TurnRole::Assistant,
+                &"y".repeat(500),
+                Some("t1"),
+            ),
             makeTurn("t3", "b_bbb", TurnRole::User, &"x".repeat(500), Some("t2")),
-            makeTurn("t4", "b_bbb", TurnRole::Assistant, &"y".repeat(500), Some("t3")),
+            makeTurn(
+                "t4",
+                "b_bbb",
+                TurnRole::Assistant,
+                &"y".repeat(500),
+                Some("t3"),
+            ),
             makeTurn("t5", "b_ccc", TurnRole::User, "question", Some("t4")),
-            makeTurn("t6", "b_ccc", TurnRole::Assistant, "answer with enough content", Some("t5")),
+            makeTurn(
+                "t6",
+                "b_ccc",
+                TurnRole::Assistant,
+                "answer with enough content",
+                Some("t5"),
+            ),
         ];
 
         let blocks = groupByBlock(&turns);
@@ -656,7 +710,10 @@ mod tests {
         let activeTurns = crate::transcript::walkBranchTurns(&allTurns, "t5");
         assert_eq!(activeTurns.len(), 4); // t1, t2, t4, t5
         let blockIds: Vec<&str> = activeTurns.iter().map(|t| t.blockId.as_str()).collect();
-        assert!(!blockIds.contains(&"b_dead"), "dead branch block should not be on active branch");
+        assert!(
+            !blockIds.contains(&"b_dead"),
+            "dead branch block should not be on active branch"
+        );
 
         let blocks = groupByBlock(&activeTurns);
         assert_eq!(blocks.len(), 2);

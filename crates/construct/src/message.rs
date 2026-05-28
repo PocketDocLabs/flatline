@@ -377,9 +377,7 @@ mod tests {
 
     #[test]
     fn contentBlocksSerializesAsArray() {
-        let c = Content::withImages("describe this", vec![
-            "data:image/png;base64,abc123".into(),
-        ]);
+        let c = Content::withImages("describe this", vec!["data:image/png;base64,abc123".into()]);
         let json = serde_json::to_string(&c).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.is_array());
@@ -401,9 +399,7 @@ mod tests {
 
     #[test]
     fn contentBlocksRoundTrip() {
-        let original = Content::withImages("look", vec![
-            "data:image/png;base64,xyz".into(),
-        ]);
+        let original = Content::withImages("look", vec!["data:image/png;base64,xyz".into()]);
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: Content = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.textContent(), "look");
@@ -414,7 +410,9 @@ mod tests {
     #[test]
     fn userMessageSerializesCorrectly() {
         // Text-only user message.
-        let msg = Message::User { content: Content::text("hi") };
+        let msg = Message::User {
+            content: Content::text("hi"),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["role"], "user");
@@ -422,9 +420,10 @@ mod tests {
 
         // Multimodal user message.
         let msg = Message::User {
-            content: Content::withImages("what is this?", vec![
-                "data:image/jpeg;base64,/9j/4A".into(),
-            ]),
+            content: Content::withImages(
+                "what is this?",
+                vec!["data:image/jpeg;base64,/9j/4A".into()],
+            ),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -449,10 +448,13 @@ mod tests {
 
     #[test]
     fn stripImagesReplacesWithPlaceholder() {
-        let c = Content::withImages("look at this", vec![
-            "data:image/png;base64,abc".into(),
-            "data:image/jpeg;base64,def".into(),
-        ]);
+        let c = Content::withImages(
+            "look at this",
+            vec![
+                "data:image/png;base64,abc".into(),
+                "data:image/jpeg;base64,def".into(),
+            ],
+        );
         let stripped = c.stripImages();
         assert!(!stripped.hasImages());
         assert_eq!(stripped.textContent(), "look at this");
@@ -462,11 +464,12 @@ mod tests {
     fn stripImagesCollapsesToText() {
         // Single text block + single image -> after stripping, two text blocks.
         // But a single image with no text -> collapses to text.
-        let c = Content::Blocks(vec![
-            ContentBlock::ImageUrl {
-                image_url: ImageUrl { url: "data:image/png;base64,x".into(), detail: None },
+        let c = Content::Blocks(vec![ContentBlock::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,x".into(),
+                detail: None,
             },
-        ]);
+        }]);
         let stripped = c.stripImages();
         assert!(!stripped.hasImages());
         // Should collapse to Content::Text("[image]").

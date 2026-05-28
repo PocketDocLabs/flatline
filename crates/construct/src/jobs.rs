@@ -45,6 +45,11 @@ pub const MAX_RESPONSE_LINES: usize = 500;
 /// stdout/stderr line).
 pub type LineCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Side-effect callback invoked once when a bash-backed task reaches a
+/// terminal state. Used by `MonitorPlane` to mirror natural backing-task
+/// exits into monitor lifecycle without polling.
+pub type ExitCallback = Box<dyn Fn(JobId, JobState) + Send + Sync>;
+
 /// Kind of background job.
 #[derive(Debug, Clone)]
 pub enum JobKind {
@@ -456,7 +461,7 @@ impl JobPlane {
     /// line order of arrival.
     pub fn spawnBash(&mut self, command: String, logTx: mpsc::Sender<LogEvent>) -> Result<JobId> {
         let id = self.reserveJobId();
-        self.spawnBashInner(id, command, JobKind::Bash, "bash", None, logTx, None)
+        self.spawnBashInner(id, command, JobKind::Bash, "bash", None, None, logTx, None)
     }
 
     /// Spawn a bash task with a pre-reserved id and the passive wake
@@ -470,7 +475,16 @@ impl JobPlane {
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<TaskWakeCtx>,
     ) -> Result<JobId> {
-        self.spawnBashInner(id, command, JobKind::Bash, "bash", None, logTx, wakeCtx)
+        self.spawnBashInner(
+            id,
+            command,
+            JobKind::Bash,
+            "bash",
+            None,
+            None,
+            logTx,
+            wakeCtx,
+        )
     }
 
     /// Spawn a bash task whose output stream is also routed through a
@@ -485,6 +499,7 @@ impl JobPlane {
         command: String,
         filter: String,
         onLine: LineCallback,
+        onExit: ExitCallback,
         logTx: mpsc::Sender<LogEvent>,
     ) -> Result<JobId> {
         let id = self.reserveJobId();
@@ -492,7 +507,16 @@ impl JobPlane {
             description,
             filter,
         };
-        self.spawnBashInner(id, command, kind, "monitor", Some(onLine), logTx, None)
+        self.spawnBashInner(
+            id,
+            command,
+            kind,
+            "monitor",
+            Some(onLine),
+            Some(onExit),
+            logTx,
+            None,
+        )
     }
 
     /// Shared body: build the bg task entry, emit `TaskSpawned`, then
@@ -504,6 +528,7 @@ impl JobPlane {
         kind: JobKind,
         kindLabel: &str,
         onLine: Option<LineCallback>,
+        onExit: Option<ExitCallback>,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<TaskWakeCtx>,
     ) -> Result<JobId> {
@@ -561,6 +586,7 @@ impl JobPlane {
                 killRx,
                 drainerLog,
                 onLine,
+                onExit,
                 fireWakeOnComplete,
             )
             .await;
@@ -729,6 +755,7 @@ async fn runBashTask(
     mut killRx: mpsc::Receiver<()>,
     logTx: mpsc::Sender<LogEvent>,
     onLine: Option<LineCallback>,
+    onExit: Option<ExitCallback>,
     fireWakeOnComplete: bool,
 ) {
     // The tool is named `bashSpawn` and the schema promises bash — use
@@ -944,9 +971,10 @@ async fn runBashTask(
     match outcome {
         Outcome::Completed(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
+            let terminalState = JobState::Completed { exitCode: code };
             {
                 let mut g = inner.lock().unwrap();
-                g.state = JobState::Completed { exitCode: code };
+                g.state = terminalState.clone();
                 g.completedAt = Some(Instant::now());
             }
             let _ = logTx
@@ -962,12 +990,16 @@ async fn runBashTask(
                 ))
                 .await;
             }
+            if let Some(cb) = onExit.as_ref() {
+                cb(id, terminalState);
+            }
         }
         Outcome::Completed(Err(e)) => {
             let msg = format!("wait failed: {e}");
+            let terminalState = JobState::Errored(msg.clone());
             {
                 let mut g = inner.lock().unwrap();
-                g.state = JobState::Errored(msg.clone());
+                g.state = terminalState.clone();
                 g.completedAt = Some(Instant::now());
             }
             let _ = logTx
@@ -983,13 +1015,17 @@ async fn runBashTask(
                 ))
                 .await;
             }
+            if let Some(cb) = onExit.as_ref() {
+                cb(id, terminalState);
+            }
         }
         Outcome::Killed => {
             // Reap the zombie.
             let _ = child.wait().await;
+            let terminalState = JobState::Killed;
             {
                 let mut g = inner.lock().unwrap();
-                g.state = JobState::Killed;
+                g.state = terminalState.clone();
                 g.completedAt = Some(Instant::now());
             }
             let _ = logTx
@@ -1007,6 +1043,9 @@ async fn runBashTask(
                     .lock()
                     .await
                     .unregisterPassive(ctx.wakeId, &logTx);
+            }
+            if let Some(cb) = onExit.as_ref() {
+                cb(id, terminalState);
             }
         }
     }

@@ -63,14 +63,9 @@ pub fn executeSearch(
         Err(e) => return format!("Failed to parse search arguments: {e}"),
     };
 
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-    let serverFilter = args
-        .get("server")
-        .and_then(|v| v.as_str());
+    let serverFilter = args.get("server").and_then(|v| v.as_str());
 
     let results = registry.search(query, serverFilter);
 
@@ -82,10 +77,16 @@ pub fn executeSearch(
     }
 
     // Format results compactly for the LLM.
-    let mut output = format!("Found {} MCP tools matching \"{query}\":\n\n", results.len());
+    let mut output = format!(
+        "Found {} MCP tools matching \"{query}\":\n\n",
+        results.len()
+    );
 
     for r in results.iter().take(20) {
-        output.push_str(&format!("▸ {} (server: {})\n", r.qualifiedName, r.serverName));
+        output.push_str(&format!(
+            "▸ {} (server: {})\n",
+            r.qualifiedName, r.serverName
+        ));
         if !r.description.is_empty() {
             output.push_str(&format!("  {}\n", r.description));
         }
@@ -133,10 +134,13 @@ mod tests {
     #[test]
     fn executeSearchFindsTools() {
         let mut reg = ToolRegistry::new();
-        reg.registerServer("github", vec![
-            makeTool("search_repos", "Search GitHub repositories"),
-            makeTool("create_issue", "Create a new issue"),
-        ]);
+        reg.registerServer(
+            "github",
+            vec![
+                makeTool("search_repos", "Search GitHub repositories"),
+                makeTool("create_issue", "Create a new issue"),
+            ],
+        );
 
         let result = executeSearch(&reg, r#"{"query": "search"}"#, None);
         assert!(result.contains("search_repos"));

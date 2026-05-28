@@ -122,7 +122,12 @@ mod tests {
         let text = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Layout = toml::from_str(&text).expect("parse");
 
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 100, height: 30 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
         let a = original.computeAreas(area);
         let b = parsed.computeAreas(area);
         assert_eq!(a.len(), b.len());
@@ -154,7 +159,10 @@ mod tests {
             std::fs::canonicalize(&found.path).unwrap(),
             std::fs::canonicalize(&layoutPath).unwrap(),
         );
-        assert!(found.result.is_ok(), "well-formed file should parse: {found:?}");
+        assert!(
+            found.result.is_ok(),
+            "well-formed file should parse: {found:?}"
+        );
     }
 
     #[test]
@@ -240,8 +248,11 @@ mod tests {
         std::fs::create_dir(&inner).unwrap();
 
         // Outer layout: ratio 0.6 (the default)
-        writeLayout(&outer.join(PROJECT_DIR).join(LAYOUT_FILENAME), &Layout::defaultPhase1())
-            .unwrap();
+        writeLayout(
+            &outer.join(PROJECT_DIR).join(LAYOUT_FILENAME),
+            &Layout::defaultPhase1(),
+        )
+        .unwrap();
 
         // Inner layout: a different ratio so we can tell them apart.
         let innerLayout = Layout::Split {
@@ -258,13 +269,21 @@ mod tests {
         let found = discoverLayout(&inner).expect("layout discovered");
         let layout = found.result.expect("parses");
         // Render at 100 wide: 0.75 → terminal width 75, agent width 25.
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 100, height: 30 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
         let areas = layout.computeAreas(area);
         let termRect = areas
             .iter()
             .find(|a| matches!(a.window, WindowId::Terminal(_)))
             .unwrap()
             .rect;
-        assert_eq!(termRect.width, 75, "closer (.flatline/) should win, got {termRect:?}");
+        assert_eq!(
+            termRect.width, 75,
+            "closer (.flatline/) should win, got {termRect:?}"
+        );
     }
 }

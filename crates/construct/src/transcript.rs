@@ -350,11 +350,7 @@ impl Transcript {
     /// (wakes are conversational boundaries — they begin a fresh turn).
     /// The content is the formatted `<wakes>…</wakes>` envelope; the model
     /// sees it as user-shaped via `context::reconstruct`.
-    pub fn recordWake(
-        &mut self,
-        content: &str,
-        parentId: Option<&str>,
-    ) -> Result<String> {
+    pub fn recordWake(&mut self, content: &str, parentId: Option<&str>) -> Result<String> {
         let blockId = randomHexId("b");
         self.currentBlockId = blockId.clone();
         let turn = Turn {
@@ -382,11 +378,7 @@ impl Transcript {
     }
 
     /// Record an assistant response (in the current block).
-    pub fn recordAssistant(
-        &mut self,
-        content: &str,
-        meta: AssistantMeta<'_>,
-    ) -> Result<String> {
+    pub fn recordAssistant(&mut self, content: &str, meta: AssistantMeta<'_>) -> Result<String> {
         let turn = Turn {
             id: randomHexId("t"),
             blockId: self.currentBlockId.clone(),
@@ -484,8 +476,7 @@ impl Transcript {
             if line.trim().is_empty() {
                 continue;
             }
-            let turn: Turn = serde_json::from_str(line)
-                .with_context(|| "parse transcript line")?;
+            let turn: Turn = serde_json::from_str(line).with_context(|| "parse transcript line")?;
             turns.push(turn);
         }
         Ok(turns)
@@ -495,16 +486,15 @@ impl Transcript {
     pub fn writeMeta(&self, meta: &SessionMeta) -> Result<()> {
         let path = self.sessionDir.join("meta.json");
         let content = serde_json::to_string_pretty(meta)?;
-        fs::write(&path, content)
-            .with_context(|| format!("write meta: {}", path.display()))?;
+        fs::write(&path, content).with_context(|| format!("write meta: {}", path.display()))?;
         Ok(())
     }
 
     /// Load session metadata from a session directory.
     pub fn loadMeta(sessionDir: &Path) -> Result<SessionMeta> {
         let path = sessionDir.join("meta.json");
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("read meta: {}", path.display()))?;
+        let content =
+            fs::read_to_string(&path).with_context(|| format!("read meta: {}", path.display()))?;
         let meta: SessionMeta = serde_json::from_str(&content)?;
         Ok(meta)
     }
@@ -628,12 +618,10 @@ mod tests {
             args: None,
             toolCallId: None,
             reasoning: None,
-            attachments: Some(vec![
-                TurnAttachment {
-                    mimeType: "image/png".into(),
-                    data: "iVBORw0KGgo=".into(),
-                },
-            ]),
+            attachments: Some(vec![TurnAttachment {
+                mimeType: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            }]),
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -689,7 +677,9 @@ mod tests {
             mimeType: "image/jpeg".into(),
             data: "/9j/4AAQ".into(),
         }];
-        transcript.recordUser("check this", None, Some(atts)).unwrap();
+        transcript
+            .recordUser("check this", None, Some(atts))
+            .unwrap();
 
         let turns = transcript.loadAll().unwrap();
         assert_eq!(turns.len(), 1);
@@ -711,7 +701,9 @@ mod tests {
             mimeType: "image/png".into(),
             data: "iVBOR=".into(),
         }];
-        transcript.recordToolResult("call_1", "[screenshot.png]", Some(atts)).unwrap();
+        transcript
+            .recordToolResult("call_1", "[screenshot.png]", Some(atts))
+            .unwrap();
 
         let turns = transcript.loadAll().unwrap();
         assert_eq!(turns.len(), 2);

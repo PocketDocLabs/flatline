@@ -43,9 +43,9 @@ pub fn renderTable(
     width: u16,
 ) -> Vec<Line<'static>> {
     let w = width as usize;
-    let colCount = header.len().max(
-        rows.iter().map(|r| r.len()).max().unwrap_or(0),
-    );
+    let colCount = header
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
 
     if colCount == 0 {
         return vec![];
@@ -89,13 +89,16 @@ pub fn renderTable(
                 _ => break,
             };
             // Next width tier below the current widest.
-            let nextW = colWidths.iter()
+            let nextW = colWidths
+                .iter()
                 .filter(|&&w| w < maxW)
                 .max()
                 .copied()
                 .unwrap_or(MIN_COL_WIDTH);
             // Indices of columns at the widest tier.
-            let atMax: Vec<usize> = colWidths.iter().enumerate()
+            let atMax: Vec<usize> = colWidths
+                .iter()
+                .enumerate()
                 .filter(|(_, w)| **w == maxW)
                 .map(|(i, _)| i)
                 .collect();
@@ -113,7 +116,13 @@ pub fn renderTable(
                 let perCol = excess / atMax.len();
                 let mut remainder = excess % atMax.len();
                 for &i in &atMax {
-                    let shrink = perCol + if remainder > 0 { remainder -= 1; 1 } else { 0 };
+                    let shrink = perCol
+                        + if remainder > 0 {
+                            remainder -= 1;
+                            1
+                        } else {
+                            0
+                        };
                     colWidths[i] -= shrink;
                 }
                 excess = 0;
@@ -124,7 +133,9 @@ pub fn renderTable(
     // Only switch to vertical when shrinking forced a column below threshold.
     let longest = longestWordWidth(header, rows);
     let minUsable = VERTICAL_THRESHOLD.max(longest);
-    let tooNarrow = colWidths.iter().zip(naturalWidths.iter())
+    let tooNarrow = colWidths
+        .iter()
+        .zip(naturalWidths.iter())
         .any(|(&actual, &natural)| actual < natural && actual.saturating_sub(2) < minUsable);
 
     let borderStyle = Style::default().fg(Color::DarkGray);
@@ -136,27 +147,57 @@ pub fn renderTable(
     let mut lines = Vec::new();
 
     // Top border.
-    lines.push(horizontalRule(&colWidths, "\u{250C}", "\u{252C}", "\u{2510}", borderStyle));
+    lines.push(horizontalRule(
+        &colWidths,
+        "\u{250C}",
+        "\u{252C}",
+        "\u{2510}",
+        borderStyle,
+    ));
 
     // Header row (multi-line with wrapping).
     if !header.is_empty() {
         let headerStyle = Style::default().add_modifier(Modifier::BOLD);
-        lines.extend(dataRows(header, &colWidths, alignments, borderStyle, Some(headerStyle)));
+        lines.extend(dataRows(
+            header,
+            &colWidths,
+            alignments,
+            borderStyle,
+            Some(headerStyle),
+        ));
     }
 
     // Header separator.
-    lines.push(horizontalRule(&colWidths, "\u{251C}", "\u{253C}", "\u{2524}", borderStyle));
+    lines.push(horizontalRule(
+        &colWidths,
+        "\u{251C}",
+        "\u{253C}",
+        "\u{2524}",
+        borderStyle,
+    ));
 
     // Data rows with separators between them.
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
-            lines.push(horizontalRule(&colWidths, "\u{251C}", "\u{253C}", "\u{2524}", borderStyle));
+            lines.push(horizontalRule(
+                &colWidths,
+                "\u{251C}",
+                "\u{253C}",
+                "\u{2524}",
+                borderStyle,
+            ));
         }
         lines.extend(dataRows(row, &colWidths, alignments, borderStyle, None));
     }
 
     // Bottom border.
-    lines.push(horizontalRule(&colWidths, "\u{2514}", "\u{2534}", "\u{2518}", borderStyle));
+    lines.push(horizontalRule(
+        &colWidths,
+        "\u{2514}",
+        "\u{2534}",
+        "\u{2518}",
+        borderStyle,
+    ));
 
     lines
 }
@@ -165,9 +206,7 @@ pub fn renderTable(
 
 /// Measure the display width of a table cell's content.
 fn cellWidth(cell: &[StyledSegment]) -> usize {
-    cell.iter()
-        .map(|seg| strDisplayWidth(&seg.text))
-        .sum()
+    cell.iter().map(|seg| strDisplayWidth(&seg.text)).sum()
 }
 
 /// Display width of a string, accounting for multi-byte and wide characters.
@@ -178,12 +217,8 @@ fn strDisplayWidth(s: &str) -> usize {
 /// Find the longest whitespace-delimited word across all cells.
 ///
 /// Returns 0 if no words exist.
-fn longestWordWidth(
-    header: &[Vec<StyledSegment>],
-    rows: &[Vec<Vec<StyledSegment>>],
-) -> usize {
-    let allCells = header.iter()
-        .chain(rows.iter().flat_map(|r| r.iter()));
+fn longestWordWidth(header: &[Vec<StyledSegment>], rows: &[Vec<Vec<StyledSegment>>]) -> usize {
+    let allCells = header.iter().chain(rows.iter().flat_map(|r| r.iter()));
     let mut longest: usize = 0;
     for cell in allCells {
         for seg in cell {
@@ -371,9 +406,7 @@ fn dataRows(
         for (colIdx, colWidth) in colWidths.iter().enumerate() {
             let alignment = alignments.get(colIdx).copied().unwrap_or(Alignment::None);
 
-            let cellLine = wrappedCells
-                .get(colIdx)
-                .and_then(|wc| wc.get(lineIdx));
+            let cellLine = wrappedCells.get(colIdx).and_then(|wc| wc.get(lineIdx));
 
             let cellSpans = if let Some(segs) = cellLine {
                 renderCellContent(segs, *colWidth, alignment, extraStyle)
@@ -435,11 +468,7 @@ fn renderCellContent(
 /// Render a horizontal rule with an embedded label.
 ///
 /// Produces: `── {label} ──────...` filling to the given width.
-fn horizontalRuleWithLabel(
-    width: usize,
-    label: &str,
-    style: Style,
-) -> Line<'static> {
+fn horizontalRuleWithLabel(width: usize, label: &str, style: Style) -> Line<'static> {
     let labelDisplay = strDisplayWidth(label);
     // Format: "── label ──..."
     let prefixLen = 2; // "── " before label, but we use "─ " (2 chars).
@@ -496,9 +525,7 @@ fn renderVerticalRecord(
             let labelText = rightAlignTruncate(&headerText, labelColWidth);
 
             // Wrap value content.
-            let valueSegments = row.get(colIdx)
-                .map(|s| s.as_slice())
-                .unwrap_or(&[]);
+            let valueSegments = row.get(colIdx).map(|s| s.as_slice()).unwrap_or(&[]);
             let wrappedValue = wrapSegments(valueSegments, valueColWidth);
 
             for (lineIdx, valueLine) in wrappedValue.iter().enumerate() {

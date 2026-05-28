@@ -204,9 +204,7 @@ impl SubagentPanel {
     /// Promotes Live → Frozen with an empty terminal if the live subagent
     /// disappeared (graceful degradation; should not happen in practice).
     fn shellMut<'a>(&'a mut self, agentPanel: &'a mut AgentPanel) -> &'a mut TerminalState {
-        if matches!(self.source, SubagentSource::Live)
-            && agentPanel.currentSubagent().is_none()
-        {
+        if matches!(self.source, SubagentSource::Live) && agentPanel.currentSubagent().is_none() {
             self.source = SubagentSource::Frozen {
                 agentType: "subagent".into(),
                 transcript: Vec::new(),
@@ -215,10 +213,12 @@ impl SubagentPanel {
         }
         match &mut self.source {
             SubagentSource::Frozen { shellTerm, .. } => shellTerm,
-            SubagentSource::Live => &mut agentPanel
-                .currentSubagentMut()
-                .expect("checked above")
-                .shellTerm,
+            SubagentSource::Live => {
+                &mut agentPanel
+                    .currentSubagentMut()
+                    .expect("checked above")
+                    .shellTerm
+            }
         }
     }
 
@@ -313,10 +313,8 @@ impl SubagentPanel {
                 }
                 if inTranscriptContent && ev.modifiers.contains(KeyModifiers::SHIFT) {
                     let localRow = ev.row.saturating_sub(self.lastContentRect.y);
-                    let gridLine = selection::toGridLine(
-                        localRow,
-                        self.transcriptPanel.displayOffset(),
-                    );
+                    let gridLine =
+                        selection::toGridLine(localRow, self.transcriptPanel.displayOffset());
                     if let Some(blockId) = self.transcriptPanel.codeBlockAtGridLine(gridLine) {
                         self.transcriptPanel.scrollCodeBlockH(blockId, -3);
                         return SubagentMouseAction::Handled;
@@ -334,10 +332,8 @@ impl SubagentPanel {
                 }
                 if inTranscriptContent && ev.modifiers.contains(KeyModifiers::SHIFT) {
                     let localRow = ev.row.saturating_sub(self.lastContentRect.y);
-                    let gridLine = selection::toGridLine(
-                        localRow,
-                        self.transcriptPanel.displayOffset(),
-                    );
+                    let gridLine =
+                        selection::toGridLine(localRow, self.transcriptPanel.displayOffset());
                     if let Some(blockId) = self.transcriptPanel.codeBlockAtGridLine(gridLine) {
                         self.transcriptPanel.scrollCodeBlockH(blockId, 3);
                         return SubagentMouseAction::Handled;
@@ -355,10 +351,8 @@ impl SubagentPanel {
                 }
                 if inTranscriptContent {
                     let localRow = ev.row.saturating_sub(self.lastContentRect.y);
-                    let gridLine = selection::toGridLine(
-                        localRow,
-                        self.transcriptPanel.displayOffset(),
-                    );
+                    let gridLine =
+                        selection::toGridLine(localRow, self.transcriptPanel.displayOffset());
                     if let Some(blockId) = self.transcriptPanel.codeBlockAtGridLine(gridLine) {
                         self.transcriptPanel.scrollCodeBlockH(blockId, -3);
                     }
@@ -372,10 +366,8 @@ impl SubagentPanel {
                 }
                 if inTranscriptContent {
                     let localRow = ev.row.saturating_sub(self.lastContentRect.y);
-                    let gridLine = selection::toGridLine(
-                        localRow,
-                        self.transcriptPanel.displayOffset(),
-                    );
+                    let gridLine =
+                        selection::toGridLine(localRow, self.transcriptPanel.displayOffset());
                     if let Some(blockId) = self.transcriptPanel.codeBlockAtGridLine(gridLine) {
                         self.transcriptPanel.scrollCodeBlockH(blockId, 3);
                     }
@@ -435,10 +427,8 @@ impl SubagentPanel {
                             .row
                             .saturating_sub(rect.y)
                             .min(rect.height.saturating_sub(1));
-                        let gridLine = selection::toGridLine(
-                            row,
-                            self.transcriptPanel.displayOffset(),
-                        );
+                        let gridLine =
+                            selection::toGridLine(row, self.transcriptPanel.displayOffset());
                         if let Some(sel) = self.selection.as_mut() {
                             sel.update(col, gridLine);
                         }
@@ -471,7 +461,11 @@ impl SubagentPanel {
         let row = self.lastTabBarRect.y;
         for (i, rect) in self.tabRects.iter().enumerate() {
             if rect.contains((col, row).into()) {
-                self.tab = if i == 0 { SubagentTab::Transcript } else { SubagentTab::Shell };
+                self.tab = if i == 0 {
+                    SubagentTab::Transcript
+                } else {
+                    SubagentTab::Shell
+                };
                 return;
             }
         }
@@ -516,12 +510,7 @@ impl SubagentPanel {
 
     /// Render the popup. Reads transcript + shell from `agentPanel.activeSubagent`
     /// when in Live mode; from owned snapshot when Frozen.
-    pub fn render(
-        &mut self,
-        screenArea: Rect,
-        buf: &mut Buffer,
-        agentPanel: &mut AgentPanel,
-    ) {
+    pub fn render(&mut self, screenArea: Rect, buf: &mut Buffer, agentPanel: &mut AgentPanel) {
         let popupWidth = (screenArea.width * 4 / 5).max(40);
         let popupHeight = (screenArea.height * 4 / 5).max(10);
         let x = screenArea.x + (screenArea.width.saturating_sub(popupWidth)) / 2;
@@ -566,7 +555,11 @@ impl SubagentPanel {
                     .map(|s| s.shellTerm.displayOffset())
                     .unwrap_or(0),
             };
-            if off > 0 { format!("[\u{2191}{}\u{FE0E}] ", off) } else { String::new() }
+            if off > 0 {
+                format!("[\u{2191}{}\u{FE0E}] ", off)
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
@@ -575,9 +568,7 @@ impl SubagentPanel {
             .fg(Color::Black)
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let inactiveTabStyle = Style::default()
-            .fg(Color::Gray)
-            .bg(Color::Black);
+        let inactiveTabStyle = Style::default().fg(Color::Gray).bg(Color::Black);
 
         // Title sections are: " {agentType}{statusSuffix}" then the two tabs.
         // Compute tab rects so clicks land on the right tab regardless of
@@ -593,8 +584,18 @@ impl SubagentPanel {
         let transcriptX = titleStart + agentSectionW;
         let shellX = transcriptX + transcriptW + 1; // +1 for the divider char.
         self.tabRects = [
-            Rect { x: transcriptX, y: popupArea.y, width: transcriptW, height: 1 },
-            Rect { x: shellX, y: popupArea.y, width: shellW, height: 1 },
+            Rect {
+                x: transcriptX,
+                y: popupArea.y,
+                width: transcriptW,
+                height: 1,
+            },
+            Rect {
+                x: shellX,
+                y: popupArea.y,
+                width: shellW,
+                height: 1,
+            },
         ];
 
         let title = Line::from(vec![
@@ -606,12 +607,20 @@ impl SubagentPanel {
             ),
             Span::styled(
                 TRANSCRIPT_LABEL,
-                if self.tab == SubagentTab::Transcript { activeTabStyle } else { inactiveTabStyle },
+                if self.tab == SubagentTab::Transcript {
+                    activeTabStyle
+                } else {
+                    inactiveTabStyle
+                },
             ),
             Span::styled("\u{2502}", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 SHELL_LABEL,
-                if self.tab == SubagentTab::Shell { activeTabStyle } else { inactiveTabStyle },
+                if self.tab == SubagentTab::Shell {
+                    activeTabStyle
+                } else {
+                    inactiveTabStyle
+                },
             ),
             Span::raw(" "),
             Span::styled(scrollSuffix, Style::default().fg(Color::DarkGray)),
@@ -665,8 +674,18 @@ impl SubagentPanel {
 
         let (contentArea, permitArea) = if permitHeight > 0 && inner.height > permitHeight + 1 {
             let split = inner.height.saturating_sub(permitHeight + 1);
-            let content = Rect { x: inner.x, y: inner.y, width: inner.width, height: split };
-            let divider = Rect { x: inner.x, y: inner.y + split, width: inner.width, height: 1 };
+            let content = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: split,
+            };
+            let divider = Rect {
+                x: inner.x,
+                y: inner.y + split,
+                width: inner.width,
+                height: 1,
+            };
             let permit = Rect {
                 x: inner.x,
                 y: inner.y + split + 1,
@@ -686,7 +705,11 @@ impl SubagentPanel {
         // When the parent has fanned out multiple parallel subagents, draw
         // a secondary tab strip just below the title row listing each one.
         // Empty otherwise so the body has the full pane.
-        let multiTabHeight: u16 = if agentPanel.activeSubagents.len() > 1 { 1 } else { 0 };
+        let multiTabHeight: u16 = if agentPanel.activeSubagents.len() > 1 {
+            1
+        } else {
+            0
+        };
         let bodyArea = if multiTabHeight > 0 && contentArea.height > multiTabHeight {
             let strip = Rect {
                 x: contentArea.x,
@@ -752,12 +775,7 @@ impl SubagentPanel {
     /// Render the parallel-subagent tab strip — one labelled chip per
     /// live subagent. Highlights the currently selected one and records
     /// per-chip click rects.
-    fn renderSubagentTabStrip(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        agentPanel: &AgentPanel,
-    ) {
+    fn renderSubagentTabStrip(&mut self, area: Rect, buf: &mut Buffer, agentPanel: &AgentPanel) {
         use unicode_width::UnicodeWidthStr as UWS;
 
         // Background fill so cell colors don't bleed.
@@ -782,8 +800,7 @@ impl SubagentPanel {
 
         let mut x = area.x;
         let mut rects: Vec<(Rect, String)> = Vec::with_capacity(agentPanel.activeSubagents.len());
-        let isSubagentPermit =
-            agentPanel.pendingPermit && agentPanel.pendingPermitIsSubagent();
+        let isSubagentPermit = agentPanel.pendingPermit && agentPanel.pendingPermitIsSubagent();
         let permitSessionId = if isSubagentPermit {
             agentPanel.pendingPermitSubagentSessionId()
         } else {
@@ -810,7 +827,12 @@ impl SubagentPanel {
                 inactive
             };
 
-            let chipRect = Rect { x, y: area.y, width: labelW, height: 1 };
+            let chipRect = Rect {
+                x,
+                y: area.y,
+                width: labelW,
+                height: 1,
+            };
             buf.set_span(x, area.y, &Span::styled(label, style), labelW);
             rects.push((chipRect, sub.sessionId.clone()));
             x += labelW;
@@ -822,7 +844,9 @@ impl SubagentPanel {
                     area.y,
                     &Span::styled(
                         "\u{2502}",
-                        Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30)),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .bg(Color::Rgb(20, 20, 30)),
                     ),
                     1,
                 );
@@ -838,7 +862,12 @@ impl SubagentPanel {
             buf.set_span(
                 hintX,
                 area.y,
-                &Span::styled(hint, Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30))),
+                &Span::styled(
+                    hint,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .bg(Color::Rgb(20, 20, 30)),
+                ),
                 hintW,
             );
         }
@@ -871,12 +900,7 @@ impl SubagentPanel {
         // line up with the convention used by extractUnwrappedText.
         let selRect = self.lastSelectionRect;
         if let Some(sel) = &self.selection {
-            selection::applyHighlight(
-                sel,
-                selRect,
-                buf,
-                self.transcriptPanel.displayOffset(),
-            );
+            selection::applyHighlight(sel, selRect, buf, self.transcriptPanel.displayOffset());
         }
 
         // Pending double/triple-click expansion (needs Buffer).
@@ -921,7 +945,9 @@ impl SubagentPanel {
                         "  No shell output\u{2026}",
                         Style::default().fg(Color::DarkGray),
                     ))];
-                    Paragraph::new(lines).wrap(Wrap { trim: false }).render(area, buf);
+                    Paragraph::new(lines)
+                        .wrap(Wrap { trim: false })
+                        .render(area, buf);
                     return;
                 }
             },
@@ -935,5 +961,4 @@ impl SubagentPanel {
         }
         EmbeddedTerminal.render(area, buf, term);
     }
-
 }

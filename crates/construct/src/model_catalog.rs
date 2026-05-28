@@ -112,7 +112,11 @@ pub fn knownModelReasoningEfforts(provider: &str, model: &str) -> Vec<String> {
             .find(|entry| entry.id == model)
             .map(|entry| entry.reasoningEfforts)
             .unwrap_or_default(),
-        "deepseek" => vec!["disabled".to_string(), "high".to_string(), "max".to_string()],
+        "deepseek" => vec![
+            "disabled".to_string(),
+            "high".to_string(),
+            "max".to_string(),
+        ],
         _ => Vec::new(),
     }
 }

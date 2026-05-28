@@ -19,7 +19,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::servers::{ServerDef, BUILTIN_SERVERS};
+use super::servers::{BUILTIN_SERVERS, ServerDef};
 
 /// Per-server configuration override from user/project config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +57,10 @@ pub struct LspServerConfig {
     pub startupTimeout: u64,
 
     /// Diagnostics wait timeout in seconds. Default: 3.
-    #[serde(default = "defaults::diagnosticsTimeout", rename = "diagnostics_timeout")]
+    #[serde(
+        default = "defaults::diagnosticsTimeout",
+        rename = "diagnostics_timeout"
+    )]
     pub diagnosticsTimeout: u64,
 }
 
@@ -104,10 +107,7 @@ pub type LspConfig = HashMap<String, LspServerConfig>;
 ///
 /// Returns:
 ///     Vec of fully resolved server configs.
-pub fn resolveServers(
-    userConfig: &LspConfig,
-    projectConfig: &LspConfig,
-) -> Vec<ResolvedServer> {
+pub fn resolveServers(userConfig: &LspConfig, projectConfig: &LspConfig) -> Vec<ResolvedServer> {
     // Project overrides user.
     let mut merged: HashMap<String, &LspServerConfig> = HashMap::new();
     for (id, cfg) in userConfig {
@@ -177,19 +177,23 @@ fn resolveBuiltinWithOverride(def: &ServerDef, cfg: &LspServerConfig) -> Resolve
             .command
             .clone()
             .unwrap_or_else(|| def.command.to_string()),
-        args: cfg.args.clone().unwrap_or_else(|| {
-            def.args.iter().map(|s| s.to_string()).collect()
-        }),
+        args: cfg
+            .args
+            .clone()
+            .unwrap_or_else(|| def.args.iter().map(|s| s.to_string()).collect()),
         env: cfg.env.clone(),
-        extensions: cfg.extensions.clone().unwrap_or_else(|| {
-            def.extensions.iter().map(|s| s.to_string()).collect()
-        }),
-        rootMarkers: cfg.rootMarkers.clone().unwrap_or_else(|| {
-            def.rootMarkers.iter().map(|s| s.to_string()).collect()
-        }),
-        languageIds: cfg.languageIds.clone().unwrap_or_else(|| {
-            def.languageIds.iter().map(|s| s.to_string()).collect()
-        }),
+        extensions: cfg
+            .extensions
+            .clone()
+            .unwrap_or_else(|| def.extensions.iter().map(|s| s.to_string()).collect()),
+        rootMarkers: cfg
+            .rootMarkers
+            .clone()
+            .unwrap_or_else(|| def.rootMarkers.iter().map(|s| s.to_string()).collect()),
+        languageIds: cfg
+            .languageIds
+            .clone()
+            .unwrap_or_else(|| def.languageIds.iter().map(|s| s.to_string()).collect()),
         installHint: def.installHint.to_string(),
         runtime: def.runtime.map(|s| s.to_string()),
         startupTimeout: cfg.startupTimeout,

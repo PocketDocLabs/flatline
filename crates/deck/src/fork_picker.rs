@@ -131,8 +131,12 @@ impl ForkPicker {
 
     /// Render the picker as a centered popup overlay.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let popupWidth = (area.width * 7 / 10).max(40).min(area.width.saturating_sub(4));
-        let popupHeight = (area.height * 7 / 10).max(10).min(area.height.saturating_sub(2));
+        let popupWidth = (area.width * 7 / 10)
+            .max(40)
+            .min(area.width.saturating_sub(4));
+        let popupHeight = (area.height * 7 / 10)
+            .max(10)
+            .min(area.height.saturating_sub(2));
         let popupX = area.x + (area.width.saturating_sub(popupWidth)) / 2;
         let popupY = area.y + (area.height.saturating_sub(popupHeight)) / 2;
 
@@ -178,8 +182,17 @@ impl ForkPicker {
         self.lastVisibleCount = visibleCount;
 
         if self.rows.is_empty() {
-            let emptyStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25));
-            renderLine(buf, inner.x + 1, y, contentWidth - 1, "No saved forks.", emptyStyle);
+            let emptyStyle = Style::default()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(15, 15, 25));
+            renderLine(
+                buf,
+                inner.x + 1,
+                y,
+                contentWidth - 1,
+                "No saved forks.",
+                emptyStyle,
+            );
         } else {
             for visIdx in 0..visibleCount {
                 let listIdx = self.scrollOffset + visIdx;
@@ -195,9 +208,13 @@ impl ForkPicker {
                     Style::default().fg(Color::White).bg(Color::Rgb(15, 15, 25))
                 };
                 let metaStyle = if isSelected {
-                    Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 80))
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .bg(Color::Rgb(40, 40, 80))
                 } else {
-                    Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25))
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .bg(Color::Rgb(15, 15, 25))
                 };
 
                 // Clear row background for selected item.
@@ -215,12 +232,22 @@ impl ForkPicker {
 
                 // Line 1: marker + label.
                 let marker = if isSelected { "\u{25B8} " } else { "  " };
-                let labelText = format!("{marker}{}", truncate(&row.label, contentWidth.saturating_sub(3)));
+                let labelText = format!(
+                    "{marker}{}",
+                    truncate(&row.label, contentWidth.saturating_sub(3))
+                );
                 renderLine(buf, inner.x, y, contentWidth, &labelText, labelStyle);
 
                 // Line 2: fork ID + relative time.
                 let metaText = format!("  {}  {}", row.forkId, row.relativeTime);
-                renderLine(buf, inner.x, y + 1, contentWidth, &truncate(&metaText, contentWidth), metaStyle);
+                renderLine(
+                    buf,
+                    inner.x,
+                    y + 1,
+                    contentWidth,
+                    &truncate(&metaText, contentWidth),
+                    metaStyle,
+                );
 
                 y += rowHeight;
             }
@@ -228,14 +255,32 @@ impl ForkPicker {
 
         // Footer.
         let footerY = popupArea.y + popupArea.height - 2;
-        let footerStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25));
+        let footerStyle = Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(15, 15, 25));
 
         if let Some(ref err) = self.error {
             let errorStyle = Style::default().fg(Color::Red).bg(Color::Rgb(15, 15, 25));
-            renderLine(buf, inner.x, footerY, contentWidth, &truncate(err, contentWidth), errorStyle);
+            renderLine(
+                buf,
+                inner.x,
+                footerY,
+                contentWidth,
+                &truncate(err, contentWidth),
+                errorStyle,
+            );
         } else if matches!(self.state, PickerState::Pending) {
-            let pendingStyle = Style::default().fg(Color::Yellow).bg(Color::Rgb(15, 15, 25));
-            renderLine(buf, inner.x, footerY, contentWidth, "Switching\u{2026}", pendingStyle);
+            let pendingStyle = Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(15, 15, 25));
+            renderLine(
+                buf,
+                inner.x,
+                footerY,
+                contentWidth,
+                "Switching\u{2026}",
+                pendingStyle,
+            );
         }
 
         let hints = if matches!(self.state, PickerState::Pending) {
@@ -243,7 +288,14 @@ impl ForkPicker {
         } else {
             "\u{2191}\u{2193}/jk: navigate  Enter: switch  Esc: close".to_string()
         };
-        renderLine(buf, inner.x, footerY + 1, contentWidth, &truncate(&hints, contentWidth), footerStyle);
+        renderLine(
+            buf,
+            inner.x,
+            footerY + 1,
+            contentWidth,
+            &truncate(&hints, contentWidth),
+            footerStyle,
+        );
     }
 
     /// Ensure the selected item is visible in the scroll window.
@@ -265,7 +317,9 @@ fn renderLine(buf: &mut Buffer, x: u16, y: u16, maxWidth: usize, text: &str, sty
         width: maxWidth as u16,
         height: 1,
     };
-    Paragraph::new(text.to_string()).style(style).render(area, buf);
+    Paragraph::new(text.to_string())
+        .style(style)
+        .render(area, buf);
 }
 
 /// Format a unix timestamp as a relative time string.
@@ -296,7 +350,10 @@ fn truncate(s: &str, maxChars: usize) -> String {
     if s.chars().count() <= maxChars {
         s.to_string()
     } else if maxChars > 3 {
-        let end = s.char_indices().nth(maxChars - 1).map_or(s.len(), |(i, _)| i);
+        let end = s
+            .char_indices()
+            .nth(maxChars - 1)
+            .map_or(s.len(), |(i, _)| i);
         format!("{}\u{2026}", &s[..end])
     } else {
         let end = s.char_indices().nth(maxChars).map_or(s.len(), |(i, _)| i);

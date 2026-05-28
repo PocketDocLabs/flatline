@@ -118,10 +118,7 @@ pub fn buildExample(
             sessionId: sessionId.to_string(),
             segmentIndex,
             snapshotHash,
-            turnRange: [
-                branch[segment.anchorIdx].id.clone(),
-                lastAsst.id.clone(),
-            ],
+            turnRange: [branch[segment.anchorIdx].id.clone(), lastAsst.id.clone()],
             model: Some(segment.last.model.clone()),
         },
     }))
@@ -150,7 +147,10 @@ fn assembleAssistantTarget(branch: &[Turn], asstIdx: usize) -> Result<Message> {
                 toolCalls.push(ToolCall {
                     id: callId,
                     callType: "function".into(),
-                    function: FunctionCall { name, arguments: args },
+                    function: FunctionCall {
+                        name,
+                        arguments: args,
+                    },
                 });
             }
             // Stop at tool results or further assistant/user/system turns.
@@ -163,10 +163,18 @@ fn assembleAssistantTarget(branch: &[Turn], asstIdx: usize) -> Result<Message> {
     } else {
         Some(asst.content.clone())
     };
-    let toolCalls = if toolCalls.is_empty() { None } else { Some(toolCalls) };
+    let toolCalls = if toolCalls.is_empty() {
+        None
+    } else {
+        Some(toolCalls)
+    };
     let reasoning = asst.reasoning.clone();
 
-    Ok(Message::Assistant { content, tool_calls: toolCalls, reasoning })
+    Ok(Message::Assistant {
+        content,
+        tool_calls: toolCalls,
+        reasoning,
+    })
 }
 
 /// Convert an internal `Message` into an OpenAI-shaped JSON value.

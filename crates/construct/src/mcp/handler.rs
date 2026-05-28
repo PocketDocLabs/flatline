@@ -17,14 +17,13 @@ use std::sync::Arc;
 use rmcp::ClientHandler;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
-    CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
-    CreateMessageRequestMethod, ElicitationAction, Implementation,
-    ListRootsResult, LoggingMessageNotificationParam, ProgressNotificationParam,
+    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
+    CreateMessageRequestMethod, CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
+    Implementation, ListRootsResult, LoggingMessageNotificationParam, ProgressNotificationParam,
     ProtocolVersion, Root,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
-use tokio::sync::{mpsc, Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Elicitation request forwarded to the supervisor (TUI or headless controller).
 pub struct ElicitationRequest {
@@ -78,9 +77,7 @@ impl ClientHandler for FlatlineHandler {
         &self,
         _params: CreateMessageRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateMessageResult, McpError>>
-           + Send
-           + '_ {
+    ) -> impl std::future::Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
         async move {
             // TODO(pocketdoc, 2026-03-11): Route to api::Client for real sampling.
             // For now, decline — most servers don't use sampling.
@@ -92,9 +89,8 @@ impl ClientHandler for FlatlineHandler {
         &self,
         request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpError>>
-           + Send
-           + '_ {
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_
+    {
         async move {
             match request {
                 CreateElicitationRequestParams::FormElicitationParams {
@@ -117,11 +113,8 @@ impl ClientHandler for FlatlineHandler {
                     }
 
                     // Wait for supervisor response with a timeout.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        responseRx,
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(120), responseRx)
+                        .await
                     {
                         Ok(Ok(ElicitationResponse::Accept(content))) => {
                             Ok(CreateElicitationResult::new(ElicitationAction::Accept)
@@ -141,9 +134,7 @@ impl ClientHandler for FlatlineHandler {
     fn list_roots(
         &self,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpError>>
-           + Send
-           + '_ {
+    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpError>> + Send + '_ {
         async move {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())

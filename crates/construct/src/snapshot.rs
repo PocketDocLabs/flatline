@@ -382,10 +382,7 @@ mod tests {
         let h1 = store.putBlob(BlobNs::SystemPrompt, b"hello").unwrap();
         let h2 = store.putBlob(BlobNs::SystemPrompt, b"hello").unwrap();
         assert_eq!(h1, h2);
-        let path = store
-            .dir
-            .join("blobs/sp")
-            .join(format!("{h1}.txt"));
+        let path = store.dir.join("blobs/sp").join(format!("{h1}.txt"));
         assert!(path.exists());
         assert_eq!(fs::read(&path).unwrap(), b"hello");
     }
@@ -422,8 +419,12 @@ mod tests {
     fn captureSnapshotRoundTripsMessages() {
         let (_dir, mut store) = tempStore();
         let history = vec![
-            Message::System { content: "you are helpful".into() },
-            Message::User { content: Content::Text("hi".into()) },
+            Message::System {
+                content: "you are helpful".into(),
+            },
+            Message::User {
+                content: Content::Text("hi".into()),
+            },
             Message::Assistant {
                 content: Some("hello".into()),
                 tool_calls: None,

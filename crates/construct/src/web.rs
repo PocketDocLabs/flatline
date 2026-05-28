@@ -57,7 +57,11 @@ impl ExaClient {
     }
 
     /// POST JSON to an Exa endpoint and return the parsed response.
-    async fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn post(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let url = format!("{EXA_BASE_URL}{path}");
 
         let response = self
@@ -377,9 +381,7 @@ async fn maybeSummarize(
                 .into(),
         },
         Message::User {
-            content: format!(
-                "Page content:\n\n{content}\n\n---\n\nExtract: {prompt}"
-            ).into(),
+            content: format!("Page content:\n\n{content}\n\n---\n\nExtract: {prompt}").into(),
         },
     ];
 

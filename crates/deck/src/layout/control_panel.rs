@@ -53,14 +53,19 @@ fn layoutsMatchShape(a: &Layout, b: &Layout) -> bool {
     // match — runtime spawns/closes change the Tabs children freely.
     match (a, b) {
         (
-            Layout::Split { orient: oa, ratio: ra, a: aa, b: ab },
-            Layout::Split { orient: ob, ratio: rb, a: ba, b: bb },
-        ) => {
-            oa == ob
-                && (ra - rb).abs() < 0.01
-                && sameChildKind(aa, ba)
-                && sameChildKind(ab, bb)
-        }
+            Layout::Split {
+                orient: oa,
+                ratio: ra,
+                a: aa,
+                b: ab,
+            },
+            Layout::Split {
+                orient: ob,
+                ratio: rb,
+                a: ba,
+                b: bb,
+            },
+        ) => oa == ob && (ra - rb).abs() < 0.01 && sameChildKind(aa, ba) && sameChildKind(ab, bb),
         _ => false,
     }
 }
@@ -294,7 +299,12 @@ impl ControlPanel {
         // Two columns: left = diagram, right = preset list. ~45/55.
         let leftW = inner.width.saturating_mul(45).saturating_div(100);
         let rightW = inner.width.saturating_sub(leftW + 1);
-        let left = Rect { x: inner.x, y: inner.y, width: leftW, height: inner.height.saturating_sub(2) };
+        let left = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: leftW,
+            height: inner.height.saturating_sub(2),
+        };
         let right = Rect {
             x: inner.x + leftW + 1,
             y: inner.y,
@@ -318,15 +328,23 @@ impl ControlPanel {
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.presets.len() * 2 + 2);
         lines.push(Line::from(Span::styled(
             "Presets",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         for (i, p) in self.presets.iter().enumerate() {
             let active = self.appliedName.as_deref() == Some(p.name);
-            let cursor = if i == self.selected { "\u{25B8} " } else { "  " };
+            let cursor = if i == self.selected {
+                "\u{25B8} "
+            } else {
+                "  "
+            };
             let suffix = if active { "  (applied)" } else { "" };
             let style = if i == self.selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Rgb(180, 180, 200))
             };
@@ -364,12 +382,19 @@ fn renderDiagram(layout: &Layout, width: u16, height: u16) -> Vec<Line<'static>>
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(Span::styled(
         "Current",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     out.push(Line::from(""));
 
     match layout {
-        Layout::Split { orient: Orient::Horizontal, ratio, a, b } => {
+        Layout::Split {
+            orient: Orient::Horizontal,
+            ratio,
+            a,
+            b,
+        } => {
             let total = width.saturating_sub(4).max(20);
             let leftW = ((total as f32) * ratio).round() as u16;
             let rightW = total.saturating_sub(leftW);
@@ -419,7 +444,11 @@ fn labelOf(layout: &Layout) -> String {
     match layout {
         Layout::Tabs { children, .. } => {
             let count = children.len();
-            if count <= 1 { "terminal".into() } else { format!("terminals ({count})") }
+            if count <= 1 {
+                "terminal".into()
+            } else {
+                format!("terminals ({count})")
+            }
         }
         Layout::Window(WindowId::Terminal(name)) => format!("term: {name}"),
         Layout::Window(WindowId::AgentPanel) => "agent".into(),
@@ -428,7 +457,9 @@ fn labelOf(layout: &Layout) -> String {
 }
 
 fn padCenter(s: &str, w: u16) -> String {
-    if w == 0 { return String::new(); }
+    if w == 0 {
+        return String::new();
+    }
     let s = if (s.chars().count() as u16) > w {
         s.chars().take(w as usize).collect()
     } else {
@@ -438,7 +469,12 @@ fn padCenter(s: &str, w: u16) -> String {
     let pad = w.saturating_sub(len);
     let left = pad / 2;
     let right = pad - left;
-    format!("{}{}{}", " ".repeat(left as usize), s, " ".repeat(right as usize))
+    format!(
+        "{}{}{}",
+        " ".repeat(left as usize),
+        s,
+        " ".repeat(right as usize)
+    )
 }
 
 fn renderConfirmOverlay(popupRect: Rect, buf: &mut Buffer) {
@@ -447,7 +483,12 @@ fn renderConfirmOverlay(popupRect: Rect, buf: &mut Buffer) {
     let h = 3u16.min(popupRect.height);
     let x = popupRect.x + (popupRect.width.saturating_sub(w)) / 2;
     let y = popupRect.y + (popupRect.height.saturating_sub(h)) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     Clear.render(rect, buf);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -470,15 +511,26 @@ mod tests {
     fn navigateAndApplyPreset() {
         let mut panel = ControlPanel::new(Layout::defaultPhase1(), None);
         // Default selection = "split" (index 0)
-        assert!(matches!(panel.handleKey(key(KeyCode::Down)), PanelAction::None));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Down)),
+            PanelAction::None
+        ));
         // Now selected = 1 = "wide". Enter applies.
         match panel.handleKey(key(KeyCode::Enter)) {
             PanelAction::ApplyPreset { name, layout } => {
                 assert_eq!(name, "wide");
                 // Render at 100 wide — wide preset is 50/50.
-                let area = ratatui::layout::Rect { x: 0, y: 0, width: 100, height: 30 };
+                let area = ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 30,
+                };
                 let areas = layout.computeAreas(area);
-                let term = areas.iter().find(|a| matches!(a.window, WindowId::Terminal(_))).unwrap();
+                let term = areas
+                    .iter()
+                    .find(|a| matches!(a.window, WindowId::Terminal(_)))
+                    .unwrap();
                 assert_eq!(term.rect.width, 50);
             }
             other => panic!("expected ApplyPreset, got {}", actionName(&other)),
@@ -490,26 +542,44 @@ mod tests {
         let mut panel = ControlPanel::new(Layout::defaultPhase1(), None);
         panel.confirmApplied("wide".into(), builtinPresets()[1].layout.clone());
         // Esc should not close yet — prompt first.
-        assert!(matches!(panel.handleKey(key(KeyCode::Esc)), PanelAction::None));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Esc)),
+            PanelAction::None
+        ));
         // y discards and closes.
-        assert!(matches!(panel.handleKey(key(KeyCode::Char('y'))), PanelAction::Close));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Char('y'))),
+            PanelAction::Close
+        ));
     }
 
     #[test]
     fn dirtyEscNCancelsConfirm() {
         let mut panel = ControlPanel::new(Layout::defaultPhase1(), None);
         panel.confirmApplied("focus".into(), builtinPresets()[2].layout.clone());
-        assert!(matches!(panel.handleKey(key(KeyCode::Esc)), PanelAction::None));
-        assert!(matches!(panel.handleKey(key(KeyCode::Char('n'))), PanelAction::None));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Esc)),
+            PanelAction::None
+        ));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Char('n'))),
+            PanelAction::None
+        ));
         // Confirm cleared; subsequent Esc still prompts because still dirty.
-        assert!(matches!(panel.handleKey(key(KeyCode::Esc)), PanelAction::None));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Esc)),
+            PanelAction::None
+        ));
     }
 
     #[test]
     fn cleanEscClosesImmediately() {
         let mut panel = ControlPanel::new(Layout::defaultPhase1(), None);
         // No dirty mutations — Esc should close right away.
-        assert!(matches!(panel.handleKey(key(KeyCode::Esc)), PanelAction::Close));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Esc)),
+            PanelAction::Close
+        ));
     }
 
     #[test]
@@ -522,7 +592,10 @@ mod tests {
         }
         panel.confirmSaved();
         // After save, Esc closes without prompting.
-        assert!(matches!(panel.handleKey(key(KeyCode::Esc)), PanelAction::Close));
+        assert!(matches!(
+            panel.handleKey(key(KeyCode::Esc)),
+            PanelAction::Close
+        ));
     }
 
     #[test]
@@ -563,9 +636,9 @@ mod tests {
                 Layout::Split { a, .. } => match a.as_ref() {
                     Layout::Tabs { children, .. } => {
                         assert!(
-                            children.iter().any(|c| matches!(
-                                c, Layout::Window(WindowId::Terminal(_))
-                            )),
+                            children
+                                .iter()
+                                .any(|c| matches!(c, Layout::Window(WindowId::Terminal(_)))),
                             "preset {} has empty Tabs container",
                             preset.name,
                         );
@@ -575,10 +648,7 @@ mod tests {
                         preset.name, other,
                     ),
                 },
-                other => panic!(
-                    "preset {} root must be Split, got {:?}",
-                    preset.name, other,
-                ),
+                other => panic!("preset {} root must be Split, got {:?}", preset.name, other,),
             }
         }
     }

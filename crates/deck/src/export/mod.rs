@@ -92,9 +92,7 @@ fn collectOne(sessionId: &str, args: &ExportArgs) -> Result<Vec<openai::Example>
     }
     let snapshotsDir = sessionDir.join("snapshots");
     if !snapshotsDir.exists() {
-        eprintln!(
-            "skipped: no snapshots (session {sessionId} predates the snapshot feature)"
-        );
+        eprintln!("skipped: no snapshots (session {sessionId} predates the snapshot feature)");
         std::process::exit(2);
     }
     let (examples, stats) = buildExamplesForSession(sessionId, &sessionDir, args)?;
@@ -259,15 +257,14 @@ use std::collections::HashMap;
 
 pub(crate) fn loadSnapshotIndex(snapshotsDir: &Path) -> Result<HashMap<String, RequestSnapshot>> {
     let path = snapshotsDir.join("index.jsonl");
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut map = HashMap::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: IndexEntry = serde_json::from_str(line)
-            .with_context(|| format!("parse index entry: {line}"))?;
+        let entry: IndexEntry =
+            serde_json::from_str(line).with_context(|| format!("parse index entry: {line}"))?;
         map.insert(entry.hash, entry.snapshot);
     }
     Ok(map)
@@ -406,7 +403,10 @@ mod tests {
         let mut index = HashMap::new();
         index.insert("s1".into(), dummySnap("sp", "tl", &["u1"]));
         index.insert("s2".into(), dummySnap("sp", "tl", &["u1", "a1", "u2"]));
-        index.insert("s3".into(), dummySnap("sp", "tl", &["u1", "a1", "u2", "a2", "u3"]));
+        index.insert(
+            "s3".into(),
+            dummySnap("sp", "tl", &["u1", "a1", "u2", "a2", "u3"]),
+        );
 
         let branch = vec![
             asstTurn("t1", "b1", "s1"),
@@ -425,7 +425,10 @@ mod tests {
         let mut index = HashMap::new();
         index.insert("s1".into(), dummySnap("sp", "tlA", &["u1"]));
         index.insert("s2".into(), dummySnap("sp", "tlA", &["u1", "a1", "u2"]));
-        index.insert("s3".into(), dummySnap("sp", "tlB", &["u1", "a1", "u2", "a2", "u3"]));
+        index.insert(
+            "s3".into(),
+            dummySnap("sp", "tlB", &["u1", "a1", "u2", "a2", "u3"]),
+        );
 
         let branch = vec![
             asstTurn("t1", "b1", "s1"),
@@ -445,10 +448,7 @@ mod tests {
         index.insert("s1".into(), dummySnap("spA", "tl", &["u1"]));
         index.insert("s2".into(), dummySnap("spB", "tl", &["u1", "a1", "u2"]));
 
-        let branch = vec![
-            asstTurn("t1", "b1", "s1"),
-            asstTurn("t2", "b2", "s2"),
-        ];
+        let branch = vec![asstTurn("t1", "b1", "s1"), asstTurn("t2", "b2", "s2")];
 
         let segs = buildSegments(&branch, &index, false);
         assert_eq!(segs.len(), 2);
@@ -459,13 +459,16 @@ mod tests {
         // s2.messages doesn't start with s1.messages because the earliest
         // user message got rewritten into a summary blob.
         let mut index = HashMap::new();
-        index.insert("s1".into(), dummySnap("sp", "tl", &["u1", "a1", "u2", "a2", "u3"]));
-        index.insert("s2".into(), dummySnap("sp", "tl", &["summary", "u3", "a3", "u4"]));
+        index.insert(
+            "s1".into(),
+            dummySnap("sp", "tl", &["u1", "a1", "u2", "a2", "u3"]),
+        );
+        index.insert(
+            "s2".into(),
+            dummySnap("sp", "tl", &["summary", "u3", "a3", "u4"]),
+        );
 
-        let branch = vec![
-            asstTurn("t1", "b1", "s1"),
-            asstTurn("t2", "b2", "s2"),
-        ];
+        let branch = vec![asstTurn("t1", "b1", "s1"), asstTurn("t2", "b2", "s2")];
 
         let segs = buildSegments(&branch, &index, false);
         assert_eq!(segs.len(), 2);
@@ -484,10 +487,16 @@ mod tests {
 
         let segs = buildSegments(&branch, &index, false);
         assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].lastAsstIdx, 0, "cancelled turn should not extend segment");
+        assert_eq!(
+            segs[0].lastAsstIdx, 0,
+            "cancelled turn should not extend segment"
+        );
 
         let segs = buildSegments(&branch, &index, true);
-        assert_eq!(segs[0].lastAsstIdx, 1, "with --include-cancelled, segment extends");
+        assert_eq!(
+            segs[0].lastAsstIdx, 1,
+            "with --include-cancelled, segment extends"
+        );
     }
 
     #[test]
@@ -496,10 +505,7 @@ mod tests {
         index.insert("s1".into(), dummySnap("sp", "tl", &["u1"]));
         // s2 not inserted; branch references it but index doesn't have it.
 
-        let branch = vec![
-            asstTurn("t1", "b1", "s1"),
-            asstTurn("t2", "b2", "s2"),
-        ];
+        let branch = vec![asstTurn("t1", "b1", "s1"), asstTurn("t2", "b2", "s2")];
 
         let segs = buildSegments(&branch, &index, false);
         assert_eq!(segs.len(), 1);

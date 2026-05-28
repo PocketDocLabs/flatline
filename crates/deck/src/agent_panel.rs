@@ -32,15 +32,47 @@ use crate::throbber::Throbber;
 pub enum PanelEntry {
     User(String),
     Assistant(String),
-    Reasoning { text: String, expanded: bool },
-    ToolRequest { summary: String, diff: Option<String>, command: Option<String> },
-    ToolApproved { name: String },
-    ToolDenied { name: String },
+    Reasoning {
+        text: String,
+        expanded: bool,
+    },
+    ToolRequest {
+        summary: String,
+        diff: Option<String>,
+        command: Option<String>,
+    },
+    ToolApproved {
+        name: String,
+    },
+    ToolDenied {
+        name: String,
+    },
     /// A tool was auto-denied by a permission rule (shown with red background).
-    ToolAutoDenied { name: String, summary: String },
-    ToolResult { name: String, output: String },
+    ToolAutoDenied {
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        name: String,
+        output: String,
+    },
     /// A tool is currently executing (shown with throbber + elapsed time).
-    ToolActive { summary: String },
+    ToolActive {
+        summary: String,
+    },
+    /// Minimal wake-source receipt for scheduleWakeup / cronCreate /
+    /// fileWatch. Updated in place as the source fires or is disarmed.
+    WakeSchedule {
+        id: u64,
+        kind: construct::control::WakeKind,
+        summary: String,
+        prompt: Option<String>,
+        status: WakeScheduleStatus,
+        armed: bool,
+        nextFireAt: Option<Instant>,
+        firesSoFar: u64,
+        registeredAt: Instant,
+    },
     /// Subagent activity — renders as a single bordered panel.
     SubagentBlock {
         agentType: String,
@@ -64,8 +96,17 @@ pub enum PanelEntry {
     /// Non-copyable informational notice (e.g. session resumed).
     SessionNotice(String),
     /// Visual marker showing where compaction replaced content.
-    CompactionMarker { stage: String },
+    CompactionMarker {
+        stage: String,
+    },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeScheduleStatus {
+    Armed,
+    Fired,
+    Disarmed,
 }
 
 /// A tool call that is still streaming from the model. Populated as
@@ -227,6 +268,8 @@ pub struct AgentPanel {
     pub selectedSubagent: Option<usize>,
     /// Last wall-clock time the throbber was ticked.
     lastThrobberTick: Instant,
+    /// Last wall-clock redraw request for wake countdown labels.
+    lastWakeScheduleTick: Instant,
     /// Scroll offset from the bottom (in visual lines).
     pub scrollOffset: u16,
     /// New content arrived while scrolled up (for border indicator).
@@ -312,6 +355,7 @@ impl AgentPanel {
             activeSubagents: Vec::new(),
             selectedSubagent: None,
             lastThrobberTick: Instant::now(),
+            lastWakeScheduleTick: Instant::now(),
             scrollOffset: 0,
             newContentWhileScrolled: false,
             idleWhileScrolled: false,
@@ -432,7 +476,11 @@ impl AgentPanel {
             text.to_string()
         } else {
             let n = self.attachments.len();
-            let suffix = if n == 1 { "1 image" } else { &format!("{n} images") };
+            let suffix = if n == 1 {
+                "1 image"
+            } else {
+                &format!("{n} images")
+            };
             format!("{text}\n[+{suffix} attached]")
         };
         self.entries.push(PanelEntry::User(display));
@@ -447,6 +495,135 @@ impl AgentPanel {
         self.thinkingStartTime = Some(Instant::now());
     }
 
+    /// Start a model turn caused by a wake event.
+    ///
+    /// Wake turns are not authored user messages, so they render as
+    /// non-copyable session notices. They still need to mark the panel as
+    /// active before streamed deltas arrive; otherwise appendContent /
+    /// appendReasoning drop the live response and it only appears after
+    /// transcript replay.
+    pub fn pushWakeTurn(&mut self, summary: &str) {
+        let label = if summary.trim().is_empty() {
+            "\u{2299} wake".to_string()
+        } else {
+            format!("\u{2299} wake \u{00B7} {summary}")
+        };
+        self.entries.push(PanelEntry::SessionNotice(label));
+        self.scrollOffset = 0;
+        self.newContentWhileScrolled = false;
+        self.idleWhileScrolled = false;
+        self.turnActive = true;
+        self.textArea.placeholder = "Queue a message...";
+        self.isStreaming = true;
+        self.retryStatus = None;
+        self.thinkingStartTime = Some(Instant::now());
+    }
+
+    /// Register or refresh the compact wake-source receipt shown for
+    /// scheduleWakeup / cronCreate / fileWatch.
+    pub fn wakeRegistered(
+        &mut self,
+        id: u64,
+        kind: construct::control::WakeKind,
+        summary: String,
+        prompt: Option<String>,
+        nextFireAt: Option<Instant>,
+    ) {
+        if !isScheduledWakeKind(kind) {
+            return;
+        }
+        let prompt = prompt.map(|p| snippetOneLine(&p, 96));
+        if let Some(PanelEntry::WakeSchedule {
+            summary: oldSummary,
+            prompt: oldPrompt,
+            status,
+            armed,
+            nextFireAt: oldNextFireAt,
+            ..
+        }) = self.findWakeScheduleMut(id)
+        {
+            *oldSummary = summary;
+            *oldPrompt = prompt;
+            *status = WakeScheduleStatus::Armed;
+            *armed = true;
+            *oldNextFireAt = nextFireAt;
+        } else {
+            self.entries.push(PanelEntry::WakeSchedule {
+                id,
+                kind,
+                summary,
+                prompt,
+                status: WakeScheduleStatus::Armed,
+                armed: true,
+                nextFireAt,
+                firesSoFar: 0,
+                registeredAt: Instant::now(),
+            });
+        }
+        self.markTimelineActivity();
+    }
+
+    /// Mark a wake receipt as fired based on a source string such as
+    /// "delay#3" or "cron#8".
+    pub fn wakeFiredSource(&mut self, source: &str) {
+        let Some(id) = parseWakeSourceId(source) else {
+            return;
+        };
+        if let Some(PanelEntry::WakeSchedule {
+            status,
+            firesSoFar,
+            nextFireAt,
+            ..
+        }) = self.findWakeScheduleMut(id)
+        {
+            *status = WakeScheduleStatus::Fired;
+            *firesSoFar = firesSoFar.saturating_add(1);
+            // Avoid showing a stale "next" timestamp after the first
+            // fire. Recurring cron can still be inspected in /tasks.
+            *nextFireAt = None;
+            self.markTimelineActivity();
+        }
+    }
+
+    /// Mark a wake receipt as no longer armed. If it already fired, keep
+    /// the user-facing state as "fired" and only clear the armed flag.
+    pub fn wakeDisarmed(&mut self, id: u64) {
+        if let Some(PanelEntry::WakeSchedule {
+            status,
+            armed,
+            nextFireAt,
+            ..
+        }) = self.findWakeScheduleMut(id)
+        {
+            let hadReachedFireTime = nextFireAt.is_some_and(|at| at <= Instant::now());
+            *armed = false;
+            *nextFireAt = None;
+            if *status == WakeScheduleStatus::Fired || hadReachedFireTime {
+                *status = WakeScheduleStatus::Fired;
+            } else {
+                *status = WakeScheduleStatus::Disarmed;
+            }
+            self.markTimelineActivity();
+        }
+    }
+
+    /// Successful wake scheduling tools render through WakeSchedule
+    /// receipts, not a generic green code block. This removes the
+    /// transient ToolActive row and resumes the model-turn throbber.
+    pub fn finishWakeToolResult(&mut self, name: &str, output: &str) -> bool {
+        let handled = match name {
+            name if isWakeToolName(name) && name != "cronDelete" => {
+                output.starts_with("Armed wake #")
+            }
+            "cronDelete" => output.starts_with("Disarmed wake #"),
+            _ => false,
+        };
+        if handled {
+            self.finishSilentToolResult();
+        }
+        handled
+    }
+
     /// Display a slash command without activating the turn or throbber.
     pub fn pushCommand(&mut self, text: &str) {
         self.entries.push(PanelEntry::User(text.into()));
@@ -457,7 +634,9 @@ impl AgentPanel {
     }
 
     pub fn appendContent(&mut self, text: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.isStreaming = true;
         self.retryStatus = None;
         // Content streaming means reasoning phase is over.
@@ -476,7 +655,9 @@ impl AgentPanel {
     }
 
     pub fn appendReasoning(&mut self, text: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.isStreaming = true;
         self.retryStatus = None;
         self.reasoningActive = true;
@@ -517,7 +698,8 @@ impl AgentPanel {
             self.entries.push(PanelEntry::Assistant(clean));
             // Transfer code block scroll state from streaming (usize::MAX) to real entry index.
             let realIdx = self.entries.len() - 1;
-            let streamingKeys: Vec<(usize, usize)> = self.codeScrollX
+            let streamingKeys: Vec<(usize, usize)> = self
+                .codeScrollX
                 .keys()
                 .filter(|(ei, _)| *ei == usize::MAX)
                 .copied()
@@ -541,7 +723,9 @@ impl AgentPanel {
 
     /// Finalize the turn completely (TurnComplete).
     pub fn finishTurn(&mut self) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.finalizeStreaming();
         self.clearPendingToolCalls();
         self.turnActive = false;
@@ -569,7 +753,9 @@ impl AgentPanel {
     ///    in `JobPlane` and `jobStop` is the dedicated way to kill
     ///    them.
     pub fn finalizeCancelled(&mut self) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.finalizeStreaming();
         self.clearPendingToolCalls();
         self.turnActive = false;
@@ -594,20 +780,25 @@ impl AgentPanel {
         impact: construct::tool::ShellImpact,
         origin: construct::control::PermitOrigin,
     ) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.finalizeStreaming();
         // Extract raw command for shell tools so the approval prompt
         // shows the full command in a code block, not just the summary
         // line. Foreground and background shell share the same shape.
-        let command = construct::tool::parse(name, args).ok().and_then(|action| {
-            match action {
+        let command = construct::tool::parse(name, args)
+            .ok()
+            .and_then(|action| match action {
                 construct::tool::ToolAction::Shell { command, .. } => Some(command),
                 _ => None,
-            }
-        });
+            });
 
-        self.entries
-            .push(PanelEntry::ToolRequest { summary: summary.into(), diff, command });
+        self.entries.push(PanelEntry::ToolRequest {
+            summary: summary.into(),
+            diff,
+            command,
+        });
         self.pendingPermit = true;
         self.pendingPermitOrigin = Some(origin);
         self.pendingToolName = name.into();
@@ -619,10 +810,7 @@ impl AgentPanel {
             .map(|a| construct::permissions::suggestPatterns(&a))
             .unwrap_or_default();
         // Pre-fill custom with the most specific pattern.
-        self.permitCustomPattern = self.permitPatterns
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        self.permitCustomPattern = self.permitPatterns.first().cloned().unwrap_or_default();
         if self.permitPatterns.is_empty() {
             // No suggestions — land directly in the custom field so the
             // user can type a pattern. Otherwise `nextPattern` can never
@@ -654,8 +842,9 @@ impl AgentPanel {
         let name = std::mem::take(&mut self.pendingToolName);
         self.permitPatterns.clear();
         self.permitEditingCustom = false;
-        // Don't push ToolApproved for task — SubagentStarted renders the panel.
-        if name != "task" {
+        // Don't push ToolApproved for task or wake scheduling tools —
+        // both render as purpose-built timeline entries.
+        if name != "task" && !isWakeToolName(&name) {
             self.entries.push(PanelEntry::ToolApproved { name });
         }
     }
@@ -947,7 +1136,9 @@ impl AgentPanel {
     /// Remove a subagent by session id. Adjusts `selectedSubagent` so
     /// the popup either shows another live subagent or closes naturally.
     pub fn removeSubagent(&mut self, sessionId: &str) {
-        let Some(idx) = self.findSubagentIndex(sessionId) else { return };
+        let Some(idx) = self.findSubagentIndex(sessionId) else {
+            return;
+        };
         self.activeSubagents.remove(idx);
         self.selectedSubagent = match self.selectedSubagent {
             None => None,
@@ -986,7 +1177,12 @@ impl AgentPanel {
 
     /// Toggle the content section of a subagent block (expand/collapse).
     pub fn toggleSubagentContent(&mut self, entryIndex: usize) {
-        if let Some(PanelEntry::SubagentBlock { contentExpanded, done: true, .. }) = self.entries.get_mut(entryIndex) {
+        if let Some(PanelEntry::SubagentBlock {
+            contentExpanded,
+            done: true,
+            ..
+        }) = self.entries.get_mut(entryIndex)
+        {
             *contentExpanded = !*contentExpanded;
         }
     }
@@ -1018,17 +1214,20 @@ impl AgentPanel {
 
     /// Find the last SubagentBlock's session info (for lazy-loading the overlay).
     pub fn lastSubagentSession(&self) -> Option<(&str, &str)> {
-        self.entries.iter().rev()
-            .find_map(|e| match e {
-                PanelEntry::SubagentBlock { agentType, sessionId: Some(sid), .. } => {
-                    Some((agentType.as_str(), sid.as_str()))
-                }
-                _ => None,
-            })
+        self.entries.iter().rev().find_map(|e| match e {
+            PanelEntry::SubagentBlock {
+                agentType,
+                sessionId: Some(sid),
+                ..
+            } => Some((agentType.as_str(), sid.as_str())),
+            _ => None,
+        })
     }
 
     pub fn toolApproved(&mut self, name: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.finalizeStreaming();
         self.clearPendingToolCalls();
         self.entries
@@ -1038,7 +1237,9 @@ impl AgentPanel {
     /// A tool call's name was just revealed in the stream. Register it so the
     /// "preparing" indicator can render while arguments continue to arrive.
     pub fn toolCallPending(&mut self, index: usize, name: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         while self.pendingToolCalls.len() <= index {
             self.pendingToolCalls.push(PendingToolCall {
                 name: String::new(),
@@ -1054,7 +1255,9 @@ impl AgentPanel {
 
     /// A tool call's arguments have grown — update the byte counter.
     pub fn toolCallProgress(&mut self, index: usize, bytes: usize) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         if let Some(slot) = self.pendingToolCalls.get_mut(index) {
             slot.bytes = bytes;
         }
@@ -1062,7 +1265,9 @@ impl AgentPanel {
 
     /// A tool call's key-arg preview just resolved (or refined).
     pub fn toolCallPreview(&mut self, index: usize, preview: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         if let Some(slot) = self.pendingToolCalls.get_mut(index) {
             slot.preview = Some(preview.into());
         }
@@ -1074,7 +1279,9 @@ impl AgentPanel {
     }
 
     pub fn toolStarted(&mut self, _name: &str, summary: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.finalizeStreaming();
         self.clearPendingToolCalls();
         self.toolActive = true;
@@ -1092,7 +1299,9 @@ impl AgentPanel {
     }
 
     pub fn toolDenied(&mut self, name: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.toolActive = false;
         self.toolStartTime = None;
         self.entries
@@ -1100,15 +1309,21 @@ impl AgentPanel {
     }
 
     pub fn toolAutoDenied(&mut self, name: &str, summary: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.toolActive = false;
         self.toolStartTime = None;
-        self.entries
-            .push(PanelEntry::ToolAutoDenied { name: name.into(), summary: summary.into() });
+        self.entries.push(PanelEntry::ToolAutoDenied {
+            name: name.into(),
+            summary: summary.into(),
+        });
     }
 
     pub fn pushToolResult(&mut self, name: &str, output: &str) {
-        if !self.turnActive { return; }
+        if !self.turnActive {
+            return;
+        }
         self.toolActive = false;
         self.toolStartTime = None;
         // Replace the most recent ToolActive entry with the result.
@@ -1138,6 +1353,46 @@ impl AgentPanel {
         // Restart thinking indicator — model will be called again after tool results.
         self.isStreaming = true;
         self.thinkingStartTime = Some(Instant::now());
+    }
+
+    fn finishSilentToolResult(&mut self) {
+        if !self.turnActive {
+            return;
+        }
+        self.toolActive = false;
+        self.toolStartTime = None;
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        {
+            self.entries.remove(pos);
+        }
+        self.finalizeStreaming();
+        self.markTimelineActivity();
+        self.isStreaming = true;
+        self.thinkingStartTime = Some(Instant::now());
+    }
+
+    fn markTimelineActivity(&mut self) {
+        if self.scrollOffset == 0 {
+            self.newContentWhileScrolled = false;
+        } else {
+            self.newContentWhileScrolled = true;
+        }
+        self.idleWhileScrolled = false;
+    }
+
+    fn findWakeScheduleMut(&mut self, id: u64) -> Option<&mut PanelEntry> {
+        self.entries.iter_mut().find(|entry| {
+            matches!(
+                entry,
+                PanelEntry::WakeSchedule {
+                    id: wakeId,
+                    ..
+                } if *wakeId == id
+            )
+        })
     }
 
     /// Show a transient retry indicator in the throbber area.
@@ -1187,9 +1442,8 @@ impl AgentPanel {
     /// zone may expand across repeated compaction runs.
     pub fn pushCompactionMarker(&mut self, stage: &str, blockIdx: usize) {
         // Remove existing marker for this stage.
-        self.entries.retain(|e| {
-            !matches!(e, PanelEntry::CompactionMarker { stage: s } if s == stage)
-        });
+        self.entries
+            .retain(|e| !matches!(e, PanelEntry::CompactionMarker { stage: s } if s == stage));
 
         // Find the insert position by counting User entries.
         let mut userCount = 0;
@@ -1204,7 +1458,12 @@ impl AgentPanel {
             }
         }
 
-        self.entries.insert(insertAt, PanelEntry::CompactionMarker { stage: stage.into() });
+        self.entries.insert(
+            insertAt,
+            PanelEntry::CompactionMarker {
+                stage: stage.into(),
+            },
+        );
     }
 
     // --- Completion ---
@@ -1229,7 +1488,11 @@ impl AgentPanel {
 
         // Preserve selection index if still valid.
         let prevSelected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
-        let selected = if prevSelected < matches.len() { prevSelected } else { 0 };
+        let selected = if prevSelected < matches.len() {
+            prevSelected
+        } else {
+            0
+        };
         self.completion = Some(CompletionState { matches, selected });
     }
 
@@ -1303,7 +1566,11 @@ impl AgentPanel {
 
     /// Scroll a code block horizontally.
     pub fn scrollCodeBlockH(&mut self, blockId: (usize, usize), delta: i16) {
-        let range = match self.lastCodeBlockRanges.iter().find(|r| r.blockId == blockId) {
+        let range = match self
+            .lastCodeBlockRanges
+            .iter()
+            .find(|r| r.blockId == blockId)
+        {
             Some(r) => r,
             None => return,
         };
@@ -1423,6 +1690,32 @@ impl AgentPanel {
         }
     }
 
+    /// Request a low-frequency redraw while armed wake receipts have
+    /// countdown text ("in 42s"). Kept separate from the throbber so a
+    /// quiet scheduled wake does not animate at 8 FPS.
+    pub fn tickWakeSchedules(&mut self) -> bool {
+        let hasCountdown = self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                PanelEntry::WakeSchedule {
+                    armed: true,
+                    nextFireAt: Some(_),
+                    ..
+                }
+            )
+        });
+        if !hasCountdown {
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.lastWakeScheduleTick) >= Duration::from_secs(1) {
+            self.lastWakeScheduleTick = now;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Advance the character reveal animation. Each character fades in fully
     /// before the next one begins. Speed is calculated directly from the
     /// stream's throughput so the reveal matches the actual rate of arrival.
@@ -1468,8 +1761,7 @@ impl AgentPanel {
 
         // Each time fadeProgress crosses 1.0, that char is fully revealed.
         while self.fadeProgress >= 1.0 && !self.pendingContent.is_empty() {
-            let firstLen = self.pendingContent
-                .chars().next().unwrap().len_utf8();
+            let firstLen = self.pendingContent.chars().next().unwrap().len_utf8();
             let ch: String = self.pendingContent.drain(..firstLen).collect();
             self.streamingContent.push_str(&ch);
             self.fadeProgress -= 1.0;
@@ -1599,9 +1891,10 @@ impl AgentPanel {
             }
 
             // Check if this visual line falls within a code block.
-            let codeBlockHit = self.lastCodeBlockRanges.iter().find(|r| {
-                visualIdx >= r.startLine && visualIdx <= r.endLine
-            });
+            let codeBlockHit = self
+                .lastCodeBlockRanges
+                .iter()
+                .find(|r| visualIdx >= r.startLine && visualIdx <= r.endLine);
 
             if let Some(range) = codeBlockHit {
                 // Inside a code block — extract from stored content, not Buffer.
@@ -1719,16 +2012,29 @@ impl AgentPanel {
             let headerLine: u16 = if hasCmd { 1 } else { 0 };
             let availW = inner.width.saturating_sub(6) as usize;
             let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
-                if availW == 0 { 1 } else { (e.len() / availW + 1) as u16 }
+                if availW == 0 {
+                    1
+                } else {
+                    (e.len() / availW + 1) as u16
+                }
             });
             let patternLines = self.permitPatterns.len() as u16 + 1; // +1 for custom field.
             // code block + header + explanation + blank + 2 keys + blank + patterns.
             (codeBlockLines + headerLine + explanationLines + 1 + 2 + 1 + patternLines)
-                .min(inner.height * 2 / 3).max(5)
+                .min(inner.height * 2 / 3)
+                .max(5)
         } else {
-            let baseHeight = self.textArea.desiredHeight(inner.width.saturating_sub(4)).min(8).max(1);
+            let baseHeight = self
+                .textArea
+                .desiredHeight(inner.width.saturating_sub(4))
+                .min(8)
+                .max(1);
             // Add space for attachment bar: entries + separator.
-            let attLines = if self.attachments.is_empty() { 0 } else { self.attachments.len() as u16 + 1 };
+            let attLines = if self.attachments.is_empty() {
+                0
+            } else {
+                self.attachments.len() as u16 + 1
+            };
             baseHeight + attLines
         };
 
@@ -1772,12 +2078,15 @@ impl AgentPanel {
         } else if self.errorHint {
             // Error hint takes over the separator slot to show the user
             // what recovery actions are available.
-            let hintText =
-                " \u{21BB} Ctrl+R retry   \u{23F5}\u{FE0E} Ctrl+Space continue ";
+            let hintText = " \u{21BB} Ctrl+R retry   \u{23F5}\u{FE0E} Ctrl+Space continue ";
             let padW = separatorArea.width as usize;
             let padded = format!("{:^width$}", hintText, width = padW);
             Paragraph::new(padded)
-                .style(Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD))
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )
                 .render(separatorArea, buf);
         } else if !self.permitVisible() {
             let sep = "\u{2500}".repeat(separatorArea.width as usize);
@@ -1810,16 +2119,22 @@ impl AgentPanel {
         };
 
         // Build all display lines (pre-wrapped to fit paddedChat width).
-        let (lines, contMap, reasoningHeaders, cbRanges, nonCopyable) = self.buildLines(paddedChat.width);
+        let (lines, contMap, reasoningHeaders, cbRanges, nonCopyable) =
+            self.buildLines(paddedChat.width);
         self.lastContinuationMap = contMap;
         self.lastReasoningHeaders = reasoningHeaders;
         self.lastCodeBlockRanges = cbRanges;
         // Clear stale copied flash after 2 seconds.
-        if self.copiedFlash.as_ref().is_some_and(|(_, t)| t.elapsed().as_secs() >= 2) {
+        if self
+            .copiedFlash
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
+        {
             self.copiedFlash = None;
         }
         // Cache plain text of each visual line for scrollback copy.
-        self.lastLineTexts = lines.iter()
+        self.lastLineTexts = lines
+            .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         self.nonCopyableLines = nonCopyable;
@@ -1832,7 +2147,9 @@ impl AgentPanel {
         // scrollOffset is "lines from bottom", so when content grows (maxScroll increases),
         // we need to increase scrollOffset by the same amount to stay looking at same content.
         if self.scrollOffset > 0 && maxScroll > self.lastMaxScroll {
-            self.scrollOffset = self.scrollOffset.saturating_add(maxScroll - self.lastMaxScroll);
+            self.scrollOffset = self
+                .scrollOffset
+                .saturating_add(maxScroll - self.lastMaxScroll);
         }
         self.lastMaxScroll = maxScroll;
         // Clamp to prevent scroll accumulation past content top.
@@ -1898,14 +2215,17 @@ impl AgentPanel {
             width: area.width.saturating_sub(2),
             height: area.height,
         };
-        if padded.width < 4 || padded.height < 1 { return; }
+        if padded.width < 4 || padded.height < 1 {
+            return;
+        }
 
         let (chatLines, contMap, reasoningHeaders, cbRanges, nonCopyable) =
             self.buildLines(padded.width);
         self.lastContinuationMap = contMap;
         self.lastReasoningHeaders = reasoningHeaders;
         self.lastCodeBlockRanges = cbRanges;
-        self.lastLineTexts = chatLines.iter()
+        self.lastLineTexts = chatLines
+            .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         self.nonCopyableLines = nonCopyable;
@@ -2060,8 +2380,12 @@ impl AgentPanel {
         let w = w as usize;
         let (impactColor, impactSymbol) = match self.pendingToolImpact {
             construct::tool::ShellImpact::Delete => (Color::Red, "\u{2620}\u{FE0E}"),
-            construct::tool::ShellImpact::MajorMod => (Color::Rgb(200, 140, 40), "\u{26A0}\u{FE0E}"),
-            construct::tool::ShellImpact::MinorMod => (Color::Rgb(180, 160, 80), "\u{2691}\u{FE0E}"),
+            construct::tool::ShellImpact::MajorMod => {
+                (Color::Rgb(200, 140, 40), "\u{26A0}\u{FE0E}")
+            }
+            construct::tool::ShellImpact::MinorMod => {
+                (Color::Rgb(180, 160, 80), "\u{2691}\u{FE0E}")
+            }
             construct::tool::ShellImpact::Read => (Color::Rgb(80, 160, 200), "\u{2315}"),
         };
         let toolLabel = format!(" {} {} ", self.pendingToolName, impactSymbol);
@@ -2072,12 +2396,21 @@ impl AgentPanel {
                 let secs = &self.pendingToolSummary[start + 1..end];
                 if secs.parse::<u64>().is_ok() {
                     format!(" \u{23F2}\u{FE0E} {secs}s ")
-                } else { String::new() }
-            } else { String::new() }
-        } else { String::new() };
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
 
         let spanWidth = |spans: &[Span]| -> usize {
-            spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
+            spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum()
         };
 
         let mut spans: Vec<Span> = Vec::new();
@@ -2085,13 +2418,18 @@ impl AgentPanel {
 
         // Left ┴ at column 1 (aligns with code block left │, shifted right by margin).
         if hasBlock {
-            spans.push(Span::styled("\u{2500}\u{2534}", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "\u{2500}\u{2534}",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         // Tool name + symbol.
         spans.push(Span::styled(
             format!("\u{2500}{toolLabel}"),
-            Style::default().fg(impactColor).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(impactColor)
+                .add_modifier(Modifier::BOLD),
         ));
 
         // Fill between tool label and timeout.
@@ -2099,16 +2437,25 @@ impl AgentPanel {
         let timeoutW = UnicodeWidthStr::width(timeoutLabel.as_str());
         let rightW: usize = if hasBlock { 1 } else { 0 }; // ┴
         let fill = w.saturating_sub(used + timeoutW + rightW);
-        spans.push(Span::styled("\u{2500}".repeat(fill), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "\u{2500}".repeat(fill),
+            Style::default().fg(Color::DarkGray),
+        ));
 
         // Timeout.
         if !timeoutLabel.is_empty() {
-            spans.push(Span::styled(timeoutLabel, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                timeoutLabel,
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         // Right ┴ at last column (aligns with code block right │).
         if hasBlock {
-            spans.push(Span::styled("\u{2534}", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "\u{2534}",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         lines.push(Line::from(spans));
@@ -2125,15 +2472,20 @@ impl AgentPanel {
 
         for (i, input) in self.queuedMessages.iter().skip(skip).enumerate() {
             let row = area.y + i as u16;
-            if row >= area.y + area.height { break; }
+            if row >= area.y + area.height {
+                break;
+            }
 
             let prefix = " \u{25B9} "; // ▹
             let imgSuffix = if input.attachments.is_empty() {
                 String::new()
             } else {
                 let n = input.attachments.len();
-                if n == 1 { "  [+1 image]".to_string() }
-                else { format!("  [+{n} images]") }
+                if n == 1 {
+                    "  [+1 image]".to_string()
+                } else {
+                    format!("  [+{n} images]")
+                }
             };
 
             let availW = (area.width as usize).saturating_sub(3 + imgSuffix.len());
@@ -2151,7 +2503,12 @@ impl AgentPanel {
                 spans.push(Span::styled(imgSuffix, imgStyle));
             }
 
-            let lineRect = Rect { x: area.x, y: row, width: area.width, height: 1 };
+            let lineRect = Rect {
+                x: area.x,
+                y: row,
+                width: area.width,
+                height: 1,
+            };
             Paragraph::new(Line::from(spans)).render(lineRect, buf);
         }
     }
@@ -2179,7 +2536,9 @@ impl AgentPanel {
                     codeWidth,
                     self.permitCodeScrollX,
                     mcw,
-                    self.copiedFlash.as_ref().is_some_and(|(bid, t)| bid.0 == usize::MAX && t.elapsed().as_secs() < 2),
+                    self.copiedFlash
+                        .as_ref()
+                        .is_some_and(|(bid, t)| bid.0 == usize::MAX && t.elapsed().as_secs() < 2),
                     None,
                     None,
                 );
@@ -2354,7 +2713,11 @@ impl AgentPanel {
             if let Some(state) = &self.completion {
                 if let Some(cmd) = state.matches.get(state.selected) {
                     let typed = self.textArea.text().trim_start();
-                    let prefix = if typed.starts_with('/') { &typed[1..] } else { "" };
+                    let prefix = if typed.starts_with('/') {
+                        &typed[1..]
+                    } else {
+                        ""
+                    };
                     if cmd.name.starts_with(prefix) && cmd.name.len() > prefix.len() {
                         let suffix = &cmd.name[prefix.len()..];
                         // Render ghost text at cursor position.
@@ -2407,7 +2770,9 @@ impl AgentPanel {
             }
         }
 
-        let borderStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30));
+        let borderStyle = Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(20, 20, 30));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(borderStyle);
@@ -2417,8 +2782,12 @@ impl AgentPanel {
         // Render each command row.
         let normalStyle = Style::default().fg(Color::White).bg(Color::Rgb(20, 20, 30));
         let selectedStyle = Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 80));
-        let descStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(20, 20, 30));
-        let selectedDescStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 80));
+        let descStyle = Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(20, 20, 30));
+        let selectedDescStyle = Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(40, 40, 80));
 
         for (i, cmd) in state.matches.iter().take(count).enumerate() {
             let row = inner.y + i as u16;
@@ -2475,7 +2844,14 @@ impl AgentPanel {
         for (idx, entry) in self.entries.iter().enumerate() {
             let mut entryLines: Vec<Line<'static>> = Vec::new();
             let mut entryCont: Vec<bool> = Vec::new();
-            self.renderEntry(entry, &mut entryLines, &mut entryCont, w as u16, idx, &mut dummyRanges);
+            self.renderEntry(
+                entry,
+                &mut entryLines,
+                &mut entryCont,
+                w as u16,
+                idx,
+                &mut dummyRanges,
+            );
 
             let entryStart = cursor;
             for line in &entryLines {
@@ -2583,7 +2959,16 @@ impl AgentPanel {
         (ranges[startIdx].0, ranges[endIdx].1)
     }
 
-    fn buildLines(&self, width: u16) -> (Vec<Line<'static>>, Vec<bool>, Vec<(Option<usize>, usize)>, Vec<CodeBlockRange>, HashSet<usize>) {
+    fn buildLines(
+        &self,
+        width: u16,
+    ) -> (
+        Vec<Line<'static>>,
+        Vec<bool>,
+        Vec<(Option<usize>, usize)>,
+        Vec<CodeBlockRange>,
+        HashSet<usize>,
+    ) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cont: Vec<bool> = Vec::new();
         let mut reasoningHeaders: Vec<(Option<usize>, usize)> = Vec::new();
@@ -2594,7 +2979,10 @@ impl AgentPanel {
             if matches!(entry, PanelEntry::Reasoning { .. }) {
                 reasoningHeaders.push((Some(i), lines.len()));
             }
-            let isNotice = matches!(entry, PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. });
+            let isNotice = matches!(
+                entry,
+                PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. }
+            );
             let linesBefore = lines.len();
             self.renderEntry(entry, &mut lines, &mut cont, width, i, &mut codeBlockRanges);
             if isNotice {
@@ -2627,7 +3015,8 @@ impl AgentPanel {
                 }
                 // Animated throbber with elapsed time.
                 let blobLines = self.throbber.renderLines();
-                let elapsed = self.thinkingStartTime
+                let elapsed = self
+                    .thinkingStartTime
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
                 // While reasoning is still actively producing characters, the
@@ -2657,7 +3046,11 @@ impl AgentPanel {
                     }
                     s
                 } else if hasReasoning {
-                    let icon = if self.thinkingExpanded { "\u{25BE}" } else { "\u{25B8}" };
+                    let icon = if self.thinkingExpanded {
+                        "\u{25BE}"
+                    } else {
+                        "\u{25B8}"
+                    };
                     format!(" thinking ({elapsed}s)  {icon}")
                 } else {
                     format!(" thinking ({elapsed}s)")
@@ -2680,8 +3073,7 @@ impl AgentPanel {
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let otherBytes: usize =
-                        namedPending[1..].iter().map(|c| c.bytes).sum();
+                    let otherBytes: usize = namedPending[1..].iter().map(|c| c.bytes).sum();
                     row2.spans.push(Span::styled(
                         format!(
                             "  +{} more: {}  ({})",
@@ -2698,7 +3090,11 @@ impl AgentPanel {
                 // Record header position for click-to-toggle.
                 reasoningHeaders.push((None, lines.len()));
                 // Reasoning finished but text exists — show static collapse header.
-                let icon = if self.thinkingExpanded { "\u{25BE}" } else { "\u{25B8}" };
+                let icon = if self.thinkingExpanded {
+                    "\u{25BE}"
+                } else {
+                    "\u{25B8}"
+                };
                 lines.push(Line::from(Span::styled(
                     format!("{icon} reasoning"),
                     Style::default().fg(Color::DarkGray),
@@ -2734,10 +3130,17 @@ impl AgentPanel {
                 let linesBeforeMd = lines.len();
                 let mdBlocks = markdown::render(&displayContent, width.saturating_sub(2));
                 prefixRenderedBlocks(
-                    &mut lines, &mut cont, mdBlocks,
-                    "\u{25C6} ", Style::default().fg(Color::White), width,
-                    usize::MAX, &self.codeScrollX, &self.codeExpanded,
-                    &mut codeBlockRanges, &self.copiedFlash,
+                    &mut lines,
+                    &mut cont,
+                    mdBlocks,
+                    "\u{25C6} ",
+                    Style::default().fg(Color::White),
+                    width,
+                    usize::MAX,
+                    &self.codeScrollX,
+                    &self.codeExpanded,
+                    &mut codeBlockRanges,
+                    &self.copiedFlash,
                 );
                 // Apply fade to the last character if one is mid-reveal.
                 if hasFadingChar {
@@ -2751,8 +3154,7 @@ impl AgentPanel {
             // row 2 lists the siblings. Held back while content is still
             // mid-reveal so the preparing line doesn't pop in under text
             // the user hasn't seen yet.
-            let revealComplete =
-                self.pendingContent.is_empty() && self.fadeProgress >= 1.0;
+            let revealComplete = self.pendingContent.is_empty() && self.fadeProgress >= 1.0;
             if !showThrobber && !namedPending.is_empty() && revealComplete {
                 let tcElapsed = self
                     .pendingToolCallStartTime
@@ -2782,11 +3184,18 @@ impl AgentPanel {
             }
         }
 
-
         (lines, cont, reasoningHeaders, codeBlockRanges, nonCopyable)
     }
 
-    fn renderEntry(&self, entry: &PanelEntry, lines: &mut Vec<Line<'static>>, cont: &mut Vec<bool>, width: u16, entryIndex: usize, codeBlockRanges: &mut Vec<CodeBlockRange>) {
+    fn renderEntry(
+        &self,
+        entry: &PanelEntry,
+        lines: &mut Vec<Line<'static>>,
+        cont: &mut Vec<bool>,
+        width: u16,
+        entryIndex: usize,
+        codeBlockRanges: &mut Vec<CodeBlockRange>,
+    ) {
         match entry {
             PanelEntry::User(text) => {
                 let style = Style::default().fg(Color::Cyan);
@@ -2803,11 +3212,7 @@ impl AgentPanel {
                     let wrapped = wrapSpannedLine(spanLine, textWidth);
                     for (idx, wLine) in wrapped.into_iter().enumerate() {
                         cont.push(idx > 0);
-                        let prefix = if isFirst {
-                            "\u{203A} "
-                        } else {
-                            "  "
-                        };
+                        let prefix = if isFirst { "\u{203A} " } else { "  " };
                         isFirst = false;
                         let mut spans = vec![Span::styled(prefix.to_string(), lineStyle)];
                         spans.extend(wLine.spans);
@@ -2823,10 +3228,17 @@ impl AgentPanel {
                 // NOTE: Subtract prefix width ("◆ " = 2 cols) so blocks size correctly.
                 let mdBlocks = markdown::render(text, width.saturating_sub(2));
                 prefixRenderedBlocks(
-                    lines, cont, mdBlocks,
-                    "\u{25C6} ", Style::default().fg(Color::White), width,
-                    entryIndex, &self.codeScrollX, &self.codeExpanded,
-                    codeBlockRanges, &self.copiedFlash,
+                    lines,
+                    cont,
+                    mdBlocks,
+                    "\u{25C6} ",
+                    Style::default().fg(Color::White),
+                    width,
+                    entryIndex,
+                    &self.codeScrollX,
+                    &self.codeExpanded,
+                    codeBlockRanges,
+                    &self.copiedFlash,
                 );
             }
             PanelEntry::Reasoning { text, expanded } => {
@@ -2853,25 +3265,20 @@ impl AgentPanel {
                     }
                 }
             }
-            PanelEntry::ToolRequest { summary, diff, command } => {
+            PanelEntry::ToolRequest {
+                summary,
+                diff,
+                command,
+            } => {
                 if let Some(diffText) = diff {
                     // File edit: summary line with (+N -M) stats + diff code block.
                     let (added, removed) = diffStats(diffText);
                     let summaryBlock = RenderedBlock::Text(vec![Line::from(vec![
-                        Span::styled(
-                            summary.clone(),
-                            Style::default().fg(Color::Yellow),
-                        ),
+                        Span::styled(summary.clone(), Style::default().fg(Color::Yellow)),
                         Span::raw(" "),
-                        Span::styled(
-                            format!("+{added}"),
-                            Style::default().fg(Color::Green),
-                        ),
+                        Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
                         Span::raw(" "),
-                        Span::styled(
-                            format!("-{removed}"),
-                            Style::default().fg(Color::Red),
-                        ),
+                        Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
                     ])]);
                     let diffBlock = RenderedBlock::Code {
                         lang: Some("diff".to_string()),
@@ -2879,17 +3286,23 @@ impl AgentPanel {
                         code: diffText.clone(),
                     };
                     prefixRenderedBlocks(
-                        lines, cont, vec![summaryBlock, diffBlock],
-                        "\u{2699}\u{FE0E} ", Style::default().fg(Color::Yellow), width,
-                        entryIndex, &self.codeScrollX, &self.codeExpanded,
-                        codeBlockRanges, &self.copiedFlash,
+                        lines,
+                        cont,
+                        vec![summaryBlock, diffBlock],
+                        "\u{2699}\u{FE0E} ",
+                        Style::default().fg(Color::Yellow),
+                        width,
+                        entryIndex,
+                        &self.codeScrollX,
+                        &self.codeExpanded,
+                        codeBlockRanges,
+                        &self.copiedFlash,
                     );
                 } else if command.is_some() {
                     // Shell command: skip rendering in chat when prompt is active
                     // (code block + info is in the input area). Show compact summary
                     // only for historical/approved entries.
-                    let isPending = self.pendingPermit
-                        && entryIndex == self.entries.len() - 1;
+                    let isPending = self.pendingPermit && entryIndex == self.entries.len() - 1;
                     if !isPending {
                         let style = Style::default().fg(Color::Yellow);
                         let content = vec![Line::from(Span::styled(summary.clone(), style))];
@@ -2908,17 +3321,12 @@ impl AgentPanel {
             }
             PanelEntry::ToolDenied { name } => {
                 let style = Style::default().fg(Color::Red);
-                let content = vec![Line::from(Span::styled(
-                    format!("{name} (denied)"),
-                    style,
-                ))];
+                let content = vec![Line::from(Span::styled(format!("{name} (denied)"), style))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
             }
             PanelEntry::ToolAutoDenied { name, summary } => {
                 // Red-tinted background for rule-blocked tool calls.
-                let style = Style::default()
-                    .fg(Color::Red)
-                    .bg(Color::Rgb(60, 20, 20));
+                let style = Style::default().fg(Color::Red).bg(Color::Rgb(60, 20, 20));
                 let content = vec![Line::from(Span::styled(
                     format!("{name}: {summary} (blocked by rule)"),
                     style,
@@ -2926,7 +3334,8 @@ impl AgentPanel {
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
             }
             PanelEntry::ToolActive { summary } => {
-                let elapsed = self.toolStartTime
+                let elapsed = self
+                    .toolStartTime
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
                 let style = Style::default().fg(Color::Yellow);
@@ -2941,13 +3350,90 @@ impl AgentPanel {
                 lines.push(blobLines[1].clone());
                 cont.push(true);
             }
-            PanelEntry::SubagentBlock { agentType, prompt, toolLines, done, turns, content, contentExpanded, .. } => {
+            PanelEntry::WakeSchedule {
+                id,
+                kind,
+                summary,
+                prompt,
+                status,
+                armed,
+                nextFireAt,
+                firesSoFar,
+                registeredAt,
+            } => {
+                let now = Instant::now();
+                let (statusText, statusStyle) =
+                    wakeScheduleStatusText(*status, *armed, *firesSoFar);
+                let nextText = if *armed {
+                    nextFireAt
+                        .map(|at| format!(" \u{00B7} {}", timeUntilLabel(at, now)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let ageText = if *status == WakeScheduleStatus::Armed && nextFireAt.is_none() {
+                    format!(
+                        " \u{00B7} armed {}",
+                        elapsedCompact(now.saturating_duration_since(*registeredAt))
+                    )
+                } else {
+                    String::new()
+                };
+                let kindText = wakeKindLabel(*kind);
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("\u{25F4} wake #{id}"),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!(" \u{00B7} {kindText}"),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(format!(" \u{00B7} {statusText}"), statusStyle),
+                    Span::styled(nextText, Style::default().fg(Color::Gray)),
+                    Span::styled(ageText, Style::default().fg(Color::DarkGray)),
+                ]);
+                lines.push(line);
+                cont.push(false);
+
+                let detail = if let Some(prompt) = prompt.as_ref().filter(|p| !p.is_empty()) {
+                    prompt.clone()
+                } else {
+                    summary.clone()
+                };
+                if !detail.is_empty() {
+                    let style = Style::default().fg(Color::DarkGray);
+                    let detailLine = Line::from(Span::styled(detail, style));
+                    for (idx, wrapped) in
+                        wrapSpannedLine(detailLine, (width as usize).saturating_sub(2))
+                            .into_iter()
+                            .enumerate()
+                    {
+                        cont.push(idx > 0);
+                        let mut spans = vec![Span::styled("  ".to_string(), style)];
+                        spans.extend(wrapped.spans);
+                        lines.push(Line::from(spans));
+                    }
+                }
+            }
+            PanelEntry::SubagentBlock {
+                agentType,
+                prompt,
+                toolLines,
+                done,
+                turns,
+                content,
+                contentExpanded,
+                ..
+            } => {
                 let prefixPad: usize = 2; // Match other entries' prefix indent.
                 let w = (width as usize).saturating_sub(prefixPad);
                 let innerW = w.saturating_sub(2); // Inside the left+right borders.
                 let indent = " ".repeat(prefixPad);
                 let borderStyle = Style::default().fg(Color::DarkGray);
-                let headerStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                let headerStyle = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
                 let toolStyle = Style::default().fg(Color::Cyan);
 
                 // Track header line for click-to-view.
@@ -3034,9 +3520,12 @@ impl AgentPanel {
                 use unicode_width::UnicodeWidthStr;
 
                 // Helper: render a horizontal border line with a centered label.
-                let makeBorderLine = |leftCorner: &str, rightCorner: &str,
-                                      label: &str, labelStyle: Style,
-                                      indent: &str| -> Line<'static> {
+                let makeBorderLine = |leftCorner: &str,
+                                      rightCorner: &str,
+                                      label: &str,
+                                      labelStyle: Style,
+                                      indent: &str|
+                 -> Line<'static> {
                     let labelW = UnicodeWidthStr::width(label);
                     let ruleLen = innerW.saturating_sub(labelW);
                     let lRule = ruleLen / 2;
@@ -3057,32 +3546,27 @@ impl AgentPanel {
                     // run gets a green ✓; cancelled/errored runs get a
                     // red ⊘ / ✗ so the block doesn't visually scan as
                     // success.
-                    let (footerGlyph, footerColor, footerSummary) = match content
-                        .as_deref()
-                        .unwrap_or("")
-                    {
-                        s if s.starts_with("[subagent cancelled by user]") => (
-                            "\u{2298}",
-                            Color::Red,
-                            "cancelled".to_string(),
-                        ),
-                        s if s.starts_with("[subagent errored") => (
-                            "\u{2717}\u{FE0E}",
-                            Color::Red,
-                            "errored".to_string(),
-                        ),
-                        _ => (
-                            "\u{2713}\u{FE0E}",
-                            Color::Green,
-                            format!("{turns} turns"),
-                        ),
-                    };
+                    let (footerGlyph, footerColor, footerSummary) =
+                        match content.as_deref().unwrap_or("") {
+                            s if s.starts_with("[subagent cancelled by user]") => {
+                                ("\u{2298}", Color::Red, "cancelled".to_string())
+                            }
+                            s if s.starts_with("[subagent errored") => {
+                                ("\u{2717}\u{FE0E}", Color::Red, "errored".to_string())
+                            }
+                            _ => ("\u{2713}\u{FE0E}", Color::Green, format!("{turns} turns")),
+                        };
                     let footerLabel = format!(" {footerGlyph} {agentType} ({footerSummary}) ");
 
                     if let Some(contentText) = content {
                         // Divider with the outcome-aware color.
-                        lines.push(makeBorderLine("\u{251C}", "\u{2524}",
-                            &footerLabel, Style::default().fg(footerColor), &indent));
+                        lines.push(makeBorderLine(
+                            "\u{251C}",
+                            "\u{2524}",
+                            &footerLabel,
+                            Style::default().fg(footerColor),
+                            &indent,
+                        ));
                         cont.push(false);
 
                         let toggleEntryIdx = entryIndex;
@@ -3108,14 +3592,15 @@ impl AgentPanel {
                                         let wrapped = wrapSpannedLine(contentLine, effW);
                                         for wLine in wrapped {
                                             // Measure and pad.
-                                            let lineText: String = barSpans.iter()
+                                            let lineText: String = barSpans
+                                                .iter()
                                                 .chain(wLine.spans.iter())
-                                                .map(|s| s.content.as_ref()).collect();
+                                                .map(|s| s.content.as_ref())
+                                                .collect();
                                             let lineW = UnicodeWidthStr::width(lineText.as_str());
                                             let pad = contentInnerW.saturating_sub(lineW);
-                                            let mut spans = vec![
-                                                Span::styled("\u{2502} ", borderStyle),
-                                            ];
+                                            let mut spans =
+                                                vec![Span::styled("\u{2502} ", borderStyle)];
                                             spans.extend(barSpans.iter().cloned());
                                             spans.extend(wLine.spans);
                                             spans.push(Span::styled(
@@ -3127,7 +3612,11 @@ impl AgentPanel {
                                         }
                                     }
                                 }
-                                crate::markdown::RenderedBlock::Code { lang, lines: codeLines, code } => {
+                                crate::markdown::RenderedBlock::Code {
+                                    lang,
+                                    lines: codeLines,
+                                    code,
+                                } => {
                                     let blockId = (entryIndex, codeOrdinal);
                                     codeOrdinal += 1;
                                     let isExpanded = self.codeExpanded.contains(&blockId);
@@ -3135,39 +3624,55 @@ impl AgentPanel {
                                     let cbCollapsible = totalCodeLines > MAX_CODE_BLOCK_LINES;
 
                                     let (visibleCodeLines, topExtra, bottomLabel): (
-                                        &[Vec<Span<'static>>], Option<String>, Option<&str>,
+                                        &[Vec<Span<'static>>],
+                                        Option<String>,
+                                        Option<&str>,
                                     ) = if cbCollapsible && !isExpanded {
                                         let hidden = totalCodeLines - MAX_CODE_BLOCK_LINES;
-                                        (&codeLines[..MAX_CODE_BLOCK_LINES], Some(format!("\u{25BE}{hidden}")), None)
+                                        (
+                                            &codeLines[..MAX_CODE_BLOCK_LINES],
+                                            Some(format!("\u{25BE}{hidden}")),
+                                            None,
+                                        )
                                     } else if cbCollapsible {
                                         (&codeLines, Some("\u{25B4}".to_string()), Some("\u{25B4}"))
                                     } else {
                                         (&codeLines, None, None)
                                     };
 
-                                    let mcw = crate::markdown::highlight::maxContentWidth(&codeLines);
-                                    let scrollX = self.codeScrollX.get(&blockId).copied().unwrap_or(0);
-                                    let showCopied = self.copiedFlash
-                                        .as_ref()
-                                        .is_some_and(|(bid, t)| *bid == blockId && t.elapsed().as_secs() < 2);
+                                    let mcw =
+                                        crate::markdown::highlight::maxContentWidth(&codeLines);
+                                    let scrollX =
+                                        self.codeScrollX.get(&blockId).copied().unwrap_or(0);
+                                    let showCopied =
+                                        self.copiedFlash.as_ref().is_some_and(|(bid, t)| {
+                                            *bid == blockId && t.elapsed().as_secs() < 2
+                                        });
 
                                     let codeBlockWidth = contentInnerW as u16;
                                     let startLine = contentLines.len();
                                     let rendered = crate::markdown::renderCodeBlock(
-                                        visibleCodeLines, lang.as_deref(), codeBlockWidth,
-                                        scrollX, mcw, showCopied,
-                                        topExtra.as_deref(), bottomLabel,
+                                        visibleCodeLines,
+                                        lang.as_deref(),
+                                        codeBlockWidth,
+                                        scrollX,
+                                        mcw,
+                                        showCopied,
+                                        topExtra.as_deref(),
+                                        bottomLabel,
                                     );
 
                                     // Wrap each code block line in outer │ ... │ borders.
                                     for codeLine in &rendered {
-                                        let codeText: String = codeLine.spans.iter()
-                                            .map(|s| s.content.as_ref()).collect();
+                                        let codeText: String = codeLine
+                                            .spans
+                                            .iter()
+                                            .map(|s| s.content.as_ref())
+                                            .collect();
                                         let codeW = UnicodeWidthStr::width(codeText.as_str());
                                         let pad = contentInnerW.saturating_sub(codeW);
-                                        let mut spans = vec![
-                                            Span::styled("\u{2502} ", borderStyle),
-                                        ];
+                                        let mut spans =
+                                            vec![Span::styled("\u{2502} ", borderStyle)];
                                         spans.extend(codeLine.spans.clone());
                                         spans.push(Span::styled(
                                             format!("{} \u{2502}", " ".repeat(pad)),
@@ -3179,9 +3684,8 @@ impl AgentPanel {
                                     let endLine = contentLines.len().saturating_sub(1);
 
                                     let cbInnerW = (codeBlockWidth as usize).saturating_sub(2);
-                                    let copyLabelCol = codeBlockWidth.saturating_sub(
-                                        if showCopied { 6 } else { 4 } + 1
-                                    );
+                                    let copyLabelCol = codeBlockWidth
+                                        .saturating_sub(if showCopied { 6 } else { 4 } + 1);
 
                                     codeBlockRanges.push(CodeBlockRange {
                                         startLine,
@@ -3237,22 +3741,43 @@ impl AgentPanel {
                         // Bottom border with collapse/expand.
                         if collapsible && !*contentExpanded {
                             let hidden = totalLines - MAX_CODE_BLOCK_LINES;
-                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                                &format!(" \u{25BE}{hidden} "), Style::default().fg(Color::Gray), &indent));
+                            lines.push(makeBorderLine(
+                                "\u{2570}",
+                                "\u{256F}",
+                                &format!(" \u{25BE}{hidden} "),
+                                Style::default().fg(Color::Gray),
+                                &indent,
+                            ));
                         } else if collapsible {
-                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                                " \u{25B4} ", Style::default().fg(Color::Gray), &indent));
+                            lines.push(makeBorderLine(
+                                "\u{2570}",
+                                "\u{256F}",
+                                " \u{25B4} ",
+                                Style::default().fg(Color::Gray),
+                                &indent,
+                            ));
                         } else {
-                            lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                                "", borderStyle, &indent));
+                            lines.push(makeBorderLine(
+                                "\u{2570}",
+                                "\u{256F}",
+                                "",
+                                borderStyle,
+                                &indent,
+                            ));
                         }
                         cont.push(false);
                         // Set toggle line AFTER the border is pushed.
-                        self.lastSubagentToggleLine.set(Some((lines.len() - 1, toggleEntryIdx)));
+                        self.lastSubagentToggleLine
+                            .set(Some((lines.len() - 1, toggleEntryIdx)));
                     } else {
                         // No content — simple bottom border.
-                        lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                            &footerLabel, Style::default().fg(footerColor), &indent));
+                        lines.push(makeBorderLine(
+                            "\u{2570}",
+                            "\u{256F}",
+                            &footerLabel,
+                            Style::default().fg(footerColor),
+                            &indent,
+                        ));
                         cont.push(false);
                     }
                 } else {
@@ -3261,38 +3786,65 @@ impl AgentPanel {
                         .map(|s| s.startTime.elapsed().as_secs())
                         .unwrap_or(0);
                     let blobLines = self.throbber.renderLines();
-                    let throbberChar = blobLines[0].spans.first()
+                    let throbberChar = blobLines[0]
+                        .spans
+                        .first()
                         .map(|s| s.content.to_string())
                         .unwrap_or_else(|| "\u{25cc}".into());
                     let footerLabel = format!(" {throbberChar} running ({elapsed}s) ");
-                    lines.push(makeBorderLine("\u{2570}", "\u{256F}",
-                        &footerLabel, Style::default().fg(Color::Yellow), &indent));
+                    lines.push(makeBorderLine(
+                        "\u{2570}",
+                        "\u{256F}",
+                        &footerLabel,
+                        Style::default().fg(Color::Yellow),
+                        &indent,
+                    ));
                     cont.push(false);
                 }
             }
             PanelEntry::ToolResult { name, output } => {
                 let codeBlock = RenderedBlock::Code {
                     lang: Some(name.clone()),
-                    lines: output.lines()
-                        .map(|l| vec![Span::styled(l.to_string(), Style::default().fg(Color::Green))])
+                    lines: output
+                        .lines()
+                        .map(|l| {
+                            vec![Span::styled(
+                                l.to_string(),
+                                Style::default().fg(Color::Green),
+                            )]
+                        })
                         .collect(),
                     code: output.clone(),
                 };
                 prefixRenderedBlocks(
-                    lines, cont, vec![codeBlock],
-                    "\u{25C7} ", Style::default().fg(Color::DarkGray), width,
-                    entryIndex, &self.codeScrollX, &self.codeExpanded,
-                    codeBlockRanges, &self.copiedFlash,
+                    lines,
+                    cont,
+                    vec![codeBlock],
+                    "\u{25C7} ",
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                    entryIndex,
+                    &self.codeScrollX,
+                    &self.codeExpanded,
+                    codeBlockRanges,
+                    &self.copiedFlash,
                 );
             }
             PanelEntry::CommandResult(text) => {
                 // NOTE: Subtract prefix width ("ℹ︎ " = 2 cols) so blocks size correctly.
                 let mdBlocks = markdown::render(text, width.saturating_sub(2));
                 prefixRenderedBlocks(
-                    lines, cont, mdBlocks,
-                    "\u{2139}\u{FE0E} ", Style::default().fg(Color::DarkGray), width,
-                    entryIndex, &self.codeScrollX, &self.codeExpanded,
-                    codeBlockRanges, &self.copiedFlash,
+                    lines,
+                    cont,
+                    mdBlocks,
+                    "\u{2139}\u{FE0E} ",
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                    entryIndex,
+                    &self.codeScrollX,
+                    &self.codeExpanded,
+                    codeBlockRanges,
+                    &self.copiedFlash,
                 );
             }
             PanelEntry::ContextDisplay(state) => {
@@ -3303,7 +3855,9 @@ impl AgentPanel {
                 let indent = " ".repeat(prefixPad);
                 let borderStyle = Style::default().fg(Color::DarkGray);
                 let dimStyle = Style::default().fg(Color::DarkGray);
-                let labelStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                let labelStyle = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
 
                 let tokens = if state.reportedTokens > 0 {
                     state.reportedTokens
@@ -3333,7 +3887,12 @@ impl AgentPanel {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
-                        format!(" {}{} / {}", prefix, formatTokenCount(tokens), formatTokenCount(state.contextWindow)),
+                        format!(
+                            " {}{} / {}",
+                            prefix,
+                            formatTokenCount(tokens),
+                            formatTokenCount(state.contextWindow)
+                        ),
                         dimStyle,
                     ),
                 ]));
@@ -3377,7 +3936,9 @@ impl AgentPanel {
                 }
 
                 if let Some(ref s3) = state.s3 {
-                    let mut contentLines: Vec<(String, Style)> = s3.topicLabels.iter()
+                    let mut contentLines: Vec<(String, Style)> = s3
+                        .topicLabels
+                        .iter()
                         .map(|l| {
                             let truncated = if l.len() > 28 {
                                 format!("{}\u{2026}", &l[..l.floor_char_boundary(27)])
@@ -3399,24 +3960,30 @@ impl AgentPanel {
                 }
 
                 if let Some(ref s2) = state.s2 {
-                    layers.push(("S2 Summaries", vec![(
-                        format!(
-                            " {} turns condensed \u{00B7} ~{} tok",
-                            s2.turnsCondensed,
-                            formatTokenCount(s2.estimatedTokens),
-                        ),
-                        dimStyle,
-                    )]));
+                    layers.push((
+                        "S2 Summaries",
+                        vec![(
+                            format!(
+                                " {} turns condensed \u{00B7} ~{} tok",
+                                s2.turnsCondensed,
+                                formatTokenCount(s2.estimatedTokens),
+                            ),
+                            dimStyle,
+                        )],
+                    ));
                 }
 
-                layers.push(("Raw", vec![(
-                    format!(
-                        " {} turns \u{00B7} ~{} tok",
-                        state.raw.turns,
-                        formatTokenCount(state.raw.estimatedTokens),
-                    ),
-                    dimStyle,
-                )]));
+                layers.push((
+                    "Raw",
+                    vec![(
+                        format!(
+                            " {} turns \u{00B7} ~{} tok",
+                            state.raw.turns,
+                            formatTokenCount(state.raw.estimatedTokens),
+                        ),
+                        dimStyle,
+                    )],
+                ));
 
                 // Render layers with box-drawing.
                 for (i, (title, contentLines)) in layers.iter().enumerate() {
@@ -3460,9 +4027,7 @@ impl AgentPanel {
             PanelEntry::SessionNotice(text) => {
                 let pillColor = Color::Rgb(30, 50, 90);
                 let ghostStyle = Style::default().fg(Color::Rgb(100, 100, 120));
-                let symbolStyle = Style::default()
-                    .fg(Color::Rgb(200, 200, 210))
-                    .bg(pillColor);
+                let symbolStyle = Style::default().fg(Color::Rgb(200, 200, 210)).bg(pillColor);
                 let edgeStyle = Style::default().fg(pillColor);
                 lines.push(Line::from(vec![
                     Span::raw("  "),
@@ -3560,6 +4125,100 @@ fn diffStats(diff: &str) -> (usize, usize) {
     (added, removed)
 }
 
+fn isScheduledWakeKind(kind: construct::control::WakeKind) -> bool {
+    matches!(
+        kind,
+        construct::control::WakeKind::Delay
+            | construct::control::WakeKind::Cron
+            | construct::control::WakeKind::FileWatch
+    )
+}
+
+pub fn isWakeToolName(name: &str) -> bool {
+    matches!(
+        name,
+        "scheduleWakeup" | "cronCreate" | "fileWatch" | "cronDelete"
+    )
+}
+
+fn wakeKindLabel(kind: construct::control::WakeKind) -> &'static str {
+    match kind {
+        construct::control::WakeKind::Delay => "delay",
+        construct::control::WakeKind::Cron => "cron",
+        construct::control::WakeKind::FileWatch => "file watch",
+        construct::control::WakeKind::MonitorMatch => "monitor",
+        construct::control::WakeKind::TaskComplete => "task",
+    }
+}
+
+fn wakeScheduleStatusText(
+    status: WakeScheduleStatus,
+    armed: bool,
+    firesSoFar: u64,
+) -> (&'static str, Style) {
+    match (status, armed, firesSoFar) {
+        (WakeScheduleStatus::Armed, true, _) => ("armed", Style::default().fg(Color::Green)),
+        (WakeScheduleStatus::Fired, true, 1) => {
+            ("fired · still armed", Style::default().fg(Color::Yellow))
+        }
+        (WakeScheduleStatus::Fired, true, _) => {
+            ("fired · still armed", Style::default().fg(Color::Yellow))
+        }
+        (WakeScheduleStatus::Fired, false, 1) => ("fired", Style::default().fg(Color::Yellow)),
+        (WakeScheduleStatus::Fired, false, _) => ("fired", Style::default().fg(Color::Yellow)),
+        (WakeScheduleStatus::Disarmed, _, _) => ("disarmed", Style::default().fg(Color::DarkGray)),
+        (WakeScheduleStatus::Armed, false, _) => ("disarmed", Style::default().fg(Color::DarkGray)),
+    }
+}
+
+fn timeUntilLabel(at: Instant, now: Instant) -> String {
+    if at <= now {
+        "due".to_string()
+    } else {
+        format!("in {}", elapsedCompact(at.duration_since(now)))
+    }
+}
+
+fn elapsedCompact(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes}m")
+        }
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn snippetOneLine(text: &str, maxBytes: usize) -> String {
+    let oneLine = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if oneLine.len() <= maxBytes {
+        oneLine
+    } else {
+        format!(
+            "{}\u{2026}",
+            &oneLine[..oneLine.floor_char_boundary(maxBytes)]
+        )
+    }
+}
+
+fn parseWakeSourceId(source: &str) -> Option<u64> {
+    let hash = source.find('#')?;
+    let digits: String = source[hash + 1..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 /// Prepend a styled symbol to the first line; indent continuations to match.
 ///
 /// Pre-wraps each content line at `(width - prefixWidth)` so that wrapped
@@ -3632,8 +4291,7 @@ fn prefixRenderedBlocks(
                 for line in textLines {
                     // Strip leading blockquote bar spans so wrapping operates
                     // on content only, then re-add bars to every wrapped line.
-                    let (barSpans, contentLine, barWidth) =
-                        stripBlockquoteBars(line);
+                    let (barSpans, contentLine, barWidth) = stripBlockquoteBars(line);
                     let effectiveWidth = textWidth.saturating_sub(barWidth);
                     let wrapped = wrapSpannedLine(contentLine, effectiveWidth);
                     for (idx, wLine) in wrapped.into_iter().enumerate() {
@@ -3651,7 +4309,11 @@ fn prefixRenderedBlocks(
                     }
                 }
             }
-            RenderedBlock::Code { lang, lines: codeLines, code } => {
+            RenderedBlock::Code {
+                lang,
+                lines: codeLines,
+                code,
+            } => {
                 let blockId = (entryIndex, codeOrdinal);
                 codeOrdinal += 1;
                 let codeWidth = width.saturating_sub(prefixWidth as u16);
@@ -3661,7 +4323,9 @@ fn prefixRenderedBlocks(
 
                 // Decide visible lines, top indicator, and bottom label.
                 let (visibleLines, topExtra, bottomLabel): (
-                    &[Vec<Span<'static>>], Option<String>, Option<&str>,
+                    &[Vec<Span<'static>>],
+                    Option<String>,
+                    Option<&str>,
                 ) = if collapsible && !isExpanded {
                     let hidden = totalLines - MAX_CODE_BLOCK_LINES;
                     (
@@ -3686,8 +4350,14 @@ fn prefixRenderedBlocks(
 
                 let startLine = out.len();
                 let rendered = markdown::renderCodeBlock(
-                    visibleLines, lang.as_deref(), codeWidth, scrollX, mcw, showCopied,
-                    topExtra.as_deref(), bottomLabel,
+                    visibleLines,
+                    lang.as_deref(),
+                    codeWidth,
+                    scrollX,
+                    mcw,
+                    showCopied,
+                    topExtra.as_deref(),
+                    bottomLabel,
                 );
                 for codeLine in rendered {
                     cont.push(false);
@@ -3726,10 +4396,21 @@ fn flattenRenderedBlocks(blocks: Vec<RenderedBlock>, width: u16) -> Vec<Line<'st
     for block in blocks {
         match block {
             RenderedBlock::Text(textLines) => lines.extend(textLines),
-            RenderedBlock::Code { lang, lines: codeLines, .. } => {
+            RenderedBlock::Code {
+                lang,
+                lines: codeLines,
+                ..
+            } => {
                 let mcw = markdown::highlight::maxContentWidth(&codeLines);
                 lines.extend(markdown::renderCodeBlock(
-                    &codeLines, lang.as_deref(), width, 0, mcw, false, None, None,
+                    &codeLines,
+                    lang.as_deref(),
+                    width,
+                    0,
+                    mcw,
+                    false,
+                    None,
+                    None,
                 ));
             }
         }
@@ -3754,9 +4435,7 @@ fn fadeColor(color: Color, progress: f32) -> Color {
         _ => return color,
     };
     let dark = 25_f32;
-    let blend = |c: u8| -> u8 {
-        (dark + (c as f32 - dark) * progress).clamp(0.0, 255.0) as u8
-    };
+    let blend = |c: u8| -> u8 { (dark + (c as f32 - dark) * progress).clamp(0.0, 255.0) as u8 };
     Color::Rgb(blend(r), blend(g), blend(b))
 }
 
@@ -3765,12 +4444,13 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
     // Walk backward to find the last line with visible content.
     for line in lines.iter_mut().rev() {
         // Find the last non-empty span with non-whitespace content.
-        let lastIdx = match line.spans.iter().rposition(|s| {
-            !s.content.is_empty() && s.content.chars().any(|c| !c.is_whitespace())
-        }) {
-            Some(i) => i,
-            None => continue,
-        };
+        let lastIdx =
+            match line.spans.iter().rposition(|s| {
+                !s.content.is_empty() && s.content.chars().any(|c| !c.is_whitespace())
+            }) {
+                Some(i) => i,
+                None => continue,
+            };
 
         let span = &line.spans[lastIdx];
         let content = span.content.to_string();
@@ -3785,7 +4465,10 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
 
             let originalFg = style.fg.unwrap_or(Color::White);
             let fadedFg = fadeColor(originalFg, progress);
-            let fadedStyle = Style { fg: Some(fadedFg), ..style };
+            let fadedStyle = Style {
+                fg: Some(fadedFg),
+                ..style
+            };
 
             if prefix.is_empty() {
                 // Entire span is one char — replace in place.
@@ -3793,7 +4476,8 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
             } else {
                 // Split: prefix keeps original style, last char gets faded style.
                 line.spans[lastIdx] = Span::styled(prefix, style);
-                line.spans.insert(lastIdx + 1, Span::styled(lastCharStr, fadedStyle));
+                line.spans
+                    .insert(lastIdx + 1, Span::styled(lastCharStr, fadedStyle));
             }
         }
         return;
@@ -3945,10 +4629,7 @@ fn styledGraphemesToLine(atoms: &[(String, Style)]) -> Line<'static> {
             currentStr.push_str(g);
         } else {
             if !currentStr.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut currentStr),
-                    currentStyle,
-                ));
+                spans.push(Span::styled(std::mem::take(&mut currentStr), currentStyle));
             }
             currentStr.push_str(g);
             currentStyle = *style;
@@ -3983,19 +4664,24 @@ mod wrapTests {
                 assert!(
                     width <= w,
                     "maxW={} line{}: wrapped width {} exceeds limit for text={:?}",
-                    w, i, width, t
+                    w,
+                    i,
+                    width,
+                    t
                 );
             }
             let joined: String = wrapped.iter().map(lineText).collect::<Vec<_>>().join(" ");
             assert!(
                 joined.replace("  ", " ").contains("those"),
                 "maxW={}: expected 'those' intact in wrapped output, got joined={:?}",
-                w, joined
+                w,
+                joined
             );
             assert!(
                 !joined.contains("thosee"),
                 "maxW={}: unexpected 'thosee' in joined={:?}",
-                w, joined
+                w,
+                joined
             );
         }
     }
@@ -4009,9 +4695,157 @@ mod wrapTests {
             assert!(
                 width <= w,
                 "maxW={}: truncated width {} > limit, got {:?}",
-                w, width, t
+                w,
+                width,
+                t
             );
         }
+    }
+
+    #[test]
+    fn wakeTurnActivatesPanelForLiveDeltas() {
+        let mut panel = AgentPanel::new();
+
+        panel.appendReasoning("dropped before active");
+        assert!(panel.streamingReasoning.is_empty());
+
+        panel.pushWakeTurn("delay#3 \u{00B7} Send the message");
+        assert!(panel.isActive());
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::SessionNotice(text))
+                if text.contains("delay#3") && text.contains("Send the message")
+        ));
+
+        panel.appendReasoning("model is thinking");
+        assert_eq!(panel.streamingReasoning, "model is thinking");
+    }
+
+    #[test]
+    fn wakeScheduleReceiptTracksFireAndDisarm() {
+        let mut panel = AgentPanel::new();
+        let next = Instant::now() + Duration::from_secs(90);
+
+        panel.wakeRegistered(
+            3,
+            construct::control::WakeKind::Delay,
+            "90s".into(),
+            Some("Good morning. Send the message.".into()),
+            Some(next),
+        );
+
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::WakeSchedule {
+                id: 3,
+                status: WakeScheduleStatus::Armed,
+                armed: true,
+                firesSoFar: 0,
+                nextFireAt: Some(_),
+                ..
+            })
+        ));
+
+        panel.wakeFiredSource("delay#3 \u{00B7} Good morning");
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::WakeSchedule {
+                id: 3,
+                status: WakeScheduleStatus::Fired,
+                armed: true,
+                firesSoFar: 1,
+                nextFireAt: None,
+                ..
+            })
+        ));
+
+        panel.wakeDisarmed(3);
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::WakeSchedule {
+                id: 3,
+                status: WakeScheduleStatus::Fired,
+                armed: false,
+                firesSoFar: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dueWakeDisarmShowsFiredInsteadOfDisarmed() {
+        let mut panel = AgentPanel::new();
+
+        panel.wakeRegistered(
+            4,
+            construct::control::WakeKind::Delay,
+            "2s".into(),
+            Some("short timer".into()),
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+        panel.wakeDisarmed(4);
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::WakeSchedule {
+                id: 4,
+                status: WakeScheduleStatus::Fired,
+                armed: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn earlyWakeDisarmStillShowsDisarmed() {
+        let mut panel = AgentPanel::new();
+
+        panel.wakeRegistered(
+            5,
+            construct::control::WakeKind::Delay,
+            "30s".into(),
+            Some("cancel me".into()),
+            Some(Instant::now() + Duration::from_secs(30)),
+        );
+        panel.wakeDisarmed(5);
+        assert!(matches!(
+            panel.entries.last(),
+            Some(PanelEntry::WakeSchedule {
+                id: 5,
+                status: WakeScheduleStatus::Disarmed,
+                armed: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wakeScheduleSilentToolResultRemovesActiveRow() {
+        let mut panel = AgentPanel::new();
+        panel.pushUser("set a wake");
+        panel.toolStarted("scheduleWakeup", "scheduleWakeup 90s: Good morning");
+        assert!(
+            panel
+                .entries
+                .iter()
+                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        );
+
+        assert!(panel.finishWakeToolResult(
+            "scheduleWakeup",
+            "Armed wake #3 — will fire in 90s with prompt: Good morning."
+        ));
+        assert!(
+            !panel
+                .entries
+                .iter()
+                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
+        );
+        assert!(
+            !panel
+                .entries
+                .iter()
+                .any(|e| matches!(e, PanelEntry::ToolResult { .. }))
+        );
     }
 
     fn snapshotBuffer(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
@@ -4022,7 +4856,11 @@ mod wrapTests {
                 (a.x..a.x + a.width)
                     .map(|x| {
                         let s = buf[(x, y)].symbol();
-                        if s.is_empty() { " ".to_string() } else { s.to_string() }
+                        if s.is_empty() {
+                            " ".to_string()
+                        } else {
+                            s.to_string()
+                        }
                     })
                     .collect()
             })
@@ -4052,7 +4890,9 @@ mod wrapTests {
         // entry 71 from that transcript — the one visible in screenshot 6.
         let msg = include_str!("../tests/fixtures/bottom_line_message.txt");
         for i in 0..4 {
-            panel.entries.push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
+            panel
+                .entries
+                .push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
         }
 
         // Initial render.
@@ -4105,7 +4945,12 @@ mod wrapTests {
             bufArea.width.saturating_sub(2),
             bufArea.height.saturating_sub(2),
         );
-        let chatRect = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(5));
+        let chatRect = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(5),
+        );
         (terminal, chatRect)
     }
 
@@ -4157,7 +5002,9 @@ mod wrapTests {
         let mut panel = AgentPanel::new();
         let msg = include_str!("../tests/fixtures/bottom_line_message.txt");
         for i in 0..4 {
-            panel.entries.push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
+            panel
+                .entries
+                .push(PanelEntry::Assistant(format!("[msg {i}]\n\n{msg}")));
         }
 
         // Initial render at offset 0.
@@ -4214,7 +5061,9 @@ mod wrapTests {
             }
             msg.push_str("\ndiff (row: col: baseline -> after):\n");
             for (y, (b, a)) in baseline.iter().zip(after.iter()).enumerate() {
-                if b == a { continue; }
+                if b == a {
+                    continue;
+                }
                 use unicode_segmentation::UnicodeSegmentation as _;
                 let bc: Vec<&str> = b.graphemes(true).collect();
                 let ac: Vec<&str> = a.graphemes(true).collect();
@@ -4255,7 +5104,10 @@ mod wrapTests {
                 "{} stray glyph(s) in the gutter after fast scroll:\n{:?}\n\nchat rect ({}, {}) {}x{}:\n{}",
                 stray.len(),
                 stray,
-                chatRect.x, chatRect.y, chatRect.width, chatRect.height,
+                chatRect.x,
+                chatRect.y,
+                chatRect.width,
+                chatRect.height,
                 render,
             );
         }
@@ -4274,15 +5126,17 @@ mod wrapTests {
             assert!(
                 !t.chars().any(|c| c.is_control()),
                 "maxW={}: truncated contained control chars, got {:?}",
-                w, t
+                w,
+                t
             );
             let width = UnicodeWidthStr::width(t.as_str());
             assert!(
                 width <= w,
                 "maxW={}: truncated width {} > limit, got {:?}",
-                w, width, t
+                w,
+                width,
+                t
             );
         }
     }
 }
-

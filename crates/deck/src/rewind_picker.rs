@@ -32,13 +32,13 @@ pub enum RewindAction {
     /// Rewind to a turn ID (destructive — no fork saved).
     Rewind {
         target: String,
-        userMessage: String,
+        userMessage: Option<String>,
         attachments: Option<Vec<construct::transcript::TurnAttachment>>,
     },
     /// Fork current branch, then rewind to a turn ID.
     ForkAndRewind {
         target: String,
-        userMessage: String,
+        userMessage: Option<String>,
         attachments: Option<Vec<construct::transcript::TurnAttachment>>,
     },
 }
@@ -50,8 +50,10 @@ struct PickerItem {
     turnCount: usize,
     /// Turn to rewind to (previous block's last turn).
     rewindTo: String,
-    /// Full user message to put back in the input box.
-    userMessage: String,
+    /// Full user message to put back in the input box. Wake blocks are
+    /// transcript events, not authored user text, so they deliberately have
+    /// no draft to restore.
+    userMessage: Option<String>,
     /// Image attachments from the user turn (for restoring on rewind).
     attachments: Option<Vec<construct::transcript::TurnAttachment>>,
 }
@@ -83,11 +85,7 @@ impl RewindPicker {
             .collect();
 
         // Default to second-to-last (most recent rewindable exchange).
-        let selected = if items.len() > 1 {
-            items.len() - 1
-        } else {
-            0
-        };
+        let selected = if items.len() > 1 { items.len() - 1 } else { 0 };
 
         Self {
             items,
@@ -141,8 +139,12 @@ impl RewindPicker {
 
     /// Render the picker as a centered popup overlay.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let popupWidth = (area.width * 7 / 10).max(40).min(area.width.saturating_sub(4));
-        let popupHeight = (area.height * 7 / 10).max(10).min(area.height.saturating_sub(2));
+        let popupWidth = (area.width * 7 / 10)
+            .max(40)
+            .min(area.width.saturating_sub(4));
+        let popupHeight = (area.height * 7 / 10)
+            .max(10)
+            .min(area.height.saturating_sub(2));
         let popupX = area.x + (area.width.saturating_sub(popupWidth)) / 2;
         let popupY = area.y + (area.height.saturating_sub(popupHeight)) / 2;
 
@@ -183,8 +185,17 @@ impl RewindPicker {
         let contentHeight = inner.height.saturating_sub(footerHeight);
 
         if self.items.is_empty() {
-            let emptyStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25));
-            renderLine(buf, inner.x + 1, y, contentWidth - 1, "No exchanges to rewind to", emptyStyle);
+            let emptyStyle = Style::default()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(15, 15, 25));
+            renderLine(
+                buf,
+                inner.x + 1,
+                y,
+                contentWidth - 1,
+                "No exchanges to rewind to",
+                emptyStyle,
+            );
         } else {
             // Each item is 3 lines tall. Measure layout.
             let itemHeight: u16 = 3;
@@ -222,9 +233,13 @@ impl RewindPicker {
                     Style::default().fg(Color::White).bg(Color::Rgb(15, 15, 25))
                 };
                 let asstStyle = if isSelected {
-                    Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 80))
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .bg(Color::Rgb(40, 40, 80))
                 } else {
-                    Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25))
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .bg(Color::Rgb(15, 15, 25))
                 };
 
                 // Clear background for selected item.
@@ -248,7 +263,14 @@ impl RewindPicker {
                     let drawY = y + itemY - scrollOff;
                     let marker = if isSelected { "\u{25B8}" } else { " " };
                     let text = format!("{marker} Exchange ({} turns)", item.turnCount);
-                    renderLine(buf, inner.x, drawY, contentWidth, &truncate(&text, contentWidth), blockStyle);
+                    renderLine(
+                        buf,
+                        inner.x,
+                        drawY,
+                        contentWidth,
+                        &truncate(&text, contentWidth),
+                        blockStyle,
+                    );
                 }
 
                 // Line 2: user preview.
@@ -256,7 +278,14 @@ impl RewindPicker {
                 if line2Y >= scrollOff && line2Y < scrollOff + contentHeight {
                     let drawY = y + line2Y - scrollOff;
                     let text = format!("  \u{25B9} {}", item.userPreview);
-                    renderLine(buf, inner.x, drawY, contentWidth, &truncate(&text, contentWidth), userStyle);
+                    renderLine(
+                        buf,
+                        inner.x,
+                        drawY,
+                        contentWidth,
+                        &truncate(&text, contentWidth),
+                        userStyle,
+                    );
                 }
 
                 // Line 3: assistant preview.
@@ -264,16 +293,26 @@ impl RewindPicker {
                 if line3Y >= scrollOff && line3Y < scrollOff + contentHeight {
                     let drawY = y + line3Y - scrollOff;
                     let text = format!("    {}", item.assistantPreview);
-                    renderLine(buf, inner.x, drawY, contentWidth, &truncate(&text, contentWidth), asstStyle);
+                    renderLine(
+                        buf,
+                        inner.x,
+                        drawY,
+                        contentWidth,
+                        &truncate(&text, contentWidth),
+                        asstStyle,
+                    );
                 }
             }
 
             // Scroll indicator.
             if totalHeight > contentHeight {
-                let scrollPct = self.scrollOffset as f64 / (totalHeight - contentHeight).max(1) as f64;
+                let scrollPct =
+                    self.scrollOffset as f64 / (totalHeight - contentHeight).max(1) as f64;
                 let trackHeight = contentHeight.saturating_sub(2);
                 let thumbY = y + 1 + (scrollPct * trackHeight as f64) as u16;
-                let scrollStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25));
+                let scrollStyle = Style::default()
+                    .fg(Color::DarkGray)
+                    .bg(Color::Rgb(15, 15, 25));
                 if let Some(cell) = buf.cell_mut((inner.x + inner.width - 1, thumbY)) {
                     cell.set_char('\u{2502}');
                     cell.set_style(scrollStyle);
@@ -283,15 +322,29 @@ impl RewindPicker {
 
         // Footer.
         let footerY = popupArea.y + popupArea.height - 3;
-        let warningStyle = Style::default().fg(Color::Yellow).bg(Color::Rgb(15, 15, 25));
-        let footerStyle = Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 25));
+        let warningStyle = Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::Rgb(15, 15, 25));
+        let footerStyle = Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(15, 15, 25));
 
-        renderLine(buf, inner.x, footerY, contentWidth,
+        renderLine(
+            buf,
+            inner.x,
+            footerY,
+            contentWidth,
             "Enter discards later turns \u{2014} f saves them as a fork first",
-            warningStyle);
-        renderLine(buf, inner.x, footerY + 1, contentWidth,
+            warningStyle,
+        );
+        renderLine(
+            buf,
+            inner.x,
+            footerY + 1,
+            contentWidth,
             "\u{2191}\u{2193}/jk: navigate  Enter: rewind  f: fork & rewind  Esc: cancel",
-            footerStyle);
+            footerStyle,
+        );
     }
 }
 
@@ -303,8 +356,10 @@ struct BlockData {
     turnCount: usize,
     /// Turn to rewind to (previous block's last turn). Empty for first block.
     rewindTo: String,
-    /// Full user message content.
-    userMessage: String,
+    /// Full user message content. Wake blocks stay as wake events in the
+    /// transcript/context and should not be converted into editable user
+    /// drafts on rewind.
+    userMessage: Option<String>,
     /// Image attachments from the user turn.
     attachments: Option<Vec<construct::transcript::TurnAttachment>>,
 }
@@ -317,21 +372,32 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
     let mut blocks: Vec<BlockData> = Vec::new();
     let mut currentBlockId = String::new();
     let mut userPreview = String::new();
-    let mut userMessage = String::new();
+    let mut userMessage: Option<String> = None;
     let mut userAttachments: Option<Vec<construct::transcript::TurnAttachment>> = None;
     let mut assistantPreview = String::new();
     let mut turnCount: usize = 0;
     let mut lastTurnId = String::new();
     let mut prevBlockLastTurn = String::new();
     let mut blockStartedByWake = false;
+    let mut firstWakeTurnId: Option<String> = None;
 
     for turn in turns {
         if turn.blockId != currentBlockId {
             if !currentBlockId.is_empty() && turnCount > 0 {
-                let rewindTo = prevBlockLastTurn.clone();
+                let rewindTo = firstWakeTurnId
+                    .clone()
+                    .unwrap_or_else(|| prevBlockLastTurn.clone());
                 blocks.push(BlockData {
-                    userPreview: if userPreview.is_empty() { "(no message)".into() } else { userPreview.clone() },
-                    assistantPreview: if assistantPreview.is_empty() { "(no response)".into() } else { assistantPreview.clone() },
+                    userPreview: if userPreview.is_empty() {
+                        "(no message)".into()
+                    } else {
+                        userPreview.clone()
+                    },
+                    assistantPreview: if assistantPreview.is_empty() {
+                        "(no response)".into()
+                    } else {
+                        assistantPreview.clone()
+                    },
                     turnCount,
                     rewindTo,
                     userMessage: userMessage.clone(),
@@ -341,11 +407,12 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
             }
             currentBlockId = turn.blockId.clone();
             userPreview = String::new();
-            userMessage = String::new();
+            userMessage = None;
             userAttachments = None;
             assistantPreview = String::new();
             turnCount = 0;
             blockStartedByWake = false;
+            firstWakeTurnId = None;
         }
 
         turnCount += 1;
@@ -355,16 +422,16 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
             TurnRole::User => {
                 if userPreview.is_empty() {
                     userPreview = firstLine(&turn.content, 120);
-                    userMessage = turn.content.clone();
+                    userMessage = Some(turn.content.clone());
                     userAttachments = turn.attachments.clone();
                 }
             }
             TurnRole::Wake => {
                 if !blockStartedByWake && userPreview.is_empty() {
                     blockStartedByWake = true;
+                    firstWakeTurnId = Some(turn.id.clone());
                     let payloads = wakePayloads(&turn.content);
                     userPreview = wakePreview(&turn.content, &payloads);
-                    userMessage = payloads.join("\n\n");
                     userAttachments = None;
                 }
             }
@@ -377,10 +444,18 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
 
     if !currentBlockId.is_empty() && turnCount > 0 {
         blocks.push(BlockData {
-            userPreview: if userPreview.is_empty() { "(no message)".into() } else { userPreview },
-            assistantPreview: if assistantPreview.is_empty() { "(no response)".into() } else { assistantPreview },
+            userPreview: if userPreview.is_empty() {
+                "(no message)".into()
+            } else {
+                userPreview
+            },
+            assistantPreview: if assistantPreview.is_empty() {
+                "(no response)".into()
+            } else {
+                assistantPreview
+            },
             turnCount,
-            rewindTo: prevBlockLastTurn,
+            rewindTo: firstWakeTurnId.unwrap_or(prevBlockLastTurn),
             userMessage,
             attachments: userAttachments,
         });
@@ -412,7 +487,7 @@ fn wakePayloads(content: &str) -> Vec<String> {
         };
         let payload = payload.trim();
         if !payload.is_empty() {
-            payloads.push(payload.to_string());
+            payloads.push(unescapeWakeXml(payload));
         }
         rest = afterClose;
     }
@@ -421,6 +496,14 @@ fn wakePayloads(content: &str) -> Vec<String> {
         payloads.push(firstLine(content, 1000));
     }
     payloads
+}
+
+fn unescapeWakeXml(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
 }
 
 fn wakePreview(content: &str, payloads: &[String]) -> String {
@@ -441,7 +524,10 @@ fn truncate(s: &str, maxChars: usize) -> String {
     if s.chars().count() <= maxChars {
         s.to_string()
     } else if maxChars > 3 {
-        let end = s.char_indices().nth(maxChars - 1).map_or(s.len(), |(i, _)| i);
+        let end = s
+            .char_indices()
+            .nth(maxChars - 1)
+            .map_or(s.len(), |(i, _)| i);
         format!("{}\u{2026}", &s[..end])
     } else {
         let end = s.char_indices().nth(maxChars).map_or(s.len(), |(i, _)| i);
@@ -456,12 +542,15 @@ fn renderLine(buf: &mut Buffer, x: u16, y: u16, maxWidth: usize, text: &str, sty
         width: maxWidth as u16,
         height: 1,
     };
-    Paragraph::new(text.to_string()).style(style).render(area, buf);
+    Paragraph::new(text.to_string())
+        .style(style)
+        .render(area, buf);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     fn turn(id: &str, block: &str, role: TurnRole, parent: Option<&str>, content: &str) -> Turn {
         Turn {
@@ -488,20 +577,57 @@ mod tests {
     }
 
     #[test]
-    fn wakeBlockRestoresWakePayloadForEditing() {
+    fn userBlockRestoresUserMessageForEditing() {
+        let turns = vec![
+            turn("u1", "b1", TurnRole::User, None, "setup"),
+            turn("a1", "b1", TurnRole::Assistant, Some("u1"), "ready"),
+            turn("u2", "b2", TurnRole::User, Some("a1"), "edit me"),
+            turn("a2", "b2", TurnRole::Assistant, Some("u2"), "done"),
+        ];
+
+        let blocks = buildBlocks(&turns);
+        assert_eq!(blocks.len(), 2);
+        let userBlock = &blocks[1];
+        assert_eq!(userBlock.rewindTo, "a1");
+        assert_eq!(userBlock.userMessage.as_deref(), Some("edit me"));
+    }
+
+    #[test]
+    fn wakeBlockDoesNotRestorePayloadAsUserDraft() {
         let wakeContent = "<wakes count=\"1\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nSend the MyHealth message now.\n</wake>\n</wakes>";
         let turns = vec![
-            turn("u1", "b1", TurnRole::User, None, "probably a spade somewhere"),
-            turn("a1", "b1", TurnRole::Assistant, Some("u1"), "Where were you picturing it?"),
+            turn(
+                "u1",
+                "b1",
+                TurnRole::User,
+                None,
+                "probably a spade somewhere",
+            ),
+            turn(
+                "a1",
+                "b1",
+                TurnRole::Assistant,
+                Some("u1"),
+                "Where were you picturing it?",
+            ),
             turn("w1", "b2", TurnRole::Wake, Some("a1"), wakeContent),
-            turn("a2", "b2", TurnRole::Assistant, Some("w1"), "Good morning. Send it."),
+            turn(
+                "a2",
+                "b2",
+                TurnRole::Assistant,
+                Some("w1"),
+                "Good morning. Send it.",
+            ),
         ];
 
         let blocks = buildBlocks(&turns);
         assert_eq!(blocks.len(), 2);
         let wakeBlock = &blocks[1];
-        assert_eq!(wakeBlock.rewindTo, "a1");
-        assert_eq!(wakeBlock.userMessage, "Send the MyHealth message now.");
+        // Wake-started blocks are different from user-started blocks: the
+        // wake envelope itself is the context boundary to preserve, not a
+        // draftable user message to replay.
+        assert_eq!(wakeBlock.rewindTo, "w1");
+        assert_eq!(wakeBlock.userMessage, None);
         assert!(
             wakeBlock.userPreview.contains("delay#3"),
             "wake preview should identify the source: {}",
@@ -510,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn wakeBlockRestoresAllCoalescedWakePayloads() {
+    fn wakeBlockPreviewStillIncludesCoalescedWakeSource() {
         let wakeContent = "<wakes count=\"2\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nFirst payload.\n</wake>\n<wake source=\"monitor#7\" kind=\"Monitor\" ageSecs=\"0\">\nSecond payload.\n</wake>\n</wakes>";
         let turns = vec![
             turn("u1", "b1", TurnRole::User, None, "setup"),
@@ -521,11 +647,35 @@ mod tests {
 
         let blocks = buildBlocks(&turns);
         let wakeBlock = &blocks[1];
-        assert_eq!(wakeBlock.userMessage, "First payload.\n\nSecond payload.");
+        assert_eq!(wakeBlock.userMessage, None);
         assert!(
             wakeBlock.userPreview.contains("delay#3"),
             "preview should identify the first wake source: {}",
             wakeBlock.userPreview,
         );
+    }
+
+    #[test]
+    fn wakePickerEnterTargetsWakeTurnWithNoDraft() {
+        let wakeContent = "<wakes count=\"1\">\n<wake source=\"delay#3\" kind=\"Delay\" ageSecs=\"0\">\nPreserve this exact envelope.\n</wake>\n</wakes>";
+        let turns = vec![
+            turn("u1", "b1", TurnRole::User, None, "setup"),
+            turn("a1", "b1", TurnRole::Assistant, Some("u1"), "ready"),
+            turn("w1", "b2", TurnRole::Wake, Some("a1"), wakeContent),
+            turn("a2", "b2", TurnRole::Assistant, Some("w1"), "handled"),
+        ];
+
+        let mut picker = RewindPicker::new(&turns);
+        match picker.handleKey(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            RewindAction::Rewind {
+                target,
+                userMessage,
+                ..
+            } => {
+                assert_eq!(target, "w1");
+                assert_eq!(userMessage, None);
+            }
+            _ => panic!("expected wake rewind action"),
+        }
     }
 }
