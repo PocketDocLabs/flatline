@@ -94,7 +94,9 @@ cargo run -p deck -- auth login openai-codex
 ```
 
 Inside the TUI, use `/model` to inspect configured profiles and save a
-heavy/light/utility profile choice to `.flatline/config.local.toml`.
+heavy/light/utility profile choice. Press `[` or `]` in the panel to choose
+whether the selection is saved to user, project, project-local, launch-dir, or
+launch-local config.
 
 See [Configuration](configuration.md) for profile examples and config layering.
 

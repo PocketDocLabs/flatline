@@ -2,7 +2,7 @@
 
 //! Model profile panel: compact UI for viewing and switching configured profiles.
 
-use construct::config::ModelTier;
+use construct::config::{ConfigScope, ModelTier};
 use construct::control::ModelStatus;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -27,7 +27,11 @@ const FOOTER_RESERVE: u16 = 3;
 pub enum PanelAction {
     None,
     Close,
-    Save { tier: ModelTier, profile: String },
+    Save {
+        scope: ConfigScope,
+        tier: ModelTier,
+        profile: String,
+    },
 }
 
 pub struct ModelPanel {
@@ -36,6 +40,7 @@ pub struct ModelPanel {
     selectedProfile: usize,
     scrollOffset: usize,
     lastVisibleCount: usize,
+    selectedScope: usize,
     notice: Option<String>,
 }
 
@@ -46,12 +51,18 @@ impl ModelPanel {
             .iter()
             .position(|p| p.name == status.heavyProfile)
             .unwrap_or(0);
+        let selectedScope = status
+            .scopes
+            .iter()
+            .position(|s| s.scope == status.saveScope)
+            .unwrap_or(0);
         Self {
             status,
             selectedTier: ModelTier::Heavy,
             selectedProfile,
             scrollOffset: 0,
             lastVisibleCount: 5,
+            selectedScope,
             notice: None,
         }
     }
@@ -85,18 +96,29 @@ impl ModelPanel {
                 }
                 PanelAction::None
             }
+            KeyCode::Char('[') => {
+                self.cycleScope(-1);
+                PanelAction::None
+            }
+            KeyCode::Char(']') => {
+                self.cycleScope(1);
+                PanelAction::None
+            }
             KeyCode::Enter | KeyCode::Char('s') => {
                 let Some(profile) = self.status.profiles.get(self.selectedProfile) else {
                     return PanelAction::None;
                 };
                 let profile = profile.name.clone();
+                let scope = self.selectedScope();
                 self.setActiveProfile(self.selectedTier, profile.clone());
                 self.notice = Some(format!(
-                    "{} -> {}",
+                    "{} -> {} ({})",
                     tierLabel(self.selectedTier),
-                    profile
+                    profile,
+                    scope.shortLabel()
                 ));
                 PanelAction::Save {
+                    scope,
                     tier: self.selectedTier,
                     profile,
                 }
@@ -171,7 +193,7 @@ impl ModelPanel {
         width = width.max(self.tierLine().chars().count());
         width = width.max(self.authLine().chars().count());
         width = width.max(self.selectionLine().chars().count());
-        width = width.max(self.saveLine().chars().count());
+        width = width.max(self.widestSaveLineWidth());
         width = width.max(self.footerLine().chars().count());
         width.max(self.profileTableNaturalWidth())
     }
@@ -182,6 +204,33 @@ impl ModelPanel {
         if let Some(idx) = self.status.profiles.iter().position(|p| p.name == active) {
             self.selectedProfile = idx;
             self.adjustScroll();
+        }
+    }
+
+    fn selectedScope(&self) -> ConfigScope {
+        self.status
+            .scopes
+            .get(self.selectedScope)
+            .map(|s| s.scope)
+            .unwrap_or(self.status.saveScope)
+    }
+
+    fn selectedScopeStatus(&self) -> Option<&construct::control::ModelConfigScopeStatus> {
+        self.status.scopes.get(self.selectedScope)
+    }
+
+    fn cycleScope(&mut self, direction: isize) {
+        if self.status.scopes.is_empty() {
+            return;
+        }
+        let len = self.status.scopes.len() as isize;
+        self.selectedScope = (self.selectedScope as isize + direction).rem_euclid(len) as usize;
+        self.status.saveScope = self.selectedScope();
+        if let Some(scope) = self.selectedScopeStatus() {
+            let label = scope.label.clone();
+            let path = scope.path.clone();
+            self.status.configPath = path;
+            self.notice = Some(format!("Save target: {label}"));
         }
     }
 
@@ -239,12 +288,25 @@ impl ModelPanel {
     }
 
     fn saveLine(&self) -> String {
-        format!(" Saves to {}", self.status.configPath)
+        if let Some(scope) = self.selectedScopeStatus() {
+            saveLineFor(&scope.label, &scope.path)
+        } else {
+            format!(" Save to {}", self.status.configPath)
+        }
+    }
+
+    fn widestSaveLineWidth(&self) -> usize {
+        self.status
+            .scopes
+            .iter()
+            .map(|scope| saveLineFor(&scope.label, &scope.path).chars().count())
+            .max()
+            .unwrap_or_else(|| self.saveLine().chars().count())
     }
 
     fn footerLine(&self) -> String {
         format!(
-            " h/l/u tier: {}   up/down select   enter save   * active profile   q close ",
+            " h/l/u tier: {}   up/down profile   [/] save target   enter save   * active   q close ",
             tierLabel(self.selectedTier)
         )
     }
@@ -356,7 +418,9 @@ impl ModelPanel {
             inner.x,
             *y,
             w,
-            &profileRow(columns, "  ", "profile", "provider", "model", "ctx", "state", w),
+            &profileRow(
+                columns, "  ", "profile", "provider", "model", "ctx", "state", w,
+            ),
             style(FG_DIM, BG),
         );
         *y += 1;
@@ -457,6 +521,10 @@ fn line(buf: &mut Buffer, x: u16, y: u16, w: usize, text: &str, style: Style) {
 
 fn style(fg: Color, bg: Color) -> Style {
     Style::default().fg(fg).bg(bg)
+}
+
+fn saveLineFor(label: &str, path: &str) -> String {
+    format!(" Save to {label}: {path}")
 }
 
 fn tierLabel(tier: ModelTier) -> &'static str {

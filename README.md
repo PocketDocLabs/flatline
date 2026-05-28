@@ -61,8 +61,10 @@ Flatline reads layered configuration:
 
 1. User config: `~/.config/flatline/config.toml`
 2. Project config: `<project-root>/.flatline/config.toml`
-3. Local project overrides: `<project-root>/.flatline/config.local.toml`
-4. Environment variables such as `OPENROUTER_API_KEY` and `OPENAI_API_KEY`
+3. Launch directory config: `<launch-dir>/.flatline/config.toml`
+4. Local project overrides: `<project-root>/.flatline/config.local.toml`
+5. Local launch directory overrides: `<launch-dir>/.flatline/config.local.toml`
+6. Environment variables such as `OPENROUTER_API_KEY` and `OPENAI_API_KEY`
 
 MCP servers are configured in `~/.config/flatline/mcp.json` and project
 `.mcp.json` files.

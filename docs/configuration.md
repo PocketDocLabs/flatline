@@ -10,14 +10,21 @@ Resolution order:
 1. Built-in defaults
 2. User config: `~/.config/flatline/config.toml`
 3. Project config: `<project-root>/.flatline/config.toml`
-4. Local project config: `<project-root>/.flatline/config.local.toml`
-5. Environment variables
+4. Launch directory config: `<launch-dir>/.flatline/config.toml`
+5. Local project config: `<project-root>/.flatline/config.local.toml`
+6. Local launch directory config: `<launch-dir>/.flatline/config.local.toml`
+7. Environment variables
 
 Set `FLATLINE_CONFIG=/path/to/config.toml` to load one explicit file instead
 of using normal layer discovery.
 
 Project root discovery walks upward from the current directory until it finds
 `.git`. If no `.git` is found, the current directory is used.
+
+The launch directory is the directory where Flatline was started. When it is
+below the project root, launch-scoped config lets a nested workspace override
+repo-level defaults without editing the repo root config. Local config files are
+gitignored by Flatline when they are created through the UI.
 
 ## Model Profiles
 
@@ -132,6 +139,18 @@ promptThinking = true
 
 Prompt thinking asks the model to use Flatline's scratchpad format instead of a
 provider-native reasoning API.
+
+## In-App Profile Switching
+
+Use `/model` to inspect configured profiles and assign one to the heavy, light,
+or utility tier. The panel has an explicit save target; press `[` or `]` to
+cycle between user, project, project-local, launch-dir, and launch-local config
+files when those scopes are distinct.
+
+When Flatline is launched from a directory below the project root, the default
+save target is launch-local config. Otherwise it defaults to project-local
+config. Pressing Enter saves only the tier selection today; full profile editing
+and model discovery are planned as follow-on work.
 
 ## Permissions
 

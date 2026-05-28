@@ -370,6 +370,14 @@ pub struct ModelProfileStatus {
     pub configured: bool,
 }
 
+/// One available config destination/source in the `/model` panel.
+#[derive(Debug, Clone)]
+pub struct ModelConfigScopeStatus {
+    pub scope: crate::config::ConfigScope,
+    pub label: String,
+    pub path: String,
+}
+
 /// Snapshot of model profile state for the `/model` panel.
 #[derive(Debug, Clone)]
 pub struct ModelStatus {
@@ -377,6 +385,8 @@ pub struct ModelStatus {
     pub lightProfile: String,
     pub utilityProfile: String,
     pub profiles: Vec<ModelProfileStatus>,
+    pub saveScope: crate::config::ConfigScope,
+    pub scopes: Vec<ModelConfigScopeStatus>,
     pub configPath: String,
     pub openAiCodex: crate::auth::OpenAiCodexStatus,
 }
@@ -446,6 +456,7 @@ pub enum TuiRequest {
 
     /// Persist a model profile selection to local project config.
     SaveModelSelection {
+        scope: crate::config::ConfigScope,
         tier: crate::config::ModelTier,
         profile: String,
         reply: oneshot::Sender<CommandAck>,

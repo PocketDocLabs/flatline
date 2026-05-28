@@ -57,6 +57,22 @@ fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
 fn buildModelStatus(config: &construct::config::Config) -> construct::control::ModelStatus {
     let codexStatus = construct::auth::openAiCodexStatus();
     let codexConfigured = codexStatus.configured;
+    let saveScope = construct::config::defaultModelSaveScope(config);
+    let scopes = construct::config::modelConfigScopes(config)
+        .into_iter()
+        .filter_map(|scope| {
+            let path = construct::config::configPathForScope(
+                scope,
+                config.projectRoot.as_deref(),
+                &config.launchDir,
+            )?;
+            Some(construct::control::ModelConfigScopeStatus {
+                scope,
+                label: scope.label().to_string(),
+                path: path.display().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
     let profiles = config
         .profiles
         .iter()
@@ -74,19 +90,22 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
             }
         })
         .collect();
-    let configPath = config
-        .projectRoot
-        .as_ref()
-        .map(|root| root.join(".flatline").join("config.local.toml"))
-        .unwrap_or_else(|| construct::config::configDir().join("config.toml"))
-        .display()
-        .to_string();
+    let configPath = construct::config::configPathForScope(
+        saveScope,
+        config.projectRoot.as_deref(),
+        &config.launchDir,
+    )
+    .unwrap_or_else(|| construct::config::configDir().join("config.toml"))
+    .display()
+    .to_string();
 
     construct::control::ModelStatus {
         heavyProfile: config.heavyProfile.clone(),
         lightProfile: config.lightProfile.clone(),
         utilityProfile: config.utilityProfile.clone(),
         profiles,
+        saveScope,
+        scopes,
         configPath,
         openAiCodex: codexStatus,
     }
@@ -861,38 +880,40 @@ pub async fn run() -> Result<()> {
                         Some(TuiRequest::GetModels { reply }) => {
                             let _ = reply.send(buildModelStatus(&config));
                         }
-                        Some(TuiRequest::SaveModelSelection { tier, profile, reply }) => {
+                        Some(TuiRequest::SaveModelSelection { scope, tier, profile, reply }) => {
                             if !config.profiles.contains_key(&profile) {
                                 let _ = reply.send(construct::control::CommandAck::err(
                                     format!("Unknown model profile: {profile}"),
                                 ));
                                 continue;
                             }
-                            if let Some(ref root) = config.projectRoot {
-                                match construct::config::saveModelSelection(root, tier, &profile) {
-                                    Ok(()) => match construct::config::load() {
-                                        Ok(next) => {
-                                            config = next;
-                                            let _ = reply.send(construct::control::CommandAck::ok(
-                                                "Saved model profile. It will be used after /clear or restart.",
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            let _ = reply.send(construct::control::CommandAck::err(
-                                                format!("Saved, but failed to reload config: {e}"),
-                                            ));
-                                        }
-                                    },
-                                    Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Failed to save model profile: {e}"),
+                            match construct::config::saveModelSelectionInScope(
+                                &config,
+                                scope,
+                                tier,
+                                &profile,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Saved model profile to {}. It will be used after /clear or restart.",
+                                                path.display()
+                                            ),
                                         ));
                                     }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Saved, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to save model profile: {e}"),
+                                    ));
                                 }
-                            } else {
-                                let _ = reply.send(construct::control::CommandAck::err(
-                                    "No project root; model profile not persisted.",
-                                ));
                             }
                         }
                         Some(TuiRequest::SavePermissions { defaultMode, rules, reply }) => {
@@ -2895,11 +2916,12 @@ async fn handleInput(
                         ModelPanelAction::Close => {
                             *modelPanel = None;
                         }
-                        ModelPanelAction::Save { tier, profile } => {
+                        ModelPanelAction::Save { scope, tier, profile } => {
                             spawnAckRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
                                 move |reply| TuiRequest::SaveModelSelection {
+                                    scope,
                                     tier,
                                     profile,
                                     reply,

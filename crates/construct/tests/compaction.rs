@@ -52,6 +52,7 @@ fn dummyClient() -> api::Client {
         permissions: None,
         budget: BudgetConfig::default(),
         projectRoot: None,
+        launchDir: std::path::PathBuf::from("."),
     };
     api::Client::new(&config).expect("build test client")
 }

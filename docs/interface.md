@@ -59,7 +59,7 @@ Slash commands are handled by the TUI before text is sent to the agent.
 - `/mcp`: show MCP server status and tool counts
 - `/lsp`: show LSP server status and install hints
 - `/permissions` or `/perms`: view and manage permission rules
-- `/model` or `/models`: view and switch model profiles
+- `/model` or `/models`: view model profiles, switch tier assignments, and choose the config file to save into
 - `/cost`: show session and rolling cost breakdown
 - `/tasks` or `/jobs`: show background jobs, monitors, and wake schedules
 - `/layout`: open layout controls

@@ -97,6 +97,10 @@ pub struct Config {
 
     /// Discovered project root (not serialized — derived at load time).
     pub projectRoot: Option<PathBuf>,
+
+    /// Directory Flatline was launched from. Used for launch-scoped config
+    /// files when the agent starts below a larger project root.
+    pub launchDir: PathBuf,
 }
 
 /// Which model tier is being edited by the in-app model profile UI.
@@ -105,6 +109,42 @@ pub enum ModelTier {
     Heavy,
     Light,
     Utility,
+}
+
+/// Where an in-app config edit should be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigScope {
+    User,
+    Project,
+    ProjectLocal,
+    Launch,
+    LaunchLocal,
+}
+
+impl ConfigScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConfigScope::User => "User",
+            ConfigScope::Project => "Project",
+            ConfigScope::ProjectLocal => "Project local",
+            ConfigScope::Launch => "Launch dir",
+            ConfigScope::LaunchLocal => "Launch local",
+        }
+    }
+
+    pub fn shortLabel(self) -> &'static str {
+        match self {
+            ConfigScope::User => "user",
+            ConfigScope::Project => "project",
+            ConfigScope::ProjectLocal => "project local",
+            ConfigScope::Launch => "launch",
+            ConfigScope::LaunchLocal => "launch local",
+        }
+    }
+
+    pub fn isLocal(self) -> bool {
+        matches!(self, ConfigScope::ProjectLocal | ConfigScope::LaunchLocal)
+    }
 }
 
 /// Budget and cost warning settings.
@@ -341,14 +381,70 @@ pub fn configDir() -> PathBuf {
         .join(CONFIG_DIR)
 }
 
+/// Directory Flatline was launched from.
+pub fn launchDir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn samePath(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
+pub fn configPathForScope(
+    scope: ConfigScope,
+    projectRoot: Option<&Path>,
+    launchDir: &Path,
+) -> Option<PathBuf> {
+    match scope {
+        ConfigScope::User => Some(configDir().join(CONFIG_FILE)),
+        ConfigScope::Project => projectRoot.map(|root| root.join(PROJECT_DIR).join(PROJECT_CONFIG)),
+        ConfigScope::ProjectLocal => {
+            projectRoot.map(|root| root.join(PROJECT_DIR).join(LOCAL_CONFIG))
+        }
+        ConfigScope::Launch => Some(launchDir.join(PROJECT_DIR).join(PROJECT_CONFIG)),
+        ConfigScope::LaunchLocal => Some(launchDir.join(PROJECT_DIR).join(LOCAL_CONFIG)),
+    }
+}
+
+pub fn modelConfigScopes(config: &Config) -> Vec<ConfigScope> {
+    let mut scopes = vec![ConfigScope::User];
+    if config.projectRoot.is_some() {
+        scopes.push(ConfigScope::Project);
+        scopes.push(ConfigScope::ProjectLocal);
+    }
+    let launchMatchesProject = config
+        .projectRoot
+        .as_deref()
+        .is_some_and(|root| samePath(root, &config.launchDir));
+    if !launchMatchesProject {
+        scopes.push(ConfigScope::Launch);
+        scopes.push(ConfigScope::LaunchLocal);
+    }
+    scopes
+}
+
+pub fn defaultModelSaveScope(config: &Config) -> ConfigScope {
+    let launchMatchesProject = config
+        .projectRoot
+        .as_deref()
+        .is_some_and(|root| samePath(root, &config.launchDir));
+    if launchMatchesProject {
+        ConfigScope::ProjectLocal
+    } else {
+        ConfigScope::LaunchLocal
+    }
+}
+
 /// Load config from all layers, merge, and resolve.
 ///
 /// Layer order (lowest → highest priority):
 /// 1. Defaults (hardcoded, provider-aware)
 /// 2. User (`~/.config/flatline/config.toml`)
 /// 3. Project (`.flatline/config.toml`)
-/// 4. Local (`.flatline/config.local.toml`, gitignored)
-/// 5. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
+/// 4. Launch directory (`<launch-dir>/.flatline/config.toml`, when distinct)
+/// 5. Project local (`.flatline/config.local.toml`, gitignored)
+/// 6. Launch directory local (`<launch-dir>/.flatline/config.local.toml`, when distinct)
+/// 7. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
 ///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`,
 ///    `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
@@ -373,6 +469,7 @@ pub fn load() -> Result<Config> {
 
     let userLayer = loadPartial(&userPath)?;
 
+    let launchDir = launchDir();
     let projectRoot = discoverProjectRoot();
     let mut merged = userLayer;
 
@@ -381,6 +478,10 @@ pub fn load() -> Result<Config> {
     } else {
         PermissionsSource::BuiltIn
     };
+
+    let launchMatchesProject = projectRoot
+        .as_deref()
+        .is_some_and(|root| samePath(root, &launchDir));
 
     if let Some(ref root) = projectRoot {
         let projectDir = root.join(PROJECT_DIR);
@@ -391,7 +492,20 @@ pub fn load() -> Result<Config> {
             permsSource = PermissionsSource::Project;
         }
         merged = merged.merge(projectLayer);
+    }
 
+    if !launchMatchesProject {
+        let launchProjectDir = launchDir.join(PROJECT_DIR);
+        let launchPath = launchProjectDir.join(PROJECT_CONFIG);
+        let launchLayer = loadPartial(&launchPath)?;
+        if launchLayer.permissions.is_some() {
+            permsSource = PermissionsSource::Project;
+        }
+        merged = merged.merge(launchLayer);
+    }
+
+    if let Some(ref root) = projectRoot {
+        let projectDir = root.join(PROJECT_DIR);
         let localPath = projectDir.join(LOCAL_CONFIG);
         let localLayer = loadPartial(&localPath)?;
         if localLayer.permissions.is_some() {
@@ -401,6 +515,20 @@ pub fn load() -> Result<Config> {
 
         if projectDir.exists() {
             ensureLocalGitignored(&projectDir);
+        }
+    }
+
+    if !launchMatchesProject {
+        let launchProjectDir = launchDir.join(PROJECT_DIR);
+        let launchLocalPath = launchProjectDir.join(LOCAL_CONFIG);
+        let launchLocalLayer = loadPartial(&launchLocalPath)?;
+        if launchLocalLayer.permissions.is_some() {
+            permsSource = PermissionsSource::Local;
+        }
+        merged = merged.merge(launchLocalLayer);
+
+        if launchProjectDir.exists() {
+            ensureLocalGitignored(&launchProjectDir);
         }
     }
 
@@ -422,6 +550,7 @@ pub fn load() -> Result<Config> {
         },
     )?;
     config.projectRoot = projectRoot;
+    config.launchDir = launchDir;
 
     if let Some(ref mut perms) = config.permissions {
         perms.source = permsSource;
@@ -462,6 +591,7 @@ fn loadExplicit(path: PathBuf) -> Result<Config> {
         },
     )?;
     config.projectRoot = discoverProjectRoot();
+    config.launchDir = launchDir();
     applyEnvKey(&mut config.heavy);
     applyEnvKey(&mut config.light);
     applyEnvKey(&mut config.utility);
@@ -753,6 +883,7 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
         permissions: partial.permissions,
         budget: partial.budget.unwrap_or_default(),
         projectRoot: None,
+        launchDir: launchDir(),
     })
 }
 
@@ -901,6 +1032,33 @@ fn defaultConfigToml() -> String {
 pub fn saveModelSelection(projectRoot: &Path, tier: ModelTier, profile: &str) -> Result<()> {
     let projectDir = projectRoot.join(PROJECT_DIR);
     let configPath = projectDir.join(LOCAL_CONFIG);
+    saveModelSelectionToPath(&configPath, tier, profile)?;
+    ensureLocalGitignored(&projectDir);
+    Ok(())
+}
+
+/// Persist a model tier selection to the requested config scope.
+pub fn saveModelSelectionInScope(
+    config: &Config,
+    scope: ConfigScope,
+    tier: ModelTier,
+    profile: &str,
+) -> Result<PathBuf> {
+    let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
+        .with_context(|| format!("config scope {} is not available", scope.label()))?;
+    saveModelSelectionToPath(&configPath, tier, profile)?;
+    if scope.isLocal() {
+        if let Some(projectDir) = configPath.parent() {
+            ensureLocalGitignored(projectDir);
+        }
+    }
+    Ok(configPath)
+}
+
+fn saveModelSelectionToPath(configPath: &Path, tier: ModelTier, profile: &str) -> Result<()> {
+    let projectDir = configPath
+        .parent()
+        .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
 
     fs::create_dir_all(&projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
@@ -923,8 +1081,6 @@ pub fn saveModelSelection(projectRoot: &Path, tier: ModelTier, profile: &str) ->
     let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
     fs::write(&configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
-
-    ensureLocalGitignored(&projectDir);
     Ok(())
 }
 
@@ -1077,6 +1233,68 @@ mod tests {
             },
         )
         .expect("resolve")
+    }
+
+    #[test]
+    fn modelScopesPreferLaunchLocalWhenLaunchDiffersFromProject() {
+        let mut cfg = resolveOk(PartialConfig::default());
+        let project = tempfile::tempdir().expect("project tempdir");
+        let launch = tempfile::tempdir().expect("launch tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = launch.path().to_path_buf();
+
+        let scopes = modelConfigScopes(&cfg);
+        assert_eq!(defaultModelSaveScope(&cfg), ConfigScope::LaunchLocal);
+        assert!(scopes.contains(&ConfigScope::User));
+        assert!(scopes.contains(&ConfigScope::Project));
+        assert!(scopes.contains(&ConfigScope::ProjectLocal));
+        assert!(scopes.contains(&ConfigScope::Launch));
+        assert!(scopes.contains(&ConfigScope::LaunchLocal));
+    }
+
+    #[test]
+    fn modelScopesCollapseLaunchWhenItMatchesProject() {
+        let mut cfg = resolveOk(PartialConfig::default());
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let scopes = modelConfigScopes(&cfg);
+        assert_eq!(defaultModelSaveScope(&cfg), ConfigScope::ProjectLocal);
+        assert!(scopes.contains(&ConfigScope::ProjectLocal));
+        assert!(!scopes.contains(&ConfigScope::Launch));
+        assert!(!scopes.contains(&ConfigScope::LaunchLocal));
+    }
+
+    #[test]
+    fn saveModelSelectionCanTargetLaunchLocal() {
+        let mut cfg = resolveOk(PartialConfig::default());
+        let project = tempfile::tempdir().expect("project tempdir");
+        let launch = tempfile::tempdir().expect("launch tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = launch.path().to_path_buf();
+
+        let path = saveModelSelectionInScope(
+            &cfg,
+            ConfigScope::LaunchLocal,
+            ModelTier::Heavy,
+            "openaiCodex",
+        )
+        .expect("save model selection");
+
+        assert_eq!(
+            path,
+            launch.path().join(".flatline").join("config.local.toml")
+        );
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("heavyProfile = \"openaiCodex\""));
+        let ignore = fs::read_to_string(launch.path().join(".flatline").join(".gitignore"))
+            .expect("read local gitignore");
+        assert!(
+            ignore
+                .lines()
+                .any(|line| line.trim() == "config.local.toml")
+        );
     }
 
     #[test]
