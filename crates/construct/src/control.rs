@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 
 use crate::context::ContextState;
 use crate::lsp;
+use crate::model_catalog::ModelCatalogEntry;
 use crate::permissions::{PermissionsSource, PermitMode, PermitResponse, Rule};
 use crate::shells::TerminalInfo;
 use crate::tool::ShellImpact;
@@ -367,6 +368,11 @@ pub struct ModelProfileStatus {
     pub provider: String,
     pub model: String,
     pub contextWindow: usize,
+    pub maxContextWindow: Option<usize>,
+    pub promptThinking: bool,
+    pub reasoningEffort: Option<String>,
+    pub reasoningEfforts: Vec<String>,
+    pub reasoningSummary: Option<String>,
     pub configured: bool,
 }
 
@@ -459,6 +465,61 @@ pub enum TuiRequest {
         scope: crate::config::ConfigScope,
         tier: crate::config::ModelTier,
         profile: String,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Discover provider models for the `/model` panel.
+    DiscoverModels {
+        provider: String,
+        reply: oneshot::Sender<std::result::Result<Vec<ModelCatalogEntry>, String>>,
+    },
+
+    /// Persist a discovered model into an existing named profile.
+    SaveDiscoveredModel {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        model: ModelCatalogEntry,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Create a new profile by copying an existing profile.
+    CreateModelProfile {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        sourceProfile: String,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Rename a profile defined in the selected config scope.
+    RenameModelProfile {
+        scope: crate::config::ConfigScope,
+        oldProfile: String,
+        newProfile: String,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Delete a profile defined in the selected config scope.
+    DeleteModelProfile {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Persist a profile's usable context window.
+    SaveModelProfileContext {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        contextWindow: usize,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Persist a profile's thinking / reasoning behavior.
+    SaveModelProfileThinking {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        promptThinking: bool,
+        reasoningEffort: Option<String>,
+        reasoningSummary: Option<String>,
         reply: oneshot::Sender<CommandAck>,
     },
 

@@ -494,7 +494,9 @@ fn buildResponsesBody(
         body["instructions"] = serde_json::Value::String(instructions);
     }
 
-    if let Some(max) = cfg.maxTokens {
+    if cfg.provider != "openai-codex"
+        && let Some(max) = cfg.maxTokens
+    {
         body["max_output_tokens"] = serde_json::json!(max);
     }
 
@@ -1648,6 +1650,7 @@ mod tests {
             providerOrder: Vec::new(),
             maxTokens: Some(123),
             contextWindow: 400_000,
+            maxContextWindow: Some(400_000),
             supportsAnthropicCache: Some(false),
         };
         let messages = vec![
@@ -1690,7 +1693,7 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call");
         assert_eq!(body["input"][3]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["name"], "shell");
-        assert_eq!(body["max_output_tokens"], 123);
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]

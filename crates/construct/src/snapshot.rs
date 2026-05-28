@@ -448,6 +448,7 @@ mod tests {
             providerOrder: vec![],
             maxTokens: None,
             contextWindow: 1_000,
+            maxContextWindow: Some(1_000),
             supportsAnthropicCache: None,
         };
 

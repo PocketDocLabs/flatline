@@ -26,6 +26,7 @@ pub mod context;
 pub mod lsp;
 pub mod mcp;
 pub mod message;
+pub mod model_catalog;
 pub mod permissions;
 pub mod prompt;
 pub mod runner;

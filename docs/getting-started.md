@@ -96,7 +96,9 @@ cargo run -p deck -- auth login openai-codex
 Inside the TUI, use `/model` to inspect configured profiles and save a
 heavy/light/utility profile choice. Press `[` or `]` in the panel to choose
 whether the selection is saved to user, project, project-local, launch-dir, or
-launch-local config.
+launch-local config. Press `e` to open the profile config view for model
+discovery, profile create/rename/delete, usable context budget, thinking mode,
+and provider-native reasoning settings.
 
 See [Configuration](configuration.md) for profile examples and config layering.
 

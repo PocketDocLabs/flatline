@@ -40,9 +40,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::model_catalog::ModelCatalogEntry;
 use crate::permissions::{Permissions, PermissionsSource, PermitMode, Rule};
 
 const CONFIG_DIR: &str = "flatline";
@@ -204,6 +205,11 @@ pub struct ModelConfig {
     /// Model context window size in tokens.
     pub contextWindow: usize,
 
+    /// Model's maximum context window in tokens. `contextWindow` may be set
+    /// lower when a profile should run with a smaller working budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxContextWindow: Option<usize>,
+
     /// Enable Anthropic-style prompt caching (cache_control markers on
     /// outgoing requests). None = auto-detect from model name; explicit
     /// true/false overrides. Auto-detect returns true for any model string
@@ -266,6 +272,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(8_000),
             contextWindow: 256_000,
+            maxContextWindow: Some(256_000),
             supportsAnthropicCache: None,
         },
         "deepseek" => ModelConfig {
@@ -278,6 +285,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(8_000),
             contextWindow: 128_000,
+            maxContextWindow: Some(128_000),
             supportsAnthropicCache: None,
         },
         "openai" => ModelConfig {
@@ -293,6 +301,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(128_000),
             contextWindow: 1_050_000,
+            maxContextWindow: Some(1_050_000),
             supportsAnthropicCache: Some(false),
         },
         "openai-codex" => ModelConfig {
@@ -306,8 +315,9 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             }),
             promptThinking: false,
             providerOrder: Vec::new(),
-            maxTokens: Some(128_000),
-            contextWindow: 400_000,
+            maxTokens: None,
+            contextWindow: 272_000,
+            maxContextWindow: Some(272_000),
             supportsAnthropicCache: Some(false),
         },
         // Default to OpenRouter for anything unrecognized.
@@ -321,6 +331,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
+            maxContextWindow: Some(250_000),
             supportsAnthropicCache: None,
         },
     }
@@ -341,6 +352,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
+            maxContextWindow: Some(250_000),
             supportsAnthropicCache: None,
         },
         Tier::Light => ModelConfig {
@@ -353,6 +365,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
+            maxContextWindow: Some(250_000),
             supportsAnthropicCache: None,
         },
         Tier::Utility => ModelConfig {
@@ -365,6 +378,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(8_000),
             contextWindow: 256_000,
+            maxContextWindow: Some(256_000),
             supportsAnthropicCache: None,
         },
     }
@@ -713,6 +727,7 @@ struct PartialModelConfig {
     providerOrder: Option<Vec<String>>,
     maxTokens: Option<usize>,
     contextWindow: Option<usize>,
+    maxContextWindow: Option<usize>,
     supportsAnthropicCache: Option<bool>,
 }
 
@@ -936,16 +951,26 @@ fn resolveModel(partial: Option<PartialModelConfig>) -> ModelConfig {
         .clone()
         .unwrap_or_else(|| "openrouter".to_string());
     let defaults = modelDefaults(&provider);
+    let model = partial.model.unwrap_or(defaults.model);
+    let maxContextWindow = partial
+        .maxContextWindow
+        .or_else(|| crate::model_catalog::knownModelContextWindow(&provider, &model))
+        .or(defaults.maxContextWindow);
+    let mut contextWindow = partial.contextWindow.unwrap_or(defaults.contextWindow);
+    if let Some(max) = maxContextWindow {
+        contextWindow = contextWindow.min(max);
+    }
     ModelConfig {
         provider,
         key: partial.key.unwrap_or(defaults.key),
-        model: partial.model.unwrap_or(defaults.model),
+        model,
         baseUrl: partial.baseUrl.unwrap_or(defaults.baseUrl),
         reasoning: partial.reasoning.or(defaults.reasoning),
         promptThinking: partial.promptThinking.unwrap_or(defaults.promptThinking),
         providerOrder: partial.providerOrder.unwrap_or(defaults.providerOrder),
         maxTokens: partial.maxTokens.or(defaults.maxTokens),
-        contextWindow: partial.contextWindow.unwrap_or(defaults.contextWindow),
+        contextWindow,
+        maxContextWindow,
         supportsAnthropicCache: partial
             .supportsAnthropicCache
             .or(defaults.supportsAnthropicCache),
@@ -1012,7 +1037,7 @@ fn defaultConfigToml() -> String {
          [profile.openaiCodex]\n\
          provider       = \"openai-codex\"\n\
          model          = \"gpt-5.3-codex\"\n\
-         contextWindow  = 400000\n\
+         contextWindow  = 272000\n\
          reasoning      = {{ effort = \"high\", summary = \"auto\" }}\n\n\
          [profile.openaiGpt54]\n\
          provider       = \"openai\"\n\
@@ -1055,6 +1080,188 @@ pub fn saveModelSelectionInScope(
     Ok(configPath)
 }
 
+/// Persist a discovered model choice into an existing profile in the requested
+/// config scope.
+pub fn saveDiscoveredModelInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    entry: &ModelCatalogEntry,
+) -> Result<PathBuf> {
+    let existing = config
+        .profiles
+        .get(profileName)
+        .with_context(|| format!("unknown model profile: {profileName}"))?;
+    let mut model = if existing.provider == entry.provider {
+        existing.clone()
+    } else {
+        modelDefaults(&entry.provider)
+    };
+    model.provider = entry.provider.clone();
+    model.model = entry.id.clone();
+    if let Some(contextWindow) = entry.contextWindow {
+        model.contextWindow = contextWindow;
+        model.maxContextWindow = Some(contextWindow);
+    }
+    if entry.provider == "openai-codex" {
+        model.maxTokens = None;
+    }
+    let shouldSeedReasoning = existing.provider != entry.provider
+        || model
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_ref())
+            .is_none();
+    if shouldSeedReasoning {
+        if let Some(effort) = &entry.defaultReasoningEffort {
+            let summary = model.reasoning.as_ref().and_then(|r| r.summary.clone());
+            model.reasoning = Some(ReasoningSettings {
+                effort: Some(effort.clone()),
+                summary,
+            });
+        }
+    }
+    saveModelProfileInScope(config, scope, profileName, &model)
+}
+
+pub fn saveModelProfileContextInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    contextWindow: usize,
+) -> Result<PathBuf> {
+    if contextWindow == 0 {
+        bail!("context window must be greater than zero");
+    }
+    let existing = config
+        .profiles
+        .get(profileName)
+        .with_context(|| format!("unknown model profile: {profileName}"))?;
+    let maxContextWindow = existing
+        .maxContextWindow
+        .or_else(|| crate::model_catalog::knownModelContextWindow(&existing.provider, &existing.model));
+    if let Some(max) = maxContextWindow {
+        if contextWindow > max {
+            bail!("context window {contextWindow} exceeds model max {max}");
+        }
+    }
+
+    let mut model = existing.clone();
+    model.contextWindow = contextWindow;
+    model.maxContextWindow = maxContextWindow.or(model.maxContextWindow);
+    saveModelProfileInScope(config, scope, profileName, &model)
+}
+
+pub fn saveModelProfileThinkingInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    promptThinking: bool,
+    reasoningEffort: Option<String>,
+    reasoningSummary: Option<String>,
+) -> Result<PathBuf> {
+    let existing = config
+        .profiles
+        .get(profileName)
+        .with_context(|| format!("unknown model profile: {profileName}"))?;
+    let mut model = existing.clone();
+    model.promptThinking = promptThinking;
+    model.reasoning = if reasoningEffort.is_some() || reasoningSummary.is_some() {
+        Some(ReasoningSettings {
+            effort: reasoningEffort,
+            summary: reasoningSummary,
+        })
+    } else {
+        None
+    };
+    saveModelProfileInScope(config, scope, profileName, &model)
+}
+
+pub fn saveModelProfileInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    model: &ModelConfig,
+) -> Result<PathBuf> {
+    let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
+        .with_context(|| format!("config scope {} is not available", scope.label()))?;
+    saveModelProfileToPath(&configPath, profileName, model)?;
+    if scope.isLocal() {
+        if let Some(projectDir) = configPath.parent() {
+            ensureLocalGitignored(projectDir);
+        }
+    }
+    Ok(configPath)
+}
+
+pub fn createModelProfileInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    sourceProfile: &str,
+) -> Result<PathBuf> {
+    validateProfileName(profileName)?;
+    if config.profiles.contains_key(profileName) {
+        bail!("model profile already exists: {profileName}");
+    }
+    let source = config
+        .profiles
+        .get(sourceProfile)
+        .with_context(|| format!("unknown source model profile: {sourceProfile}"))?;
+    saveModelProfileInScope(config, scope, profileName, source)
+}
+
+pub fn renameModelProfileInScope(
+    config: &Config,
+    scope: ConfigScope,
+    oldName: &str,
+    newName: &str,
+) -> Result<PathBuf> {
+    validateProfileName(newName)?;
+    if oldName == newName {
+        bail!("profile already has that name");
+    }
+    if !config.profiles.contains_key(oldName) {
+        bail!("unknown model profile: {oldName}");
+    }
+    if config.profiles.contains_key(newName) {
+        bail!("model profile already exists: {newName}");
+    }
+
+    let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
+        .with_context(|| format!("config scope {} is not available", scope.label()))?;
+    renameModelProfileInPath(&configPath, oldName, newName)?;
+    if scope.isLocal() {
+        if let Some(projectDir) = configPath.parent() {
+            ensureLocalGitignored(projectDir);
+        }
+    }
+    Ok(configPath)
+}
+
+pub fn deleteModelProfileInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+) -> Result<PathBuf> {
+    if config.heavyProfile == profileName
+        || config.lightProfile == profileName
+        || config.utilityProfile == profileName
+    {
+        bail!("profile {profileName} is assigned to a tier; switch that tier before deleting it");
+    }
+
+    let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
+        .with_context(|| format!("config scope {} is not available", scope.label()))?;
+    deleteModelProfileFromPath(&configPath, profileName)?;
+    if scope.isLocal() {
+        if let Some(projectDir) = configPath.parent() {
+            ensureLocalGitignored(projectDir);
+        }
+    }
+    Ok(configPath)
+}
+
 fn saveModelSelectionToPath(configPath: &Path, tier: ModelTier, profile: &str) -> Result<()> {
     let projectDir = configPath
         .parent()
@@ -1082,6 +1289,132 @@ fn saveModelSelectionToPath(configPath: &Path, tier: ModelTier, profile: &str) -
     fs::write(&configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
     Ok(())
+}
+
+fn renameModelProfileInPath(configPath: &Path, oldName: &str, newName: &str) -> Result<()> {
+    let projectDir = configPath
+        .parent()
+        .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
+
+    fs::create_dir_all(&projectDir)
+        .with_context(|| format!("failed to create {}", projectDir.display()))?;
+
+    let existing = if configPath.exists() {
+        fs::read_to_string(&configPath)
+            .with_context(|| format!("failed to read {}", configPath.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+    let profileValue = doc
+        .get_mut("profile")
+        .context("selected config file has no profile table")?;
+    let profileTable = profileValue
+        .as_table_mut()
+        .context("config `profile` value must be a table")?;
+    if profileTable.contains_key(newName) {
+        bail!("selected config file already has profile {newName}");
+    }
+    let Some(modelValue) = profileTable.remove(oldName) else {
+        bail!("profile {oldName} is not defined in the selected config file");
+    };
+    profileTable.insert(newName.to_string(), modelValue);
+
+    for tierKey in ["heavyProfile", "lightProfile", "utilityProfile"] {
+        if doc.get(tierKey).and_then(toml::Value::as_str) == Some(oldName) {
+            doc.insert(
+                tierKey.to_string(),
+                toml::Value::String(newName.to_string()),
+            );
+        }
+    }
+
+    let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
+    fs::write(&configPath, output)
+        .with_context(|| format!("failed to write {}", configPath.display()))?;
+    Ok(())
+}
+
+fn deleteModelProfileFromPath(configPath: &Path, profileName: &str) -> Result<()> {
+    let projectDir = configPath
+        .parent()
+        .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
+
+    fs::create_dir_all(&projectDir)
+        .with_context(|| format!("failed to create {}", projectDir.display()))?;
+
+    let existing = if configPath.exists() {
+        fs::read_to_string(&configPath)
+            .with_context(|| format!("failed to read {}", configPath.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+    let profileValue = doc
+        .get_mut("profile")
+        .context("selected config file has no profile table")?;
+    let profileTable = profileValue
+        .as_table_mut()
+        .context("config `profile` value must be a table")?;
+    if profileTable.remove(profileName).is_none() {
+        bail!("profile {profileName} is not defined in the selected config file");
+    }
+
+    let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
+    fs::write(&configPath, output)
+        .with_context(|| format!("failed to write {}", configPath.display()))?;
+    Ok(())
+}
+
+fn saveModelProfileToPath(configPath: &Path, profileName: &str, model: &ModelConfig) -> Result<()> {
+    let projectDir = configPath
+        .parent()
+        .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
+
+    fs::create_dir_all(&projectDir)
+        .with_context(|| format!("failed to create {}", projectDir.display()))?;
+
+    let existing = if configPath.exists() {
+        fs::read_to_string(&configPath)
+            .with_context(|| format!("failed to read {}", configPath.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+    let profileValue = doc
+        .entry("profile".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let profileTable = profileValue
+        .as_table_mut()
+        .context("config `profile` value must be a table")?;
+    let modelValue = toml::Value::try_from(model).context("failed to serialize model profile")?;
+    profileTable.insert(profileName.to_string(), modelValue);
+
+    let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
+    fs::write(&configPath, output)
+        .with_context(|| format!("failed to write {}", configPath.display()))?;
+    Ok(())
+}
+
+fn validateProfileName(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("profile name cannot be empty");
+    }
+    if trimmed != name {
+        bail!("profile name cannot start or end with whitespace");
+    }
+    if !name.chars().all(validProfileNameChar) {
+        bail!("profile names may contain only letters, numbers, dot, dash, and underscore");
+    }
+    Ok(())
+}
+
+fn validProfileNameChar(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
 }
 
 // ── Permission persistence ──────────────────────────────────────────
@@ -1298,6 +1631,265 @@ mod tests {
     }
 
     #[test]
+    fn saveDiscoveredModelWritesProfileOverride() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        let launch = tempfile::tempdir().expect("launch tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = launch.path().to_path_buf();
+
+        let entry = ModelCatalogEntry {
+            id: "anthropic/claude-opus-4.6".to_string(),
+            name: "Claude Opus 4.6".to_string(),
+            provider: "openrouter".to_string(),
+            contextWindow: Some(250000),
+            promptPrice: None,
+            completionPrice: None,
+            reasoningEfforts: Vec::new(),
+            defaultReasoningEffort: None,
+            description: None,
+        };
+        let path = saveDiscoveredModelInScope(&cfg, ConfigScope::LaunchLocal, "sonnet", &entry)
+            .expect("save discovered model");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("[profile.sonnet]"));
+        assert!(contents.contains("model = \"anthropic/claude-opus-4.6\""));
+        assert!(contents.contains("contextWindow = 250000"));
+    }
+
+    #[test]
+    fn saveDiscoveredCodexModelOmitsUnsupportedMaxTokens() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "codex"
+            [profile.codex]
+            provider = "openai-codex"
+            model = "gpt-5.3-codex"
+            maxTokens = 128000
+            contextWindow = 400000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let entry = ModelCatalogEntry {
+            id: "gpt-5.5".to_string(),
+            name: "GPT-5.5".to_string(),
+            provider: "openai-codex".to_string(),
+            contextWindow: Some(272_000),
+            promptPrice: None,
+            completionPrice: None,
+            reasoningEfforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            defaultReasoningEffort: Some("medium".into()),
+            description: None,
+        };
+        let path = saveDiscoveredModelInScope(&cfg, ConfigScope::ProjectLocal, "codex", &entry)
+            .expect("save discovered codex model");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("model = \"gpt-5.5\""));
+        assert!(contents.contains("contextWindow = 272000"));
+        assert!(!contents.contains("maxTokens"));
+    }
+
+    #[test]
+    fn saveModelProfileContextCanLowerBudgetBelowMax() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "codex"
+            [profile.codex]
+            provider = "openai-codex"
+            model = "gpt-5.5"
+            contextWindow = 272000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let path = saveModelProfileContextInScope(
+            &cfg,
+            ConfigScope::ProjectLocal,
+            "codex",
+            128_000,
+        )
+        .expect("save model profile context");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("contextWindow = 128000"));
+        assert!(contents.contains("maxContextWindow = 272000"));
+    }
+
+    #[test]
+    fn saveModelProfileContextRejectsAboveMax() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "codex"
+            [profile.codex]
+            provider = "openai-codex"
+            model = "gpt-5.5"
+            contextWindow = 272000
+            maxContextWindow = 272000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let err = saveModelProfileContextInScope(
+            &cfg,
+            ConfigScope::ProjectLocal,
+            "codex",
+            300_000,
+        )
+        .expect_err("context above max should fail");
+        assert!(err.to_string().contains("exceeds model max"));
+    }
+
+    #[test]
+    fn saveModelProfileThinkingWritesPromptAndNativeReasoning() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "opus"
+            [profile.opus]
+            provider = "openrouter"
+            model = "anthropic/claude-opus-4.6"
+            contextWindow = 250000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let path = saveModelProfileThinkingInScope(
+            &cfg,
+            ConfigScope::ProjectLocal,
+            "opus",
+            true,
+            Some("high".to_string()),
+            Some("auto".to_string()),
+        )
+        .expect("save thinking settings");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("promptThinking = true"));
+        assert!(contents.contains("[profile.opus.reasoning]"));
+        assert!(contents.contains("effort = \"high\""));
+        assert!(contents.contains("summary = \"auto\""));
+    }
+
+    #[test]
+    fn createModelProfileCopiesSourceProfile() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            promptThinking = true
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let path =
+            createModelProfileInScope(&cfg, ConfigScope::ProjectLocal, "sonnetFast", "sonnet")
+                .expect("create model profile");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("[profile.sonnetFast]"));
+        assert!(contents.contains("model = \"anthropic/claude-sonnet-4.6\""));
+        assert!(contents.contains("promptThinking = true"));
+    }
+
+    #[test]
+    fn renameModelProfileUpdatesScopedTierSelection() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+        let path = saveModelProfileInScope(
+            &cfg,
+            ConfigScope::ProjectLocal,
+            "sonnet",
+            cfg.profiles.get("sonnet").expect("sonnet profile"),
+        )
+        .expect("seed model profile");
+        fs::write(
+            &path,
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            "#,
+        )
+        .expect("write scoped config");
+
+        renameModelProfileInScope(&cfg, ConfigScope::ProjectLocal, "sonnet", "sonnetWork")
+            .expect("rename model profile");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("heavyProfile = \"sonnetWork\""));
+        assert!(contents.contains("[profile.sonnetWork]"));
+        assert!(!contents.contains("[profile.sonnet]"));
+    }
+
+    #[test]
+    fn deleteModelProfileRemovesScopedProfileOnlyWhenUnused() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            [profile.scratch]
+            provider = "openrouter"
+            model = "moonshotai/kimi-k2.6"
+            contextWindow = 256000
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+        let path = saveModelProfileInScope(
+            &cfg,
+            ConfigScope::ProjectLocal,
+            "scratch",
+            cfg.profiles.get("scratch").expect("scratch profile"),
+        )
+        .expect("seed model profile");
+
+        deleteModelProfileInScope(&cfg, ConfigScope::ProjectLocal, "scratch")
+            .expect("delete model profile");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(!contents.contains("[profile.scratch]"));
+    }
+
+    #[test]
     fn atomicProfileReplace() {
         // Base defines provider=openrouter + providerOrder. Overlay redefines
         // profile.foo to fireworks/kimi with no providerOrder. Merge must NOT
@@ -1442,6 +2034,8 @@ mod tests {
         assert_eq!(cfg.heavy.baseUrl, "https://chatgpt.com/backend-api/codex");
         assert_eq!(cfg.heavy.model, "gpt-5.3-codex");
         assert_eq!(cfg.heavy.key, "");
+        assert_eq!(cfg.heavy.maxTokens, None);
+        assert_eq!(cfg.heavy.contextWindow, 272_000);
         assert_eq!(cfg.utility.baseUrl, "https://api.openai.com/v1");
         assert_eq!(cfg.utility.model, "gpt-5.4");
         assert!(cfg.profiles.contains_key("codex"));

@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 
 /// Tools that are considered read-only by [`Permissions::allowReadOnly`].
 /// Each gets an explicit `allow` rule so the model never hits an
-/// approval prompt for inspecting state. Shell is NOT in this set —
-/// the model's `impact: read` self-classification is not trusted.
+/// approval prompt for inspecting state. Shell is handled separately:
+/// a blanket shell rule would allow mutating commands too, so
+/// [`Permissions::check`] only auto-approves shell calls explicitly
+/// marked with `impact: read` when these read-only tool rules are enabled.
 const READ_ONLY_TOOLS: &[&str] = &[
     "readFile", "glob", "grep", "listDir", "structSearch", "diff",
     "fuzzyFind", "fileOutline", "viewSymbol", "relatedFiles",
@@ -469,8 +471,46 @@ impl Permissions {
             };
         }
 
+        if isReadOnlyShell(action) && self.readOnlyToolsEnabled() {
+            return Verdict::Allow;
+        }
+
         Verdict::NeedsApproval
     }
+
+    /// Whether the permission set includes the read-only allow preset.
+    ///
+    /// This is derived from rules instead of a non-serialized flag so
+    /// persisted configs seeded from the built-in preset keep the same
+    /// behavior after restart.
+    fn readOnlyToolsEnabled(&self) -> bool {
+        READ_ONLY_TOOLS
+            .iter()
+            .all(|tool| self.unconditionalToolVerdict(tool) == Some(true))
+    }
+
+    fn unconditionalToolVerdict(&self, toolName: &str) -> Option<bool> {
+        for rule in &self.rules {
+            if !matchesTool(&rule.tool, toolName) {
+                continue;
+            }
+            if rule.pattern.is_some() {
+                continue;
+            }
+            return Some(rule.allow);
+        }
+        None
+    }
+}
+
+fn isReadOnlyShell(action: &ToolAction) -> bool {
+    matches!(
+        action,
+        ToolAction::Shell {
+            impact: crate::tool::ShellImpact::Read,
+            ..
+        }
+    )
 }
 
 /// Decide how a user-supplied pattern from the permit prompt should be
@@ -654,10 +694,8 @@ mod tests {
     }
 
     #[test]
-    fn shellAlwaysNeedsApprovalUnderReadOnly() {
+    fn readOnlyShellAutoApprovedUnderReadOnly() {
         use crate::tool::ShellImpact;
-        // Even a model-classified "read" shell command must request
-        // approval. The model's self-classification is not trusted.
         let perms = Permissions::allowReadOnly();
         let action = ToolAction::Shell {
             command: "cat foo.txt".into(),
@@ -667,7 +705,64 @@ mod tests {
             terminal: None,
             runInBackground: false,
         };
+        assert_eq!(perms.check(&action), Verdict::Allow);
+    }
+
+    #[test]
+    fn mutatingShellStillNeedsApprovalUnderReadOnly() {
+        use crate::tool::ShellImpact;
+        let perms = Permissions::allowReadOnly();
+        let action = ToolAction::Shell {
+            command: "cargo fmt".into(),
+            explanation: "format the project".into(),
+            impact: ShellImpact::MinorMod,
+            timeout: None,
+            terminal: None,
+            runInBackground: false,
+        };
         assert_eq!(perms.check(&action), Verdict::NeedsApproval);
+    }
+
+    #[test]
+    fn readOnlyShellAutoApprovalSurvivesPersistedPresetRules() {
+        use crate::tool::ShellImpact;
+        let persisted = Permissions {
+            defaultMode: PermitMode::Ask,
+            rules: Permissions::allowReadOnly().rules,
+            source: PermissionsSource::Project,
+        };
+        let action = ToolAction::Shell {
+            command: "git status --short".into(),
+            explanation: "inspect working tree status".into(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: false,
+        };
+        assert_eq!(persisted.check(&action), Verdict::Allow);
+    }
+
+    #[test]
+    fn explicitShellDenyBeatsReadOnlyShellAutoApproval() {
+        use crate::tool::ShellImpact;
+        let mut perms = Permissions::allowReadOnly();
+        perms.rules.insert(
+            0,
+            Rule {
+                tool: "shell".into(),
+                pattern: None,
+                allow: false,
+            },
+        );
+        let action = ToolAction::Shell {
+            command: "git status --short".into(),
+            explanation: "inspect working tree status".into(),
+            impact: ShellImpact::Read,
+            timeout: None,
+            terminal: None,
+            runInBackground: false,
+        };
+        assert_eq!(perms.check(&action), Verdict::Deny);
     }
 
     #[test]

@@ -36,6 +36,7 @@ fn dummyClient() -> api::Client {
         providerOrder: vec![],
         maxTokens: None,
         contextWindow: 100_000,
+        maxContextWindow: Some(100_000),
         supportsAnthropicCache: None,
     };
     let config = Config {

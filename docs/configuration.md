@@ -127,18 +127,28 @@ ChatGPT/Codex OAuth profile:
 [profile.openaiCodex]
 provider = "openai-codex"
 model = "gpt-5.3-codex"
-contextWindow = 400000
+contextWindow = 272000
 reasoning = { effort = "high", summary = "auto" }
 ```
+
+Flatline does not send `maxTokens` / `max_output_tokens` for `openai-codex`
+profiles because the Codex OAuth backend uses a narrower contract than the
+public OpenAI Responses API.
 
 Profiles can also set:
 
 ```toml
 promptThinking = true
+maxContextWindow = 272000
 ```
 
 Prompt thinking asks the model to use Flatline's scratchpad format instead of a
-provider-native reasoning API.
+provider-native reasoning API. In the in-app editor, this is represented as a
+single thinking mode: `off`, `provider`, or `prompt scratchpad`. Provider
+effort and summary settings are active only in `provider` mode.
+`contextWindow` is the usable profile budget. `maxContextWindow` is optional
+model metadata used by the in-app editor so a profile can be lowered below the
+model maximum and later raised back up without rediscovering the model.
 
 ## In-App Profile Switching
 
@@ -149,13 +159,41 @@ files when those scopes are distinct.
 
 When Flatline is launched from a directory below the project root, the default
 save target is launch-local config. Otherwise it defaults to project-local
-config. Pressing Enter saves only the tier selection today; full profile editing
-and model discovery are planned as follow-on work.
+config. Pressing Enter in the profile view saves the tier selection.
+
+Press `e` to open the selected profile's config view. This view exposes the
+model picker, usable context budget, thinking mode, provider effort, reasoning
+summary, profile create/rename, and profile deletion. Space cycles common
+values and each change is saved to the active save target. Provider effort and
+reasoning summary are dimmed unless thinking mode is set to `provider`.
+Provider effort cycles through the reasoning levels Flatline knows for the
+selected model; models without known provider reasoning support cannot enter
+provider thinking mode. Reasoning summary cycles through `off`, `auto`,
+`concise`, and `detailed`. The context
+editor accepts raw token counts plus shorthand such as `128k` or `1.05m` and
+caps the value at the model max when Flatline knows it. Rename and delete
+operate on the selected config file; if a profile is inherited from another
+scope, switch the save target to that scope before renaming or deleting it.
+Profiles assigned to heavy, light, or utility cannot be deleted until those
+tiers are moved to another profile.
+
+The model picker uses OpenRouter, OpenAI, and DeepSeek provider model APIs.
+Known OpenAI API models are enriched with documented context windows and
+reasoning effort options when available.
+The `openai-codex` provider refreshes the same Codex-style `/models` catalog
+shape used by Codex CLI when ChatGPT OAuth is configured, including model
+slugs, display names, effective context windows, and supported reasoning
+levels. If that refresh fails, Flatline falls back to a small built-in Codex
+catalog so the picker remains usable offline.
 
 ## Permissions
 
 If no permissions are configured, interactive sessions use the built-in
 read-only allow preset and ask for everything else.
+
+The built-in read-only preset also auto-approves `shell` calls whose tool
+arguments mark them as `impact = "read"`. Mutating shell calls still ask unless
+an explicit rule allows them.
 
 Example project permissions:
 

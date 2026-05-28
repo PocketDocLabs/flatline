@@ -86,6 +86,14 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
                 provider: model.provider.clone(),
                 model: model.model.clone(),
                 contextWindow: model.contextWindow,
+                maxContextWindow: model.maxContextWindow,
+                promptThinking: model.promptThinking,
+                reasoningEffort: model.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                reasoningEfforts: construct::model_catalog::knownModelReasoningEfforts(
+                    &model.provider,
+                    &model.model,
+                ),
+                reasoningSummary: model.reasoning.as_ref().and_then(|r| r.summary.clone()),
                 configured,
             }
         })
@@ -136,6 +144,10 @@ enum DeckUpdate {
     LspStatus(construct::control::LspStatus),
     PermissionsStatus(construct::control::PermissionsStatus),
     ModelStatus(construct::control::ModelStatus),
+    ModelCatalog {
+        provider: String,
+        result: std::result::Result<Vec<construct::model_catalog::ModelCatalogEntry>, String>,
+    },
     ContextDisplay(construct::context::ContextState),
     RewindOptions(Vec<construct::transcript::Turn>),
     Forks(Vec<construct::transcript::Fork>),
@@ -912,6 +924,222 @@ pub async fn run() -> Result<()> {
                                 Err(e) => {
                                     let _ = reply.send(construct::control::CommandAck::err(
                                         format!("Failed to save model profile: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::DiscoverModels { provider, reply }) => {
+                            let result = construct::model_catalog::discoverModels(&config, &provider)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = reply.send(result);
+                        }
+                        Some(TuiRequest::SaveDiscoveredModel { scope, profile, model, reply }) => {
+                            if !config.profiles.contains_key(&profile) {
+                                let _ = reply.send(construct::control::CommandAck::err(
+                                    format!("Unknown model profile: {profile}"),
+                                ));
+                                continue;
+                            }
+                            match construct::config::saveDiscoveredModelInScope(
+                                &config,
+                                scope,
+                                &profile,
+                                &model,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Saved model {} into profile {profile} at {}. It will be used after /clear or restart.",
+                                                model.id,
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Saved, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to save discovered model: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::CreateModelProfile {
+                            scope,
+                            profile,
+                            sourceProfile,
+                            reply,
+                        }) => {
+                            match construct::config::createModelProfileInScope(
+                                &config,
+                                scope,
+                                &profile,
+                                &sourceProfile,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Created model profile {profile} at {}.",
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Created, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to create model profile: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::RenameModelProfile {
+                            scope,
+                            oldProfile,
+                            newProfile,
+                            reply,
+                        }) => {
+                            match construct::config::renameModelProfileInScope(
+                                &config,
+                                scope,
+                                &oldProfile,
+                                &newProfile,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Renamed model profile {oldProfile} to {newProfile} at {}.",
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Renamed, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to rename model profile: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::DeleteModelProfile { scope, profile, reply }) => {
+                            match construct::config::deleteModelProfileInScope(
+                                &config,
+                                scope,
+                                &profile,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Deleted model profile {profile} from {}.",
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Deleted, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to delete model profile: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::SaveModelProfileContext {
+                            scope,
+                            profile,
+                            contextWindow,
+                            reply,
+                        }) => {
+                            match construct::config::saveModelProfileContextInScope(
+                                &config,
+                                scope,
+                                &profile,
+                                contextWindow,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Saved context window for profile {profile} to {}.",
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Saved, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to save context window: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::SaveModelProfileThinking {
+                            scope,
+                            profile,
+                            promptThinking,
+                            reasoningEffort,
+                            reasoningSummary,
+                            reply,
+                        }) => {
+                            match construct::config::saveModelProfileThinkingInScope(
+                                &config,
+                                scope,
+                                &profile,
+                                promptThinking,
+                                reasoningEffort,
+                                reasoningSummary,
+                            ) {
+                                Ok(path) => match construct::config::load() {
+                                    Ok(next) => {
+                                        config = next;
+                                        let _ = reply.send(construct::control::CommandAck::ok(
+                                            format!(
+                                                "Saved thinking settings for profile {profile} to {}.",
+                                                path.display()
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(
+                                            format!("Saved, but failed to reload config: {e}"),
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to save thinking settings: {e}"),
                                     ));
                                 }
                             }
@@ -2150,6 +2378,11 @@ async fn runLoop(
                 DeckUpdate::ModelStatus(status) => {
                     modelPanel = Some(ModelPanel::new(status));
                 }
+                DeckUpdate::ModelCatalog { provider, result } => {
+                    if let Some(panel) = modelPanel.as_mut() {
+                        panel.setCatalogResult(provider, result);
+                    }
+                }
                 DeckUpdate::PermissionsStatus(status) => {
                     permissionsPanel = Some(crate::permissions_panel::PermissionsPanel::new(
                         status.defaultMode,
@@ -2917,13 +3150,123 @@ async fn handleInput(
                             *modelPanel = None;
                         }
                         ModelPanelAction::Save { scope, tier, profile } => {
-                            spawnAckRequest(
+                            spawnSilentSettingsRequest(
                                 requestTx.clone(),
                                 deckUpdateTx.clone(),
                                 move |reply| TuiRequest::SaveModelSelection {
                                     scope,
                                     tier,
                                     profile,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::Discover { provider } => {
+                            let requestTx = requestTx.clone();
+                            let deckUpdateTx = deckUpdateTx.clone();
+                            tokio::spawn(async move {
+                                let (replyTx, replyRx) = oneshot::channel();
+                                let _ = requestTx
+                                    .send(TuiRequest::DiscoverModels {
+                                        provider: provider.clone(),
+                                        reply: replyTx,
+                                    })
+                                    .await;
+                                let result = replyRx.await.unwrap_or_else(|_| {
+                                    Err("model discovery task ended".to_string())
+                                });
+                                let _ = deckUpdateTx
+                                    .send(DeckUpdate::ModelCatalog { provider, result })
+                                    .await;
+                            });
+                        }
+                        ModelPanelAction::SaveDiscoveredModel { scope, profile, model } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SaveDiscoveredModel {
+                                    scope,
+                                    profile,
+                                    model,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::CreateProfile {
+                            scope,
+                            profile,
+                            sourceProfile,
+                        } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::CreateModelProfile {
+                                    scope,
+                                    profile,
+                                    sourceProfile,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::RenameProfile {
+                            scope,
+                            oldProfile,
+                            newProfile,
+                        } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::RenameModelProfile {
+                                    scope,
+                                    oldProfile,
+                                    newProfile,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::DeleteProfile { scope, profile } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::DeleteModelProfile {
+                                    scope,
+                                    profile,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::SaveContext {
+                            scope,
+                            profile,
+                            contextWindow,
+                        } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SaveModelProfileContext {
+                                    scope,
+                                    profile,
+                                    contextWindow,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::SaveThinking {
+                            scope,
+                            profile,
+                            promptThinking,
+                            reasoningEffort,
+                            reasoningSummary,
+                        } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SaveModelProfileThinking {
+                                    scope,
+                                    profile,
+                                    promptThinking,
+                                    reasoningEffort,
+                                    reasoningSummary,
                                     reply,
                                 },
                             );
@@ -4198,6 +4541,26 @@ fn spawnAckRequest<F>(
         let req = build(rTx);
         let _ = requestTx.send(req).await;
         if let Ok(ack) = rRx.await {
+            let _ = deckUpdateTx.send(DeckUpdate::CommandAck(ack)).await;
+        }
+    });
+}
+
+/// Send a settings mutation and surface only failures in the command log.
+fn spawnSilentSettingsRequest<F>(
+    requestTx: mpsc::Sender<TuiRequest>,
+    deckUpdateTx: mpsc::Sender<DeckUpdate>,
+    build: F,
+) where
+    F: FnOnce(oneshot::Sender<construct::control::CommandAck>) -> TuiRequest + Send + 'static,
+{
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let req = build(rTx);
+        let _ = requestTx.send(req).await;
+        if let Ok(ack) = rRx.await
+            && !ack.ok
+        {
             let _ = deckUpdateTx.send(DeckUpdate::CommandAck(ack)).await;
         }
     });
