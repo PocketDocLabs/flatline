@@ -183,6 +183,14 @@ struct CodeBlockRange {
     totalLines: usize,
 }
 
+type BuiltLines = (
+    Vec<Line<'static>>,
+    Vec<bool>,
+    Vec<(Option<usize>, usize)>,
+    Vec<CodeBlockRange>,
+    HashSet<usize>,
+);
+
 /// Agent panel state.
 pub struct AgentPanel {
     pub(crate) entries: Vec<PanelEntry>,
@@ -770,6 +778,7 @@ impl AgentPanel {
         self.entries.push(PanelEntry::Cancelled);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn showToolRequest(
         &mut self,
         name: &str,
@@ -1003,11 +1012,7 @@ impl AgentPanel {
             sessionId: Some(sessionId.into()),
         });
         // Subagent started — DO NOT snap scroll
-        if self.scrollOffset == 0 {
-            self.newContentWhileScrolled = false;
-        } else {
-            self.newContentWhileScrolled = true;
-        }
+        self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
     }
 
@@ -1028,11 +1033,7 @@ impl AgentPanel {
                 name: format!("{name}: {summary}"),
             });
         }
-        if self.scrollOffset == 0 {
-            self.newContentWhileScrolled = false;
-        } else {
-            self.newContentWhileScrolled = true;
-        }
+        self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
     }
 
@@ -1290,11 +1291,7 @@ impl AgentPanel {
             summary: summary.into(),
         });
         // Tool started — DO NOT snap scroll
-        if self.scrollOffset == 0 {
-            self.newContentWhileScrolled = false;
-        } else {
-            self.newContentWhileScrolled = true;
-        }
+        self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
     }
 
@@ -1344,11 +1341,7 @@ impl AgentPanel {
             output: output.into(),
         });
         // Tool result — DO NOT snap scroll
-        if self.scrollOffset == 0 {
-            self.newContentWhileScrolled = false;
-        } else {
-            self.newContentWhileScrolled = true;
-        }
+        self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
         // Restart thinking indicator — model will be called again after tool results.
         self.isStreaming = true;
@@ -1375,11 +1368,7 @@ impl AgentPanel {
     }
 
     fn markTimelineActivity(&mut self) {
-        if self.scrollOffset == 0 {
-            self.newContentWhileScrolled = false;
-        } else {
-            self.newContentWhileScrolled = true;
-        }
+        self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
     }
 
@@ -1508,10 +1497,10 @@ impl AgentPanel {
 
     /// Move selection down in the completion menu.
     pub fn selectNext(&mut self) {
-        if let Some(state) = &mut self.completion {
-            if state.selected + 1 < state.matches.len() {
-                state.selected += 1;
-            }
+        if let Some(state) = &mut self.completion
+            && state.selected + 1 < state.matches.len()
+        {
+            state.selected += 1;
         }
     }
 
@@ -1732,10 +1721,10 @@ impl AgentPanel {
 
         // Spool-up delay: let the buffer fill for 150ms before starting reveal.
         const SPOOL_DELAY: Duration = Duration::from_millis(150);
-        if let Some(start) = self.revealStart {
-            if start.elapsed() < SPOOL_DELAY {
-                return false;
-            }
+        if let Some(start) = self.revealStart
+            && start.elapsed() < SPOOL_DELAY
+        {
+            return false;
         }
 
         let now = Instant::now();
@@ -1880,7 +1869,7 @@ impl AgentPanel {
         let mut segments: Vec<(String, bool)> = Vec::new();
 
         for gridLine in sr..=er {
-            let visualIdx = (gridLine as i32 + maxScroll) as usize;
+            let visualIdx = (gridLine + maxScroll) as usize;
             let colStart = if gridLine == sr { sc } else { 0 };
             let colEnd = if gridLine == er { ec } else { area.width };
 
@@ -2027,8 +2016,7 @@ impl AgentPanel {
             let baseHeight = self
                 .textArea
                 .desiredHeight(inner.width.saturating_sub(4))
-                .min(8)
-                .max(1);
+                .clamp(1, 8);
             // Add space for attachment bar: entries + separator.
             let attLines = if self.attachments.is_empty() {
                 0
@@ -2710,27 +2698,23 @@ impl AgentPanel {
 
             self.textArea.render(inputArea, buf, focused);
             // Ghost text overlay for completion.
-            if let Some(state) = &self.completion {
-                if let Some(cmd) = state.matches.get(state.selected) {
-                    let typed = self.textArea.text().trim_start();
-                    let prefix = if typed.starts_with('/') {
-                        &typed[1..]
-                    } else {
-                        ""
-                    };
-                    if cmd.name.starts_with(prefix) && cmd.name.len() > prefix.len() {
-                        let suffix = &cmd.name[prefix.len()..];
-                        // Render ghost text at cursor position.
-                        if let Some((cx, cy)) = self.textArea.cursorScreenPos {
-                            let ghostStyle = Style::default().fg(Color::DarkGray);
-                            for (i, ch) in suffix.chars().enumerate() {
-                                let col = cx + i as u16;
-                                if col < area.x + area.width {
-                                    if let Some(cell) = buf.cell_mut((col, cy)) {
-                                        cell.set_char(ch);
-                                        cell.set_style(ghostStyle);
-                                    }
-                                }
+            if let Some(state) = &self.completion
+                && let Some(cmd) = state.matches.get(state.selected)
+            {
+                let typed = self.textArea.text().trim_start();
+                let prefix = typed.strip_prefix('/').unwrap_or_default();
+                if cmd.name.starts_with(prefix) && cmd.name.len() > prefix.len() {
+                    let suffix = &cmd.name[prefix.len()..];
+                    // Render ghost text at cursor position.
+                    if let Some((cx, cy)) = self.textArea.cursorScreenPos {
+                        let ghostStyle = Style::default().fg(Color::DarkGray);
+                        for (i, ch) in suffix.chars().enumerate() {
+                            let col = cx + i as u16;
+                            if col < area.x + area.width
+                                && let Some(cell) = buf.cell_mut((col, cy))
+                            {
+                                cell.set_char(ch);
+                                cell.set_style(ghostStyle);
                             }
                         }
                     }
@@ -2859,7 +2843,7 @@ impl AgentPanel {
                 if lineWidth == 0 {
                     cursor += 1;
                 } else {
-                    cursor += ((lineWidth + w - 1) / w) as u32;
+                    cursor += lineWidth.div_ceil(w) as u32;
                 }
             }
             ranges.push((entryStart, cursor));
@@ -2891,7 +2875,7 @@ impl AgentPanel {
                         cursor += if lineWidth == 0 {
                             1
                         } else {
-                            ((lineWidth + w - 1) / w) as u32
+                            lineWidth.div_ceil(w) as u32
                         };
                     }
                 }
@@ -2908,7 +2892,7 @@ impl AgentPanel {
                     cursor += if lineWidth == 0 {
                         1
                     } else {
-                        ((lineWidth + w - 1) / w) as u32
+                        lineWidth.div_ceil(w) as u32
                     };
                 }
             }
@@ -2942,33 +2926,24 @@ impl AgentPanel {
         let mut startIdx = idx;
         let mut endIdx = idx;
 
-        if matches!(self.entries[idx], PanelEntry::Assistant(_)) {
-            if idx > 0 && matches!(self.entries[idx - 1], PanelEntry::Reasoning { .. }) {
-                startIdx = idx - 1;
-            }
+        if matches!(self.entries[idx], PanelEntry::Assistant(_))
+            && idx > 0
+            && matches!(self.entries[idx - 1], PanelEntry::Reasoning { .. })
+        {
+            startIdx = idx - 1;
         }
 
-        if matches!(self.entries[idx], PanelEntry::Reasoning { .. }) {
-            if idx + 1 < self.entries.len()
-                && matches!(self.entries[idx + 1], PanelEntry::Assistant(_))
-            {
-                endIdx = idx + 1;
-            }
+        if matches!(self.entries[idx], PanelEntry::Reasoning { .. })
+            && idx + 1 < self.entries.len()
+            && matches!(self.entries[idx + 1], PanelEntry::Assistant(_))
+        {
+            endIdx = idx + 1;
         }
 
         (ranges[startIdx].0, ranges[endIdx].1)
     }
 
-    fn buildLines(
-        &self,
-        width: u16,
-    ) -> (
-        Vec<Line<'static>>,
-        Vec<bool>,
-        Vec<(Option<usize>, usize)>,
-        Vec<CodeBlockRange>,
-        HashSet<usize>,
-    ) {
+    fn buildLines(&self, width: u16) -> BuiltLines {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cont: Vec<bool> = Vec::new();
         let mut reasoningHeaders: Vec<(Option<usize>, usize)> = Vec::new();
@@ -4257,6 +4232,7 @@ fn prefixFirstLine(
 ///
 /// Text blocks are word-wrapped; code blocks are rendered with borders
 /// and pushed without wrapping. Tracks code block metadata for scrolling and copy.
+#[allow(clippy::too_many_arguments)]
 fn prefixRenderedBlocks(
     out: &mut Vec<Line<'static>>,
     cont: &mut Vec<bool>,
@@ -4459,7 +4435,7 @@ fn applyFadeToLastChar(lines: &mut [Line<'static>], progress: f32) {
         // Find the byte offset of the last grapheme so we don't split
         // emoji sequences like ⚠\u{FE0F} across spans.
         use unicode_segmentation::UnicodeSegmentation;
-        if let Some((byteIdx, _)) = content.grapheme_indices(true).last() {
+        if let Some((byteIdx, _)) = content.grapheme_indices(true).next_back() {
             let prefix = content[..byteIdx].to_string();
             let lastCharStr = content[byteIdx..].to_string();
 

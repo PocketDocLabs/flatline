@@ -120,15 +120,15 @@ pub fn sanitizeJsonSchema(schema: &mut Value) {
     };
 
     // Normalize array type fields: ["string", "null"] → "string".
-    if let Some(typeVal) = obj.get("type").cloned() {
-        if let Some(arr) = typeVal.as_array() {
-            let first = arr
-                .iter()
-                .find(|v| v.as_str().is_some_and(|s| s != "null"))
-                .cloned()
-                .unwrap_or(Value::String("string".into()));
-            obj.insert("type".into(), first);
-        }
+    if let Some(typeVal) = obj.get("type").cloned()
+        && let Some(arr) = typeVal.as_array()
+    {
+        let first = arr
+            .iter()
+            .find(|v| v.as_str().is_some_and(|s| s != "null"))
+            .cloned()
+            .unwrap_or(Value::String("string".into()));
+        obj.insert("type".into(), first);
     }
 
     // Infer missing type from context.
@@ -162,25 +162,25 @@ pub fn sanitizeJsonSchema(schema: &mut Value) {
     }
 
     // Ensure objects have properties.
-    if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
-        if !obj.contains_key("properties") {
-            obj.insert("properties".into(), serde_json::json!({}));
-        }
+    if obj.get("type").and_then(|v| v.as_str()) == Some("object") && !obj.contains_key("properties")
+    {
+        obj.insert("properties".into(), serde_json::json!({}));
     }
 
     // Ensure arrays have items.
-    if obj.get("type").and_then(|v| v.as_str()) == Some("array") {
-        if !obj.contains_key("items") && !obj.contains_key("prefixItems") {
-            obj.insert("items".into(), serde_json::json!({ "type": "string" }));
-        }
+    if obj.get("type").and_then(|v| v.as_str()) == Some("array")
+        && !obj.contains_key("items")
+        && !obj.contains_key("prefixItems")
+    {
+        obj.insert("items".into(), serde_json::json!({ "type": "string" }));
     }
 
     // Recurse into properties.
-    if let Some(props) = obj.get_mut("properties") {
-        if let Some(propsObj) = props.as_object_mut() {
-            for (_, propSchema) in propsObj.iter_mut() {
-                sanitizeJsonSchema(propSchema);
-            }
+    if let Some(props) = obj.get_mut("properties")
+        && let Some(propsObj) = props.as_object_mut()
+    {
+        for (_, propSchema) in propsObj.iter_mut() {
+            sanitizeJsonSchema(propSchema);
         }
     }
 
@@ -190,28 +190,28 @@ pub fn sanitizeJsonSchema(schema: &mut Value) {
     }
 
     // Recurse into prefixItems.
-    if let Some(prefixItems) = obj.get_mut("prefixItems") {
-        if let Some(arr) = prefixItems.as_array_mut() {
-            for item in arr.iter_mut() {
-                sanitizeJsonSchema(item);
-            }
+    if let Some(prefixItems) = obj.get_mut("prefixItems")
+        && let Some(arr) = prefixItems.as_array_mut()
+    {
+        for item in arr.iter_mut() {
+            sanitizeJsonSchema(item);
         }
     }
 
     // Recurse into additionalProperties (when it's a schema, not a bool).
-    if let Some(additional) = obj.get_mut("additionalProperties") {
-        if additional.is_object() {
-            sanitizeJsonSchema(additional);
-        }
+    if let Some(additional) = obj.get_mut("additionalProperties")
+        && additional.is_object()
+    {
+        sanitizeJsonSchema(additional);
     }
 
     // Recurse into composition keywords.
     for keyword in &["oneOf", "anyOf", "allOf"] {
-        if let Some(arr) = obj.get_mut(*keyword) {
-            if let Some(variants) = arr.as_array_mut() {
-                for variant in variants.iter_mut() {
-                    sanitizeJsonSchema(variant);
-                }
+        if let Some(arr) = obj.get_mut(*keyword)
+            && let Some(variants) = arr.as_array_mut()
+        {
+            for variant in variants.iter_mut() {
+                sanitizeJsonSchema(variant);
             }
         }
     }

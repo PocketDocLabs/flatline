@@ -2164,7 +2164,7 @@ pub async fn execute(
                     "Error: background shell calls must be executed through the session.",
                 );
             }
-            let dur = timeout.map(|s| std::time::Duration::from_secs(s));
+            let dur = timeout.map(std::time::Duration::from_secs);
             let raw = shell.execute(command, dur).await;
             // Apply same size guard as readFile. Full output is in shell history.
             let index = shell.historyLen().saturating_sub(1);
@@ -2559,12 +2559,11 @@ fn formatNumberedLines(content: &str, offset: Option<usize>, limit: Option<usize
 
 fn executeWriteFile(path: &str, content: &str) -> String {
     // Create parent directories if needed.
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("Failed to create directories: {e}");
-            }
-        }
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create directories: {e}");
     }
     match std::fs::write(path, content) {
         Ok(()) => format!("Wrote {} bytes to {path}", content.len()),
@@ -2683,12 +2682,11 @@ fn executeCopyFile(src: &str, dest: &str, overwrite: bool) -> String {
     if destPath.exists() && !overwrite {
         return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
     }
-    if let Some(parent) = destPath.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("Failed to create parent directories of {dest}: {e}");
-            }
-        }
+    if let Some(parent) = destPath.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create parent directories of {dest}: {e}");
     }
     if srcPath.is_dir() {
         match copyDirRecursive(srcPath, destPath) {
@@ -2741,12 +2739,11 @@ fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String {
     if destPath.exists() && !overwrite {
         return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
     }
-    if let Some(parent) = destPath.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("Failed to create parent directories of {dest}: {e}");
-            }
-        }
+    if let Some(parent) = destPath.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create parent directories of {dest}: {e}");
     }
     // Try a rename first (cheap, atomic when on the same filesystem). Fall back
     // to copy+delete on EXDEV (cross-device link) or other rename failures.
@@ -3029,11 +3026,9 @@ async fn executeGlob(pattern: &str, path: Option<&str>, metadata: bool) -> Strin
             let mut output = String::new();
             for line in lines.iter().take(MAX_GLOB_RESULTS) {
                 output.push_str(line);
-                if metadata {
-                    if let Some(meta) = formatMetadata(std::path::Path::new(line)) {
-                        output.push_str("  ");
-                        output.push_str(&meta);
-                    }
+                if metadata && let Some(meta) = formatMetadata(std::path::Path::new(line)) {
+                    output.push_str("  ");
+                    output.push_str(&meta);
                 }
                 output.push('\n');
             }
@@ -3076,7 +3071,7 @@ fn getFileSymbols(path: &str) -> Vec<(usize, String)> {
 
 /// Find the enclosing symbol for a given line number.
 /// Returns the symbol signature from the last definition before or at that line.
-fn symbolAtLine<'a>(symbols: &'a [(usize, String)], line: usize) -> Option<&'a str> {
+fn symbolAtLine(symbols: &[(usize, String)], line: usize) -> Option<&str> {
     // Binary search for the last symbol with startLine <= line.
     let idx = symbols.partition_point(|(l, _)| *l <= line);
     if idx == 0 {
@@ -3152,6 +3147,7 @@ fn annotateGrepWithSymbols(rgOutput: &str) -> String {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn executeGrep(
     pattern: &str,
     path: Option<&str>,
@@ -3407,11 +3403,9 @@ fn listDirRecurse(
         }
         let suffix = if *isSymlink { "@" } else { "" };
         let mut line = format!("{indent}{name}{suffix}");
-        if metadata {
-            if let Some(meta) = formatMetadata(path) {
-                line.push_str("  ");
-                line.push_str(&meta);
-            }
+        if metadata && let Some(meta) = formatMetadata(path) {
+            line.push_str("  ");
+            line.push_str(&meta);
         }
         output.push(line);
         *count += 1;
@@ -3525,23 +3519,23 @@ fn formatStructSearchOutput(jsonOutput: &str) -> String {
         }
 
         // Show meta-variable bindings if present.
-        if let Some(metaVars) = obj["metaVariables"].as_object() {
-            if !metaVars.is_empty() {
-                for (name, val) in metaVars {
-                    // NOTE: ast-grep meta-vars can be objects with "text" field.
-                    let binding = if let Some(t) = val["single"]["text"].as_str() {
-                        t.to_string()
-                    } else if let Some(arr) = val["multi"].as_array() {
-                        arr.iter()
-                            .filter_map(|v| v["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    } else {
-                        continue;
-                    };
-                    if !binding.is_empty() {
-                        output.push_str(&format!("    {name} = {binding}\n"));
-                    }
+        if let Some(metaVars) = obj["metaVariables"].as_object()
+            && !metaVars.is_empty()
+        {
+            for (name, val) in metaVars {
+                // NOTE: ast-grep meta-vars can be objects with "text" field.
+                let binding = if let Some(t) = val["single"]["text"].as_str() {
+                    t.to_string()
+                } else if let Some(arr) = val["multi"].as_array() {
+                    arr.iter()
+                        .filter_map(|v| v["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    continue;
+                };
+                if !binding.is_empty() {
+                    output.push_str(&format!("    {name} = {binding}\n"));
                 }
             }
         }
@@ -3690,8 +3684,7 @@ fn expandFromAnchor(content: &str, anchorLine: usize) -> String {
 
     // Walk forward to find the block end.
     let mut endIdx = anchorIdx;
-    for i in (anchorIdx + 1)..totalLines {
-        let line = lines[i];
+    for (i, line) in lines.iter().enumerate().skip(anchorIdx + 1) {
         if line.trim().is_empty() {
             continue;
         }
@@ -3713,12 +3706,17 @@ fn expandFromAnchor(content: &str, anchorLine: usize) -> String {
     };
 
     let mut output = String::new();
-    for i in startIdx..=effectiveEnd {
+    for (i, line) in lines
+        .iter()
+        .enumerate()
+        .take(effectiveEnd + 1)
+        .skip(startIdx)
+    {
         let lineNum = i + 1;
-        let displayLine = if lines[i].len() > MAX_LINE_LENGTH {
-            format!("{}...", &lines[i][..MAX_LINE_LENGTH])
+        let displayLine = if line.len() > MAX_LINE_LENGTH {
+            format!("{}...", &line[..MAX_LINE_LENGTH])
         } else {
-            lines[i].to_string()
+            line.to_string()
         };
         output.push_str(&format!("{lineNum:>6}\t{displayLine}\n"));
     }
@@ -4011,10 +4009,10 @@ fn looksLikeDeclaration(line: &str, symbol: &str) -> bool {
     ];
 
     for prefix in &declarationPrefixes {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            if rest.starts_with(symbol) {
-                return true;
-            }
+        if let Some(rest) = line.strip_prefix(prefix)
+            && rest.starts_with(symbol)
+        {
+            return true;
         }
     }
 
@@ -4077,16 +4075,16 @@ fn executeRelatedFiles(path: &str) -> String {
 
     // Sibling files in the same directory.
     let mut siblings: Vec<String> = Vec::new();
-    if let Some(dir) = fileDir {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let canonPath = filePath.canonicalize().ok();
-            for entry in entries.flatten() {
-                let entryFt = entry.file_type();
-                if entryFt.map(|ft| ft.is_file()).unwrap_or(false) {
-                    let entryCanon = entry.path().canonicalize().ok();
-                    if entryCanon != canonPath {
-                        siblings.push(entry.path().to_string_lossy().to_string());
-                    }
+    if let Some(dir) = fileDir
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let canonPath = filePath.canonicalize().ok();
+        for entry in entries.flatten() {
+            let entryFt = entry.file_type();
+            if entryFt.map(|ft| ft.is_file()).unwrap_or(false) {
+                let entryCanon = entry.path().canonicalize().ok();
+                if entryCanon != canonPath {
+                    siblings.push(entry.path().to_string_lossy().to_string());
                 }
             }
         }
@@ -4514,7 +4512,7 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
         },
         "listDir" => ToolAction::ListDir {
             path: args["path"].as_str().unwrap_or(".").into(),
-            depth: optU64!("depth").unwrap_or(2).min(5).max(1) as usize,
+            depth: optU64!("depth").unwrap_or(2).clamp(1, 5) as usize,
             offset: optU64!("offset").unwrap_or(0) as usize,
             limit: optU64!("limit").unwrap_or(500) as usize,
             metadata: optBool!("metadata").unwrap_or(false),

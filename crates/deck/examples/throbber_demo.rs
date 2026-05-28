@@ -2,6 +2,8 @@
 //!
 //! Run: cargo run -p deck --example throbber_demo
 
+#![allow(non_snake_case)]
+
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 

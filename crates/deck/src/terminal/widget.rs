@@ -215,13 +215,13 @@ impl TerminalState {
             }
             b'D' => {
                 // Command finished. Close the pending region.
-                if let Some(start) = self.pendingOutputStart.take() {
-                    if absLine > start {
-                        self.commandRegions.push(CommandRegion {
-                            outputStart: start,
-                            outputEnd: absLine,
-                        });
-                    }
+                if let Some(start) = self.pendingOutputStart.take()
+                    && absLine > start
+                {
+                    self.commandRegions.push(CommandRegion {
+                        outputStart: start,
+                        outputEnd: absLine,
+                    });
                 }
             }
             // A (prompt start) and B (command input start) — not used for selection yet.

@@ -49,10 +49,10 @@ struct ModelCatalogCache {
 
 pub async fn discoverModels(config: &Config, provider: &str) -> Result<Vec<ModelCatalogEntry>> {
     let cache = readCache();
-    if let Some(cached) = cache.providers.get(provider) {
-        if nowSecs().saturating_sub(cached.fetchedAt) <= cacheTtlSecs(provider) {
-            return Ok(cached.models.clone());
-        }
+    if let Some(cached) = cache.providers.get(provider)
+        && nowSecs().saturating_sub(cached.fetchedAt) <= cacheTtlSecs(provider)
+    {
+        return Ok(cached.models.clone());
     }
 
     match fetchProviderModels(config, provider).await {

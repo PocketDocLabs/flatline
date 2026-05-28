@@ -132,14 +132,13 @@ impl JobsPanel {
     pub fn refresh(&mut self, jobs: Vec<JobInfo>) {
         let prevId = self.selectedJob().map(|t| t.id);
         self.jobs = jobs;
-        if let Some(id) = prevId {
-            if let Some(pos) = self
+        if let Some(id) = prevId
+            && let Some(pos) = self
                 .visibleJobIndexes()
                 .iter()
                 .position(|idx| self.jobs[*idx].id == id)
-            {
-                self.selected = pos;
-            }
+        {
+            self.selected = pos;
         }
         self.clampSelection();
         if let Mode::Inspect(state) = &self.mode {
@@ -273,10 +272,10 @@ impl JobsPanel {
                 .map(|t| PanelAction::Inspect(t.id))
                 .unwrap_or(PanelAction::None),
             KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(t) = self.selectedJob() {
-                    if matches!(t.state, JobState::Running) {
-                        return PanelAction::Kill(t.id);
-                    }
+                if let Some(t) = self.selectedJob()
+                    && matches!(t.state, JobState::Running)
+                {
+                    return PanelAction::Kill(t.id);
                 }
                 PanelAction::None
             }
@@ -419,14 +418,13 @@ impl JobsPanel {
     fn toggleFinished(&mut self) {
         let prevId = self.selectedJob().map(|t| t.id);
         self.showFinished = !self.showFinished;
-        if let Some(id) = prevId {
-            if let Some(pos) = self
+        if let Some(id) = prevId
+            && let Some(pos) = self
                 .visibleJobIndexes()
                 .iter()
                 .position(|idx| self.jobs[*idx].id == id)
-            {
-                self.selected = pos;
-            }
+        {
+            self.selected = pos;
         }
         self.clampSelection();
     }

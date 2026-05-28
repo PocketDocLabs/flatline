@@ -180,10 +180,10 @@ fn dedupFileReads(
 
     // Clean up: set empty tool_calls to None, remove fully empty Assistant messages.
     for msg in history.iter_mut() {
-        if let Message::Assistant { tool_calls, .. } = msg {
-            if tool_calls.as_ref().map_or(false, |c| c.is_empty()) {
-                *tool_calls = None;
-            }
+        if let Message::Assistant { tool_calls, .. } = msg
+            && tool_calls.as_ref().is_some_and(|c| c.is_empty())
+        {
+            *tool_calls = None;
         }
     }
     history.retain(|msg| {
@@ -193,7 +193,7 @@ fn dedupFileReads(
             ..
         } = msg
         {
-            let hasContent = content.as_ref().map_or(false, |c| !c.is_empty());
+            let hasContent = content.as_ref().is_some_and(|c| !c.is_empty());
             let hasCalls = tool_calls.is_some();
             hasContent || hasCalls
         } else {
@@ -207,7 +207,7 @@ fn dedupFileReads(
 /// For readFile results that get truncated, adds the path to
 /// `invalidatedFiles` so the edit gate is invalidated.
 fn truncateLongResults(
-    history: &mut Vec<Message>,
+    history: &mut [Message],
     threshold: usize,
     blockHints: &HashMap<String, String>,
     middleOutCallIds: &mut Vec<String>,
@@ -224,14 +224,12 @@ fn truncateLongResults(
         } = msg
         {
             for call in calls {
-                if call.function.name == "readFile" {
-                    if let Ok(args) =
+                if call.function.name == "readFile"
+                    && let Ok(args) =
                         serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                    {
-                        if let Some(path) = args["path"].as_str() {
-                            readFilePaths.insert(call.id.clone(), normalizePath(path));
-                        }
-                    }
+                    && let Some(path) = args["path"].as_str()
+                {
+                    readFilePaths.insert(call.id.clone(), normalizePath(path));
                 }
             }
         }
@@ -275,18 +273,18 @@ fn truncateLongResults(
             middleOutCallIds.push(tool_call_id.clone());
 
             // If this was a readFile result, invalidate the edit gate.
-            if let Some(path) = readFilePaths.get(tool_call_id) {
-                if !invalidatedFiles.contains(path) {
-                    invalidatedFiles.push(path.clone());
-                }
+            if let Some(path) = readFilePaths.get(tool_call_id)
+                && !invalidatedFiles.contains(path)
+            {
+                invalidatedFiles.push(path.clone());
             }
         }
 
         // Strip images from User messages in the S1 zone too.
-        if let Message::User { content } = msg {
-            if content.hasImages() {
-                *content = content.stripImages();
-            }
+        if let Message::User { content } = msg
+            && content.hasImages()
+        {
+            *content = content.stripImages();
         }
     }
 }
@@ -329,7 +327,7 @@ fn calculateZone(history: &[Message]) -> HashSet<usize> {
         return zone;
     }
 
-    let totalChars: usize = history[1..].iter().map(|m| messageLen(m)).sum();
+    let totalChars: usize = history[1..].iter().map(messageLen).sum();
     if totalChars == 0 {
         return zone;
     }
@@ -337,11 +335,11 @@ fn calculateZone(history: &[Message]) -> HashSet<usize> {
     let boundary = totalChars * 30 / 100;
     let mut cumulative: usize = 0;
 
-    for i in 1..history.len() {
+    for (i, msg) in history.iter().enumerate().skip(1) {
         if cumulative >= boundary {
             break;
         }
-        cumulative += messageLen(&history[i]);
+        cumulative += messageLen(msg);
         // Include the message even if it straddles the boundary.
         zone.insert(i);
     }

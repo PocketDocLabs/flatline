@@ -289,10 +289,10 @@ pub fn applyHighlight(selection: &Selection, area: Rect, buf: &mut Buffer, displ
     for screenRow in 0..area.height {
         let gridLine = toGridLine(screenRow, displayOffset);
         for col in 0..area.width {
-            if selection.contains(gridLine, col) {
-                if let Some(cell) = buf.cell_mut((area.x + col, area.y + screenRow)) {
-                    cell.set_style(selStyle);
-                }
+            if selection.contains(gridLine, col)
+                && let Some(cell) = buf.cell_mut((area.x + col, area.y + screenRow))
+            {
+                cell.set_style(selStyle);
             }
         }
     }

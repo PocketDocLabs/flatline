@@ -36,7 +36,6 @@ const IDLE_GLYPH: &str = "\u{25CB}"; // ○
 
 /// Per-terminal state held inside the pane.
 pub struct TerminalEntry {
-    pub name: String,
     pub io: ShellIo,
     pub state: TerminalState,
     /// True when output arrived since the user last looked at this tab.
@@ -44,9 +43,8 @@ pub struct TerminalEntry {
 }
 
 impl TerminalEntry {
-    pub fn new(name: impl Into<String>, io: ShellIo, cols: u16, rows: u16) -> Self {
+    pub fn new(io: ShellIo, cols: u16, rows: u16) -> Self {
         Self {
-            name: name.into(),
             io,
             state: TerminalState::new(cols, rows),
             unread: false,
@@ -62,6 +60,7 @@ pub enum TabClick {
     /// Click hit the `[+]` add button — spawn a new terminal.
     NewTab,
     /// Click hit a tab's `[×]` close affordance (none currently).
+    #[allow(dead_code)]
     Close(String),
     /// Click landed on the strip but no tab matched.
     Empty,
@@ -84,7 +83,7 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn newWithMain(io: ShellIo, cols: u16, rows: u16) -> Self {
         let mut entries = HashMap::new();
-        entries.insert("main".into(), TerminalEntry::new("main", io, cols, rows));
+        entries.insert("main".into(), TerminalEntry::new(io, cols, rows));
         Self {
             entries,
             order: vec!["main".into()],
@@ -103,7 +102,7 @@ impl TerminalPane {
             self.order.push(name.clone());
         }
         self.entries
-            .insert(name.clone(), TerminalEntry::new(name, io, cols, rows));
+            .insert(name.clone(), TerminalEntry::new(io, cols, rows));
     }
 
     /// Remove a terminal. If the active tab is removed, focus falls back
@@ -132,6 +131,7 @@ impl TerminalPane {
     }
 
     /// Cycle to the next tab in order. Wraps around.
+    #[allow(dead_code)]
     pub fn cycleNext(&mut self) {
         if self.order.is_empty() {
             return;
@@ -147,6 +147,7 @@ impl TerminalPane {
     }
 
     /// Cycle to the previous tab.
+    #[allow(dead_code)]
     pub fn cyclePrev(&mut self) {
         if self.order.is_empty() {
             return;
@@ -221,6 +222,7 @@ impl TerminalPane {
 
     /// Resize the active terminal's PTY (and its VT). Called when the
     /// pane area changes.
+    #[allow(dead_code)]
     pub fn resizeActive(&mut self, cols: u16, rows: u16) {
         let active = self.active.clone();
         if let Some(entry) = self.entries.get_mut(&active) {

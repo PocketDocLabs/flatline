@@ -219,14 +219,13 @@ impl Block {
     fn readFilePaths(&self) -> Vec<String> {
         let mut paths = Vec::new();
         for t in &self.agentTurns {
-            if t.toolName.as_deref() == Some("readFile") {
-                if let Some(args) = &t.toolArgs {
-                    if let Some(path) = args["path"].as_str() {
-                        let norm = normalizePath(path);
-                        if !paths.contains(&norm) {
-                            paths.push(norm);
-                        }
-                    }
+            if t.toolName.as_deref() == Some("readFile")
+                && let Some(args) = &t.toolArgs
+                && let Some(path) = args["path"].as_str()
+            {
+                let norm = normalizePath(path);
+                if !paths.contains(&norm) {
+                    paths.push(norm);
                 }
             }
         }
@@ -384,11 +383,11 @@ async fn compactBlock(
 
 /// Extract content from `<compacted_monolithic_string>` tags, or return raw.
 fn extractCompactedString(response: &str) -> String {
-    if let Some(start) = response.find("<compacted_monolithic_string>") {
-        if let Some(end) = response.find("</compacted_monolithic_string>") {
-            let inner = &response[start + 29..end];
-            return inner.trim().to_string();
-        }
+    if let Some(start) = response.find("<compacted_monolithic_string>")
+        && let Some(end) = response.find("</compacted_monolithic_string>")
+    {
+        let inner = &response[start + 29..end];
+        return inner.trim().to_string();
     }
     response.trim().to_string()
 }

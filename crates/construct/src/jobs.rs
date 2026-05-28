@@ -521,6 +521,7 @@ impl JobPlane {
 
     /// Shared body: build the bg task entry, emit `TaskSpawned`, then
     /// kick off the bash drainer with an optional per-line side effect.
+    #[allow(clippy::too_many_arguments)]
     fn spawnBashInner(
         &mut self,
         id: JobId,
@@ -709,11 +710,11 @@ impl JobPlane {
     pub fn stopAll(&self) -> Vec<JobId> {
         let mut killed = Vec::new();
         for id in &self.order {
-            if let Some(task) = self.jobs.get(id) {
-                if !task.state().isTerminal() {
-                    task.kill();
-                    killed.push(*id);
-                }
+            if let Some(task) = self.jobs.get(id)
+                && !task.state().isTerminal()
+            {
+                task.kill();
+                killed.push(*id);
             }
         }
         killed
@@ -729,6 +730,10 @@ impl JobPlane {
 
     pub fn len(&self) -> usize {
         self.jobs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
     }
 
     pub fn isEmpty(&self) -> bool {
@@ -747,6 +752,7 @@ impl JobPlane {
 /// Drainer body: spawn the child, fan out stdout/stderr into the shared
 /// ring buffer, race the child against `killRx`. On any termination,
 /// update the task's state and emit `TaskComplete` / `TaskStopped`.
+#[allow(clippy::too_many_arguments)]
 async fn runBashTask(
     id: JobId,
     command: String,
@@ -819,17 +825,12 @@ async fn runBashTask(
         let onLineStdout = onLineShared.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(s).lines();
-            loop {
-                match reader.next_line().await {
-                    Ok(Some(line)) => {
-                        innerStdout.lock().unwrap().stdoutTail.push(line.clone());
-                        if let Some(cb) = onLineStdout.as_ref() {
-                            cb(&line);
-                        }
-                        let _ = logStdout.try_send(LogEvent::JobOutput { id, line });
-                    }
-                    _ => break,
+            while let Ok(Some(line)) = reader.next_line().await {
+                innerStdout.lock().unwrap().stdoutTail.push(line.clone());
+                if let Some(cb) = onLineStdout.as_ref() {
+                    cb(&line);
                 }
+                let _ = logStdout.try_send(LogEvent::JobOutput { id, line });
             }
         })
     });
@@ -839,17 +840,12 @@ async fn runBashTask(
         let onLineStderr = onLineShared.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(s).lines();
-            loop {
-                match reader.next_line().await {
-                    Ok(Some(line)) => {
-                        innerStderr.lock().unwrap().stdoutTail.push(line.clone());
-                        if let Some(cb) = onLineStderr.as_ref() {
-                            cb(&line);
-                        }
-                        let _ = logStderr.try_send(LogEvent::JobOutput { id, line });
-                    }
-                    _ => break,
+            while let Ok(Some(line)) = reader.next_line().await {
+                innerStderr.lock().unwrap().stdoutTail.push(line.clone());
+                if let Some(cb) = onLineStderr.as_ref() {
+                    cb(&line);
                 }
+                let _ = logStderr.try_send(LogEvent::JobOutput { id, line });
             }
         })
     });
@@ -918,12 +914,12 @@ async fn runBashTask(
     // SIGTERM above may have been ignored, and the readers might have
     // exited on our abort rather than EOF.
     #[cfg(unix)]
-    if matches!(outcome, Outcome::Completed(_)) {
-        if let Some(pgid) = pgid {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
+    if matches!(outcome, Outcome::Completed(_))
+        && let Some(pgid) = pgid
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
 

@@ -55,6 +55,7 @@ pub struct S3Result {
 /// targets the oldest 30% of live context by char count, retrieves
 /// original content from transcript, and compresses each eligible
 /// topic in parallel.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     transcript: &Transcript,
     compactionLog: &CompactionLog,
@@ -166,8 +167,8 @@ pub async fn run(
 ///
 /// Builds the zone, filters superseded blocks, and finds topics with
 /// >= 2 S2'd blocks in the zone. This is the complete eligibility
-/// pipeline that `run` uses — extracted so tests can verify it without
-/// needing an API client.
+/// > pipeline that `run` uses — extracted so tests can verify it without
+/// > needing an API client.
 ///
 /// Topic membership is derived from `topics[i].startBlock` walking the
 /// active branch in chronological order, not from `turn.topicId`. The
@@ -408,14 +409,13 @@ fn collectReadFiles(
     for bid in blockIds {
         if let Some(block) = blockContent.get(bid) {
             for turn in &block.agentTurns {
-                if turn.toolName.as_deref() == Some("readFile") {
-                    if let Some(args) = &turn.toolArgs {
-                        if let Some(path) = args["path"].as_str() {
-                            let norm = normalizePath(path);
-                            if !paths.contains(&norm) {
-                                paths.push(norm);
-                            }
-                        }
+                if turn.toolName.as_deref() == Some("readFile")
+                    && let Some(args) = &turn.toolArgs
+                    && let Some(path) = args["path"].as_str()
+                {
+                    let norm = normalizePath(path);
+                    if !paths.contains(&norm) {
+                        paths.push(norm);
                     }
                 }
             }
@@ -509,11 +509,11 @@ async fn compactTopic(
 
 /// Extract content from `<compacted_monolithic_string>` tags, or return raw.
 fn extractCompactedString(response: &str) -> String {
-    if let Some(start) = response.find("<compacted_monolithic_string>") {
-        if let Some(end) = response.find("</compacted_monolithic_string>") {
-            let inner = &response[start + 29..end];
-            return inner.trim().to_string();
-        }
+    if let Some(start) = response.find("<compacted_monolithic_string>")
+        && let Some(end) = response.find("</compacted_monolithic_string>")
+    {
+        let inner = &response[start + 29..end];
+        return inner.trim().to_string();
     }
     response.trim().to_string()
 }

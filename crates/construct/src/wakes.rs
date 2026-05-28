@@ -204,6 +204,10 @@ impl WakeRegistry {
         self.sources.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
     /// Disarm every wake AND stop the batcher. Use this before swapping
     /// the registry slot on `/clear` / `/resume` so the previous
     /// session's schedulers and batcher actor stop firing into the new
@@ -691,6 +695,7 @@ async fn cronScheduler(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fileWatchScheduler(
     id: WakeId,
     path: PathBuf,

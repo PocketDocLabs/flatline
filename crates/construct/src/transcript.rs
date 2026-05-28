@@ -49,8 +49,10 @@ pub enum TurnRole {
 /// partial or diverged from what the user wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TurnStatus {
     /// Stream finished normally. Default for turns missing the field.
+    #[default]
     Completed,
     /// User interrupted mid-stream. Content may be partial.
     Cancelled,
@@ -58,12 +60,6 @@ pub enum TurnStatus {
     /// drop, mid-stream provider error). Content may be partial; a later
     /// turn may want to resume from where this one was cut off.
     Errored,
-}
-
-impl Default for TurnStatus {
-    fn default() -> Self {
-        Self::Completed
-    }
 }
 
 /// A single turn in the transcript.
@@ -533,10 +529,10 @@ pub fn newSessionId() -> String {
 /// tests and advanced workflows that need to isolate sessions from the normal
 /// user-data location.
 pub fn sessionsDir() -> PathBuf {
-    if let Ok(explicit) = std::env::var("FLATLINE_SESSIONS_DIR") {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
-        }
+    if let Ok(explicit) = std::env::var("FLATLINE_SESSIONS_DIR")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
     }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -563,10 +559,10 @@ pub fn listSessions(projectDir: Option<&str>) -> Result<Vec<SessionMeta>> {
         }
         match Transcript::loadMeta(&entry.path()) {
             Ok(meta) => {
-                if let Some(filter) = projectDir {
-                    if meta.projectDir != filter {
-                        continue;
-                    }
+                if let Some(filter) = projectDir
+                    && meta.projectDir != filter
+                {
+                    continue;
                 }
                 sessions.push(meta);
             }

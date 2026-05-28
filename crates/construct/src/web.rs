@@ -91,6 +91,12 @@ pub struct UrlCache {
     entries: HashMap<String, (Instant, String)>,
 }
 
+impl Default for UrlCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UrlCache {
     pub fn new() -> Self {
         Self {
@@ -150,8 +156,8 @@ fn formatExaResults(results: &[serde_json::Value]) -> String {
 
 /// Normalize a URL: upgrade http to https.
 fn normalizeUrl(url: &str) -> String {
-    if url.starts_with("http://") {
-        format!("https://{}", &url[7..])
+    if let Some(stripped) = url.strip_prefix("http://") {
+        format!("https://{stripped}")
     } else {
         url.to_string()
     }
@@ -189,11 +195,11 @@ pub async fn executeFetch(
     let url = normalizeUrl(url);
 
     // Check cache (only for non-subpage fetches).
-    if subpages.unwrap_or(0) == 0 {
-        if let Some(cached) = cache.get(&url) {
-            let content = cached.to_string();
-            return maybeSummarize(content, prompt, apiClient, config).await;
-        }
+    if subpages.unwrap_or(0) == 0
+        && let Some(cached) = cache.get(&url)
+    {
+        let content = cached.to_string();
+        return maybeSummarize(content, prompt, apiClient, config).await;
     }
 
     let mut body = serde_json::json!({
@@ -201,10 +207,10 @@ pub async fn executeFetch(
         "text": true,
     });
 
-    if let Some(n) = subpages {
-        if n > 0 {
-            body["subpages"] = serde_json::json!(n);
-        }
+    if let Some(n) = subpages
+        && n > 0
+    {
+        body["subpages"] = serde_json::json!(n);
     }
 
     let response = match exa.post("/contents", &body).await {
@@ -287,16 +293,16 @@ pub async fn executeSearch(
         }
     });
 
-    if let Some(domains) = allowedDomains {
-        if !domains.is_empty() {
-            body["includeDomains"] = serde_json::json!(domains);
-        }
+    if let Some(domains) = allowedDomains
+        && !domains.is_empty()
+    {
+        body["includeDomains"] = serde_json::json!(domains);
     }
 
-    if let Some(domains) = blockedDomains {
-        if !domains.is_empty() {
-            body["excludeDomains"] = serde_json::json!(domains);
-        }
+    if let Some(domains) = blockedDomains
+        && !domains.is_empty()
+    {
+        body["excludeDomains"] = serde_json::json!(domains);
     }
 
     let response = match exa.post("/search", &body).await {
@@ -331,16 +337,16 @@ pub async fn executeSimilar(
         }
     });
 
-    if let Some(domains) = allowedDomains {
-        if !domains.is_empty() {
-            body["includeDomains"] = serde_json::json!(domains);
-        }
+    if let Some(domains) = allowedDomains
+        && !domains.is_empty()
+    {
+        body["includeDomains"] = serde_json::json!(domains);
     }
 
-    if let Some(domains) = blockedDomains {
-        if !domains.is_empty() {
-            body["excludeDomains"] = serde_json::json!(domains);
-        }
+    if let Some(domains) = blockedDomains
+        && !domains.is_empty()
+    {
+        body["excludeDomains"] = serde_json::json!(domains);
     }
 
     let response = match exa.post("/findSimilar", &body).await {

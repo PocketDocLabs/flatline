@@ -240,14 +240,13 @@ impl Layout {
     /// Remove a named terminal from the canonical Tabs container.
     /// Returns true if the terminal was present and removed.
     pub fn removeTerminal(&mut self, name: &str) -> bool {
-        if let Some(tabs) = self.findTerminalTabsContainer() {
-            if let Some(pos) = tabs
+        if let Some(tabs) = self.findTerminalTabsContainer()
+            && let Some(pos) = tabs
                 .iter()
                 .position(|c| matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name))
-            {
-                tabs.remove(pos);
-                return true;
-            }
+        {
+            tabs.remove(pos);
+            return true;
         }
         false
     }
@@ -255,14 +254,13 @@ impl Layout {
     /// Set the active tab in the canonical Tabs container by terminal name.
     /// Returns true on success.
     pub fn setActiveTerminal(&mut self, name: &str) -> bool {
-        if let Some((children, activeRef)) = self.findTerminalTabsParts() {
-            if let Some(pos) = children
+        if let Some((children, activeRef)) = self.findTerminalTabsParts()
+            && let Some(pos) = children
                 .iter()
                 .position(|c| matches!(c, Layout::Window(WindowId::Terminal(n)) if n == name))
-            {
-                *activeRef = pos;
-                return true;
-            }
+        {
+            *activeRef = pos;
+            return true;
         }
         false
     }

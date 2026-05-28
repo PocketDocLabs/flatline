@@ -121,10 +121,10 @@ impl Content {
                     .collect();
 
                 // Collapse to plain text if only one text block remains.
-                if stripped.len() == 1 {
-                    if let ContentBlock::Text { ref text } = stripped[0] {
-                        return Content::Text(text.clone());
-                    }
+                if stripped.len() == 1
+                    && let ContentBlock::Text { ref text } = stripped[0]
+                {
+                    return Content::Text(text.clone());
                 }
                 Content::Blocks(stripped)
             }

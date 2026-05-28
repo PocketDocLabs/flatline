@@ -58,6 +58,12 @@ pub struct TopicTracker {
     nextTopicNum: usize,
 }
 
+impl Default for TopicTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TopicTracker {
     pub fn new() -> Self {
         Self {
@@ -315,16 +321,16 @@ fn parseTopicResponse(response: &str) -> TopicDecision {
     let trimmed = response.trim();
 
     // Try to extract content from <topic>...</topic> tags.
-    if let Some(start) = trimmed.find("<topic>") {
-        if let Some(end) = trimmed.find("</topic>") {
-            let inner = trimmed[start + 7..end].trim();
-            if inner.eq_ignore_ascii_case("same") {
-                return TopicDecision::Same;
-            }
-            let label = sanitizeLabel(inner);
-            if !label.is_empty() {
-                return TopicDecision::New(label);
-            }
+    if let Some(start) = trimmed.find("<topic>")
+        && let Some(end) = trimmed.find("</topic>")
+    {
+        let inner = trimmed[start + 7..end].trim();
+        if inner.eq_ignore_ascii_case("same") {
+            return TopicDecision::Same;
+        }
+        let label = sanitizeLabel(inner);
+        if !label.is_empty() {
+            return TopicDecision::New(label);
         }
     }
 

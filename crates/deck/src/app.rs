@@ -259,6 +259,7 @@ fn spawnInspectorFetch(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pushOperationalLog(
     developerLog: &mut DeveloperLog,
     toastCenter: &mut ToastCenter,
@@ -1710,13 +1711,13 @@ async fn runLoop(
                     if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
                         frame.set_cursor_position(ratatui::layout::Position::new(col, row));
                     }
-                } else if *focus == Focus::Terminal {
-                    if let Some((col, row)) = termPane.activeStateRef().cursorViewportPos() {
-                        frame.set_cursor_position(ratatui::layout::Position::new(
-                            termInner.x + col,
-                            termInner.y + row,
-                        ));
-                    }
+                } else if *focus == Focus::Terminal
+                    && let Some((col, row)) = termPane.activeStateRef().cursorViewportPos()
+                {
+                    frame.set_cursor_position(ratatui::layout::Position::new(
+                        termInner.x + col,
+                        termInner.y + row,
+                    ));
                 }
 
                 // Status bar. Minimal layout: right-aligned cost + ctx% + cache.
@@ -2148,7 +2149,7 @@ async fn runLoop(
                     unreadCompletedTaskIds.clear();
                     monitorActiveCount = 0;
                     wakeSourceCount = 0;
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                     writeTerminalTitle(TITLE_IDLE_GLYPH, None);
                 }
                 LogEvent::Rewound { targetTurnId } => {
@@ -2179,7 +2180,7 @@ async fn runLoop(
                             agentPanel.addAttachment(construct::session::Attachment {
                                 mimeType: att.mimeType.clone(),
                                 data,
-                                label: format!("restored image"),
+                                label: "restored image".to_string(),
                                 rgbaDimensions: None,
                             });
                         }
@@ -2204,7 +2205,7 @@ async fn runLoop(
                     unreadCompletedTaskIds.clear();
                     monitorActiveCount = 0;
                     wakeSourceCount = 0;
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                     replayTranscript(agentPanel, &turns);
                     for (stage, blockIdx) in &markers {
                         agentPanel.pushCompactionMarker(stage, *blockIdx);
@@ -2327,7 +2328,7 @@ async fn runLoop(
                         Some(command),
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::JobOutput { id, line } => {
                     pushOperationalLog(
@@ -2363,9 +2364,7 @@ async fn runLoop(
                     }
                 }
                 LogEvent::JobComplete { id, exitCode } => {
-                    if taskRunningCount > 0 {
-                        taskRunningCount -= 1;
-                    }
+                    taskRunningCount = taskRunningCount.saturating_sub(1);
                     // Mark as unread unless the panel is already open
                     // (in which case the user sees the row land live).
                     if tasksPanel.is_none() {
@@ -2384,12 +2383,10 @@ async fn runLoop(
                         Some(code),
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::JobStopped { id, reason } => {
-                    if taskRunningCount > 0 {
-                        taskRunningCount -= 1;
-                    }
+                    taskRunningCount = taskRunningCount.saturating_sub(1);
                     if tasksPanel.is_none() {
                         unreadCompletedTaskIds.insert(id);
                     }
@@ -2403,7 +2400,7 @@ async fn runLoop(
                         Some(reason),
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::MonitorRegistered {
                     id,
@@ -2422,7 +2419,7 @@ async fn runLoop(
                         Some(format!("{description} · /{filter}/")),
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::MonitorEvent {
                     id,
@@ -2447,9 +2444,7 @@ async fn runLoop(
                     // that actually acts on these.
                 }
                 LogEvent::MonitorAutoStopped { id, reason } => {
-                    if monitorActiveCount > 0 {
-                        monitorActiveCount -= 1;
-                    }
+                    monitorActiveCount = monitorActiveCount.saturating_sub(1);
                     pushOperationalLog(
                         &mut developerLog,
                         &mut toastCenter,
@@ -2460,12 +2455,10 @@ async fn runLoop(
                         Some(reason),
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::MonitorStopped { id } => {
-                    if monitorActiveCount > 0 {
-                        monitorActiveCount -= 1;
-                    }
+                    monitorActiveCount = monitorActiveCount.saturating_sub(1);
                     pushOperationalLog(
                         &mut developerLog,
                         &mut toastCenter,
@@ -2476,7 +2469,7 @@ async fn runLoop(
                         None,
                         true,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::TerminalSpawned { name, spawnedBy } => {
                     use construct::control::TerminalSpawnedBy;
@@ -2611,12 +2604,10 @@ async fn runLoop(
                         Some(format!("{} · {summary}", kind.asStr())),
                         false,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
                 LogEvent::WakeDisarmed { id } => {
-                    if wakeSourceCount > 0 {
-                        wakeSourceCount -= 1;
-                    }
+                    wakeSourceCount = wakeSourceCount.saturating_sub(1);
                     agentPanel.wakeDisarmed(id);
                     pushOperationalLog(
                         &mut developerLog,
@@ -2628,7 +2619,7 @@ async fn runLoop(
                         None,
                         false,
                     );
-                    refreshTasksPanel(&tasksPanel, &requestTx, &deckUpdateTx);
+                    refreshTasksPanel(&tasksPanel, requestTx, deckUpdateTx);
                 }
             }
         }
@@ -2780,24 +2771,24 @@ async fn runLoop(
                     sinceLine,
                     snap,
                 } => {
-                    if let Some(ref mut panel) = tasksPanel {
-                        if let Some(snap) = snap {
-                            // Tagged-fetch race guard: if the user paged
-                            // back while this fetch was in flight, the
-                            // panel's `requestedSinceLine` has already
-                            // moved on. Pass the fetched-against value
-                            // so the panel can drop stale snapshots
-                            // instead of momentarily clobbering the
-                            // paged-back view.
-                            if panel.applyInspectorSnapshot(id, sinceLine, snap) {
-                                needsRedraw = true;
-                            }
+                    if let Some(ref mut panel) = tasksPanel
+                        && let Some(snap) = snap
+                    {
+                        // Tagged-fetch race guard: if the user paged
+                        // back while this fetch was in flight, the
+                        // panel's `requestedSinceLine` has already
+                        // moved on. Pass the fetched-against value
+                        // so the panel can drop stale snapshots
+                        // instead of momentarily clobbering the
+                        // paged-back view.
+                        if panel.applyInspectorSnapshot(id, sinceLine, snap) {
+                            needsRedraw = true;
                         }
-                        // Snap=None means the task is gone from the
-                        // session. The next ListJobs refresh will drop
-                        // the inspector via JobsPanel::refresh, so we
-                        // don't need to touch the panel here.
                     }
+                    // Snap=None means the task is gone from the
+                    // session. The next ListJobs refresh will drop
+                    // the inspector via JobsPanel::refresh, so we
+                    // don't need to touch the panel here.
                     // Coalescing: the in-flight fetch just returned. If
                     // TaskOutput events landed while it was flying, fire
                     // one more refresh — only on the same id, only if the
@@ -2869,11 +2860,11 @@ async fn runLoop(
         }
 
         // Clear the quit hint after the double-tap window expires.
-        if let Some(t) = lastQuitPress {
-            if t.elapsed() >= Duration::from_secs(1) {
-                lastQuitPress = None;
-                needsRedraw = true;
-            }
+        if let Some(t) = lastQuitPress
+            && t.elapsed() >= Duration::from_secs(1)
+        {
+            lastQuitPress = None;
+            needsRedraw = true;
         }
 
         // Handle input.
@@ -3045,10 +3036,10 @@ async fn handleInput(
                 // Double-tap Ctrl+Q to quit — prevents accidental exits.
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                     const DOUBLE_TAP_WINDOW: Duration = Duration::from_secs(1);
-                    if let Some(prev) = *lastQuitPress {
-                        if prev.elapsed() < DOUBLE_TAP_WINDOW {
-                            return Ok((true, true, false));
-                        }
+                    if let Some(prev) = *lastQuitPress
+                        && prev.elapsed() < DOUBLE_TAP_WINDOW
+                    {
+                        return Ok((true, true, false));
                     }
                     *lastQuitPress = Some(Instant::now());
                     break;
@@ -4104,7 +4095,6 @@ async fn handleInput(
                 let termRows = rows.saturating_sub(4);
                 termPane.resizeAll(termCols, termRows);
             }
-            _ => {}
         }
 
         // Keep draining if more events are queued.
@@ -4118,6 +4108,7 @@ async fn handleInput(
 
 /// Handle mouse events — selection, scroll wheel.
 /// Returns true if the event modified state (needs redraw).
+#[allow(clippy::too_many_arguments)]
 fn handleMouse(
     mouse: event::MouseEvent,
     focus: &mut Focus,
@@ -4178,11 +4169,12 @@ fn handleMouse(
                     let localRow = mouse.row.saturating_sub(selState.inputContentRect.y);
                     let localCol = mouse.column.saturating_sub(selState.inputContentRect.x);
                     // Top border row — check if click is on "copy" label.
-                    if localRow == 0 && localCol + 6 >= selState.inputContentRect.width {
-                        if let Some(cmd) = agentPanel.pendingCommand() {
-                            crate::selection::copyToClipboard(cmd);
-                            agentPanel.flashCopied();
-                        }
+                    if localRow == 0
+                        && localCol + 6 >= selState.inputContentRect.width
+                        && let Some(cmd) = agentPanel.pendingCommand()
+                    {
+                        crate::selection::copyToClipboard(cmd);
+                        agentPanel.flashCopied();
                     }
                     return true;
                 }
@@ -4241,19 +4233,18 @@ fn handleMouse(
                         // Resumed session — load child transcript on demand.
                         let agentType = agentType.to_string();
                         let sid = sid.to_string();
-                        if let Ok(transcript) = construct::transcript::Transcript::open(&sid) {
-                            if let Ok(turns) = transcript.loadAll() {
-                                // Build a temporary AgentPanel to replay the
-                                // child transcript into PanelEntries.
-                                let mut tmp = crate::agent_panel::AgentPanel::new();
-                                replayTranscript(&mut tmp, &turns);
-                                let entries = tmp.entries;
-                                *subagentPanel =
-                                    Some(crate::subagent_panel::SubagentPanel::frozen(
-                                        &agentType, entries,
-                                    ));
-                                return true;
-                            }
+                        if let Ok(transcript) = construct::transcript::Transcript::open(&sid)
+                            && let Ok(turns) = transcript.loadAll()
+                        {
+                            // Build a temporary AgentPanel to replay the
+                            // child transcript into PanelEntries.
+                            let mut tmp = crate::agent_panel::AgentPanel::new();
+                            replayTranscript(&mut tmp, &turns);
+                            let entries = tmp.entries;
+                            *subagentPanel = Some(crate::subagent_panel::SubagentPanel::frozen(
+                                &agentType, entries,
+                            ));
+                            return true;
                         }
                     }
                 }
@@ -4681,13 +4672,13 @@ fn wakeNoticeFromContent(content: &str) -> String {
         .split_once("source=\"")
         .and_then(|(_, rest)| rest.split_once('"'))
         .map(|(s, _)| s.to_string());
-    let label = match (count, firstSource) {
+
+    match (count, firstSource) {
         (n, Some(src)) if n > 1 => format!("\u{2299} {n} wakes (first: {src})"),
         (_, Some(src)) => format!("\u{2299} wake \u{00B7} {src}"),
         (n, None) if n > 0 => format!("\u{2299} {n} wakes"),
         _ => "\u{2299} wake".to_string(),
-    };
-    label
+    }
 }
 
 /// Convert deck's CommandAction to construct's CommandAction.
@@ -4728,15 +4719,15 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                     .push(crate::agent_panel::PanelEntry::SessionNotice(summary));
             }
             TurnRole::Assistant => {
-                if let Some(ref reasoning) = turn.reasoning {
-                    if !reasoning.is_empty() {
-                        panel
-                            .entries
-                            .push(crate::agent_panel::PanelEntry::Reasoning {
-                                text: reasoning.clone(),
-                                expanded: false,
-                            });
-                    }
+                if let Some(ref reasoning) = turn.reasoning
+                    && !reasoning.is_empty()
+                {
+                    panel
+                        .entries
+                        .push(crate::agent_panel::PanelEntry::Reasoning {
+                            text: reasoning.clone(),
+                            expanded: false,
+                        });
                 }
                 if !turn.content.is_empty() {
                     panel
@@ -4803,56 +4794,55 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
             }
             TurnRole::ToolResult => {
                 // Check if this result belongs to a pending task.
-                if let Some(ref callId) = turn.toolCallId {
-                    if let Some(entryIdx) = pendingTasks.remove(callId) {
-                        // Extract child session ID and content from
-                        // "[subagent session: {id}]\n\n{content}".
-                        let raw = &turn.content;
-                        let (childSessionId, content) =
-                            if let Some(start) = raw.find("[subagent session: ") {
-                                let idStart = start + "[subagent session: ".len();
-                                if let Some(end) = raw[idStart..].find(']') {
-                                    let sid = raw[idStart..idStart + end].to_string();
-                                    let bodyStart = idStart + end + 1;
-                                    let body = if raw[bodyStart..].starts_with("\n\n") {
-                                        raw[bodyStart + 2..].to_string()
-                                    } else {
-                                        raw[bodyStart..].to_string()
-                                    };
-                                    (Some(sid), body)
+                if let Some(ref callId) = turn.toolCallId
+                    && let Some(entryIdx) = pendingTasks.remove(callId)
+                {
+                    // Extract child session ID and content from
+                    // "[subagent session: {id}]\n\n{content}".
+                    let raw = &turn.content;
+                    let (childSessionId, content) =
+                        if let Some(start) = raw.find("[subagent session: ") {
+                            let idStart = start + "[subagent session: ".len();
+                            if let Some(end) = raw[idStart..].find(']') {
+                                let sid = raw[idStart..idStart + end].to_string();
+                                let bodyStart = idStart + end + 1;
+                                let body = if raw[bodyStart..].starts_with("\n\n") {
+                                    raw[bodyStart + 2..].to_string()
                                 } else {
-                                    (None, raw.clone())
-                                }
+                                    raw[bodyStart..].to_string()
+                                };
+                                (Some(sid), body)
                             } else {
                                 (None, raw.clone())
-                            };
-
-                        // Load the child transcript to reconstruct tool lines and turn count.
-                        let (childToolLines, childTurns) = if let Some(ref csid) = childSessionId {
-                            loadChildToolLines(csid)
+                            }
                         } else {
-                            (Vec::new(), 0)
+                            (None, raw.clone())
                         };
 
-                        if let Some(crate::agent_panel::PanelEntry::SubagentBlock {
-                            content: c,
-                            sessionId: sid,
-                            toolLines: tl,
-                            turns: t,
-                            ..
-                        }) = panel.entries.get_mut(entryIdx)
-                        {
-                            *sid = childSessionId;
-                            *tl = childToolLines;
-                            *t = childTurns;
-                            if !content.is_empty() && content != "Task completed (no text output)."
-                            {
-                                *c = Some(content);
-                            }
+                    // Load the child transcript to reconstruct tool lines and turn count.
+                    let (childToolLines, childTurns) = if let Some(ref csid) = childSessionId {
+                        loadChildToolLines(csid)
+                    } else {
+                        (Vec::new(), 0)
+                    };
+
+                    if let Some(crate::agent_panel::PanelEntry::SubagentBlock {
+                        content: c,
+                        sessionId: sid,
+                        toolLines: tl,
+                        turns: t,
+                        ..
+                    }) = panel.entries.get_mut(entryIdx)
+                    {
+                        *sid = childSessionId;
+                        *tl = childToolLines;
+                        *t = childTurns;
+                        if !content.is_empty() && content != "Task completed (no text output)." {
+                            *c = Some(content);
                         }
-                        // Skip pushing a ToolResult — SubagentBlock handles display.
-                        continue;
                     }
+                    // Skip pushing a ToolResult — SubagentBlock handles display.
+                    continue;
                 }
 
                 let name = turn.tool.as_deref().unwrap_or("tool");

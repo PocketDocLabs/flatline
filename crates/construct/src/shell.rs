@@ -102,8 +102,10 @@ fn newRenderVt() -> (Term<VoidListener>, Processor) {
         cols: VT_RENDER_COLS,
         rows: VT_RENDER_ROWS,
     };
-    let mut config = VtConfig::default();
-    config.scrolling_history = VT_SCROLLBACK_LINES;
+    let config = VtConfig {
+        scrolling_history: VT_SCROLLBACK_LINES,
+        ..VtConfig::default()
+    };
     let term = Term::new(config, &size, VoidListener);
     let processor: Processor = Processor::new();
     (term, processor)
@@ -265,8 +267,8 @@ impl Shell {
         for &mi in &matchIndices {
             let start = mi.saturating_sub(contextLines);
             let end = (mi + contextLines + 1).min(totalLines);
-            for j in start..end {
-                included[j] = true;
+            for flag in included.iter_mut().take(end).skip(start) {
+                *flag = true;
             }
         }
 

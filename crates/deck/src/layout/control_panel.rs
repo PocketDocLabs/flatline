@@ -71,12 +71,18 @@ fn layoutsMatchShape(a: &Layout, b: &Layout) -> bool {
 }
 
 fn sameChildKind(a: &Layout, b: &Layout) -> bool {
-    match (a, b) {
-        (Layout::Tabs { .. }, Layout::Tabs { .. }) => true,
-        (Layout::Window(WindowId::AgentPanel), Layout::Window(WindowId::AgentPanel)) => true,
-        (Layout::Window(WindowId::Terminal(_)), Layout::Window(WindowId::Terminal(_))) => true,
-        _ => false,
-    }
+    matches!(
+        (a, b),
+        (Layout::Tabs { .. }, Layout::Tabs { .. })
+            | (
+                Layout::Window(WindowId::AgentPanel),
+                Layout::Window(WindowId::AgentPanel)
+            )
+            | (
+                Layout::Window(WindowId::Terminal(_)),
+                Layout::Window(WindowId::Terminal(_))
+            )
+    )
 }
 
 /// Return the built-in preset list. All three presets use a Tabs
@@ -208,10 +214,10 @@ impl ControlPanel {
     pub fn resetTo(&mut self, layout: Layout, appliedPreset: Option<String>) {
         self.working = layout;
         self.appliedName = appliedPreset.clone();
-        if let Some(name) = appliedPreset {
-            if let Some(idx) = self.presets.iter().position(|p| p.name == name) {
-                self.selected = idx;
-            }
+        if let Some(name) = appliedPreset
+            && let Some(idx) = self.presets.iter().position(|p| p.name == name)
+        {
+            self.selected = idx;
         }
         self.dirty = false;
     }

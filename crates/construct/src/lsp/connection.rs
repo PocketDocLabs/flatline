@@ -359,10 +359,10 @@ impl LspConnection {
             // a race where notify_waiters fires between check and await.
             loop {
                 let waiter = notify.notified();
-                if let Some(diags) = diagnostics.get(&uri) {
-                    if !diags.is_empty() {
-                        break;
-                    }
+                if let Some(diags) = diagnostics.get(&uri)
+                    && !diags.is_empty()
+                {
+                    break;
                 }
                 waiter.await;
             }

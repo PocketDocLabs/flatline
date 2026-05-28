@@ -270,23 +270,23 @@ fn applyOps<'a>(turns: &'a [&'a Turn], ops: &[CompactionOp]) -> Vec<TransformedT
 
         // Full block replacement (S3/S4): emit summary once, skip all turns.
         if summarizedBlocks.contains(bid.as_str()) {
-            if !emittedSummaries.contains(bid.as_str()) {
-                if let Some(summary) = blockSummaries.get(bid.as_str()) {
-                    let kind = *summaryKinds
-                        .get(bid.as_str())
-                        .unwrap_or(&SummaryKind::Topic);
-                    let blockIds = summaryBlockIds
-                        .get(bid.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| vec![bid.clone()]);
-                    result.push(TransformedTurn::Summary {
-                        blockId: bid.clone(),
-                        content: summary.clone(),
-                        kind,
-                        sourceBlockIds: blockIds,
-                    });
-                    emittedSummaries.insert(bid.clone());
-                }
+            if !emittedSummaries.contains(bid.as_str())
+                && let Some(summary) = blockSummaries.get(bid.as_str())
+            {
+                let kind = *summaryKinds
+                    .get(bid.as_str())
+                    .unwrap_or(&SummaryKind::Topic);
+                let blockIds = summaryBlockIds
+                    .get(bid.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| vec![bid.clone()]);
+                result.push(TransformedTurn::Summary {
+                    blockId: bid.clone(),
+                    content: summary.clone(),
+                    kind,
+                    sourceBlockIds: blockIds,
+                });
+                emittedSummaries.insert(bid.clone());
             }
             continue;
         }
@@ -295,39 +295,38 @@ fn applyOps<'a>(turns: &'a [&'a Turn], ops: &[CompactionOp]) -> Vec<TransformedT
         if s2SummarizedBlocks.contains(bid.as_str()) {
             if matches!(turn.role, TurnRole::User) {
                 result.push(TransformedTurn::Original(turn));
-            } else if !emittedSummaries.contains(bid.as_str()) {
-                if let Some(summary) = blockSummaries.get(bid.as_str()) {
-                    result.push(TransformedTurn::Summary {
-                        blockId: bid.clone(),
-                        content: summary.clone(),
-                        kind: SummaryKind::Block,
-                        sourceBlockIds: vec![bid.clone()],
-                    });
-                    emittedSummaries.insert(bid.clone());
-                }
+            } else if !emittedSummaries.contains(bid.as_str())
+                && let Some(summary) = blockSummaries.get(bid.as_str())
+            {
+                result.push(TransformedTurn::Summary {
+                    blockId: bid.clone(),
+                    content: summary.clone(),
+                    kind: SummaryKind::Block,
+                    sourceBlockIds: vec![bid.clone()],
+                });
+                emittedSummaries.insert(bid.clone());
             }
             // Skip remaining assistant/tool turns in this block.
             continue;
         }
 
         // FileDedup: skip turns whose toolCallId was removed.
-        if let Some(tcid) = &turn.toolCallId {
-            if removedCallIds.contains(tcid.as_str()) {
-                continue;
-            }
+        if let Some(tcid) = &turn.toolCallId
+            && removedCallIds.contains(tcid.as_str())
+        {
+            continue;
         }
 
         // MiddleOut: truncate ToolResult content.
-        if let Some(tcid) = &turn.toolCallId {
-            if let Some(&thresh) = middleOutCallIds.get(tcid.as_str()) {
-                if matches!(turn.role, TurnRole::ToolResult) {
-                    result.push(TransformedTurn::Replaced {
-                        turn,
-                        newContent: middleOut(&turn.content, thresh, Some(&turn.blockId)),
-                    });
-                    continue;
-                }
-            }
+        if let Some(tcid) = &turn.toolCallId
+            && let Some(&thresh) = middleOutCallIds.get(tcid.as_str())
+            && matches!(turn.role, TurnRole::ToolResult)
+        {
+            result.push(TransformedTurn::Replaced {
+                turn,
+                newContent: middleOut(&turn.content, thresh, Some(&turn.blockId)),
+            });
+            continue;
         }
 
         result.push(TransformedTurn::Original(turn));
@@ -523,7 +522,7 @@ pub fn calculateZones(history: &[Message], _contextWindow: usize, _compactRatio:
     }
 
     // Calculate total character count (excluding system message).
-    let charCounts: Vec<usize> = history.iter().map(|m| messageCharCount(m)).collect();
+    let charCounts: Vec<usize> = history.iter().map(messageCharCount).collect();
 
     let totalChars: usize = charCounts[1..].iter().sum();
     if totalChars == 0 {
@@ -541,8 +540,8 @@ pub fn calculateZones(history: &[Message], _contextWindow: usize, _compactRatio:
     let mut cumulative: usize = 0;
 
     // Start at index 1 to skip the system message.
-    for i in 1..history.len() {
-        cumulative += charCounts[i];
+    for (i, count) in charCounts.iter().enumerate().skip(1) {
+        cumulative += *count;
 
         if cumulative <= s3Boundary {
             s3Zone.push(i);

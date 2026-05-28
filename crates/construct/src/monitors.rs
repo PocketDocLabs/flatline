@@ -204,6 +204,7 @@ impl MonitorPlane {
     /// passive-wake context resolved up front. The per-line callback
     /// captures the wake slot before the backing bash task spawns —
     /// the first match cannot precede the attach.
+    #[allow(clippy::too_many_arguments)]
     pub fn registerWithId(
         &mut self,
         id: MonitorId,
@@ -480,6 +481,10 @@ impl MonitorPlane {
         self.monitors.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.monitors.is_empty()
+    }
+
     pub fn isEmpty(&self) -> bool {
         self.monitors.is_empty()
     }
@@ -713,7 +718,7 @@ mod tests {
         // The unregister happens via tokio::spawn from the sync
         // callback — give it a beat to run before asserting.
         for _ in 0..50 {
-            if regArc.lock().await.len() == 0 {
+            if regArc.lock().await.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

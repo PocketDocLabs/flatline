@@ -246,6 +246,10 @@ impl ShellRegistry {
         self.shells.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.shells.is_empty()
+    }
+
     /// True when the named shell exists.
     pub fn contains(&self, name: &str) -> bool {
         self.shells.contains_key(name)

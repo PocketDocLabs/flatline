@@ -270,11 +270,11 @@ impl ParseState {
             }
 
             Event::End(TagEnd::TableRow) => {
-                if let Some(t) = &mut self.table {
-                    if !t.inHead {
-                        let row = std::mem::take(&mut t.currentRow);
-                        t.rows.push(row);
-                    }
+                if let Some(t) = &mut self.table
+                    && !t.inHead
+                {
+                    let row = std::mem::take(&mut t.currentRow);
+                    t.rows.push(row);
                 }
             }
 
@@ -323,18 +323,16 @@ impl ParseState {
             Event::Text(text) => {
                 if let Some((_, ref mut code)) = self.codeBlock {
                     code.push_str(&text);
-                } else if self.table.is_some() {
+                } else {
                     let style = self.currentStyle();
-                    self.table
-                        .as_mut()
-                        .unwrap()
-                        .currentCell
-                        .push(StyledSegment {
+                    if let Some(table) = self.table.as_mut() {
+                        table.currentCell.push(StyledSegment {
                             text: text.to_string(),
                             style,
                         });
-                } else {
-                    self.pushText(&text);
+                    } else {
+                        self.pushText(&text);
+                    }
                 }
             }
 
@@ -356,18 +354,16 @@ impl ParseState {
             Event::SoftBreak => {
                 if self.codeBlock.is_some() {
                     // Ignored in code blocks.
-                } else if self.table.is_some() {
+                } else {
                     let style = self.currentStyle();
-                    self.table
-                        .as_mut()
-                        .unwrap()
-                        .currentCell
-                        .push(StyledSegment {
+                    if let Some(table) = self.table.as_mut() {
+                        table.currentCell.push(StyledSegment {
                             text: " ".to_string(),
                             style,
                         });
-                } else {
-                    self.pushText(" ");
+                    } else {
+                        self.pushText(" ");
+                    }
                 }
             }
 

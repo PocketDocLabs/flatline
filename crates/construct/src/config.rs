@@ -464,10 +464,10 @@ pub fn defaultModelSaveScope(config: &Config) -> ConfigScope {
 pub fn load() -> Result<Config> {
     // Explicit-path override: FLATLINE_CONFIG=/path/to/config.toml bypasses
     // user/project/local discovery and loads exactly that file.
-    if let Ok(explicit) = std::env::var("FLATLINE_CONFIG") {
-        if !explicit.is_empty() {
-            return loadExplicit(PathBuf::from(explicit));
-        }
+    if let Ok(explicit) = std::env::var("FLATLINE_CONFIG")
+        && !explicit.is_empty()
+    {
+        return loadExplicit(PathBuf::from(explicit));
     }
 
     let userDir = configDir();
@@ -575,10 +575,10 @@ pub fn load() -> Result<Config> {
     applyEnvKey(&mut config.utility);
     applyEnvKeysToProfiles(&mut config.profiles);
 
-    if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
-        if !exaKey.is_empty() {
-            config.web.searchKey = exaKey;
-        }
+    if let Ok(exaKey) = std::env::var("EXA_API_KEY")
+        && !exaKey.is_empty()
+    {
+        config.web.searchKey = exaKey;
     }
 
     Ok(config)
@@ -610,10 +610,10 @@ fn loadExplicit(path: PathBuf) -> Result<Config> {
     applyEnvKey(&mut config.light);
     applyEnvKey(&mut config.utility);
     applyEnvKeysToProfiles(&mut config.profiles);
-    if let Ok(exaKey) = std::env::var("EXA_API_KEY") {
-        if !exaKey.is_empty() {
-            config.web.searchKey = exaKey;
-        }
+    if let Ok(exaKey) = std::env::var("EXA_API_KEY")
+        && !exaKey.is_empty()
+    {
+        config.web.searchKey = exaKey;
     }
     Ok(config)
 }
@@ -632,10 +632,10 @@ fn applyEnvKey(config: &mut ModelConfig) {
         _ => "OPENROUTER_API_KEY",
     };
 
-    if let Ok(key) = std::env::var(envVar) {
-        if !key.is_empty() {
-            config.key = key;
-        }
+    if let Ok(key) = std::env::var(envVar)
+        && !key.is_empty()
+    {
+        config.key = key;
     }
 }
 
@@ -1072,10 +1072,10 @@ pub fn saveModelSelectionInScope(
     let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
         .with_context(|| format!("config scope {} is not available", scope.label()))?;
     saveModelSelectionToPath(&configPath, tier, profile)?;
-    if scope.isLocal() {
-        if let Some(projectDir) = configPath.parent() {
-            ensureLocalGitignored(projectDir);
-        }
+    if scope.isLocal()
+        && let Some(projectDir) = configPath.parent()
+    {
+        ensureLocalGitignored(projectDir);
     }
     Ok(configPath)
 }
@@ -1112,14 +1112,12 @@ pub fn saveDiscoveredModelInScope(
             .as_ref()
             .and_then(|reasoning| reasoning.effort.as_ref())
             .is_none();
-    if shouldSeedReasoning {
-        if let Some(effort) = &entry.defaultReasoningEffort {
-            let summary = model.reasoning.as_ref().and_then(|r| r.summary.clone());
-            model.reasoning = Some(ReasoningSettings {
-                effort: Some(effort.clone()),
-                summary,
-            });
-        }
+    if shouldSeedReasoning && let Some(effort) = &entry.defaultReasoningEffort {
+        let summary = model.reasoning.as_ref().and_then(|r| r.summary.clone());
+        model.reasoning = Some(ReasoningSettings {
+            effort: Some(effort.clone()),
+            summary,
+        });
     }
     saveModelProfileInScope(config, scope, profileName, &model)
 }
@@ -1140,10 +1138,10 @@ pub fn saveModelProfileContextInScope(
     let maxContextWindow = existing.maxContextWindow.or_else(|| {
         crate::model_catalog::knownModelContextWindow(&existing.provider, &existing.model)
     });
-    if let Some(max) = maxContextWindow {
-        if contextWindow > max {
-            bail!("context window {contextWindow} exceeds model max {max}");
-        }
+    if let Some(max) = maxContextWindow
+        && contextWindow > max
+    {
+        bail!("context window {contextWindow} exceeds model max {max}");
     }
 
     let mut model = existing.clone();
@@ -1186,10 +1184,10 @@ pub fn saveModelProfileInScope(
     let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
         .with_context(|| format!("config scope {} is not available", scope.label()))?;
     saveModelProfileToPath(&configPath, profileName, model)?;
-    if scope.isLocal() {
-        if let Some(projectDir) = configPath.parent() {
-            ensureLocalGitignored(projectDir);
-        }
+    if scope.isLocal()
+        && let Some(projectDir) = configPath.parent()
+    {
+        ensureLocalGitignored(projectDir);
     }
     Ok(configPath)
 }
@@ -1231,10 +1229,10 @@ pub fn renameModelProfileInScope(
     let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
         .with_context(|| format!("config scope {} is not available", scope.label()))?;
     renameModelProfileInPath(&configPath, oldName, newName)?;
-    if scope.isLocal() {
-        if let Some(projectDir) = configPath.parent() {
-            ensureLocalGitignored(projectDir);
-        }
+    if scope.isLocal()
+        && let Some(projectDir) = configPath.parent()
+    {
+        ensureLocalGitignored(projectDir);
     }
     Ok(configPath)
 }
@@ -1254,10 +1252,10 @@ pub fn deleteModelProfileInScope(
     let configPath = configPathForScope(scope, config.projectRoot.as_deref(), &config.launchDir)
         .with_context(|| format!("config scope {} is not available", scope.label()))?;
     deleteModelProfileFromPath(&configPath, profileName)?;
-    if scope.isLocal() {
-        if let Some(projectDir) = configPath.parent() {
-            ensureLocalGitignored(projectDir);
-        }
+    if scope.isLocal()
+        && let Some(projectDir) = configPath.parent()
+    {
+        ensureLocalGitignored(projectDir);
     }
     Ok(configPath)
 }
@@ -1267,11 +1265,11 @@ fn saveModelSelectionToPath(configPath: &Path, tier: ModelTier, profile: &str) -
         .parent()
         .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
 
-    fs::create_dir_all(&projectDir)
+    fs::create_dir_all(projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
 
     let existing = if configPath.exists() {
-        fs::read_to_string(&configPath)
+        fs::read_to_string(configPath)
             .with_context(|| format!("failed to read {}", configPath.display()))?
     } else {
         String::new()
@@ -1286,7 +1284,7 @@ fn saveModelSelectionToPath(configPath: &Path, tier: ModelTier, profile: &str) -
     doc.insert(key.to_string(), toml::Value::String(profile.to_string()));
 
     let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
-    fs::write(&configPath, output)
+    fs::write(configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
     Ok(())
 }
@@ -1296,11 +1294,11 @@ fn renameModelProfileInPath(configPath: &Path, oldName: &str, newName: &str) -> 
         .parent()
         .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
 
-    fs::create_dir_all(&projectDir)
+    fs::create_dir_all(projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
 
     let existing = if configPath.exists() {
-        fs::read_to_string(&configPath)
+        fs::read_to_string(configPath)
             .with_context(|| format!("failed to read {}", configPath.display()))?
     } else {
         String::new()
@@ -1331,7 +1329,7 @@ fn renameModelProfileInPath(configPath: &Path, oldName: &str, newName: &str) -> 
     }
 
     let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
-    fs::write(&configPath, output)
+    fs::write(configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
     Ok(())
 }
@@ -1341,11 +1339,11 @@ fn deleteModelProfileFromPath(configPath: &Path, profileName: &str) -> Result<()
         .parent()
         .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
 
-    fs::create_dir_all(&projectDir)
+    fs::create_dir_all(projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
 
     let existing = if configPath.exists() {
-        fs::read_to_string(&configPath)
+        fs::read_to_string(configPath)
             .with_context(|| format!("failed to read {}", configPath.display()))?
     } else {
         String::new()
@@ -1363,7 +1361,7 @@ fn deleteModelProfileFromPath(configPath: &Path, profileName: &str) -> Result<()
     }
 
     let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
-    fs::write(&configPath, output)
+    fs::write(configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
     Ok(())
 }
@@ -1373,11 +1371,11 @@ fn saveModelProfileToPath(configPath: &Path, profileName: &str, model: &ModelCon
         .parent()
         .with_context(|| format!("config path has no parent: {}", configPath.display()))?;
 
-    fs::create_dir_all(&projectDir)
+    fs::create_dir_all(projectDir)
         .with_context(|| format!("failed to create {}", projectDir.display()))?;
 
     let existing = if configPath.exists() {
-        fs::read_to_string(&configPath)
+        fs::read_to_string(configPath)
             .with_context(|| format!("failed to read {}", configPath.display()))?
     } else {
         String::new()
@@ -1394,7 +1392,7 @@ fn saveModelProfileToPath(configPath: &Path, profileName: &str, model: &ModelCon
     profileTable.insert(profileName.to_string(), modelValue);
 
     let output = toml::to_string_pretty(&doc).context("failed to serialize config")?;
-    fs::write(&configPath, output)
+    fs::write(configPath, output)
         .with_context(|| format!("failed to write {}", configPath.display()))?;
     Ok(())
 }

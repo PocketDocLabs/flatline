@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 //! S4 — deep recompaction (single LLM call).
 //!
 //! Last-resort recompression of the OLDER compacted layers when S1–S3

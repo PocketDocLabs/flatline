@@ -36,9 +36,9 @@ const DISSOLVE_TICKS: u32 = 8;
 
 fn bitsToGrid(bits: [u8; 8]) -> Grid {
     let mut grid = [[false; COLS]; ROWS];
-    for row in 0..ROWS {
-        for col in 0..COLS {
-            grid[row][col] = bits[row] & (0x80 >> col) != 0;
+    for (row, gridRow) in grid.iter_mut().enumerate().take(ROWS) {
+        for (col, cell) in gridRow.iter_mut().enumerate().take(COLS) {
+            *cell = bits[row] & (0x80 >> col) != 0;
         }
     }
     grid
@@ -148,12 +148,12 @@ pub struct Throbber {
 /// Generate an initial blob-shaped grid seeded from center.
 fn initGrid() -> Grid {
     let mut grid = [[false; COLS]; ROWS];
-    for row in 0..ROWS {
-        for col in 0..COLS {
+    for (row, gridRow) in grid.iter_mut().enumerate().take(ROWS) {
+        for (col, cell) in gridRow.iter_mut().enumerate().take(COLS) {
             let dx = col as f32 - CENTER_X;
             let dy = row as f32 - CENTER_Y;
             let dist = (dx * dx + dy * dy).sqrt();
-            grid[row][col] = dist < 2.8;
+            *cell = dist < 2.8;
         }
     }
     grid
@@ -192,7 +192,7 @@ impl Throbber {
                     self.shapeIdx = self
                         .forcedShape
                         .take()
-                        .unwrap_or_else(|| (self.seed as usize / 7) % SHAPE_COUNT);
+                        .unwrap_or((self.seed as usize / 7) % SHAPE_COUNT);
                     Phase::Forming(0)
                 } else {
                     self.ticksUntilShape -= 1;
@@ -293,8 +293,8 @@ impl Throbber {
         let edgeThreshold = -0.3 + leniency * 0.3; // -0.3 → 0.0
         let killDist = 4.5 + leniency * 0.5; // 4.5 → 5.0
 
-        for row in 0..ROWS {
-            for col in 0..COLS {
+        for (row, nextRow) in next.iter_mut().enumerate().take(ROWS) {
+            for (col, cell) in nextRow.iter_mut().enumerate().take(COLS) {
                 let dx = col as f32 - CENTER_X;
                 let dy = row as f32 - CENTER_Y;
                 let dist = (dx * dx + dy * dy).sqrt();
@@ -302,19 +302,19 @@ impl Throbber {
 
                 // Core: spontaneous generation keeps the center alive.
                 if dist < coreRadius && noise > coreThreshold {
-                    next[row][col] = true;
+                    *cell = true;
                 }
                 // Mid-ring: occasional spontaneous generation.
-                if dist < midRadius && !next[row][col] && noise > midThreshold {
-                    next[row][col] = true;
+                if dist < midRadius && !*cell && noise > midThreshold {
+                    *cell = true;
                 }
                 // Edges: cull to prevent infinite growth.
                 if dist > edgeStart && noise > edgeThreshold {
-                    next[row][col] = false;
+                    *cell = false;
                 }
                 // Hard kill past outer boundary.
                 if dist > killDist {
-                    next[row][col] = false;
+                    *cell = false;
                 }
             }
         }
@@ -328,8 +328,8 @@ impl Throbber {
         let mut result = [[false; COLS]; ROWS];
         let maxDist: f32 = 5.0;
 
-        for row in 0..ROWS {
-            for col in 0..COLS {
+        for (row, resultRow) in result.iter_mut().enumerate().take(ROWS) {
+            for (col, cell) in resultRow.iter_mut().enumerate().take(COLS) {
                 let dx = col as f32 - CENTER_X;
                 let dy = row as f32 - CENTER_Y;
                 let dist = (dx * dx + dy * dy).sqrt();
@@ -340,7 +340,7 @@ impl Throbber {
                 let noise = self.noise(col as u32, row as u32) * 0.25;
                 let cellBlend = (cellBlend + noise).clamp(0.0, 1.0);
 
-                result[row][col] = if cellBlend > 0.5 {
+                *cell = if cellBlend > 0.5 {
                     target[row][col]
                 } else {
                     source[row][col]
@@ -365,10 +365,10 @@ impl Throbber {
 /// Advance a Game of Life grid by one generation (no wrapping).
 fn stepGol(grid: &Grid) -> Grid {
     let mut next = [[false; COLS]; ROWS];
-    for row in 0..ROWS {
-        for col in 0..COLS {
+    for (row, nextRow) in next.iter_mut().enumerate().take(ROWS) {
+        for (col, cell) in nextRow.iter_mut().enumerate().take(COLS) {
             let n = golNeighbors(grid, row, col);
-            next[row][col] = matches!((grid[row][col], n), (true, 2) | (true, 3) | (false, 3));
+            *cell = matches!((grid[row][col], n), (true, 2) | (true, 3) | (false, 3));
         }
     }
     next

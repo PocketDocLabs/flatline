@@ -14,6 +14,7 @@
 //! # Dependencies
 //! `ratatui`
 
+use construct::control::McpServerStatusEntry;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
@@ -81,7 +82,7 @@ impl McpPanel {
     ///     searchMode: Whether tool search mode is active.
     ///     configPath: Resolved path to the config file.
     pub fn new(
-        servers: Vec<(String, String, usize, Vec<(String, String)>, String)>,
+        servers: Vec<McpServerStatusEntry>,
         totalTools: usize,
         searchMode: bool,
         configPath: String,
@@ -641,10 +642,10 @@ fn stateIndicator(state: &str) -> (&'static str, Color) {
 /// Strip the `mcp__serverName__` prefix from a qualified tool name.
 fn stripPrefix(qualifiedName: &str) -> &str {
     // Format: mcp__{server}__{tool}
-    if let Some(rest) = qualifiedName.strip_prefix("mcp__") {
-        if let Some(pos) = rest.find("__") {
-            return &rest[pos + 2..];
-        }
+    if let Some(rest) = qualifiedName.strip_prefix("mcp__")
+        && let Some(pos) = rest.find("__")
+    {
+        return &rest[pos + 2..];
     }
     qualifiedName
 }

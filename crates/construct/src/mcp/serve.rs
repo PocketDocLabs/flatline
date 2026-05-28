@@ -275,7 +275,7 @@ impl FlatlineServer {
         Parameters(params): Parameters<ListDirParams>,
     ) -> Result<CallToolResult, McpError> {
         let dirPath = params.path.as_deref().unwrap_or(".");
-        let maxDepth = params.depth.unwrap_or(2).min(5).max(1);
+        let maxDepth = params.depth.unwrap_or(2).clamp(1, 5);
 
         let mut cmd = tokio::process::Command::new("find");
         cmd.arg(dirPath)

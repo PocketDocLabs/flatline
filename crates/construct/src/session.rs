@@ -28,7 +28,7 @@ use crate::compaction::CompactionLog;
 use crate::compaction_trigger;
 use crate::config::Config;
 use crate::context;
-use crate::control::{LogEvent, PermitOrigin, SessionRequest};
+use crate::control::{LogEvent, McpServerStatusEntry, PermitOrigin, SessionRequest};
 use crate::jobs::JobPlane;
 use crate::lsp;
 use crate::mcp;
@@ -119,6 +119,7 @@ pub struct Rider {
 /// 3. Completion calls `handle.complete(...)` / `handle.killed()` /
 ///    `handle.errored(...)` so the JobPlane's state machine and the
 ///    tasks panel both reflect the outcome.
+#[allow(clippy::too_many_arguments)]
 async fn runSubagentTaskInBackground(
     mut child: Session,
     childMainIo: crate::shell::ShellIo,
@@ -316,10 +317,7 @@ async fn runSubagentTaskInBackground(
     drop(childLogTx);
     drop(childRequestTx);
 
-    let (rawContent, turns) = match logHandle.await {
-        Ok(r) => r,
-        Err(_) => (String::new(), 0),
-    };
+    let (rawContent, turns) = logHandle.await.unwrap_or_default();
     let _ = permitHandle.await;
     cancelBridge.abort();
 
@@ -682,7 +680,7 @@ impl Session {
         interface: InterfaceMode,
         domains: &[DomainModule],
     ) -> Result<Self> {
-        let client = api::Client::new(&config)?;
+        let client = api::Client::new(config)?;
         let tools = tool::builtinDefs();
 
         let reasoning = config.heavy.reasoning.as_ref().map(|r| ReasoningConfig {
@@ -818,7 +816,7 @@ impl Session {
             std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
         ),
     > {
-        let client = match api::Client::new(&config) {
+        let client = match api::Client::new(config) {
             Ok(c) => c,
             Err(e) => return Err((e, shells)),
         };
@@ -853,12 +851,11 @@ impl Session {
             .or_else(|| transcript.lastTurnId());
 
         // Set the transcript's append point to the active branch head.
-        if let Some(ref head) = headTurnId {
-            if let Ok(allTurns) = transcript.loadAll() {
-                if let Some(headTurn) = allTurns.iter().find(|t| t.id == *head) {
-                    transcript.setHead(head, &headTurn.blockId);
-                }
-            }
+        if let Some(ref head) = headTurnId
+            && let Ok(allTurns) = transcript.loadAll()
+            && let Some(headTurn) = allTurns.iter().find(|t| t.id == *head)
+        {
+            transcript.setHead(head, &headTurn.blockId);
         }
 
         // Reconstruct conversation from the active branch.
@@ -911,17 +908,15 @@ impl Session {
             } = msg
             {
                 for call in calls {
-                    if call.function.name == "readFile" {
-                        if let Ok(args) =
+                    if call.function.name == "readFile"
+                        && let Ok(args) =
                             serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                        {
-                            if let Some(path) = args["path"].as_str() {
-                                let norm = normalizePath(path);
-                                if let Ok(bytes) = std::fs::read(&norm) {
-                                    let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                    filesRead.insert(norm, digest);
-                                }
-                            }
+                        && let Some(path) = args["path"].as_str()
+                    {
+                        let norm = normalizePath(path);
+                        if let Ok(bytes) = std::fs::read(&norm) {
+                            let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
+                            filesRead.insert(norm, digest);
                         }
                     }
                 }
@@ -1386,19 +1381,15 @@ impl Session {
 
             // Walk headTurnId back to the user turn so the new assistant's
             // transcript entry parents onto the user, not the errored turn.
-            if let Some(erroredId) = self.headTurnId.clone() {
-                if let Ok(turns) = self.transcript.loadAll() {
-                    if let Some(t) = turns.iter().find(|t| t.id == erroredId) {
-                        if matches!(t.role, crate::transcript::TurnRole::Assistant) {
-                            if let Some(parentId) = t.parentId.clone() {
-                                if let Some(parent) = turns.iter().find(|t| t.id == parentId) {
-                                    self.transcript.setHead(&parentId, &parent.blockId);
-                                    self.headTurnId = Some(parentId);
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(erroredId) = self.headTurnId.clone()
+                && let Ok(turns) = self.transcript.loadAll()
+                && let Some(t) = turns.iter().find(|t| t.id == erroredId)
+                && matches!(t.role, crate::transcript::TurnRole::Assistant)
+                && let Some(parentId) = t.parentId.clone()
+                && let Some(parent) = turns.iter().find(|t| t.id == parentId)
+            {
+                self.transcript.setHead(&parentId, &parent.blockId);
+                self.headTurnId = Some(parentId);
             }
 
             tracing::info!("retrying last turn");
@@ -1546,17 +1537,17 @@ impl Session {
                             self.compactionTracker.updateTokens(tokens);
                         }
                         // Hard budget enforcement.
-                        if let Some(limit) = self.maxBudgetUsd {
-                            if self.costTracker.sessionCost() >= limit {
-                                let msg = format!(
-                                    "Budget limit reached ({} / {}). Stopping.",
-                                    crate::cost::formatCost(self.costTracker.sessionCost()),
-                                    crate::cost::formatCost(limit),
-                                );
-                                tracing::warn!(%msg, "hard budget limit hit");
-                                let _ = logTx.send(LogEvent::Error(msg)).await;
-                                break 'turns Ok(());
-                            }
+                        if let Some(limit) = self.maxBudgetUsd
+                            && self.costTracker.sessionCost() >= limit
+                        {
+                            let msg = format!(
+                                "Budget limit reached ({} / {}). Stopping.",
+                                crate::cost::formatCost(self.costTracker.sessionCost()),
+                                crate::cost::formatCost(limit),
+                            );
+                            tracing::warn!(%msg, "hard budget limit hit");
+                            let _ = logTx.send(LogEvent::Error(msg)).await;
+                            break 'turns Ok(());
                         }
                         tracing::info!(
                             callCount = calls.len(),
@@ -1701,8 +1692,8 @@ impl Session {
                                                                 allow: true,
                                                             });
                                                             // Persist to .flatline/config.toml if we have a project root.
-                                                            if let Some(ref root) = self.config.projectRoot {
-                                                                if let Err(e) = crate::config::persistPermissionRule(
+                                                            if let Some(ref root) = self.config.projectRoot
+                                                                && let Err(e) = crate::config::persistPermissionRule(
                                                                     root,
                                                                     &self.permissions,
                                                                     toolName,
@@ -1711,7 +1702,6 @@ impl Session {
                                                                 ) {
                                                                     tracing::warn!("failed to persist permission rule: {e}");
                                                                 }
-                                                            }
                                                             true
                                                         }
                                                         Ok(PermitResponse::AlwaysDeny { pattern }) => {
@@ -1727,8 +1717,8 @@ impl Session {
                                                                 pattern: rulePattern,
                                                                 allow: false,
                                                             });
-                                                            if let Some(ref root) = self.config.projectRoot {
-                                                                if let Err(e) = crate::config::persistPermissionRule(
+                                                            if let Some(ref root) = self.config.projectRoot
+                                                                && let Err(e) = crate::config::persistPermissionRule(
                                                                     root,
                                                                     &self.permissions,
                                                                     toolName,
@@ -1737,7 +1727,6 @@ impl Session {
                                                                 ) {
                                                                     tracing::warn!("failed to persist deny rule: {e}");
                                                                 }
-                                                            }
                                                             false
                                                         }
                                                         // Deny or disconnected reply → reject.
@@ -1776,10 +1765,8 @@ impl Session {
                             };
 
                             // Revert pre-emptive LSP notification if denied/aborted.
-                            if !approved {
-                                if let Some((ref path, ref original)) = lspPreemptive {
-                                    self.lspManager.touchFile(path, original).await;
-                                }
+                            if !approved && let Some((ref path, ref original)) = lspPreemptive {
+                                self.lspManager.touchFile(path, original).await;
                             }
 
                             if aborted {
@@ -1797,25 +1784,25 @@ impl Session {
                             }
 
                             // Guard: editFile/writeFile require a prior readFile of the same path.
-                            if approved {
-                                if let Some(ref rejection) = self.checkReadBeforeWrite(&action) {
-                                    tracing::info!(
-                                        tool = %call.function.name,
-                                        "rejected: file not read first"
-                                    );
-                                    // Revert pre-emptive LSP notification.
-                                    if let Some((ref path, ref original)) = lspPreemptive {
-                                        self.lspManager.touchFile(path, original).await;
-                                    }
-                                    let _ = logTx
-                                        .send(LogEvent::ToolResult {
-                                            name: call.function.name.clone(),
-                                            output: rejection.clone(),
-                                        })
-                                        .await;
-                                    self.pushToolResult(&call.id, rejection.clone().into());
-                                    continue;
+                            if approved
+                                && let Some(ref rejection) = self.checkReadBeforeWrite(&action)
+                            {
+                                tracing::info!(
+                                    tool = %call.function.name,
+                                    "rejected: file not read first"
+                                );
+                                // Revert pre-emptive LSP notification.
+                                if let Some((ref path, ref original)) = lspPreemptive {
+                                    self.lspManager.touchFile(path, original).await;
                                 }
+                                let _ = logTx
+                                    .send(LogEvent::ToolResult {
+                                        name: call.function.name.clone(),
+                                        output: rejection.clone(),
+                                    })
+                                    .await;
+                                self.pushToolResult(&call.id, rejection.clone().into());
+                                continue;
                             }
 
                             let output = if approved {
@@ -1951,7 +1938,7 @@ impl Session {
                                                     // shell driver. Idempotency is the caller's problem.
                                                     let buildConverted = |jobId: u64, elapsed: u64, userBg: bool, partial: &str| {
                                                 let trigger = if userBg {
-                                                    format!("you pressed Ctrl+B")
+                                                    "you pressed Ctrl+B".to_string()
                                                 } else {
                                                     format!("the shell exceeded its {elapsed}s timeout")
                                                 };
@@ -2112,31 +2099,28 @@ impl Session {
                             };
 
                             // Track file reads for the edit gate (hash for staleness detection).
-                            if call.function.name == "readFile" {
-                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                            if call.function.name == "readFile"
+                                && let Ok(args) = serde_json::from_str::<serde_json::Value>(
                                     &call.function.arguments,
-                                ) {
-                                    if let Some(path) = args["path"].as_str() {
-                                        let norm = normalizePath(path);
-                                        if let Ok(bytes) = std::fs::read(&norm) {
-                                            let digest =
-                                                sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                            self.filesRead.insert(norm.clone(), digest);
-                                        }
-                                        // Sync file with LSP server (lazy spawn if needed).
-                                        if let Ok(content) = std::fs::read_to_string(&norm) {
-                                            if let Some(hint) =
-                                                self.lspManager.touchFile(&norm, &content).await
-                                            {
-                                                let _ = logTx
-                                                    .send(LogEvent::LspHint {
-                                                        serverId: hint.serverId,
-                                                        installHint: hint.installHint,
-                                                    })
-                                                    .await;
-                                            }
-                                        }
-                                    }
+                                )
+                                && let Some(path) = args["path"].as_str()
+                            {
+                                let norm = normalizePath(path);
+                                if let Ok(bytes) = std::fs::read(&norm) {
+                                    let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
+                                    self.filesRead.insert(norm.clone(), digest);
+                                }
+                                // Sync file with LSP server (lazy spawn if needed).
+                                if let Ok(content) = std::fs::read_to_string(&norm)
+                                    && let Some(hint) =
+                                        self.lspManager.touchFile(&norm, &content).await
+                                {
+                                    let _ = logTx
+                                        .send(LogEvent::LspHint {
+                                            serverId: hint.serverId,
+                                            installHint: hint.installHint,
+                                        })
+                                        .await;
                                 }
                             }
 
@@ -2144,18 +2128,14 @@ impl Session {
                             if matches!(
                                 call.function.name.as_str(),
                                 "editFile" | "writeFile" | "multiEdit"
-                            ) {
-                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                    &call.function.arguments,
-                                ) {
-                                    if let Some(path) = args["path"].as_str() {
-                                        let norm = normalizePath(path);
-                                        if let Ok(bytes) = std::fs::read(&norm) {
-                                            let digest =
-                                                sha1_smol::Sha1::from(&bytes).digest().bytes();
-                                            self.filesRead.insert(norm, digest);
-                                        }
-                                    }
+                            ) && let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                && let Some(path) = args["path"].as_str()
+                            {
+                                let norm = normalizePath(path);
+                                if let Ok(bytes) = std::fs::read(&norm) {
+                                    let digest = sha1_smol::Sha1::from(&bytes).digest().bytes();
+                                    self.filesRead.insert(norm, digest);
                                 }
                             }
 
@@ -2165,53 +2145,48 @@ impl Session {
                             if matches!(
                                 call.function.name.as_str(),
                                 "editFile" | "writeFile" | "multiEdit"
-                            ) {
-                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                    &call.function.arguments,
-                                ) {
-                                    if let Some(path) = args["path"].as_str() {
-                                        // Baseline: cached diagnostics from before the edit
-                                        // (populated by the pre-emptive touchFile or prior reads).
-                                        let baseline =
-                                            self.lspManager.getRawCachedDiagnostics(path);
+                            ) && let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                && let Some(path) = args["path"].as_str()
+                            {
+                                // Baseline: cached diagnostics from before the edit
+                                // (populated by the pre-emptive touchFile or prior reads).
+                                let baseline = self.lspManager.getRawCachedDiagnostics(path);
 
-                                        let content =
-                                            std::fs::read_to_string(path).unwrap_or_default();
-                                        let (postEdit, hint) = self
-                                            .lspManager
-                                            .getRawDiagnostics(
-                                                path,
-                                                &content,
-                                                std::time::Duration::from_secs(10),
-                                            )
-                                            .await;
+                                let content = std::fs::read_to_string(path).unwrap_or_default();
+                                let (postEdit, hint) = self
+                                    .lspManager
+                                    .getRawDiagnostics(
+                                        path,
+                                        &content,
+                                        std::time::Duration::from_secs(10),
+                                    )
+                                    .await;
 
-                                        // Multiset diff: only new errors survive.
-                                        let newErrors =
-                                            lsp::diagnostics::diffDiagnostics(&baseline, &postEdit);
-                                        if !newErrors.is_empty() {
-                                            let formatted = lsp::diagnostics::formatDiagnostics(
-                                                path,
-                                                &newErrors,
-                                                async_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                                            );
-                                            if !formatted.is_empty() {
-                                                // Append diagnostics to text content.
-                                                let mut text = output.textContent().to_string();
-                                                text.push_str("\n\nNew LSP errors after edit:\n");
-                                                text.push_str(&formatted);
-                                                output = crate::message::Content::text(text);
-                                            }
-                                        }
-                                        if let Some(hint) = hint {
-                                            let _ = logTx
-                                                .send(LogEvent::LspHint {
-                                                    serverId: hint.serverId,
-                                                    installHint: hint.installHint,
-                                                })
-                                                .await;
-                                        }
+                                // Multiset diff: only new errors survive.
+                                let newErrors =
+                                    lsp::diagnostics::diffDiagnostics(&baseline, &postEdit);
+                                if !newErrors.is_empty() {
+                                    let formatted = lsp::diagnostics::formatDiagnostics(
+                                        path,
+                                        &newErrors,
+                                        async_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                                    );
+                                    if !formatted.is_empty() {
+                                        // Append diagnostics to text content.
+                                        let mut text = output.textContent().to_string();
+                                        text.push_str("\n\nNew LSP errors after edit:\n");
+                                        text.push_str(&formatted);
+                                        output = crate::message::Content::text(text);
                                     }
+                                }
+                                if let Some(hint) = hint {
+                                    let _ = logTx
+                                        .send(LogEvent::LspHint {
+                                            serverId: hint.serverId,
+                                            installHint: hint.installHint,
+                                        })
+                                        .await;
                                 }
                             }
 
@@ -2418,8 +2393,7 @@ impl Session {
                             }
                             if let Some((toolName, argsStr)) =
                                 toolAccum.pendingCall(index)
-                            {
-                                if let Some(preview) =
+                                && let Some(preview) =
                                     crate::tool_preview::previewForTool(
                                         toolName, argsStr,
                                     )
@@ -2435,7 +2409,6 @@ impl Session {
                                             .await;
                                     }
                                 }
-                            }
                         }
                         Some(StreamEvent::Done { usage, finishReason }) => {
                             if let Some(u) = usage {
@@ -2567,30 +2540,32 @@ impl Session {
         // `</scratchpad` w/ no `>`), the streaming extractor flushes the
         // entire buffer as reasoning and the visible answer is lost. Scan
         // the reasoning tail for a malformed close and split it back out.
-        if self.config.heavy.promptThinking && contentBuf.is_empty() && !reasoningBuf.is_empty() {
-            if let Some(recovery) = crate::text::recoverScratchpadClose(&reasoningBuf) {
-                let recoveredChars = recovery.content.chars().count();
-                let snippet: String = recovery.content.chars().take(80).collect::<String>();
-                let snippet = if recoveredChars > 80 {
-                    format!("{snippet}…")
-                } else {
-                    snippet
-                };
-                tracing::info!(
-                    matchedTag = %recovery.matchedTag,
+        if self.config.heavy.promptThinking
+            && contentBuf.is_empty()
+            && !reasoningBuf.is_empty()
+            && let Some(recovery) = crate::text::recoverScratchpadClose(&reasoningBuf)
+        {
+            let recoveredChars = recovery.content.chars().count();
+            let snippet: String = recovery.content.chars().take(80).collect::<String>();
+            let snippet = if recoveredChars > 80 {
+                format!("{snippet}…")
+            } else {
+                snippet
+            };
+            tracing::info!(
+                matchedTag = %recovery.matchedTag,
+                recoveredChars,
+                "recovered malformed scratchpad close"
+            );
+            contentBuf = recovery.content;
+            reasoningBuf = recovery.reasoning;
+            let _ = tx
+                .send(LogEvent::ScratchpadRecovered {
+                    matchedTag: recovery.matchedTag,
+                    snippet,
                     recoveredChars,
-                    "recovered malformed scratchpad close"
-                );
-                contentBuf = recovery.content;
-                reasoningBuf = recovery.reasoning;
-                let _ = tx
-                    .send(LogEvent::ScratchpadRecovered {
-                        matchedTag: recovery.matchedTag,
-                        snippet,
-                        recoveredChars,
-                    })
-                    .await;
-            }
+                })
+                .await;
         }
 
         let calls = toolAccum.finish();
@@ -2614,15 +2589,15 @@ impl Session {
                 })
                 .await;
             // Check budget warning threshold.
-            if let Some(limit) = self.config.budget.sessionLimit {
-                if self.costTracker.checkWarning(limit) {
-                    let _ = tx
-                        .send(LogEvent::BudgetWarning {
-                            sessionCost: self.costTracker.sessionCost(),
-                            limit,
-                        })
-                        .await;
-                }
+            if let Some(limit) = self.config.budget.sessionLimit
+                && self.costTracker.checkWarning(limit)
+            {
+                let _ = tx
+                    .send(LogEvent::BudgetWarning {
+                        sessionCost: self.costTracker.sessionCost(),
+                        limit,
+                    })
+                    .await;
             }
 
             // Cache watchdog: if we requested caching and this isn't the
@@ -2831,22 +2806,21 @@ impl Session {
         );
         if s1Result.didWork {
             let afterTurn = self.headTurnId.clone().unwrap_or_default();
-            if !s1Result.dedupedCallIds.is_empty() {
-                if let Err(e) = self
+            if !s1Result.dedupedCallIds.is_empty()
+                && let Err(e) = self
                     .compactionLog
                     .recordFileDedup(s1Result.dedupedCallIds.clone(), &afterTurn)
-                {
-                    tracing::warn!("compaction log write failed: {e}");
-                }
+            {
+                tracing::warn!("compaction log write failed: {e}");
             }
-            if !s1Result.middleOutCallIds.is_empty() {
-                if let Err(e) = self.compactionLog.recordMiddleOut(
+            if !s1Result.middleOutCallIds.is_empty()
+                && let Err(e) = self.compactionLog.recordMiddleOut(
                     s1Result.middleOutCallIds.clone(),
                     &afterTurn,
                     s1Result.middleOutThreshold,
-                ) {
-                    tracing::warn!("compaction log write failed: {e}");
-                }
+                )
+            {
+                tracing::warn!("compaction log write failed: {e}");
             }
             for path in &s1Result.invalidatedFiles {
                 self.filesRead.remove(path);
@@ -3517,13 +3491,10 @@ impl Session {
                             }
 
                             // Indicate attachments.
-                            if let Some(ref atts) = turn.attachments {
-                                if !atts.is_empty() {
-                                    output.push_str(&format!(
-                                        "[+{} image(s) attached]\n",
-                                        atts.len()
-                                    ));
-                                }
+                            if let Some(ref atts) = turn.attachments
+                                && !atts.is_empty()
+                            {
+                                output.push_str(&format!("[+{} image(s) attached]\n", atts.len()));
                             }
                             output.push('\n');
                         }
@@ -3542,7 +3513,7 @@ impl Session {
                             // Filter by mediaType if specified.
                             if let Some(mt) = mediaType {
                                 let hasMatchingMedia =
-                                    turn.attachments.as_ref().map_or(false, |atts| {
+                                    turn.attachments.as_ref().is_some_and(|atts| {
                                         atts.iter().any(|a| a.mimeType.starts_with(mt.as_str()))
                                     });
                                 if !hasMatchingMedia {
@@ -3717,11 +3688,11 @@ impl Session {
             .collect();
 
         let mcpPrompt = prompt::mcpSection(&serverInfos, searchMode);
-        if !mcpPrompt.is_empty() {
-            if let Some(Message::System { content }) = self.history.first_mut() {
-                content.push_str("\n\n");
-                content.push_str(&mcpPrompt);
-            }
+        if !mcpPrompt.is_empty()
+            && let Some(Message::System { content }) = self.history.first_mut()
+        {
+            content.push_str("\n\n");
+            content.push_str(&mcpPrompt);
         }
 
         self.mcpManager = Some(mgr);
@@ -4189,7 +4160,7 @@ impl Session {
 
         let registry = mgr.registry().read().await;
 
-        let servers: Vec<(String, String, usize, Vec<(String, String)>, String)> = statuses
+        let servers: Vec<McpServerStatusEntry> = statuses
             .iter()
             .map(|s| {
                 let stateStr = format!("{:?}", s.state);
@@ -4444,10 +4415,10 @@ impl Session {
         }
 
         // Set transcript append point to the rewind target.
-        if let Ok(allTurns) = self.transcript.loadAll() {
-            if let Some(turn) = allTurns.iter().find(|t| t.id == targetTurnId) {
-                self.transcript.setHead(targetTurnId, &turn.blockId);
-            }
+        if let Ok(allTurns) = self.transcript.loadAll()
+            && let Some(turn) = allTurns.iter().find(|t| t.id == targetTurnId)
+        {
+            self.transcript.setHead(targetTurnId, &turn.blockId);
         }
 
         // Rebuild history.
@@ -4523,10 +4494,10 @@ impl Session {
         }
 
         // Set transcript append point.
-        if let Ok(allTurns) = self.transcript.loadAll() {
-            if let Some(turn) = allTurns.iter().find(|t| t.id == fork.headTurn) {
-                self.transcript.setHead(&fork.headTurn, &turn.blockId);
-            }
+        if let Ok(allTurns) = self.transcript.loadAll()
+            && let Some(turn) = allTurns.iter().find(|t| t.id == fork.headTurn)
+        {
+            self.transcript.setHead(&fork.headTurn, &turn.blockId);
         }
 
         // Rebuild.

@@ -95,8 +95,11 @@ pub fn buildExample(
         None
     } else {
         let mut traces: Vec<String> = Vec::new();
-        for i in segment.anchorIdx..=segment.lastAsstIdx {
-            let t = &branch[i];
+        for t in branch
+            .iter()
+            .take(segment.lastAsstIdx + 1)
+            .skip(segment.anchorIdx)
+        {
             if matches!(t.role, TurnRole::Assistant) {
                 traces.push(t.reasoning.clone().unwrap_or_default());
             }

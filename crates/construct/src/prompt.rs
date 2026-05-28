@@ -48,12 +48,11 @@ pub fn build(interface: InterfaceMode, domains: &[DomainModule], promptThinking:
     // Static region — byte-stable across processes in the same profile.
     let mut staticParts = Vec::with_capacity(3 + domains.len());
     let mut persona = basePersona();
-    if promptThinking {
-        if let (Some(start), Some(end)) = (persona.find("<thinking>"), persona.find("</thinking>"))
-        {
-            let endTag = end + "</thinking>".len();
-            persona.replace_range(start..endTag, &thinkingPromptWithScratchpad());
-        }
+    if promptThinking
+        && let (Some(start), Some(end)) = (persona.find("<thinking>"), persona.find("</thinking>"))
+    {
+        let endTag = end + "</thinking>".len();
+        persona.replace_range(start..endTag, &thinkingPromptWithScratchpad());
     }
     staticParts.push(persona);
     staticParts.push(interfaceModule(interface));

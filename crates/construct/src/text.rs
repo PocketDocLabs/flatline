@@ -19,13 +19,12 @@ pub fn sanitizeVariationSelectors(input: &str) -> String {
     let mut prev: Option<char> = None;
 
     for ch in input.chars() {
-        if ch == '\u{FE0E}' {
-            if let Some(p) = prev {
-                if isEmojiPresentation(p) {
-                    // Drop the selector — no text glyph exists.
-                    continue;
-                }
-            }
+        if ch == '\u{FE0E}'
+            && let Some(p) = prev
+            && isEmojiPresentation(p)
+        {
+            // Drop the selector — no text glyph exists.
+            continue;
         }
         out.push(ch);
         prev = Some(ch);

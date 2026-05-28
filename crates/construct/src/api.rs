@@ -254,12 +254,11 @@ impl Client {
         // tokens on mechanical utility calls (topic naming, compaction).
         // Honour the utility profile's reasoning.effort — including
         // "disabled" — so the operator can opt out.
-        if self.utility.provider == "deepseek" {
-            if let Some(ref settings) = self.utility.reasoning {
-                if let Some(ref effort) = settings.effort {
-                    body["thinking"] = deepseekThinking(effort);
-                }
-            }
+        if self.utility.provider == "deepseek"
+            && let Some(ref settings) = self.utility.reasoning
+            && let Some(ref effort) = settings.effort
+        {
+            body["thinking"] = deepseekThinking(effort);
         }
 
         tracing::debug!(
@@ -545,17 +544,17 @@ fn responsesInput(messages: &[Message]) -> (String, Vec<serde_json::Value>) {
                 tool_calls,
                 reasoning: _,
             } => {
-                if let Some(text) = content {
-                    if !text.is_empty() {
-                        input.push(serde_json::json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": text,
-                            }],
-                        }));
-                    }
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text,
+                        }],
+                    }));
                 }
 
                 if let Some(calls) = tool_calls {
@@ -649,10 +648,9 @@ fn injectCacheControl(messages: &mut serde_json::Value) {
     if let Some(sys) = arr
         .iter_mut()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        && !splitSystemAtBoundary(sys)
     {
-        if !splitSystemAtBoundary(sys) {
-            markContentBlock(sys, Ttl::FiveMin);
-        }
+        markContentBlock(sys, Ttl::FiveMin);
     }
 
     // Rolling marker — last user message in the array. Always 5m.
@@ -736,10 +734,10 @@ fn markContentBlock(msg: &mut serde_json::Value, ttl: Ttl) {
             }]);
         }
         serde_json::Value::Array(blocks) => {
-            if let Some(last) = blocks.last_mut() {
-                if let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".into(), cacheControlJson(ttl));
-                }
+            if let Some(last) = blocks.last_mut()
+                && let Some(obj) = last.as_object_mut()
+            {
+                obj.insert("cache_control".into(), cacheControlJson(ttl));
             }
         }
         _ => {}
@@ -777,16 +775,15 @@ fn warnIfProviderNotPinned(cfg: &ModelConfig) {
 /// so the internal Message type stays provider-agnostic.
 fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
     let mut value = serde_json::to_value(messages).unwrap_or_default();
-    if provider == "fireworks" || provider == "deepseek" {
-        if let serde_json::Value::Array(ref mut arr) = value {
-            for msg in arr.iter_mut() {
-                if let serde_json::Value::Object(map) = msg {
-                    if map.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                        if let Some(reasoning) = map.remove("reasoning") {
-                            map.insert("reasoning_content".to_string(), reasoning);
-                        }
-                    }
-                }
+    if (provider == "fireworks" || provider == "deepseek")
+        && let serde_json::Value::Array(ref mut arr) = value
+    {
+        for msg in arr.iter_mut() {
+            if let serde_json::Value::Object(map) = msg
+                && map.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && let Some(reasoning) = map.remove("reasoning")
+            {
+                map.insert("reasoning_content".to_string(), reasoning);
             }
         }
     }
@@ -1075,18 +1072,17 @@ fn parseResponseOutputItem(
         arguments: None,
     }];
 
-    if !state.emittedArgs.contains(&index) {
-        if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-            if !args.is_empty() {
-                state.emittedArgs.insert(index);
-                events.push(StreamEvent::ToolCallDelta {
-                    index,
-                    id: entry.id.clone(),
-                    name: entry.name.clone(),
-                    arguments: Some(args.to_string()),
-                });
-            }
-        }
+    if !state.emittedArgs.contains(&index)
+        && let Some(args) = item.get("arguments").and_then(|v| v.as_str())
+        && !args.is_empty()
+    {
+        state.emittedArgs.insert(index);
+        events.push(StreamEvent::ToolCallDelta {
+            index,
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            arguments: Some(args.to_string()),
+        });
     }
 
     events
@@ -1197,9 +1193,9 @@ impl ThinkingExtractor {
                     return vec![];
                 }
 
-                if trimmed.starts_with(OPEN_TAG) {
+                if let Some(stripped) = trimmed.strip_prefix(OPEN_TAG) {
                     // Tag found. Everything after it is reasoning.
-                    let after = trimmed[OPEN_TAG.len()..].to_string();
+                    let after = stripped.to_string();
                     self.state = ThinkingState::Thinking(String::new());
                     if after.is_empty() {
                         return vec![];
@@ -1340,11 +1336,11 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
     if let Some(choices) = chunk.choices {
         for choice in choices {
             if let Some(delta) = choice.delta {
-                if let Some(content) = delta.content {
-                    if !content.is_empty() {
-                        tracing::trace!(len = content.len(), "content delta");
-                        events.push(StreamEvent::ContentDelta(content));
-                    }
+                if let Some(content) = delta.content
+                    && !content.is_empty()
+                {
+                    tracing::trace!(len = content.len(), "content delta");
+                    events.push(StreamEvent::ContentDelta(content));
                 }
 
                 // Reasoning tokens arrive under different field names per provider:
@@ -1355,41 +1351,32 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
                 let mut hadReasoning = false;
 
                 // Simple reasoning field (OpenRouter).
-                if let Some(reasoning) = delta.reasoning {
-                    if !reasoning.is_empty() {
-                        tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning)");
-                        events.push(StreamEvent::ReasoningDelta(reasoning));
-                        hadReasoning = true;
-                    }
+                if let Some(reasoning) = delta.reasoning
+                    && !reasoning.is_empty()
+                {
+                    tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning)");
+                    events.push(StreamEvent::ReasoningDelta(reasoning));
+                    hadReasoning = true;
                 }
 
                 // Fireworks reasoning_content field.
-                if !hadReasoning {
-                    if let Some(reasoning) = delta.reasoning_content {
-                        if !reasoning.is_empty() {
-                            tracing::trace!(
-                                len = reasoning.len(),
-                                "reasoning delta (reasoning_content)"
-                            );
-                            events.push(StreamEvent::ReasoningDelta(reasoning));
-                            hadReasoning = true;
-                        }
-                    }
+                if !hadReasoning
+                    && let Some(reasoning) = delta.reasoning_content
+                    && !reasoning.is_empty()
+                {
+                    tracing::trace!(len = reasoning.len(), "reasoning delta (reasoning_content)");
+                    events.push(StreamEvent::ReasoningDelta(reasoning));
+                    hadReasoning = true;
                 }
 
                 // Structured reasoning details (Claude via OpenRouter).
-                if !hadReasoning {
-                    if let Some(details) = delta.reasoning_details {
-                        for detail in details {
-                            if let Some(text) = detail.text {
-                                if !text.is_empty() {
-                                    tracing::trace!(
-                                        len = text.len(),
-                                        "reasoning delta (structured)"
-                                    );
-                                    events.push(StreamEvent::ReasoningDelta(text));
-                                }
-                            }
+                if !hadReasoning && let Some(details) = delta.reasoning_details {
+                    for detail in details {
+                        if let Some(text) = detail.text
+                            && !text.is_empty()
+                        {
+                            tracing::trace!(len = text.len(), "reasoning delta (structured)");
+                            events.push(StreamEvent::ReasoningDelta(text));
                         }
                     }
                 }

@@ -829,16 +829,16 @@ impl ModelPanel {
                 return PanelAction::None;
             }
         };
-        if let Some(max) = maxContextWindow {
-            if contextWindow > max {
-                self.notice = Some(format!("Context must be <= {}", formatContextInput(max)));
-                self.profileEdit = Some(ProfileEdit::Context {
-                    profile: profileName,
-                    text,
-                    maxContextWindow,
-                });
-                return PanelAction::None;
-            }
+        if let Some(max) = maxContextWindow
+            && contextWindow > max
+        {
+            self.notice = Some(format!("Context must be <= {}", formatContextInput(max)));
+            self.profileEdit = Some(ProfileEdit::Context {
+                profile: profileName,
+                text,
+                maxContextWindow,
+            });
+            return PanelAction::None;
         }
 
         let Some(profile) = self
@@ -1819,9 +1819,7 @@ fn cycleOptionalValue(current: Option<&str>, choices: &[&str]) -> Option<String>
     let Some(current) = current else {
         return choices.first().map(|value| (*value).to_string());
     };
-    let Some(idx) = choices.iter().position(|value| *value == current) else {
-        return None;
-    };
+    let idx = choices.iter().position(|value| *value == current)?;
     choices.get(idx + 1).map(|value| (*value).to_string())
 }
 
@@ -1937,13 +1935,13 @@ fn profileContextLabel(contextWindow: usize, maxContextWindow: Option<usize>) ->
 }
 
 fn formatContextInput(contextWindow: usize) -> String {
-    if contextWindow % 1_000_000 == 0 {
+    if contextWindow.is_multiple_of(1_000_000) {
         format!("{}m", contextWindow / 1_000_000)
-    } else if contextWindow % 100_000 == 0 && contextWindow >= 1_000_000 {
+    } else if contextWindow.is_multiple_of(100_000) && contextWindow >= 1_000_000 {
         let whole = contextWindow / 1_000_000;
         let tenth = (contextWindow % 1_000_000) / 100_000;
         format!("{whole}.{tenth}m")
-    } else if contextWindow % 1000 == 0 {
+    } else if contextWindow.is_multiple_of(1000) {
         format!("{}k", contextWindow / 1000)
     } else {
         contextWindow.to_string()
@@ -2150,6 +2148,7 @@ fn catalogNaturalWidth(
         + 5
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalogRow(
     columns: CatalogColumns,
     marker: &str,
@@ -2197,6 +2196,7 @@ fn profileNaturalWidth(
         + 5
 }
 
+#[allow(clippy::too_many_arguments)]
 fn profileRow(
     columns: ProfileColumns,
     marker: &str,

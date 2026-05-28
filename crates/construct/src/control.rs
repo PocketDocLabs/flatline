@@ -341,12 +341,16 @@ impl CommandAck {
 /// Snapshot of MCP server state for the `/mcp` panel.
 #[derive(Debug, Clone)]
 pub struct McpStatus {
-    /// Vec of (name, state, toolCount, tools: Vec<(qualifiedName, description)>, transport).
-    pub servers: Vec<(String, String, usize, Vec<(String, String)>, String)>,
+    pub servers: Vec<McpServerStatusEntry>,
     pub totalTools: usize,
     pub searchMode: bool,
     pub configPath: String,
 }
+
+/// (name, state, toolCount, tools, transport).
+pub type McpServerStatusEntry = (String, String, usize, Vec<McpToolStatusEntry>, String);
+/// (qualifiedName, description).
+pub type McpToolStatusEntry = (String, String);
 
 /// Snapshot of LSP server state for the `/lsp` panel.
 #[derive(Debug, Clone)]

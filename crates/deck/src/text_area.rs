@@ -126,13 +126,13 @@ impl TextArea {
             return;
         }
         // Backspace at the end of a paste region: delete the whole paste.
-        if let Some((start, end)) = self.pasteRegion {
-            if self.cursorPos == end {
-                self.text.drain(start..end);
-                self.cursorPos = start;
-                self.pasteRegion = None;
-                return;
-            }
+        if let Some((start, end)) = self.pasteRegion
+            && self.cursorPos == end
+        {
+            self.text.drain(start..end);
+            self.cursorPos = start;
+            self.pasteRegion = None;
+            return;
         }
         let prev = self.prevGraphemeBoundary(self.cursorPos);
         self.adjustPasteDelete(prev, self.cursorPos);
@@ -146,12 +146,12 @@ impl TextArea {
             return;
         }
         // Delete at the start of a paste region: delete the whole paste.
-        if let Some((start, end)) = self.pasteRegion {
-            if self.cursorPos == start {
-                self.text.drain(start..end);
-                self.pasteRegion = None;
-                return;
-            }
+        if let Some((start, end)) = self.pasteRegion
+            && self.cursorPos == start
+        {
+            self.text.drain(start..end);
+            self.pasteRegion = None;
+            return;
         }
         let next = self.nextGraphemeBoundary(self.cursorPos);
         self.adjustPasteDelete(self.cursorPos, next);
@@ -461,32 +461,32 @@ impl TextArea {
             .render(area, buf);
 
         // Apply selection highlight over rendered cells.
-        if self.pasteRegion.is_none() {
-            if let (Some(anchor), Some(end)) = (self.selAnchor, self.selEnd) {
-                let start = anchor.min(end);
-                let finish = anchor.max(end);
-                if start != finish {
-                    let (sv, sc) = self.byteToVisual(start, contentWidth);
-                    let (ev, ec) = self.byteToVisual(finish, contentWidth);
-                    let selStyle = Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(60, 60, 120));
+        if self.pasteRegion.is_none()
+            && let (Some(anchor), Some(end)) = (self.selAnchor, self.selEnd)
+        {
+            let start = anchor.min(end);
+            let finish = anchor.max(end);
+            if start != finish {
+                let (sv, sc) = self.byteToVisual(start, contentWidth);
+                let (ev, ec) = self.byteToVisual(finish, contentWidth);
+                let selStyle = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 60, 120));
 
-                    for vLine in sv..=ev {
-                        let row = vLine as i32 - self.scroll as i32;
-                        if row < 0 || row >= area.height as i32 {
-                            continue;
-                        }
-                        let cs = if vLine == sv { sc } else { 0 };
-                        let ce = if vLine == ev { ec } else { contentWidth };
-                        for col in cs..ce {
-                            let bufCol = area.x + 2 + col as u16;
-                            let bufRow = area.y + row as u16;
-                            if bufCol < area.x + area.width {
-                                if let Some(cell) = buf.cell_mut((bufCol, bufRow)) {
-                                    cell.set_style(selStyle);
-                                }
-                            }
+                for vLine in sv..=ev {
+                    let row = vLine as i32 - self.scroll as i32;
+                    if row < 0 || row >= area.height as i32 {
+                        continue;
+                    }
+                    let cs = if vLine == sv { sc } else { 0 };
+                    let ce = if vLine == ev { ec } else { contentWidth };
+                    for col in cs..ce {
+                        let bufCol = area.x + 2 + col as u16;
+                        let bufRow = area.y + row as u16;
+                        if bufCol < area.x + area.width
+                            && let Some(cell) = buf.cell_mut((bufCol, bufRow))
+                        {
+                            cell.set_style(selStyle);
                         }
                     }
                 }
@@ -498,31 +498,33 @@ impl TextArea {
 
     /// If cursor landed inside the paste region, jump to the start.
     fn skipPasteLeft(&mut self) {
-        if let Some((start, end)) = self.pasteRegion {
-            if self.cursorPos > start && self.cursorPos < end {
-                self.cursorPos = start;
-            }
+        if let Some((start, end)) = self.pasteRegion
+            && self.cursorPos > start
+            && self.cursorPos < end
+        {
+            self.cursorPos = start;
         }
     }
 
     /// If cursor landed inside the paste region, jump to the end.
     fn skipPasteRight(&mut self) {
-        if let Some((start, end)) = self.pasteRegion {
-            if self.cursorPos > start && self.cursorPos < end {
-                self.cursorPos = end;
-            }
+        if let Some((start, end)) = self.pasteRegion
+            && self.cursorPos > start
+            && self.cursorPos < end
+        {
+            self.cursorPos = end;
         }
     }
 
     /// Shift paste region after an insertion of `len` bytes at `pos`.
     fn adjustPasteInsert(&mut self, pos: usize, len: usize) {
-        if let Some((ref mut start, ref mut end)) = self.pasteRegion {
-            if pos <= *start {
-                *start += len;
-                *end += len;
-            }
-            // Insertions inside or after the paste don't shift it.
+        if let Some((ref mut start, ref mut end)) = self.pasteRegion
+            && pos <= *start
+        {
+            *start += len;
+            *end += len;
         }
+        // Insertions inside or after the paste don't shift it.
     }
 
     /// Adjust paste region after deleting bytes [from..to).
@@ -784,12 +786,12 @@ fn buildSegmentSpans(
     }
 
     // If no placeholder overlap but cursor present, use simple cursor split.
-    if splits.is_empty() {
-        if let Some(cursorAbs) = cursorAbsPos {
-            let local = cursorAbs - segAbsStart;
-            let s = segStyle(segAbsStart, segText.len(), phRange, style, pasteStyle);
-            return cursorSplitSpans(segText, local, s, cursorStyle);
-        }
+    if splits.is_empty()
+        && let Some(cursorAbs) = cursorAbsPos
+    {
+        let local = cursorAbs - segAbsStart;
+        let s = segStyle(segAbsStart, segText.len(), phRange, style, pasteStyle);
+        return cursorSplitSpans(segText, local, s, cursorStyle);
     }
 
     // General case: split at placeholder boundaries, then embed cursor in
@@ -846,10 +848,11 @@ fn segStyle(
     normalStyle: Style,
     pasteStyle: Style,
 ) -> Style {
-    if let Some((phStart, phEnd)) = phRange {
-        if absStart >= phStart && absStart + len <= phEnd {
-            return pasteStyle;
-        }
+    if let Some((phStart, phEnd)) = phRange
+        && absStart >= phStart
+        && absStart + len <= phEnd
+    {
+        return pasteStyle;
     }
     normalStyle
 }

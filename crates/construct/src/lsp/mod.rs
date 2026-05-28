@@ -148,16 +148,15 @@ impl LspManager {
             // Skip servers we know are unavailable.
             if self.unavailable.contains(&serverId) {
                 // Generate a one-time hint.
-                if !self.hintedServers.contains(&serverId) {
-                    if let Some(def) = self.serverDefs.iter().find(|d| d.id == serverId) {
-                        if !def.installHint.is_empty() {
-                            self.hintedServers.insert(serverId.clone());
-                            hint = Some(LspHint {
-                                serverId: serverId.clone(),
-                                installHint: def.installHint.clone(),
-                            });
-                        }
-                    }
+                if !self.hintedServers.contains(&serverId)
+                    && let Some(def) = self.serverDefs.iter().find(|d| d.id == serverId)
+                    && !def.installHint.is_empty()
+                {
+                    self.hintedServers.insert(serverId.clone());
+                    hint = Some(LspHint {
+                        serverId: serverId.clone(),
+                        installHint: def.installHint.clone(),
+                    });
                 }
                 continue;
             }
@@ -185,17 +184,15 @@ impl LspManager {
                         {
                             tracing::info!(server = %serverId, "marking unavailable: {e}");
                             self.unavailable.insert(serverId.clone());
-                            if !self.hintedServers.contains(&serverId) {
-                                if let Some(def) = self.serverDefs.iter().find(|d| d.id == serverId)
-                                {
-                                    if !def.installHint.is_empty() {
-                                        self.hintedServers.insert(serverId.clone());
-                                        hint = Some(LspHint {
-                                            serverId: serverId.clone(),
-                                            installHint: def.installHint.clone(),
-                                        });
-                                    }
-                                }
+                            if !self.hintedServers.contains(&serverId)
+                                && let Some(def) = self.serverDefs.iter().find(|d| d.id == serverId)
+                                && !def.installHint.is_empty()
+                            {
+                                self.hintedServers.insert(serverId.clone());
+                                hint = Some(LspHint {
+                                    serverId: serverId.clone(),
+                                    installHint: def.installHint.clone(),
+                                });
                             }
                         } else {
                             tracing::warn!(server = %serverId, "start failed: {e}");
@@ -332,10 +329,10 @@ impl LspManager {
             }
             let projectRoot = self.findProjectRoot(path, &serverId);
             let connKey = format!("{serverId}:{}", projectRoot.display());
-            if let Some(conn) = self.connections.get(&connKey) {
-                if *conn.state() == ConnectionState::Ready {
-                    conn.didSave(path);
-                }
+            if let Some(conn) = self.connections.get(&connKey)
+                && *conn.state() == ConnectionState::Ready
+            {
+                conn.didSave(path);
             }
         }
     }
@@ -423,12 +420,11 @@ impl LspManager {
 
             if let Some(conn) = self.connections.get(&connKey) {
                 let uri = async_lsp::lsp_types::Url::from_file_path(path).ok();
-                if let Some(uri) = uri {
-                    if let Some(diags) = conn.diagnosticsStore().get(&uri) {
-                        if !diags.is_empty() {
-                            allDiagnostics.extend(diags.clone());
-                        }
-                    }
+                if let Some(uri) = uri
+                    && let Some(diags) = conn.diagnosticsStore().get(&uri)
+                    && !diags.is_empty()
+                {
+                    allDiagnostics.extend(diags.clone());
                 }
             }
         }

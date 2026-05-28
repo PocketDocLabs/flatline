@@ -250,10 +250,10 @@ fn pathPatterns(path: &str) -> Vec<String> {
         patterns.push(parent.to_string());
 
         // Grandparent.
-        if pos > 0 {
-            if let Some(gpos) = normalized[..pos].rfind('/') {
-                patterns.push(normalized[..=gpos].to_string());
-            }
+        if pos > 0
+            && let Some(gpos) = normalized[..pos].rfind('/')
+        {
+            patterns.push(normalized[..=gpos].to_string());
         }
     }
 
@@ -287,7 +287,7 @@ fn shellPatterns(command: &str) -> Vec<String> {
     // Tokenize, skipping env assignments (FOO=bar).
     let tokens: Vec<&str> = firstCmd
         .split_whitespace()
-        .filter(|t| !(t.contains('=') && !t.starts_with('-')))
+        .filter(|t| !t.contains('=') || t.starts_with('-'))
         .collect();
 
     if tokens.is_empty() {

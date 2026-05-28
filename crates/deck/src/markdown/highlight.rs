@@ -111,6 +111,7 @@ fn truncateLabelToWidth(s: &str, maxWidth: usize) -> String {
     s.to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn renderCodeBlock(
     contentLines: &[Vec<Span<'static>>],
     lang: Option<&str>,

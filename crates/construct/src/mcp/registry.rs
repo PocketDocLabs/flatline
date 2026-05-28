@@ -45,6 +45,12 @@ pub struct ToolRegistry {
     totalDefTokens: usize,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -156,7 +162,7 @@ impl ToolRegistry {
             return self
                 .tools
                 .values()
-                .filter(|e| serverFilter.map_or(true, |s| e.serverName == s))
+                .filter(|e| serverFilter.is_none_or(|s| e.serverName == s))
                 .map(|e| SearchResult {
                     qualifiedName: e.qualifiedName.clone(),
                     serverName: e.serverName.clone(),
@@ -171,7 +177,7 @@ impl ToolRegistry {
         let mut results: Vec<SearchResult> = self
             .tools
             .values()
-            .filter(|e| serverFilter.map_or(true, |s| e.serverName == s))
+            .filter(|e| serverFilter.is_none_or(|s| e.serverName == s))
             .filter_map(|e| {
                 let score = scoreMatch(&queryTerms, e);
                 if score > 0 {

@@ -276,20 +276,20 @@ fn parseEdgeChain(stmt: &str) -> Option<Vec<EdgeSegment>> {
 /// Returns (label_from_op_text, remaining_string).
 fn parseEdgeOp(s: &str) -> Option<(Option<String>, &str)> {
     for op in EDGE_OPS {
-        if s.starts_with(op) {
-            return Some((None, &s[op.len()..]));
+        if let Some(stripped) = s.strip_prefix(op) {
+            return Some((None, stripped));
         }
     }
     None
 }
 
 /// Parse optional `|label|` after an edge operator.
-fn parseEdgeLabel<'a>(s: &'a str, opLabel: Option<String>) -> (Option<String>, &'a str) {
-    if let Some(rest) = s.strip_prefix('|') {
-        if let Some(endIdx) = rest.find('|') {
-            let label = rest[..endIdx].trim().to_string();
-            return (Some(label), &rest[endIdx + 1..]);
-        }
+fn parseEdgeLabel(s: &str, opLabel: Option<String>) -> (Option<String>, &str) {
+    if let Some(rest) = s.strip_prefix('|')
+        && let Some(endIdx) = rest.find('|')
+    {
+        let label = rest[..endIdx].trim().to_string();
+        return (Some(label), &rest[endIdx + 1..]);
     }
     (opLabel, s)
 }
@@ -346,17 +346,17 @@ fn parseShapeDelimiter(s: &str) -> Option<(String, NodeShape, &str)> {
     ];
 
     for &(open, close, shape) in delimiters {
-        if let Some(inner) = s.strip_prefix(open) {
-            if let Some(endIdx) = inner.find(close) {
-                let label = inner[..endIdx].trim();
-                // Strip surrounding quotes if present.
-                let label = label
-                    .strip_prefix('"')
-                    .and_then(|l| l.strip_suffix('"'))
-                    .unwrap_or(label);
-                let remaining = &inner[endIdx + close.len()..];
-                return Some((label.to_string(), shape, remaining));
-            }
+        if let Some(inner) = s.strip_prefix(open)
+            && let Some(endIdx) = inner.find(close)
+        {
+            let label = inner[..endIdx].trim();
+            // Strip surrounding quotes if present.
+            let label = label
+                .strip_prefix('"')
+                .and_then(|l| l.strip_suffix('"'))
+                .unwrap_or(label);
+            let remaining = &inner[endIdx + close.len()..];
+            return Some((label.to_string(), shape, remaining));
         }
     }
     None

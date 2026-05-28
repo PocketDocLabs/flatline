@@ -70,10 +70,10 @@ impl ToolFilter {
     }
 
     fn allows(&self, toolName: &str) -> bool {
-        if let Some(ref enabled) = self.enabled {
-            if !enabled.contains(toolName) {
-                return false;
-            }
+        if let Some(ref enabled) = self.enabled
+            && !enabled.contains(toolName)
+        {
+            return false;
         }
         !self.disabled.contains(toolName)
     }

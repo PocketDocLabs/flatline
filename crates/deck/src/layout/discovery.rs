@@ -50,10 +50,10 @@ pub fn discoverLayout(cwd: &Path) -> Option<DiscoveredLayout> {
     if let Some(found) = walkUp(cwd) {
         return Some(loadAt(found));
     }
-    if let Some(fallback) = configFallbackPath() {
-        if fallback.exists() {
-            return Some(loadAt(fallback));
-        }
+    if let Some(fallback) = configFallbackPath()
+        && fallback.exists()
+    {
+        return Some(loadAt(fallback));
     }
     None
 }

@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+#![allow(clippy::manual_async_fn)]
 
 //! MCP client handler — routes server requests back through Flatline.
 //!

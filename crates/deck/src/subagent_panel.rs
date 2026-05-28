@@ -41,6 +41,7 @@ pub enum SubagentTab {
 }
 
 /// Where the popup reads its content from.
+#[allow(clippy::large_enum_variant)]
 pub enum SubagentSource {
     /// Live: read from `agentPanel.activeSubagent` on every render.
     /// Stays Live as long as the subagent's data is in `activeSubagent`,
@@ -165,10 +166,9 @@ impl SubagentPanel {
                 done,
                 ..
             } = entry
+                && sid == &sub.sessionId
             {
-                if sid == &sub.sessionId {
-                    return !*done;
-                }
+                return !*done;
             }
         }
         true
@@ -383,12 +383,13 @@ impl SubagentPanel {
                 if inPermit && agentPanel.pendingPermit && agentPanel.pendingCommand().is_some() {
                     let localRow = ev.row.saturating_sub(self.lastPermitRect.y);
                     let localCol = ev.column.saturating_sub(self.lastPermitRect.x);
-                    if localRow == 0 && localCol + 6 >= self.lastPermitRect.width {
-                        if let Some(cmd) = agentPanel.pendingCommand() {
-                            selection::copyToClipboard(cmd);
-                            agentPanel.flashCopied();
-                            return SubagentMouseAction::Handled;
-                        }
+                    if localRow == 0
+                        && localCol + 6 >= self.lastPermitRect.width
+                        && let Some(cmd) = agentPanel.pendingCommand()
+                    {
+                        selection::copyToClipboard(cmd);
+                        agentPanel.flashCopied();
+                        return SubagentMouseAction::Handled;
                     }
                 }
 
@@ -904,19 +905,19 @@ impl SubagentPanel {
         }
 
         // Pending double/triple-click expansion (needs Buffer).
-        if let Some(clickCount) = self.pendingExpand.take() {
-            if let Some(sel) = self.selection.as_mut() {
-                selection::expandSelection(
-                    sel,
-                    clickCount,
-                    buf,
-                    selRect,
-                    self.transcriptPanel.displayOffset(),
-                );
-                sel.finalize();
-                self.pendingCopy = true;
-                self.selecting = false;
-            }
+        if let Some(clickCount) = self.pendingExpand.take()
+            && let Some(sel) = self.selection.as_mut()
+        {
+            selection::expandSelection(
+                sel,
+                clickCount,
+                buf,
+                selRect,
+                self.transcriptPanel.displayOffset(),
+            );
+            sel.finalize();
+            self.pendingCopy = true;
+            self.selecting = false;
         }
 
         // Deferred clipboard copy.
