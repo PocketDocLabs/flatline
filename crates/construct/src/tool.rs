@@ -12,6 +12,8 @@
 //! # Dependencies
 //! `serde_json`, `regex`, `similar`, `tokio::process`
 
+use std::fmt;
+
 use crate::message::ToolDef;
 use crate::shell::Shell;
 
@@ -1569,6 +1571,69 @@ pub enum ToolAction {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolParseError {
+    MalformedJson(String),
+    MissingField {
+        field: &'static str,
+    },
+    MissingFieldWithExpected {
+        field: &'static str,
+        expected: &'static str,
+    },
+    WrongType {
+        field: &'static str,
+        expected: &'static str,
+    },
+    WrongNestedType {
+        context: &'static str,
+        field: &'static str,
+        expected: &'static str,
+    },
+    InvalidField {
+        field: &'static str,
+        expected: &'static str,
+    },
+    MissingNestedField {
+        context: &'static str,
+        field: &'static str,
+    },
+}
+
+impl fmt::Display for ToolParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ToolParseError::MalformedJson(msg) => {
+                write!(f, "Malformed JSON arguments: {msg}")
+            }
+            ToolParseError::MissingField { field } => {
+                write!(f, "Missing required field '{field}'.")
+            }
+            ToolParseError::MissingFieldWithExpected { field, expected } => {
+                write!(f, "Missing required field '{field}' ({expected}).")
+            }
+            ToolParseError::WrongType { field, expected } => {
+                write!(f, "Field '{field}': expected {expected}.")
+            }
+            ToolParseError::WrongNestedType {
+                context,
+                field,
+                expected,
+            } => {
+                write!(f, "{context} field '{field}': expected {expected}.")
+            }
+            ToolParseError::InvalidField { field, expected } => {
+                write!(f, "Field '{field}': expected {expected}.")
+            }
+            ToolParseError::MissingNestedField { context, field } => {
+                write!(f, "{context} missing '{field}'.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolParseError {}
+
 /// Which tools a subagent can access.
 #[derive(Debug, Clone)]
 pub enum ToolSet {
@@ -2951,10 +3016,62 @@ fn classifyFile(bytes: &[u8]) -> FileKind {
 
 // --- Subprocess helper ---
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubprocessError {
+    NotFound {
+        message: String,
+    },
+    Spawn {
+        program: String,
+        error: String,
+    },
+    Failed {
+        program: String,
+        status: String,
+        output: String,
+    },
+    Run {
+        program: String,
+        error: String,
+    },
+    Timeout {
+        program: String,
+        seconds: u64,
+    },
+}
+
+impl fmt::Display for SubprocessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubprocessError::NotFound { message } => f.write_str(message),
+            SubprocessError::Spawn { program, error } => {
+                write!(f, "Failed to start {program}: {error}")
+            }
+            SubprocessError::Failed {
+                program,
+                status,
+                output,
+            } => write!(f, "{program} failed (exit {status}): {}", output.trim()),
+            SubprocessError::Run { program, error } => {
+                write!(f, "Failed to run {program}: {error}")
+            }
+            SubprocessError::Timeout { program, seconds } => {
+                write!(f, "{program} timed out after {seconds}s.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubprocessError {}
+
 /// Run an external program, capture stdout+stderr, enforce timeout.
 /// Returns Ok(stdout) on success or Err(message) on failure.
 /// rg exit code 1 ("no matches") is treated as success with empty output.
-async fn runSubprocess(program: &str, args: &[&str], notFoundMsg: &str) -> Result<String, String> {
+async fn runSubprocess(
+    program: &str,
+    args: &[&str],
+    notFoundMsg: &str,
+) -> std::result::Result<String, SubprocessError> {
     use tokio::process::Command;
 
     let result = Command::new(program)
@@ -2966,9 +3083,16 @@ async fn runSubprocess(program: &str, args: &[&str], notFoundMsg: &str) -> Resul
     let child = match result {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(notFoundMsg.to_string());
+            return Err(SubprocessError::NotFound {
+                message: notFoundMsg.to_string(),
+            });
         }
-        Err(e) => return Err(format!("Failed to start {program}: {e}")),
+        Err(e) => {
+            return Err(SubprocessError::Spawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            });
+        }
     };
 
     let timeout = tokio::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
@@ -2982,20 +3106,24 @@ async fn runSubprocess(program: &str, args: &[&str], notFoundMsg: &str) -> Resul
                 Ok(stdout)
             } else {
                 let msg = if stderr.is_empty() { &stdout } else { &stderr };
-                Err(format!(
-                    "{program} failed (exit {}): {}",
-                    output.status,
-                    msg.trim()
-                ))
+                Err(SubprocessError::Failed {
+                    program: program.to_string(),
+                    status: output.status.to_string(),
+                    output: msg.to_string(),
+                })
             }
         }
-        Ok(Err(e)) => Err(format!("Failed to run {program}: {e}")),
+        Ok(Err(e)) => Err(SubprocessError::Run {
+            program: program.to_string(),
+            error: e.to_string(),
+        }),
         Err(_) => {
             // Process is still running but we lost ownership via wait_with_output.
             // The child is dropped here which sends SIGKILL on Unix.
-            Err(format!(
-                "{program} timed out after {SUBPROCESS_TIMEOUT_SECS}s."
-            ))
+            Err(SubprocessError::Timeout {
+                program: program.to_string(),
+                seconds: SUBPROCESS_TIMEOUT_SECS,
+            })
         }
     }
 }
@@ -3039,7 +3167,7 @@ async fn executeGlob(pattern: &str, path: Option<&str>, metadata: bool) -> Strin
             }
             output
         }
-        Err(e) => e,
+        Err(e) => e.to_string(),
     }
 }
 
@@ -3272,7 +3400,7 @@ async fn executeGrep(
             }
             output
         }
-        Err(e) => e,
+        Err(e) => e.to_string(),
     }
 }
 
@@ -3486,7 +3614,7 @@ async fn executeStructSearch(pattern: &str, language: &str, path: Option<&str>) 
             }
             formatStructSearchOutput(&stdout)
         }
-        Err(e) => e,
+        Err(e) => e.to_string(),
     }
 }
 
@@ -3583,7 +3711,7 @@ async fn executeDiff(
                 }
                 return truncateDiffOutput(&stdout);
             }
-            Err(e) => return e,
+            Err(e) => return e.to_string(),
         }
     }
 
@@ -3627,7 +3755,7 @@ async fn diffGitRef(path: &str, reference: &str) -> String {
             }
             truncateDiffOutput(&stdout)
         }
-        Err(e) => e,
+        Err(e) => e.to_string(),
     }
 }
 
@@ -3761,7 +3889,7 @@ async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
     .await
     {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return e.to_string(),
     };
 
     if stdout.trim().is_empty() {
@@ -3808,7 +3936,7 @@ async fn executeFileOutline(path: &str) -> String {
     .await
     {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return e.to_string(),
     };
 
     let mut entries = parseSgEntries(&stdout);
@@ -4307,289 +4435,393 @@ fn parseSgEntries(stdout: &str) -> Vec<(usize, String)> {
     entries
 }
 
+type ToolParseResult<T> = std::result::Result<T, ToolParseError>;
+
+fn reqString(args: &serde_json::Value, field: &'static str) -> ToolParseResult<String> {
+    match &args[field] {
+        serde_json::Value::String(s) if !s.is_empty() => Ok(s.clone()),
+        serde_json::Value::String(_) | serde_json::Value::Null => {
+            Err(ToolParseError::MissingField { field })
+        }
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn reqStringAllowEmpty(args: &serde_json::Value, field: &'static str) -> ToolParseResult<String> {
+    match &args[field] {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Null => Err(ToolParseError::MissingField { field }),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn optString(args: &serde_json::Value, field: &'static str) -> ToolParseResult<Option<String>> {
+    match &args[field] {
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn optStringDefault(
+    args: &serde_json::Value,
+    field: &'static str,
+    default: &'static str,
+) -> ToolParseResult<String> {
+    Ok(optString(args, field)?.unwrap_or_else(|| default.to_string()))
+}
+
+fn optStringArray(
+    args: &serde_json::Value,
+    field: &'static str,
+) -> ToolParseResult<Option<Vec<String>>> {
+    match &args[field] {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                serde_json::Value::String(s) => Ok(s.clone()),
+                _ => Err(ToolParseError::WrongType {
+                    field,
+                    expected: "array of strings",
+                }),
+            })
+            .collect::<ToolParseResult<Vec<_>>>()
+            .map(Some),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "array of strings",
+        }),
+    }
+}
+
+fn optU64(args: &serde_json::Value, field: &'static str) -> ToolParseResult<Option<u64>> {
+    match &args[field] {
+        serde_json::Value::Number(n) => n.as_u64().map(Some).ok_or(ToolParseError::WrongType {
+            field,
+            expected: "integer",
+        }),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "integer",
+        }),
+    }
+}
+
+fn reqU64(args: &serde_json::Value, field: &'static str) -> ToolParseResult<u64> {
+    optU64(args, field)?.ok_or(ToolParseError::MissingField { field })
+}
+
+fn optBool(args: &serde_json::Value, field: &'static str) -> ToolParseResult<Option<bool>> {
+    match &args[field] {
+        serde_json::Value::Bool(b) => Ok(Some(*b)),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "boolean",
+        }),
+    }
+}
+
+fn reqArray<'a>(
+    args: &'a serde_json::Value,
+    field: &'static str,
+) -> ToolParseResult<&'a Vec<serde_json::Value>> {
+    match &args[field] {
+        serde_json::Value::Array(items) => Ok(items),
+        serde_json::Value::Null => Err(ToolParseError::MissingField { field }),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "array",
+        }),
+    }
+}
+
+fn reqNestedStringAllowEmpty(
+    args: &serde_json::Value,
+    context: &'static str,
+    field: &'static str,
+) -> ToolParseResult<String> {
+    match &args[field] {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Null => Err(ToolParseError::MissingNestedField { context, field }),
+        _ => Err(ToolParseError::WrongNestedType {
+            context,
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn optNestedBool(
+    args: &serde_json::Value,
+    context: &'static str,
+    field: &'static str,
+) -> ToolParseResult<Option<bool>> {
+    match &args[field] {
+        serde_json::Value::Bool(b) => Ok(Some(*b)),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongNestedType {
+            context,
+            field,
+            expected: "boolean",
+        }),
+    }
+}
+
+fn validateStringEnum(
+    value: String,
+    field: &'static str,
+    expected: &'static str,
+    allowed: &[&str],
+) -> ToolParseResult<String> {
+    if allowed.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(ToolParseError::InvalidField { field, expected })
+    }
+}
+
 /// Parse a tool call name + JSON arguments into a ToolAction.
 ///
-/// Returns Err with a message listing missing/malformed required fields.
-/// The error message is sent back to the model as the tool result so it can retry.
-pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
+/// Returns Err with structured missing/malformed required-field details.
+/// The error's Display text is sent back to the model as the tool result so it can retry.
+pub fn parse(name: &str, argsJson: &str) -> ToolParseResult<ToolAction> {
     let args: serde_json::Value =
-        serde_json::from_str(argsJson).map_err(|e| format!("Malformed JSON arguments: {e}"))?;
-
-    /// Extract a required string field, or collect its name into `missing`.
-    macro_rules! reqStr {
-        ($field:expr) => {
-            match args[$field].as_str() {
-                Some(s) if !s.is_empty() => s.to_string(),
-                Some(_) => return Err(format!("Missing required field '{}'.", $field)),
-                None => return Err(format!("Missing required field '{}'.", $field)),
-            }
-        };
-    }
-
-    /// Extract an optional string field. Returns Err if present but wrong type.
-    macro_rules! optStr {
-        ($field:expr) => {
-            match &args[$field] {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Null => None,
-                _ => return Err(format!("Field '{}': expected string.", $field)),
-            }
-        };
-    }
-
-    /// Extract an optional u64 field. Returns Err if present but wrong type.
-    macro_rules! optU64 {
-        ($field:expr) => {
-            match &args[$field] {
-                serde_json::Value::Number(n) => n.as_u64(),
-                serde_json::Value::Null => None,
-                _ => return Err(format!("Field '{}': expected integer.", $field)),
-            }
-        };
-    }
-
-    /// Extract an optional bool field. Returns Err if present but wrong type.
-    macro_rules! optBool {
-        ($field:expr) => {
-            match &args[$field] {
-                serde_json::Value::Bool(b) => Some(*b),
-                serde_json::Value::Null => None,
-                _ => return Err(format!("Field '{}': expected boolean.", $field)),
-            }
-        };
-    }
+        serde_json::from_str(argsJson).map_err(|e| ToolParseError::MalformedJson(e.to_string()))?;
 
     let action = match name {
         "shell" => {
-            let impact: ShellImpact = args["impact"]
-                .as_str()
-                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok())
-                .ok_or_else(|| {
-                    "Missing required field 'impact' (one of: read, minorMod, majorMod, delete)."
-                        .to_string()
+            let impactString =
+                optString(&args, "impact")?.ok_or(ToolParseError::MissingFieldWithExpected {
+                    field: "impact",
+                    expected: "one of: read, minorMod, majorMod, delete",
+                })?;
+            let impact: ShellImpact =
+                serde_json::from_value(serde_json::Value::String(impactString)).map_err(|_| {
+                    ToolParseError::InvalidField {
+                        field: "impact",
+                        expected: "one of: read, minorMod, majorMod, delete",
+                    }
                 })?;
             ToolAction::Shell {
-                command: reqStr!("command"),
-                explanation: reqStr!("explanation"),
+                command: reqString(&args, "command")?,
+                explanation: reqString(&args, "explanation")?,
                 impact,
-                timeout: optU64!("timeout"),
-                terminal: optStr!("terminal"),
-                runInBackground: optBool!("runInBackground").unwrap_or(false),
+                timeout: optU64(&args, "timeout")?,
+                terminal: optString(&args, "terminal")?,
+                runInBackground: optBool(&args, "runInBackground")?.unwrap_or(false),
             }
         }
         "readFile" => ToolAction::ReadFile {
-            path: reqStr!("path"),
-            offset: optU64!("offset").map(|v| v as usize),
-            limit: optU64!("limit").map(|v| v as usize),
-            anchor: optU64!("anchor").map(|v| v as usize),
+            path: reqString(&args, "path")?,
+            offset: optU64(&args, "offset")?.map(|v| v as usize),
+            limit: optU64(&args, "limit")?.map(|v| v as usize),
+            anchor: optU64(&args, "anchor")?.map(|v| v as usize),
         },
         "writeFile" => ToolAction::WriteFile {
-            path: reqStr!("path"),
-            content: reqStr!("content"),
+            path: reqString(&args, "path")?,
+            content: reqString(&args, "content")?,
         },
         "editFile" => ToolAction::EditFile {
-            path: reqStr!("path"),
-            oldString: reqStr!("old_string"),
-            newString: args["new_string"].as_str().unwrap_or("").into(),
-            replaceAll: optBool!("replace_all").unwrap_or(false),
+            path: reqString(&args, "path")?,
+            oldString: reqString(&args, "old_string")?,
+            newString: reqStringAllowEmpty(&args, "new_string")?,
+            replaceAll: optBool(&args, "replace_all")?.unwrap_or(false),
         },
         "multiEdit" => ToolAction::MultiEdit {
-            path: reqStr!("path"),
-            edits: args["edits"]
-                .as_array()
-                .ok_or_else(|| "Missing required field 'edits'.".to_string())?
+            path: reqString(&args, "path")?,
+            edits: reqArray(&args, "edits")?
                 .iter()
                 .map(|e| {
                     Ok(EditOp {
-                        oldString: e["old_string"]
-                            .as_str()
-                            .ok_or_else(|| "Edit missing 'old_string'.".to_string())?
-                            .into(),
-                        newString: e["new_string"].as_str().unwrap_or("").into(),
-                        replaceAll: e["replace_all"].as_bool().unwrap_or(false),
+                        oldString: reqNestedStringAllowEmpty(e, "Edit", "old_string")?,
+                        newString: reqNestedStringAllowEmpty(e, "Edit", "new_string")?,
+                        replaceAll: optNestedBool(e, "Edit", "replace_all")?.unwrap_or(false),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<ToolParseResult<Vec<_>>>()?,
         },
         "copyFile" => ToolAction::CopyFile {
-            src: reqStr!("src"),
-            dest: reqStr!("dest"),
-            overwrite: optBool!("overwrite").unwrap_or(false),
+            src: reqString(&args, "src")?,
+            dest: reqString(&args, "dest")?,
+            overwrite: optBool(&args, "overwrite")?.unwrap_or(false),
         },
         "moveFile" => ToolAction::MoveFile {
-            src: reqStr!("src"),
-            dest: reqStr!("dest"),
-            overwrite: optBool!("overwrite").unwrap_or(false),
+            src: reqString(&args, "src")?,
+            dest: reqString(&args, "dest")?,
+            overwrite: optBool(&args, "overwrite")?.unwrap_or(false),
         },
         "deleteFile" => ToolAction::DeleteFile {
-            path: reqStr!("path"),
-            recursive: optBool!("recursive").unwrap_or(false),
+            path: reqString(&args, "path")?,
+            recursive: optBool(&args, "recursive")?.unwrap_or(false),
         },
         "makeDirs" => ToolAction::MakeDirs {
-            path: reqStr!("path"),
+            path: reqString(&args, "path")?,
         },
         "shellHistory" => ToolAction::ShellHistory {
-            terminal: optStr!("terminal"),
+            terminal: optString(&args, "terminal")?,
         },
         "readOutput" => ToolAction::ReadOutput {
-            index: optU64!("index").unwrap_or(0) as usize,
-            offset: optU64!("offset").map(|v| v as usize),
-            limit: optU64!("limit").map(|v| v as usize),
-            terminal: optStr!("terminal"),
+            index: optU64(&args, "index")?.unwrap_or(0) as usize,
+            offset: optU64(&args, "offset")?.map(|v| v as usize),
+            limit: optU64(&args, "limit")?.map(|v| v as usize),
+            terminal: optString(&args, "terminal")?,
         },
         "searchOutput" => ToolAction::SearchOutput {
-            index: optU64!("index").unwrap_or(0) as usize,
-            pattern: reqStr!("pattern"),
-            context: optU64!("context").unwrap_or(3) as usize,
-            terminal: optStr!("terminal"),
+            index: optU64(&args, "index")?.unwrap_or(0) as usize,
+            pattern: reqString(&args, "pattern")?,
+            context: optU64(&args, "context")?.unwrap_or(3) as usize,
+            terminal: optString(&args, "terminal")?,
         },
         "readTerminal" => ToolAction::ReadTerminal {
-            lines: optU64!("lines").unwrap_or(50) as usize,
-            terminal: optStr!("terminal"),
+            lines: optU64(&args, "lines")?.unwrap_or(50) as usize,
+            terminal: optString(&args, "terminal")?,
         },
         "terminalSpawn" => ToolAction::TerminalSpawn {
-            name: optStr!("name"),
+            name: optString(&args, "name")?,
         },
         "terminalSwitch" => ToolAction::TerminalSwitch {
-            name: reqStr!("name"),
+            name: reqString(&args, "name")?,
         },
         "terminalKill" => ToolAction::TerminalKill {
-            name: reqStr!("name"),
+            name: reqString(&args, "name")?,
         },
         "terminalList" => ToolAction::TerminalList,
         "jobOutput" => ToolAction::JobOutput {
-            jobId: optU64!("jobId").ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
-            sinceLine: optU64!("sinceLine"),
-            maxLines: optU64!("maxLines").map(|v| v as usize),
+            jobId: reqU64(&args, "jobId")?,
+            sinceLine: optU64(&args, "sinceLine")?,
+            maxLines: optU64(&args, "maxLines")?.map(|v| v as usize),
         },
         "jobStop" => ToolAction::JobStop {
-            jobId: optU64!("jobId").ok_or_else(|| "Missing required field 'jobId'.".to_string())?,
+            jobId: reqU64(&args, "jobId")?,
         },
         "jobList" => ToolAction::JobList,
         "monitor" => ToolAction::Monitor {
-            description: reqStr!("description"),
-            command: reqStr!("command"),
-            filter: reqStr!("filter"),
+            description: reqString(&args, "description")?,
+            command: reqString(&args, "command")?,
+            filter: reqString(&args, "filter")?,
         },
         "monitorStop" => ToolAction::MonitorStop {
-            monitorId: optU64!("monitorId")
-                .ok_or_else(|| "Missing required field 'monitorId'.".to_string())?,
+            monitorId: reqU64(&args, "monitorId")?,
         },
         "monitorList" => ToolAction::MonitorList,
         "scheduleWakeup" => ToolAction::ScheduleWakeup {
-            delaySeconds: optU64!("delaySeconds")
-                .ok_or_else(|| "Missing required field 'delaySeconds'.".to_string())?,
-            prompt: reqStr!("prompt"),
+            delaySeconds: reqU64(&args, "delaySeconds")?,
+            prompt: reqString(&args, "prompt")?,
         },
         "cronCreate" => ToolAction::CronCreate {
-            spec: reqStr!("spec"),
-            prompt: reqStr!("prompt"),
-            recurring: optBool!("recurring").unwrap_or(true),
+            spec: reqString(&args, "spec")?,
+            prompt: reqString(&args, "prompt")?,
+            recurring: optBool(&args, "recurring")?.unwrap_or(true),
         },
         "cronList" => ToolAction::CronList,
         "cronDelete" => ToolAction::CronDelete {
-            wakeId: optU64!("wakeId")
-                .ok_or_else(|| "Missing required field 'wakeId'.".to_string())?,
+            wakeId: reqU64(&args, "wakeId")?,
         },
         "fileWatch" => ToolAction::FileWatch {
-            path: reqStr!("path"),
-            prompt: reqStr!("prompt"),
+            path: reqString(&args, "path")?,
+            prompt: reqString(&args, "prompt")?,
         },
         "glob" => ToolAction::Glob {
-            pattern: reqStr!("pattern"),
-            path: optStr!("path"),
-            metadata: optBool!("metadata").unwrap_or(false),
+            pattern: reqString(&args, "pattern")?,
+            path: optString(&args, "path")?,
+            metadata: optBool(&args, "metadata")?.unwrap_or(false),
         },
         "grep" => ToolAction::Grep {
-            pattern: reqStr!("pattern"),
-            path: optStr!("path"),
-            include: optStr!("include"),
-            fileType: optStr!("type"),
-            outputMode: args["output_mode"].as_str().unwrap_or("files").into(),
-            caseSensitive: optBool!("case_sensitive"),
-            contextLines: optU64!("context_lines").map(|v| v as usize),
-            multiline: optBool!("multiline").unwrap_or(false),
+            pattern: reqString(&args, "pattern")?,
+            path: optString(&args, "path")?,
+            include: optString(&args, "include")?,
+            fileType: optString(&args, "type")?,
+            outputMode: validateStringEnum(
+                optStringDefault(&args, "output_mode", "files")?,
+                "output_mode",
+                "one of: files, content, count",
+                &["files", "content", "count"],
+            )?,
+            caseSensitive: optBool(&args, "case_sensitive")?,
+            contextLines: optU64(&args, "context_lines")?.map(|v| v as usize),
+            multiline: optBool(&args, "multiline")?.unwrap_or(false),
         },
         "listDir" => ToolAction::ListDir {
-            path: args["path"].as_str().unwrap_or(".").into(),
-            depth: optU64!("depth").unwrap_or(2).clamp(1, 5) as usize,
-            offset: optU64!("offset").unwrap_or(0) as usize,
-            limit: optU64!("limit").unwrap_or(500) as usize,
-            metadata: optBool!("metadata").unwrap_or(false),
+            path: reqString(&args, "path")?,
+            depth: optU64(&args, "depth")?.unwrap_or(2).clamp(1, 5) as usize,
+            offset: optU64(&args, "offset")?.unwrap_or(0) as usize,
+            limit: optU64(&args, "limit")?.unwrap_or(500) as usize,
+            metadata: optBool(&args, "metadata")?.unwrap_or(false),
         },
         "structSearch" => ToolAction::StructSearch {
-            pattern: reqStr!("pattern"),
-            language: args["language"].as_str().unwrap_or("").into(),
-            path: optStr!("path"),
+            pattern: reqString(&args, "pattern")?,
+            language: reqString(&args, "language")?,
+            path: optString(&args, "path")?,
         },
         "diff" => ToolAction::Diff {
-            path: optStr!("path"),
-            gitRef: optStr!("ref"),
-            pathA: optStr!("path_a"),
-            pathB: optStr!("path_b"),
+            path: optString(&args, "path")?,
+            gitRef: optString(&args, "ref")?,
+            pathA: optString(&args, "path_a")?,
+            pathB: optString(&args, "path_b")?,
         },
         "fuzzyFind" => ToolAction::FuzzyFind {
-            query: reqStr!("query"),
-            path: optStr!("path"),
+            query: reqString(&args, "query")?,
+            path: optString(&args, "path")?,
         },
         "fileOutline" => ToolAction::FileOutline {
-            path: reqStr!("path"),
+            path: reqString(&args, "path")?,
         },
         "viewSymbol" => ToolAction::ViewSymbol {
-            file: reqStr!("file"),
-            symbol: reqStr!("symbol"),
+            file: reqString(&args, "file")?,
+            symbol: reqString(&args, "symbol")?,
         },
         "relatedFiles" => ToolAction::RelatedFiles {
-            path: reqStr!("path"),
+            path: reqString(&args, "path")?,
         },
         "webSearch" => ToolAction::WebSearch {
-            query: reqStr!("query"),
-            allowedDomains: args["allowed_domains"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-            blockedDomains: args["blocked_domains"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-            maxResults: optU64!("max_results").map(|v| v as usize),
+            query: reqString(&args, "query")?,
+            allowedDomains: optStringArray(&args, "allowed_domains")?,
+            blockedDomains: optStringArray(&args, "blocked_domains")?,
+            maxResults: optU64(&args, "max_results")?.map(|v| v as usize),
         },
         "webFetch" => ToolAction::WebFetch {
-            url: reqStr!("url"),
-            prompt: optStr!("prompt"),
-            subpages: optU64!("subpages").map(|v| v as usize),
+            url: reqString(&args, "url")?,
+            prompt: optString(&args, "prompt")?,
+            subpages: optU64(&args, "subpages")?.map(|v| v as usize),
         },
         "webSimilar" => ToolAction::WebSimilar {
-            url: reqStr!("url"),
-            allowedDomains: args["allowed_domains"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-            blockedDomains: args["blocked_domains"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-            maxResults: optU64!("max_results").map(|v| v as usize),
+            url: reqString(&args, "url")?,
+            allowedDomains: optStringArray(&args, "allowed_domains")?,
+            blockedDomains: optStringArray(&args, "blocked_domains")?,
+            maxResults: optU64(&args, "max_results")?.map(|v| v as usize),
         },
         "historyFetch" => ToolAction::HistoryFetch {
-            blockId: reqStr!("blockId"),
+            blockId: reqString(&args, "blockId")?,
         },
         "historySearch" => ToolAction::HistorySearch {
-            query: reqStr!("query"),
-            mediaType: args["mediaType"].as_str().map(String::from),
+            query: reqString(&args, "query")?,
+            mediaType: optString(&args, "mediaType")?,
         },
         "task" => ToolAction::Task {
-            prompt: reqStr!("prompt"),
-            agent: optStr!("agent"),
-            runInBackground: optBool!("runInBackground").unwrap_or(false),
+            prompt: reqString(&args, "prompt")?,
+            agent: optString(&args, "agent")?,
+            runInBackground: optBool(&args, "runInBackground")?.unwrap_or(false),
         },
         "diagnostics" => ToolAction::Diagnostics {
-            path: reqStr!("path"),
-            severity: args["severity"].as_str().unwrap_or("error").into(),
+            path: reqString(&args, "path")?,
+            severity: validateStringEnum(
+                optStringDefault(&args, "severity", "error")?,
+                "severity",
+                "one of: error, warning",
+                &["error", "warning"],
+            )?,
         },
         _ if crate::mcp::schema::isMcpTool(name) => ToolAction::Mcp {
             qualifiedName: name.into(),
@@ -4607,6 +4839,160 @@ pub fn parse(name: &str, argsJson: &str) -> Result<ToolAction, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parseReportsMissingRequiredFieldStructurally() {
+        let err = parse("readFile", "{}").unwrap_err();
+        assert_eq!(err, ToolParseError::MissingField { field: "path" });
+        assert_eq!(err.to_string(), "Missing required field 'path'.");
+    }
+
+    #[test]
+    fn parseReportsWrongFieldTypeStructurally() {
+        let err = parse("readFile", r#"{"path":"src/main.rs","offset":"1"}"#).unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::WrongType {
+                field: "offset",
+                expected: "integer",
+            }
+        );
+        assert_eq!(err.to_string(), "Field 'offset': expected integer.");
+    }
+
+    #[test]
+    fn parseReportsMalformedJsonStructurally() {
+        let err = parse("readFile", r#"{"path":"src/main.rs""#).unwrap_err();
+        assert!(matches!(err, ToolParseError::MalformedJson(_)));
+        assert!(err.to_string().starts_with("Malformed JSON arguments:"));
+    }
+
+    #[test]
+    fn parseReportsInvalidImpactStructurally() {
+        let err = parse(
+            "shell",
+            r#"{"command":"pwd","explanation":"inspect cwd","impact":"tiny"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::InvalidField {
+                field: "impact",
+                expected: "one of: read, minorMod, majorMod, delete",
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "Field 'impact': expected one of: read, minorMod, majorMod, delete.",
+        );
+    }
+
+    #[test]
+    fn parseReportsNestedEditFieldStructurally() {
+        let err = parse("multiEdit", r#"{"path":"src/main.rs","edits":[{}]}"#).unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::MissingNestedField {
+                context: "Edit",
+                field: "old_string",
+            }
+        );
+        assert_eq!(err.to_string(), "Edit missing 'old_string'.");
+    }
+
+    #[test]
+    fn parseAllowsEmptyReplacementString() {
+        let action = parse(
+            "editFile",
+            r#"{"path":"src/main.rs","old_string":"delete me","new_string":""}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            ToolAction::EditFile { newString, .. } if newString.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parseReportsNestedEditWrongTypeStructurally() {
+        let err = parse(
+            "multiEdit",
+            r#"{"path":"src/main.rs","edits":[{"old_string":"a","new_string":"b","replace_all":"yes"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::WrongNestedType {
+                context: "Edit",
+                field: "replace_all",
+                expected: "boolean",
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "Edit field 'replace_all': expected boolean.",
+        );
+    }
+
+    #[test]
+    fn parseReportsInvalidEnumLikeFieldsStructurally() {
+        let err = parse("grep", r#"{"pattern":"TODO","output_mode":"everything"}"#).unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::InvalidField {
+                field: "output_mode",
+                expected: "one of: files, content, count",
+            }
+        );
+
+        let err = parse("diagnostics", r#"{"path":"src/main.rs","severity":"info"}"#).unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::InvalidField {
+                field: "severity",
+                expected: "one of: error, warning",
+            }
+        );
+    }
+
+    #[test]
+    fn parseReportsStringArrayTypeStructurally() {
+        let err = parse(
+            "webSearch",
+            r#"{"query":"rust","allowed_domains":["docs.rs", 42]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ToolParseError::WrongType {
+                field: "allowed_domains",
+                expected: "array of strings",
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "Field 'allowed_domains': expected array of strings.",
+        );
+    }
+
+    #[test]
+    fn subprocessErrorsFormatAtToolBoundary() {
+        let err = SubprocessError::Timeout {
+            program: "rg".into(),
+            seconds: 30,
+        };
+        assert_eq!(err.to_string(), "rg timed out after 30s.");
+
+        let err = SubprocessError::Failed {
+            program: "git".into(),
+            status: "exit status: 2".into(),
+            output: "fatal: bad revision\n".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "git failed (exit exit status: 2): fatal: bad revision",
+        );
+    }
 
     #[test]
     fn classifyPng() {

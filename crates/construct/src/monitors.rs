@@ -17,18 +17,57 @@
 //! `regex`, [`crate::jobs`], [`crate::control`]
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::Result;
 use regex::Regex;
 use tokio::sync::mpsc;
 
 use crate::control::LogEvent;
-use crate::jobs::{ExitCallback, JobId, JobPlane, LineCallback};
+use crate::jobs::{ExitCallback, JobError, JobId, JobPlane, LineCallback};
 
 /// Monotonically increasing per-session monitor id.
 pub type MonitorId = u64;
+
+pub type MonitorResult<T> = std::result::Result<T, MonitorError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorError {
+    MissingDescription,
+    MissingFilter,
+    InvalidRegex { filter: String, error: String },
+    NotFound { id: MonitorId },
+    BackingJob(JobError),
+}
+
+impl fmt::Display for MonitorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MonitorError::MissingDescription => write!(
+                f,
+                "monitor description is required (short label like 'errors in deploy.log')",
+            ),
+            MonitorError::MissingFilter => write!(
+                f,
+                "monitor filter is required \u{2014} pass a regex that matches only the lines you want to be notified about",
+            ),
+            MonitorError::InvalidRegex { filter, error } => {
+                write!(f, "invalid regex filter `{filter}`: {error}")
+            }
+            MonitorError::NotFound { id } => write!(f, "no monitor #{id}"),
+            MonitorError::BackingJob(err) => write!(f, "backing task failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for MonitorError {}
+
+impl From<JobError> for MonitorError {
+    fn from(value: JobError) -> Self {
+        MonitorError::BackingJob(value)
+    }
+}
 
 /// Default threshold for the flood-guard EWMA, in matched-events/second.
 /// 50/s was too low for any real log incident (the original value);
@@ -186,7 +225,7 @@ impl MonitorPlane {
         autoStopThresholdEps: f64,
         tasks: &Arc<Mutex<JobPlane>>,
         logTx: mpsc::Sender<LogEvent>,
-    ) -> Result<MonitorId> {
+    ) -> MonitorResult<MonitorId> {
         let id = self.reserveMonitorId();
         self.registerWithId(
             id,
@@ -215,7 +254,7 @@ impl MonitorPlane {
         tasks: &Arc<Mutex<JobPlane>>,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<MonitorWakeCtx>,
-    ) -> Result<MonitorId> {
+    ) -> MonitorResult<MonitorId> {
         self.registerImpl(
             id,
             description,
@@ -244,23 +283,21 @@ impl MonitorPlane {
         tasks: &Arc<Mutex<JobPlane>>,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<MonitorWakeCtx>,
-    ) -> Result<MonitorId> {
+    ) -> MonitorResult<MonitorId> {
         // Description is required — the tool layer enforces non-empty
         // strings, but accept defensively here too.
         if description.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "monitor description is required (short label like 'errors in deploy.log')",
-            ));
+            return Err(MonitorError::MissingDescription);
         }
         if filter.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "monitor filter is required \u{2014} pass a regex that matches only the lines you want to be notified about",
-            ));
+            return Err(MonitorError::MissingFilter);
         }
         // Compile regex up-front so bad patterns reject at registration
         // time (rather than silently never matching).
-        let compiled: Regex = Regex::new(&filter)
-            .map_err(|e| anyhow::anyhow!("invalid regex filter `{filter}`: {e}"))?;
+        let compiled: Regex = Regex::new(&filter).map_err(|e| MonitorError::InvalidRegex {
+            filter: filter.clone(),
+            error: e.to_string(),
+        })?;
 
         let inner = Arc::new(Mutex::new(MonitorInner {
             state: MonitorState::Running,
@@ -449,11 +486,11 @@ impl MonitorPlane {
     /// after an auto-stop can still reap a runaway process if the
     /// in-callback kill didn't take (e.g. process group leader exited
     /// but a `disown`ed grandchild kept the stdout pipe open).
-    pub fn stop(&self, id: MonitorId, tasks: &Arc<Mutex<JobPlane>>) -> Result<()> {
+    pub fn stop(&self, id: MonitorId, tasks: &Arc<Mutex<JobPlane>>) -> MonitorResult<()> {
         let m = self
             .monitors
             .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("no monitor #{id}"))?;
+            .ok_or(MonitorError::NotFound { id })?;
         {
             let mut g = m.inner.lock().unwrap();
             if !g.state.isTerminal() {
@@ -656,6 +693,7 @@ mod tests {
                 tx.clone(),
             )
             .unwrap_err();
+        assert_eq!(err, MonitorError::MissingFilter);
         assert!(err.to_string().contains("filter is required"));
         assert_eq!(plane.len(), 0);
     }
@@ -675,6 +713,7 @@ mod tests {
                 tx.clone(),
             )
             .unwrap_err();
+        assert_eq!(err, MonitorError::MissingDescription);
         assert!(err.to_string().contains("description is required"));
         assert_eq!(plane.len(), 0);
     }
@@ -695,8 +734,23 @@ mod tests {
                 tx.clone(),
             )
             .unwrap_err();
+        assert!(matches!(
+            err,
+            MonitorError::InvalidRegex { ref filter, .. } if filter == "[unclosed"
+        ));
         assert!(err.to_string().contains("invalid regex"));
         assert_eq!(plane.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopUnknownMonitorIsTypedError() {
+        let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
+        let plane = MonitorPlane::new();
+
+        assert_eq!(
+            plane.stop(9999, &tasks),
+            Err(MonitorError::NotFound { id: 9999 }),
+        );
     }
 
     #[tokio::test]

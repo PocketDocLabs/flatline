@@ -18,11 +18,11 @@
 //! `tokio` (process + io + sync), [`crate::control`]
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -31,6 +31,23 @@ use crate::control::LogEvent;
 
 /// Identifier for a background job, monotonically increasing per session.
 pub type JobId = u64;
+
+pub type JobResult<T> = std::result::Result<T, JobError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobError {
+    NotFound { id: JobId },
+}
+
+impl fmt::Display for JobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobError::NotFound { id } => write!(f, "no task #{id}"),
+        }
+    }
+}
+
+impl std::error::Error for JobError {}
 
 /// Cap on lines kept in a task's stdout ring buffer. Earlier lines are
 /// dropped with a "[truncated N earlier lines]" marker on retrieval.
@@ -459,7 +476,11 @@ impl JobPlane {
     /// features (pipes, redirects, env expansion, bashisms) work.
     /// Stdout and stderr are interleaved into the same ring buffer in
     /// line order of arrival.
-    pub fn spawnBash(&mut self, command: String, logTx: mpsc::Sender<LogEvent>) -> Result<JobId> {
+    pub fn spawnBash(
+        &mut self,
+        command: String,
+        logTx: mpsc::Sender<LogEvent>,
+    ) -> JobResult<JobId> {
         let id = self.reserveJobId();
         self.spawnBashInner(id, command, JobKind::Bash, "bash", None, None, logTx, None)
     }
@@ -474,7 +495,7 @@ impl JobPlane {
         command: String,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<TaskWakeCtx>,
-    ) -> Result<JobId> {
+    ) -> JobResult<JobId> {
         self.spawnBashInner(
             id,
             command,
@@ -501,7 +522,7 @@ impl JobPlane {
         onLine: LineCallback,
         onExit: ExitCallback,
         logTx: mpsc::Sender<LogEvent>,
-    ) -> Result<JobId> {
+    ) -> JobResult<JobId> {
         let id = self.reserveJobId();
         let kind = JobKind::Monitor {
             description,
@@ -532,7 +553,7 @@ impl JobPlane {
         onExit: Option<ExitCallback>,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<TaskWakeCtx>,
-    ) -> Result<JobId> {
+    ) -> JobResult<JobId> {
         let cwd = self.cwd.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         });
@@ -680,11 +701,8 @@ impl JobPlane {
         id: JobId,
         sinceLine: Option<u64>,
         maxLines: usize,
-    ) -> Result<JobOutputSnapshot> {
-        let task = self
-            .jobs
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("no task #{id}"))?;
+    ) -> JobResult<JobOutputSnapshot> {
+        let task = self.jobs.get(&id).ok_or(JobError::NotFound { id })?;
         Ok(task.snapshot(sinceLine, maxLines.min(MAX_RESPONSE_LINES)))
     }
 
@@ -693,11 +711,8 @@ impl JobPlane {
     /// is "no-op on already-terminal tasks", which means callers should
     /// not see an error for the harmless case of stopping a task that
     /// has just exited on its own. Only unknown task ids return Err.
-    pub fn stop(&self, id: JobId) -> Result<()> {
-        let task = self
-            .jobs
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("no task #{id}"))?;
+    pub fn stop(&self, id: JobId) -> JobResult<()> {
+        let task = self.jobs.get(&id).ok_or(JobError::NotFound { id })?;
         if task.state().isTerminal() {
             return Ok(());
         }
@@ -1408,7 +1423,11 @@ mod tests {
             .expect("stop on terminal task should be no-op");
 
         // Stopping an unknown id is still an error.
-        assert!(plane.stop(9999).is_err());
+        assert_eq!(plane.stop(9999), Err(JobError::NotFound { id: 9999 }));
+        match plane.output(9999, None, 100) {
+            Err(err) => assert_eq!(err, JobError::NotFound { id: 9999 }),
+            Ok(_) => panic!("expected missing job error"),
+        }
 
         drop(tx);
         drop(plane);

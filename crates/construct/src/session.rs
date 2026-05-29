@@ -16,6 +16,7 @@
 //! `tokio`, `serde_json`
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -64,6 +65,38 @@ pub struct Attachment {
     /// Raw RGBA dimensions — set when data is raw pixels, None when already encoded.
     pub rgbaDimensions: Option<(u32, u32)>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellResolveError {
+    MissingNamed {
+        name: String,
+        available: Vec<String>,
+        target: String,
+    },
+    NoAgentTarget,
+}
+
+impl fmt::Display for ShellResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShellResolveError::MissingNamed {
+                name,
+                available,
+                target,
+            } => write!(
+                f,
+                "No terminal named '{name}'. \
+                 Available terminals: [{}]. \
+                 Agent's current target: '{target}'. \
+                 Call terminalList to inspect, or terminalSpawn to create.",
+                available.join(", "),
+            ),
+            ShellResolveError::NoAgentTarget => f.write_str("No agent target terminal available."),
+        }
+    }
+}
+
+impl std::error::Error for ShellResolveError {}
 
 impl From<String> for UserInput {
     fn from(text: String) -> Self {
@@ -1604,8 +1637,8 @@ impl Session {
                             let action =
                                 match tool::parse(&call.function.name, &call.function.arguments) {
                                     Ok(a) => a,
-                                    Err(msg) => {
-                                        self.pushToolResult(&call.id, msg.into());
+                                    Err(err) => {
+                                        self.pushToolResult(&call.id, err.to_string().into());
                                         continue;
                                     }
                                 };
@@ -1903,7 +1936,7 @@ impl Session {
                                                 .to_string(),
                                         };
                                         match resolvedShell {
-                                            Err(e) => crate::message::Content::text(e),
+                                            Err(e) => crate::message::Content::text(e.to_string()),
                                             Ok(shell) => {
                                                 // Race tool execution against cancel + user-triggered
                                                 // bg (Ctrl+B) for shell commands. Auto-bg on a long
@@ -3062,22 +3095,22 @@ impl Session {
     /// list of available terminals — if the named terminal doesn't
     /// exist. The verbose error is the model's recovery path; without
     /// it, a single typo can derail several turns.
-    async fn resolveShell(&self, action: &tool::ToolAction) -> std::result::Result<Shell, String> {
+    async fn resolveShell(
+        &self,
+        action: &tool::ToolAction,
+    ) -> std::result::Result<Shell, ShellResolveError> {
         let guard = self.shells.lock().await;
         match action.terminal() {
-            Some(name) => guard.shellFor(Some(name)).ok_or_else(|| {
-                let available = guard.names().join(", ");
-                let target = guard.activeForAgent();
-                format!(
-                    "No terminal named '{name}'. \
-                     Available terminals: [{available}]. \
-                     Agent's current target: '{target}'. \
-                     Call terminalList to inspect, or terminalSpawn to create."
-                )
-            }),
-            None => guard
-                .shellFor(None)
-                .ok_or_else(|| "No agent target terminal available.".into()),
+            Some(name) => {
+                guard
+                    .shellFor(Some(name))
+                    .ok_or_else(|| ShellResolveError::MissingNamed {
+                        name: name.to_string(),
+                        available: guard.names().to_vec(),
+                        target: guard.activeForAgent().to_string(),
+                    })
+            }
+            None => guard.shellFor(None).ok_or(ShellResolveError::NoAgentTarget),
         }
     }
 
@@ -3397,10 +3430,9 @@ impl Session {
                         logTxClone,
                     )
                 })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+                .await;
                 match result {
-                    Ok(id) => format!(
+                    Ok(Ok(id)) => format!(
                         "Armed wake #{id} \u{2014} cron `{spec}`{}.\n\
                          You'll receive a <wake source=\"cron#{id}\" kind=\"Cron\"> message on each fire. \
                          Cancel with cronDelete({id}).",
@@ -3410,7 +3442,8 @@ impl Session {
                             " (one-shot)"
                         },
                     ),
-                    Err(e) => format!("Failed to arm cron: {e}"),
+                    Ok(Err(e)) => format!("Failed to arm cron: {e}"),
+                    Err(e) => format!("Failed to arm cron: join error: {e}"),
                 }
             }
             tool::ToolAction::CronList => {
@@ -3438,15 +3471,15 @@ impl Session {
                         logTxClone,
                     )
                 })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")));
+                .await;
                 match result {
-                    Ok(id) => format!(
+                    Ok(Ok(id)) => format!(
                         "Armed wake #{id} \u{2014} watching {path}.\n\
                          Each fs event under that path fires a <wake source=\"fileWatch#{id}\"> message. \
                          Cancel with cronDelete({id})."
                     ),
-                    Err(e) => format!("Failed to arm fileWatch: {e}"),
+                    Ok(Err(e)) => format!("Failed to arm fileWatch: {e}"),
+                    Err(e) => format!("Failed to arm fileWatch: join error: {e}"),
                 }
             }
             _ => unreachable!("non-wake action passed to executeWakeTool"),
@@ -5169,6 +5202,19 @@ fn formatWakeList(sources: &[crate::wakes::WakeSourceInfo]) -> String {
 mod tests {
     use super::*;
     use crate::message::Content;
+
+    #[test]
+    fn shellResolveErrorFormatsRecoveryHint() {
+        let err = ShellResolveError::MissingNamed {
+            name: "build".into(),
+            available: vec!["main".into(), "logs".into()],
+            target: "main".into(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("No terminal named 'build'"));
+        assert!(text.contains("Available terminals: [main, logs]"));
+        assert!(text.contains("Agent's current target: 'main'"));
+    }
 
     #[test]
     fn formatWakeBatchEscapesMarkupPayload() {

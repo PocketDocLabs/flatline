@@ -35,12 +35,12 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::control::{LogEvent, WakeKind as ControlWakeKind};
@@ -84,6 +84,35 @@ pub struct WakeBatch {
 
 /// Monotonically increasing per-session wake source id.
 pub type WakeId = u64;
+
+pub type WakeResult<T> = std::result::Result<T, WakeError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeError {
+    InvalidCron { spec: String, error: String },
+    PathNotFound { path: PathBuf },
+    FileWatchInit { error: String },
+    FileWatchWatch { path: PathBuf, error: String },
+}
+
+impl fmt::Display for WakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WakeError::InvalidCron { spec, error } => {
+                write!(f, "invalid cron spec `{spec}`: {error}")
+            }
+            WakeError::PathNotFound { path } => {
+                write!(f, "path does not exist: {}", path.display())
+            }
+            WakeError::FileWatchInit { error } => write!(f, "fileWatch init failed: {error}"),
+            WakeError::FileWatchWatch { path, error } => {
+                write!(f, "fileWatch watch({}) failed: {error}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for WakeError {}
 
 /// Why a wake fires. The control-plane `WakeKind` is the on-the-wire
 /// shape (used in the synthetic `<wake>` message); this is the
@@ -301,7 +330,7 @@ impl WakeRegistry {
         recurring: bool,
         prompt: String,
         logTx: mpsc::Sender<LogEvent>,
-    ) -> Result<WakeId> {
+    ) -> WakeResult<WakeId> {
         // The `cron` crate uses 6-field with seconds in field 0. Accept
         // standard 5-field input by prepending "0 ".
         let normalized = if spec.split_whitespace().count() == 5 {
@@ -309,8 +338,11 @@ impl WakeRegistry {
         } else {
             spec.clone()
         };
-        let schedule = cron::Schedule::from_str(&normalized)
-            .map_err(|e| anyhow::anyhow!("invalid cron spec `{spec}`: {e}"))?;
+        let schedule =
+            cron::Schedule::from_str(&normalized).map_err(|e| WakeError::InvalidCron {
+                spec: spec.clone(),
+                error: e.to_string(),
+            })?;
         let nextFireAt = schedule
             .upcoming(chrono::Local)
             .next()
@@ -365,11 +397,11 @@ impl WakeRegistry {
         path: PathBuf,
         prompt: String,
         logTx: mpsc::Sender<LogEvent>,
-    ) -> Result<WakeId> {
+    ) -> WakeResult<WakeId> {
         use notify::{RecursiveMode, Watcher};
 
         if !path.exists() {
-            return Err(anyhow::anyhow!("path does not exist: {}", path.display()));
+            return Err(WakeError::PathNotFound { path });
         }
 
         // Create + start the watcher up front so any error surfaces as a
@@ -379,10 +411,15 @@ impl WakeRegistry {
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = evTx.blocking_send(res);
         })
-        .map_err(|e| anyhow::anyhow!("fileWatch init failed: {e}"))?;
+        .map_err(|e| WakeError::FileWatchInit {
+            error: e.to_string(),
+        })?;
         watcher
             .watch(&path, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("fileWatch watch({}) failed: {e}", path.display()))?;
+            .map_err(|e| WakeError::FileWatchWatch {
+                path: path.clone(),
+                error: e.to_string(),
+            })?;
 
         let mut g = registryArc.blocking_lock();
         let id = g.nextId;
@@ -915,6 +952,22 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let (reg, _batchRx) = WakeRegistry::new();
         let err = WakeRegistry::armCron(&reg, "nope".into(), true, "x".into(), tx).unwrap_err();
+        assert!(matches!(
+            err,
+            WakeError::InvalidCron { ref spec, .. } if spec == "nope"
+        ));
         assert!(err.to_string().contains("invalid cron"));
+    }
+
+    #[tokio::test]
+    async fn fileWatchMissingPathRejectedWithTypedError() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (reg, _batchRx) = WakeRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        let err = WakeRegistry::armFileWatch(&reg, missing.clone(), "x".into(), tx).unwrap_err();
+        assert_eq!(err, WakeError::PathNotFound { path: missing });
+        assert!(err.to_string().contains("path does not exist"));
     }
 }
