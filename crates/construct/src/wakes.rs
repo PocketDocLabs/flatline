@@ -744,6 +744,11 @@ async fn fileWatchScheduler(
 mod tests {
     use super::*;
 
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+    fn testBatchTimeout() -> Duration {
+        WAKE_BATCH_WINDOW + Duration::from_millis(300)
+    }
+
     /// Build a registry + log channel pair ready for tests. Returns
     /// `(registry, logTx, logRx, wakeBatchRx)`.
     fn buildTestRegistry() -> (
@@ -757,19 +762,58 @@ mod tests {
         (regArc, tx, rx, batchRx)
     }
 
+    async fn recvLogMatching(
+        rx: &mut mpsc::Receiver<LogEvent>,
+        matchesEvent: impl Fn(&LogEvent) -> bool,
+        label: &str,
+    ) -> LogEvent {
+        tokio::time::timeout(TEST_EVENT_TIMEOUT, async move {
+            loop {
+                let ev = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("log channel closed before {label}"));
+                if matchesEvent(&ev) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
+
+    async fn recvWakeBatch(rx: &mut mpsc::Receiver<WakeBatch>, label: &str) -> WakeBatch {
+        tokio::time::timeout(testBatchTimeout(), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+            .unwrap_or_else(|| panic!("batch channel closed before {label}"))
+    }
+
+    async fn assertNoWakeBatch(rx: &mut mpsc::Receiver<WakeBatch>, duration: Duration) {
+        let received = tokio::time::timeout(duration, rx.recv()).await;
+        assert!(
+            matches!(received, Err(_) | Ok(None)),
+            "expected no wake batch, got {received:?}",
+        );
+    }
+
     #[tokio::test]
     async fn delayFiresOnce() {
         let (reg, tx, mut rx, mut batchRx) = buildTestRegistry();
         let id = tokio::task::spawn_blocking({
             let reg = reg.clone();
             let tx = tx.clone();
-            move || WakeRegistry::armDelay(&reg, Duration::from_millis(100), "ping".into(), tx)
+            move || WakeRegistry::armDelay(&reg, Duration::ZERO, "ping".into(), tx)
         })
         .await
         .unwrap();
         assert!(id > 0);
-        // First log event is WakeRegistered.
-        let reg1 = rx.recv().await.unwrap();
+        let reg1 = recvLogMatching(
+            &mut rx,
+            |e| matches!(e, LogEvent::WakeRegistered { id: eventId, .. } if *eventId == id),
+            "delay wake registration",
+        )
+        .await;
         assert!(matches!(
             reg1,
             LogEvent::WakeRegistered {
@@ -777,21 +821,15 @@ mod tests {
                 ..
             }
         ));
-        // After ~100ms + the batch window the wake arrives as a batch.
-        let batch = tokio::time::timeout(
-            Duration::from_millis(100) + WAKE_BATCH_WINDOW + Duration::from_millis(300),
-            batchRx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let batch = recvWakeBatch(&mut batchRx, "delay wake batch").await;
         assert_eq!(batch.fires.len(), 1);
         assert!(matches!(batch.fires[0].kind, ControlWakeKind::Delay));
-        // The one-shot disarm log event lands on the log channel.
-        let dis = tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let dis = recvLogMatching(
+            &mut rx,
+            |e| matches!(e, LogEvent::WakeDisarmed { id: eventId } if *eventId == id),
+            "delay one-shot disarm",
+        )
+        .await;
         assert!(matches!(dis, LogEvent::WakeDisarmed { .. }));
         assert_eq!(reg.lock().await.len(), 0);
     }
@@ -806,22 +844,22 @@ mod tests {
         })
         .await
         .unwrap();
-        let _ = rx.recv().await; // WakeRegistered
+        let _ = recvLogMatching(
+            &mut rx,
+            |e| matches!(e, LogEvent::WakeRegistered { id: eventId, .. } if *eventId == id),
+            "delay wake registration",
+        )
+        .await;
         assert!(reg.lock().await.disarm(id, &tx));
-        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let ev = recvLogMatching(
+            &mut rx,
+            |e| matches!(e, LogEvent::WakeDisarmed { id: eventId } if *eventId == id),
+            "delay disarm",
+        )
+        .await;
         assert!(matches!(ev, LogEvent::WakeDisarmed { .. }));
         // No batch should be produced.
-        assert!(
-            tokio::time::timeout(
-                WAKE_BATCH_WINDOW + Duration::from_millis(100),
-                batchRx.recv(),
-            )
-            .await
-            .is_err()
-        );
+        assertNoWakeBatch(&mut batchRx, WAKE_BATCH_WINDOW + Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
@@ -836,13 +874,7 @@ mod tests {
                 .await
                 .enqueueFire(id, "monitor#7".into(), format!("line {i}"));
         }
-        let batch = tokio::time::timeout(
-            WAKE_BATCH_WINDOW + Duration::from_millis(200),
-            batchRx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let batch = recvWakeBatch(&mut batchRx, "coalesced monitor batch").await;
         assert_eq!(batch.fires.len(), 10);
         for (i, f) in batch.fires.iter().enumerate() {
             assert_eq!(f.payload, format!("line {i}"));
@@ -867,15 +899,7 @@ mod tests {
             payload: "line after clear".into(),
             firedAt: Instant::now(),
         });
-        let received = tokio::time::timeout(
-            WAKE_BATCH_WINDOW + Duration::from_millis(200),
-            batchRx.recv(),
-        )
-        .await;
-        assert!(
-            matches!(received, Err(_) | Ok(None)),
-            "closed registry must not emit fires from stale callback senders",
-        );
+        assertNoWakeBatch(&mut batchRx, WAKE_BATCH_WINDOW + Duration::from_millis(200)).await;
     }
 
     #[test]

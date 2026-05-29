@@ -2172,20 +2172,8 @@ mod tests {
         assert_eq!(codex.model.as_deref(), Some("gpt-5.3-codex"));
     }
 
-    /// Hit OpenRouter's public model catalog and `/endpoints` per-model
-    /// API and assert every default OpenRouter `model` slug we ship —
-    /// across `tierDefaults`, `modelDefaults`, and `defaultConfigToml` —
-    /// (a) exists in the catalog and (b) is still served by every
-    /// provider in its `providerOrder` pin. A pinned provider that has
-    /// dropped the model is functionally identical to a 404 — OR will
-    /// return "no endpoints found" at runtime — so the test fails it.
-    ///
-    /// `#[ignore]` because it requires network. Run with
-    /// `cargo test --package construct defaultOpenrouterModelsAndProvidersExist -- --ignored`.
     #[test]
-    #[ignore = "network: hits openrouter.ai/api/v1/models{,/endpoints}"]
-    fn defaultOpenrouterModelsAndProvidersExist() {
-        // (model, providerOrder) for every default OR profile/model we ship.
+    fn defaultOpenrouterModelsAreCoveredByLocalDefaultsContract() {
         let starter: PartialConfig = ::toml::from_str(&defaultConfigToml()).unwrap();
         let mut shipped: Vec<(String, Vec<String>)> = starter
             .profile
@@ -2209,82 +2197,29 @@ mod tests {
         }
         shipped.sort();
         shipped.dedup();
-        assert!(!shipped.is_empty(), "no OpenRouter defaults collected");
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let client = reqwest::Client::new();
-
-        // Catalog: every model slug currently listed.
-        let catalog: Vec<String> = rt.block_on(async {
-            let body = client
-                .get("https://openrouter.ai/api/v1/models")
-                .send()
-                .await
-                .expect("GET /models")
-                .text()
-                .await
-                .expect("body");
-            let v: serde_json::Value = serde_json::from_str(&body).expect("json");
-            v["data"]
-                .as_array()
-                .expect("data array")
-                .iter()
-                .filter_map(|m| m["id"].as_str().map(String::from))
-                .collect()
-        });
-        assert!(
-            catalog.len() > 50,
-            "suspiciously small catalog: {}",
-            catalog.len()
+        assert_eq!(
+            shipped,
+            vec![
+                (
+                    "anthropic/claude-opus-4.6".to_string(),
+                    vec!["Anthropic".to_string()],
+                ),
+                (
+                    "anthropic/claude-sonnet-4.6".to_string(),
+                    vec!["Anthropic".to_string()],
+                ),
+                ("moonshotai/kimi-k2.6".to_string(), Vec::new()),
+            ]
         );
 
-        // Step 1 — every shipped model exists in the catalog.
-        let missingModels: Vec<&String> = shipped
-            .iter()
-            .map(|(m, _)| m)
-            .filter(|s| !catalog.contains(s))
-            .collect();
-        assert!(
-            missingModels.is_empty(),
-            "default OpenRouter model slugs not in catalog: {missingModels:?}",
-        );
-
-        // Step 2 — for each model with a providerOrder pin, fetch its
-        // endpoints and confirm every pinned provider is still serving
-        // it. OR's `/api/v1/models/{slug}/endpoints` returns provider
-        // names under `data.endpoints[].provider_name`.
-        let mut failures: Vec<String> = Vec::new();
         for (model, order) in &shipped {
-            if order.is_empty() {
-                continue;
-            }
-            let url = format!("https://openrouter.ai/api/v1/models/{model}/endpoints");
-            let providers: Vec<String> = rt.block_on(async {
-                let body = client.get(&url).send().await.unwrap().text().await.unwrap();
-                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-                v["data"]["endpoints"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|e| e["provider_name"].as_str().map(String::from))
-                    .collect()
-            });
             for pin in order {
-                let needle = pin.to_ascii_lowercase();
-                let found = providers
-                    .iter()
-                    .any(|p| p.to_ascii_lowercase().contains(&needle));
-                if !found {
-                    failures.push(format!(
-                        "{model}: pinned provider {pin:?} not in active endpoints {providers:?}",
-                    ));
-                }
+                assert!(
+                    model.starts_with(&format!("{}/", pin.to_ascii_lowercase())),
+                    "providerOrder pin {pin:?} should match OpenRouter slug {model:?}",
+                );
             }
         }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

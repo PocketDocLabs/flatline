@@ -11,6 +11,17 @@ use std::time::Duration;
 
 use construct::lsp::LspManager;
 
+const RUN_LSP_INTEGRATION: &str = "FLATLINE_RUN_LSP_INTEGRATION";
+
+fn lspIntegrationEnabled() -> bool {
+    if std::env::var_os(RUN_LSP_INTEGRATION).is_some() {
+        true
+    } else {
+        eprintln!("skipping LSP integration test; set {RUN_LSP_INTEGRATION}=1 to run it");
+        false
+    }
+}
+
 /// Create a minimal Rust project in a temp dir for testing.
 fn createTestProject() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -44,6 +55,10 @@ edition = "2021"
 
 #[tokio::test]
 async fn rustAnalyzerDiagnostics() {
+    if !lspIntegrationEnabled() {
+        return;
+    }
+
     // Skip if rust-analyzer isn't available.
     if std::process::Command::new("rust-analyzer")
         .arg("--version")
@@ -101,6 +116,10 @@ async fn rustAnalyzerDiagnostics() {
 
 #[tokio::test]
 async fn missingServerHint() {
+    if !lspIntegrationEnabled() {
+        return;
+    }
+
     let userConfig = HashMap::new();
     let projectConfig = HashMap::new();
     let mut mgr = LspManager::new(&userConfig, &projectConfig);

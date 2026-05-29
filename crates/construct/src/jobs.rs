@@ -1075,63 +1075,89 @@ async fn killProcessTree(pgid: Option<i32>, child: &mut tokio::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn drain(mut rx: mpsc::Receiver<LogEvent>) -> tokio::task::JoinHandle<Vec<LogEvent>> {
-        tokio::spawn(async move {
-            let mut events = Vec::new();
-            while let Some(ev) = rx.recv().await {
-                events.push(ev);
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    async fn recvLogMatching(
+        rx: &mut mpsc::Receiver<LogEvent>,
+        matchesEvent: impl Fn(&LogEvent) -> bool,
+        label: &str,
+    ) -> LogEvent {
+        tokio::time::timeout(TEST_EVENT_TIMEOUT, async move {
+            loop {
+                let ev = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("log channel closed before {label}"));
+                if matchesEvent(&ev) {
+                    return ev;
+                }
             }
-            events
         })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
+
+    async fn waitForJobTerminal(rx: &mut mpsc::Receiver<LogEvent>, id: JobId) -> LogEvent {
+        recvLogMatching(
+            rx,
+            |ev| {
+                matches!(
+                    ev,
+                    LogEvent::JobComplete { id: eventId, .. }
+                        | LogEvent::JobStopped { id: eventId, .. }
+                        if *eventId == id
+                )
+            },
+            "job terminal event",
+        )
+        .await
     }
 
     #[tokio::test]
     async fn spawnAndComplete() {
-        let (tx, rx) = mpsc::channel(64);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
         let id = plane.spawnBash("echo hello".into(), tx.clone()).unwrap();
 
-        // Wait for completion.
-        for _ in 0..50 {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let ev = waitForJobTerminal(&mut rx, id).await;
+        assert!(matches!(
+            ev,
+            LogEvent::JobComplete {
+                id: eventId,
+                exitCode: Some(0),
+            } if eventId == id
+        ));
         let snap = plane.output(id, None, 100).unwrap();
         assert!(matches!(snap.state, JobState::Completed { exitCode: 0 }));
         assert!(snap.lines.iter().any(|l| l == "hello"));
 
         drop(tx);
         drop(plane);
-        let _events = drainer.await.unwrap();
     }
 
     #[tokio::test]
     async fn killStopsRunning() {
-        let (tx, rx) = mpsc::channel(64);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
         let id = plane.spawnBash("sleep 30".into(), tx.clone()).unwrap();
 
-        // Give it a moment to actually start.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(plane.jobs[&id].state(), JobState::Running);
         plane.stop(id).unwrap();
 
-        for _ in 0..50 {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let ev = waitForJobTerminal(&mut rx, id).await;
+        assert!(matches!(
+            ev,
+            LogEvent::JobStopped {
+                id: eventId,
+                reason,
+            } if eventId == id && reason == "killed"
+        ));
         assert_eq!(plane.jobs[&id].state(), JobState::Killed);
 
         drop(tx);
         drop(plane);
-        let _events = drainer.await.unwrap();
     }
 
     #[tokio::test]
@@ -1143,24 +1169,11 @@ mod tests {
         // child.wait(). With the fix, the process group is reaped and
         // the drainer is aborted on the grace timeout, so the task
         // reaches a terminal state quickly.
-        let (tx, rx) = mpsc::channel(1024);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(1024);
         let mut plane = JobPlane::new(None);
         let id = plane.spawnBash("yes hello &".into(), tx.clone()).unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "task #{id} stuck on {:?} after grandchild detach",
-                    plane.jobs[&id].state(),
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let _ = waitForJobTerminal(&mut rx, id).await;
         // Should report as completed (not killed) — the leader exited
         // on its own. The producer was reaped as cleanup, not as a
         // user-initiated kill.
@@ -1171,7 +1184,6 @@ mod tests {
 
         drop(tx);
         drop(plane);
-        let _ = drainer.await.unwrap();
     }
 
     #[tokio::test]
@@ -1375,12 +1387,6 @@ mod tests {
         plane.stop(id).unwrap();
         // Watch propagation is synchronous on send, so cancelRequested
         // should observe `true` immediately.
-        for _ in 0..20 {
-            if handle.cancelRequested() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         assert!(handle.cancelRequested());
     }
 
@@ -1389,17 +1395,11 @@ mod tests {
         // The tool-facing contract says taskStop is a no-op on
         // already-terminal tasks. The agent must not see an error for
         // stopping a task that has just exited on its own.
-        let (tx, rx) = mpsc::channel(64);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
         let id = plane.spawnBash("true".into(), tx.clone()).unwrap();
 
-        for _ in 0..50 {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _ = waitForJobTerminal(&mut rx, id).await;
         assert!(plane.jobs[&id].state().isTerminal());
 
         // Stopping the now-completed task must succeed silently.
@@ -1412,7 +1412,6 @@ mod tests {
 
         drop(tx);
         drop(plane);
-        let _ = drainer.await.unwrap();
     }
 
     #[test]
@@ -1446,8 +1445,7 @@ mod tests {
         // lines are still in the ring and can be fetched with an explicit
         // sinceLine. This is the value the session-side formatter uses to
         // distinguish "evicted" from "just not in this slice."
-        let (tx, rx) = mpsc::channel(64);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
         let id = plane
             .spawnBash(
@@ -1456,12 +1454,7 @@ mod tests {
             )
             .unwrap();
 
-        for _ in 0..100 {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _ = waitForJobTerminal(&mut rx, id).await;
 
         let snap = plane.output(id, None, 10).unwrap();
         assert_eq!(snap.totalLines, 50);
@@ -1474,13 +1467,11 @@ mod tests {
 
         drop(tx);
         drop(plane);
-        let _ = drainer.await.unwrap();
     }
 
     #[tokio::test]
     async fn sinceLinePagingWorks() {
-        let (tx, rx) = mpsc::channel(64);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut plane = JobPlane::new(None);
         let id = plane
             .spawnBash(
@@ -1489,12 +1480,7 @@ mod tests {
             )
             .unwrap();
 
-        for _ in 0..50 {
-            if plane.jobs[&id].state().isTerminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _ = waitForJobTerminal(&mut rx, id).await;
 
         let all = plane.output(id, None, 100).unwrap();
         assert_eq!(all.lines.len(), 5);
@@ -1507,6 +1493,5 @@ mod tests {
 
         drop(tx);
         drop(plane);
-        let _events = drainer.await.unwrap();
     }
 }

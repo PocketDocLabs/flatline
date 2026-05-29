@@ -508,21 +508,47 @@ impl Default for MonitorPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn drain(mut rx: mpsc::Receiver<LogEvent>) -> tokio::task::JoinHandle<Vec<LogEvent>> {
-        tokio::spawn(async move {
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    async fn collectLogUntil(
+        rx: &mut mpsc::Receiver<LogEvent>,
+        mut done: impl FnMut(&[LogEvent]) -> bool,
+        label: &str,
+    ) -> Vec<LogEvent> {
+        tokio::time::timeout(TEST_EVENT_TIMEOUT, async move {
             let mut events = Vec::new();
-            while let Some(ev) = rx.recv().await {
+            loop {
+                let ev = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("log channel closed before {label}"));
                 events.push(ev);
+                if done(&events) {
+                    return events;
+                }
             }
-            events
         })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
+
+    async fn recvLogMatching(
+        rx: &mut mpsc::Receiver<LogEvent>,
+        matchesEvent: impl Fn(&LogEvent) -> bool,
+        label: &str,
+    ) -> LogEvent {
+        collectLogUntil(rx, |events| events.iter().any(&matchesEvent), label)
+            .await
+            .into_iter()
+            .find(matchesEvent)
+            .unwrap_or_else(|| panic!("matched event disappeared while waiting for {label}"))
     }
 
     #[tokio::test]
     async fn registerAndMatchEmitsMonitorEvent() {
-        let (tx, rx) = mpsc::channel(256);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(256);
         let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
         let mut plane = MonitorPlane::new();
         let monitorId = plane
@@ -536,24 +562,27 @@ mod tests {
             )
             .unwrap();
 
-        // Wait for the underlying task to finish (it's a one-shot).
-        for _ in 0..100 {
-            let info = plane.lookup(monitorId).unwrap().info();
-            if info.eventCount >= 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        // Give drainers a moment to flush.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-        let info = plane.lookup(monitorId).unwrap().info();
-        assert_eq!(info.eventCount, 1, "only `ERROR final` should match");
-
-        drop(tx);
-        drop(plane);
-        drop(tasks);
-        let events = drainer.await.unwrap();
+        let events = collectLogUntil(
+            &mut rx,
+            |events| {
+                let registered = events.iter().any(
+                    |e| matches!(e, LogEvent::MonitorRegistered { id, .. } if *id == monitorId),
+                );
+                let matched = events.iter().any(|e| {
+                    matches!(
+                        e,
+                        LogEvent::MonitorEvent {
+                            id,
+                            line,
+                            eventCount: 1,
+                        } if *id == monitorId && line == "ERROR final"
+                    )
+                });
+                registered && matched
+            },
+            "monitor registration and match event",
+        )
+        .await;
         let registered = events
             .iter()
             .filter(|e| matches!(e, LogEvent::MonitorRegistered { id, .. } if *id == monitorId))
@@ -564,14 +593,20 @@ mod tests {
             .count();
         assert_eq!(registered, 1);
         assert_eq!(matched, 1);
+
+        let info = plane.lookup(monitorId).unwrap().info();
+        assert_eq!(info.eventCount, 1, "only `ERROR final` should match");
+
+        drop(tx);
+        drop(plane);
+        drop(tasks);
     }
 
     #[tokio::test]
     async fn matchAllRegexCountsEveryLine() {
         // Filter is required, so to exercise the count-every-line path
         // we pass a regex that matches everything.
-        let (tx, rx) = mpsc::channel(256);
-        let drainer = drain(rx);
+        let (tx, mut rx) = mpsc::channel(256);
         let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
         let mut plane = MonitorPlane::new();
         let id = plane
@@ -584,20 +619,26 @@ mod tests {
                 tx.clone(),
             )
             .unwrap();
-        for _ in 0..100 {
-            let info = plane.lookup(id).unwrap().info();
-            if info.eventCount >= 5 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let _ = recvLogMatching(
+            &mut rx,
+            |e| {
+                matches!(
+                    e,
+                    LogEvent::MonitorEvent {
+                        id: eventId,
+                        eventCount,
+                        ..
+                    } if *eventId == id && *eventCount == 5
+                )
+            },
+            "fifth monitor match",
+        )
+        .await;
         let info = plane.lookup(id).unwrap().info();
         assert_eq!(info.eventCount, 5);
         drop(tx);
         drop(plane);
         drop(tasks);
-        let _ = drainer.await.unwrap();
     }
 
     #[tokio::test]
@@ -666,7 +707,7 @@ mod tests {
         // monitor has gone away.
         use crate::wakes::WakeRegistry;
 
-        let (tx, _rx) = mpsc::channel(1024);
+        let (tx, mut rx) = mpsc::channel(1024);
         let (regArc, _batchRx) = WakeRegistry::new();
         let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
         let mut plane = MonitorPlane::new();
@@ -683,46 +724,37 @@ mod tests {
             fireTx,
         };
 
-        // Drive the flood guard hard: threshold 0.0001 eps (any match
-        // exceeds it), 0.3s flood window (vs production 5s). Bash loop
-        // emits a matching line every 20ms so the EWMA stays well above
-        // threshold across the window.
+        // Collapse the test flood window to zero so the auto-stop path is
+        // driven by a matching line, not by wall-clock sleeping. Production
+        // callers still use the 5s sustained-flood window.
         plane
             .registerImpl(
                 monitorId,
                 "burst".into(),
-                "while true; do echo HIT; sleep 0.02; done".into(),
+                "echo HIT".into(),
                 "HIT".into(),
                 0.0001,
-                0.3,
+                0.0,
                 &tasks,
                 tx.clone(),
                 Some(wakeCtx),
             )
             .unwrap();
 
-        // Wait until the auto-stop fires. Budget = flood window +
-        // tokio::spawn slack for the unregister.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let state = plane.lookup(monitorId).unwrap().state();
-            if matches!(state, MonitorState::AutoStopped(_)) {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("monitor never auto-stopped (state still {state:?})");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        // The unregister happens via tokio::spawn from the sync
-        // callback — give it a beat to run before asserting.
-        for _ in 0..50 {
-            if regArc.lock().await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _events = collectLogUntil(
+            &mut rx,
+            |events| {
+                let stopped = events.iter().any(
+                    |e| matches!(e, LogEvent::MonitorAutoStopped { id, .. } if *id == monitorId),
+                );
+                let disarmed = events
+                    .iter()
+                    .any(|e| matches!(e, LogEvent::WakeDisarmed { id } if *id == wakeId));
+                stopped && disarmed
+            },
+            "monitor auto-stop and passive wake unregister",
+        )
+        .await;
         assert_eq!(
             regArc.lock().await.len(),
             0,
@@ -779,26 +811,26 @@ mod tests {
             )
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut sawStopped = false;
-        loop {
-            while let Ok(ev) = rx.try_recv() {
-                if matches!(ev, LogEvent::MonitorStopped { id } if id == monitorId) {
-                    sawStopped = true;
-                }
-            }
-            let state = plane.lookup(monitorId).unwrap().state();
-            let wakeCount = regArc.lock().await.len();
-            if matches!(state, MonitorState::Stopped) && wakeCount == 0 && sawStopped {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "finite monitor did not stop cleanly (state {state:?}, wakeCount {wakeCount}, sawStopped {sawStopped})"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _events = collectLogUntil(
+            &mut rx,
+            |events| {
+                let stopped = events
+                    .iter()
+                    .any(|e| matches!(e, LogEvent::MonitorStopped { id } if *id == monitorId));
+                let disarmed = events
+                    .iter()
+                    .any(|e| matches!(e, LogEvent::WakeDisarmed { id } if *id == wakeId));
+                stopped && disarmed
+            },
+            "finite monitor stop and passive wake unregister",
+        )
+        .await;
+        let state = plane.lookup(monitorId).unwrap().state();
+        let wakeCount = regArc.lock().await.len();
+        assert!(
+            matches!(state, MonitorState::Stopped) && wakeCount == 0,
+            "finite monitor did not stop cleanly (state {state:?}, wakeCount {wakeCount})",
+        );
 
         let batch = tokio::time::timeout(
             crate::wakes::WAKE_BATCH_WINDOW + std::time::Duration::from_millis(300),
@@ -820,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopMarksMonitorAndKillsBackingTask() {
-        let (tx, _rx) = mpsc::channel(256);
+        let (tx, mut rx) = mpsc::channel(256);
         let tasks = Arc::new(Mutex::new(JobPlane::new(None)));
         let mut plane = MonitorPlane::new();
         let id = plane
@@ -833,10 +865,24 @@ mod tests {
                 tx.clone(),
             )
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let taskId = plane.lookup(id).unwrap().taskId;
         plane.stop(id, &tasks).unwrap();
         let info = plane.lookup(id).unwrap().info();
         assert_eq!(info.state, MonitorState::Stopped);
+        let _ = recvLogMatching(
+            &mut rx,
+            |e| {
+                matches!(
+                    e,
+                    LogEvent::JobStopped {
+                        id: eventId,
+                        reason,
+                    } if *eventId == taskId && reason == "killed"
+                )
+            },
+            "monitor backing task stop",
+        )
+        .await;
         // Second stop is a no-op (no error).
         plane.stop(id, &tasks).unwrap();
     }
