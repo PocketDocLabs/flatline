@@ -64,7 +64,7 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     `grep --line-buffered`, `awk 'BEGIN {{...}}'` with \
                     `fflush()`, `stdbuf -oL <cmd>`, or `ssh host 'stdbuf \
                     -oL tail -F /path'` to keep output flowing.\n\n\
-                    Async terminal runs are archived in /runs. If \
+                    Async terminal runs are archived in terminal history. If \
                     `runInBackground` is true and `terminal` is omitted, \
                     Flatline creates a visible ephemeral terminal and closes \
                     it after the run is archived."
@@ -1012,7 +1012,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 name: "terminalRunList".into(),
                 description: "List archived visible terminal runs with run id, \
                     purpose, impact, terminal, status, and exit code. Use this \
-                    to rediscover async run ids; /runs is the user-facing view."
+                    to rediscover async run ids; terminal history is the \
+                    user-facing view."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1105,7 +1106,7 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                 description: "List JobPlane-backed background tasks (running, \
                     completed, killed, errored) with age, total lines emitted, \
                     and state. Visible async terminal runs live in terminalRunList \
-                    and /runs."
+                    and terminal history."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1351,7 +1352,7 @@ pub enum ToolAction {
         /// For `runInBackground`, None creates a visible ephemeral terminal.
         terminal: Option<String>,
         /// Spawn non-blocking as a visible terminal run. When true, returns a
-        /// terminal run id immediately and archives replay bytes for `/runs`.
+        /// terminal run id immediately and archives replay bytes for terminal history.
         runInBackground: bool,
     },
     ReadFile {

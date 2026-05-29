@@ -1124,8 +1124,19 @@ ZDOTDIR="{originalZdotdir}"
 # Agent shell has no interactive history — disable ! expansion
 # so globs like [!.]* don't trigger "event not found".
 set +H
+# zsh's prompt-spacer paints PROMPT_EOL_MARK (usually inverse "%") and
+# can add a protective newline when a hook writes control-only bytes
+# before the prompt. Flatline's OSC 133 markers are terminal metadata,
+# not user output, so disable the spacer in managed shells.
+unsetopt PROMPT_SP
+PROMPT_EOL_MARK=''
+_flatline_seen_prompt=0
 flatline_precmd() {{
     local _ec=$?
+    if [[ "$_flatline_seen_prompt" != 1 ]]; then
+        _flatline_seen_prompt=1
+        return
+    fi
     printf '\e]133;D;%s\a\e]133;A\a' "$_ec"
     if [[ -n "$_flatline_uuid" ]]; then
         printf '\n__FLATLINE_END_%s_%s__\n' "$_flatline_uuid" "$_ec"

@@ -3,13 +3,13 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget},
 };
 
-use construct::storage::TerminalRunRecord;
+use construct::storage::{TerminalRunRecord, TerminalRunStatus};
 
 const BG: Color = Color::Rgb(32, 36, 44);
 const FG: Color = Color::Rgb(225, 228, 235);
@@ -44,6 +44,10 @@ impl RunsPanel {
         if self.selected >= self.runs.len() {
             self.selected = self.runs.len().saturating_sub(1);
         }
+        if self.runs.is_empty() {
+            self.detail = false;
+            self.scroll = 0;
+        }
     }
 
     pub fn handleKey(&mut self, key: KeyEvent) -> RunsAction {
@@ -66,8 +70,10 @@ impl RunsPanel {
                 RunsAction::None
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.detail = !self.detail;
-                self.scroll = 0;
+                if !self.runs.is_empty() {
+                    self.detail = !self.detail;
+                    self.scroll = 0;
+                }
                 RunsAction::None
             }
             KeyCode::Backspace | KeyCode::Left => {
@@ -80,14 +86,21 @@ impl RunsPanel {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup = centerRect(area, 92, 28);
+        let popup = if self.runs.is_empty() {
+            centerRect(area, 50, 7)
+        } else if self.detail {
+            centerRect(area, 88, 24)
+        } else {
+            let h = (self.runs.len() as u16).saturating_add(4).clamp(8, 20);
+            centerRect(area, 84, h)
+        };
         Clear.render(popup, buf);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER))
             .style(Style::default().bg(BG))
             .title(Span::styled(
-                " /runs ",
+                " terminal history ",
                 Style::default().fg(BORDER).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(popup);
@@ -101,9 +114,25 @@ impl RunsPanel {
 
     fn renderList(&self, area: Rect, buf: &mut Buffer) {
         if self.runs.is_empty() {
-            Paragraph::new("  no terminal runs archived yet")
-                .style(Style::default().fg(DIM).bg(BG))
-                .render(area, buf);
+            let textArea = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(2) / 2,
+                width: area.width,
+                height: 2.min(area.height),
+            };
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No archived terminal runs",
+                    Style::default().fg(FG).bg(BG),
+                )),
+                Line::from(Span::styled(
+                    "Async command output will appear here.",
+                    Style::default().fg(DIM).bg(BG),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(DIM).bg(BG))
+            .render(textArea, buf);
             return;
         }
         let height = area.height as usize;
@@ -112,12 +141,12 @@ impl RunsPanel {
             let y = area.y + (row - start) as u16;
             let selected = row == self.selected;
             let bg = if selected { SELECTED } else { BG };
-            let (glyph, color) = crate::impact::shellImpactGlyphColor(&run.impact);
-            let status = match run.status.as_str() {
-                "running" => "\u{25F4}",
-                "completed" => "\u{2713}",
-                "failed" | "timed_out" => "\u{2717}",
-                _ => "\u{00B7}",
+            let (glyph, color) = crate::impact::terminalRunImpactGlyphColor(run.impact);
+            let status = match run.status {
+                TerminalRunStatus::Running => "\u{25F4}",
+                TerminalRunStatus::Completed => "\u{2713}",
+                TerminalRunStatus::Failed | TerminalRunStatus::TimedOut => "\u{2717}",
+                TerminalRunStatus::Rejected => "\u{00B7}",
             };
             let mut purpose = run.purpose.clone();
             let maxPurpose = area.width.saturating_sub(30) as usize;
@@ -153,7 +182,7 @@ impl RunsPanel {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .split(area);
-        let (glyph, color) = crate::impact::shellImpactGlyphColor(&run.impact);
+        let (glyph, color) = crate::impact::terminalRunImpactGlyphColor(run.impact);
         let header = vec![
             Line::from(vec![
                 Span::styled(glyph, Style::default().fg(color).bg(BG)),
@@ -179,7 +208,7 @@ impl RunsPanel {
 
 fn centerRect(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width.saturating_sub(4)).max(20);
-    let h = height.min(area.height.saturating_sub(2)).max(8);
+    let h = height.min(area.height.saturating_sub(2)).max(5);
     Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,

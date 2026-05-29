@@ -104,11 +104,6 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Show background jobs, monitors, and wake schedules",
     },
     CommandDef {
-        name: "runs",
-        aliases: &[],
-        description: "Show archived terminal runs",
-    },
-    CommandDef {
         name: "logs",
         aliases: &["log"],
         description: "Show developer log history",
@@ -161,8 +156,6 @@ pub enum CommandAction {
     ShowCost,
     /// Open the background jobs / monitors / schedules panel.
     Tasks,
-    /// Open the terminal run history panel.
-    Runs,
     /// Open the developer log history panel.
     Logs,
     /// Open the same layout controls as Ctrl+O.
@@ -238,7 +231,6 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "model" => CommandOutput::Action(CommandAction::Model),
         "cost" => CommandOutput::Action(CommandAction::ShowCost),
         "tasks" => CommandOutput::Action(CommandAction::Tasks),
-        "runs" => CommandOutput::Action(CommandAction::Runs),
         "logs" => CommandOutput::Action(CommandAction::Logs),
         "layout" => CommandOutput::Action(CommandAction::ShowLayout),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
@@ -344,5 +336,23 @@ mod tests {
             matches.iter().any(|c| c.name == "tasks"),
             "completions for `jo` should match the /jobs alias and surface /tasks",
         );
+    }
+
+    #[test]
+    fn runsIsNotASlashCommand() {
+        assert!(
+            completions("ru").iter().all(|c| c.name != "runs"),
+            "/runs must stay out of the slash-command surface",
+        );
+        match tryHandle("/runs") {
+            Some(CommandOutput::Inline(msg)) => assert!(
+                msg.contains("Unknown command"),
+                "expected unknown-command response, got: {msg}",
+            ),
+            Some(CommandOutput::Action(action)) => {
+                panic!("expected /runs to be unavailable, got action {action:?}")
+            }
+            None => panic!("slash commands should return an inline response"),
+        }
     }
 }

@@ -7,11 +7,13 @@
 //! files are imported once when a database is first opened.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Type;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::compaction::CompactionOp;
 use crate::snapshot::RequestSnapshot;
@@ -19,11 +21,15 @@ use crate::transcript::{SessionMeta, Turn};
 
 pub const DB_FILE: &str = "session.sqlite";
 
-pub fn dbPath(sessionDir: &Path) -> std::path::PathBuf {
+pub(crate) fn dbPath(sessionDir: &Path) -> std::path::PathBuf {
     sessionDir.join(DB_FILE)
 }
 
-pub fn openSessionDb(sessionDir: &Path) -> Result<Connection> {
+pub fn ensureSessionDb(sessionDir: &Path) -> Result<()> {
+    openSessionDb(sessionDir).map(drop)
+}
+
+pub(crate) fn openSessionDb(sessionDir: &Path) -> Result<Connection> {
     sqliteBlocking(|| {
         fs::create_dir_all(sessionDir)
             .with_context(|| format!("create session dir: {}", sessionDir.display()))?;
@@ -255,7 +261,7 @@ fn importLegacySnapshots(tx: &rusqlite::Transaction<'_>, sessionDir: &Path) -> R
     Ok(())
 }
 
-pub fn insertTurn(conn: &Connection, turn: &Turn) -> Result<()> {
+pub(crate) fn insertTurn(conn: &Connection, turn: &Turn) -> Result<()> {
     sqliteBlocking(|| insertTurnTx(conn, turn))
 }
 
@@ -285,7 +291,7 @@ fn insertTurnTx(conn: &Connection, turn: &Turn) -> Result<()> {
     Ok(())
 }
 
-pub fn loadTurns(conn: &Connection) -> Result<Vec<Turn>> {
+pub(crate) fn loadTurns(conn: &Connection) -> Result<Vec<Turn>> {
     sqliteBlocking(|| {
         let mut stmt = conn.prepare("SELECT turn_json FROM turns ORDER BY seq ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -297,7 +303,7 @@ pub fn loadTurns(conn: &Connection) -> Result<Vec<Turn>> {
     })
 }
 
-pub fn upsertMeta(conn: &Connection, meta: &SessionMeta) -> Result<()> {
+pub(crate) fn upsertMeta(conn: &Connection, meta: &SessionMeta) -> Result<()> {
     sqliteBlocking(|| upsertMetaTx(conn, meta))
 }
 
@@ -330,7 +336,7 @@ fn upsertMetaTx(conn: &Connection, meta: &SessionMeta) -> Result<()> {
     Ok(())
 }
 
-pub fn loadMeta(conn: &Connection) -> Result<Option<SessionMeta>> {
+pub(crate) fn loadMeta(conn: &Connection) -> Result<Option<SessionMeta>> {
     sqliteBlocking(|| {
         let json: Option<String> = conn
             .query_row("SELECT meta_json FROM session_meta WHERE id = 1", [], |r| {
@@ -344,7 +350,7 @@ pub fn loadMeta(conn: &Connection) -> Result<Option<SessionMeta>> {
     })
 }
 
-pub fn insertCompaction(conn: &Connection, op: &CompactionOp) -> Result<()> {
+pub(crate) fn insertCompaction(conn: &Connection, op: &CompactionOp) -> Result<()> {
     sqliteBlocking(|| insertCompactionTx(conn, op))
 }
 
@@ -369,7 +375,7 @@ fn insertCompactionTx(conn: &Connection, op: &CompactionOp) -> Result<()> {
     Ok(())
 }
 
-pub fn loadCompaction(conn: &Connection) -> Result<Vec<CompactionOp>> {
+pub(crate) fn loadCompaction(conn: &Connection) -> Result<Vec<CompactionOp>> {
     sqliteBlocking(|| {
         let mut stmt = conn.prepare("SELECT op_json FROM compaction_ops ORDER BY seq ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -381,7 +387,7 @@ pub fn loadCompaction(conn: &Connection) -> Result<Vec<CompactionOp>> {
     })
 }
 
-pub fn insertSnapshot(conn: &Connection, hash: &str, snap: &RequestSnapshot) -> Result<()> {
+pub(crate) fn insertSnapshot(conn: &Connection, hash: &str, snap: &RequestSnapshot) -> Result<()> {
     sqliteBlocking(|| insertSnapshotTx(conn, hash, snap))
 }
 
@@ -393,7 +399,7 @@ fn insertSnapshotTx(conn: &Connection, hash: &str, snap: &RequestSnapshot) -> Re
     Ok(())
 }
 
-pub fn snapshotHashes(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+pub(crate) fn snapshotHashes(conn: &Connection) -> Result<std::collections::HashSet<String>> {
     sqliteBlocking(|| {
         let mut stmt = conn.prepare("SELECT hash FROM snapshots")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -405,7 +411,12 @@ pub fn snapshotHashes(conn: &Connection) -> Result<std::collections::HashSet<Str
     })
 }
 
-pub fn putSnapshotBlob(conn: &Connection, namespace: &str, hash: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn putSnapshotBlob(
+    conn: &Connection,
+    namespace: &str,
+    hash: &str,
+    bytes: &[u8],
+) -> Result<()> {
     sqliteBlocking(|| {
         conn.execute(
             "INSERT OR IGNORE INTO snapshot_blobs (hash, namespace, bytes) VALUES (?1, ?2, ?3)",
@@ -449,23 +460,134 @@ pub fn snapshotBlobForSession(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalRunFieldParseError {
+    field: &'static str,
+    value: String,
+}
+
+impl TerminalRunFieldParseError {
+    fn new(field: &'static str, value: &str) -> Self {
+        Self {
+            field,
+            value: value.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for TerminalRunFieldParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown terminal run {} `{}`", self.field, self.value)
+    }
+}
+
+impl std::error::Error for TerminalRunFieldParseError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRunImpact {
+    Read,
+    MinorMod,
+    MajorMod,
+    Delete,
+}
+
+impl TerminalRunImpact {
+    pub(crate) fn asStorageName(self) -> &'static str {
+        match self {
+            TerminalRunImpact::Read => "read",
+            TerminalRunImpact::MinorMod => "minorMod",
+            TerminalRunImpact::MajorMod => "majorMod",
+            TerminalRunImpact::Delete => "delete",
+        }
+    }
+
+    pub(crate) fn fromStorageName(
+        value: &str,
+    ) -> std::result::Result<Self, TerminalRunFieldParseError> {
+        match value {
+            "read" => Ok(TerminalRunImpact::Read),
+            "minorMod" => Ok(TerminalRunImpact::MinorMod),
+            "majorMod" => Ok(TerminalRunImpact::MajorMod),
+            "delete" => Ok(TerminalRunImpact::Delete),
+            other => Err(TerminalRunFieldParseError::new("impact", other)),
+        }
+    }
+}
+
+impl fmt::Display for TerminalRunImpact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.asStorageName())
+    }
+}
+
+impl From<&crate::tool::ShellImpact> for TerminalRunImpact {
+    fn from(impact: &crate::tool::ShellImpact) -> Self {
+        match impact {
+            crate::tool::ShellImpact::Read => TerminalRunImpact::Read,
+            crate::tool::ShellImpact::MinorMod => TerminalRunImpact::MinorMod,
+            crate::tool::ShellImpact::MajorMod => TerminalRunImpact::MajorMod,
+            crate::tool::ShellImpact::Delete => TerminalRunImpact::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRunStatus {
+    Running,
+    Completed,
+    Failed,
+    TimedOut,
+    Rejected,
+}
+
+impl TerminalRunStatus {
+    pub(crate) fn asStorageName(self) -> &'static str {
+        match self {
+            TerminalRunStatus::Running => "running",
+            TerminalRunStatus::Completed => "completed",
+            TerminalRunStatus::Failed => "failed",
+            TerminalRunStatus::TimedOut => "timed_out",
+            TerminalRunStatus::Rejected => "rejected",
+        }
+    }
+
+    pub(crate) fn fromStorageName(
+        value: &str,
+    ) -> std::result::Result<Self, TerminalRunFieldParseError> {
+        match value {
+            "running" => Ok(TerminalRunStatus::Running),
+            "completed" => Ok(TerminalRunStatus::Completed),
+            "failed" => Ok(TerminalRunStatus::Failed),
+            "timed_out" => Ok(TerminalRunStatus::TimedOut),
+            "rejected" => Ok(TerminalRunStatus::Rejected),
+            other => Err(TerminalRunFieldParseError::new("status", other)),
+        }
+    }
+}
+
+impl fmt::Display for TerminalRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.asStorageName())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalRunRecord {
     pub runId: String,
     pub terminalName: String,
     pub command: String,
     pub purpose: String,
-    pub impact: String,
+    pub impact: TerminalRunImpact,
     pub ephemeral: bool,
     pub startedAt: u64,
     pub endedAt: Option<u64>,
-    pub status: String,
+    pub status: TerminalRunStatus,
     pub exitCode: Option<i32>,
     pub lineCount: usize,
     pub replayBlob: Vec<u8>,
 }
 
-pub fn upsertTerminalRun(conn: &Connection, run: &TerminalRunRecord) -> Result<()> {
+pub(crate) fn upsertTerminalRun(conn: &Connection, run: &TerminalRunRecord) -> Result<()> {
     sqliteBlocking(|| {
         conn.execute(
             "INSERT INTO terminal_runs
@@ -489,11 +611,11 @@ pub fn upsertTerminalRun(conn: &Connection, run: &TerminalRunRecord) -> Result<(
                 run.terminalName,
                 run.command,
                 run.purpose,
-                run.impact,
+                run.impact.asStorageName(),
                 if run.ephemeral { 1 } else { 0 },
                 run.startedAt as i64,
                 run.endedAt.map(|v| v as i64),
-                run.status,
+                run.status.asStorageName(),
                 run.exitCode,
                 run.lineCount as i64,
                 run.replayBlob,
@@ -503,29 +625,14 @@ pub fn upsertTerminalRun(conn: &Connection, run: &TerminalRunRecord) -> Result<(
     })
 }
 
-pub fn listTerminalRuns(conn: &Connection) -> Result<Vec<TerminalRunRecord>> {
+pub(crate) fn listTerminalRuns(conn: &Connection) -> Result<Vec<TerminalRunRecord>> {
     sqliteBlocking(|| {
         let mut stmt = conn.prepare(
             "SELECT run_id, terminal_name, command, purpose, impact, ephemeral, started_at,
                 ended_at, status, exit_code, line_count, replay_blob
          FROM terminal_runs ORDER BY started_at DESC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(TerminalRunRecord {
-                runId: r.get(0)?,
-                terminalName: r.get(1)?,
-                command: r.get(2)?,
-                purpose: r.get(3)?,
-                impact: r.get(4)?,
-                ephemeral: r.get::<_, i64>(5)? != 0,
-                startedAt: r.get::<_, i64>(6)? as u64,
-                endedAt: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                status: r.get(8)?,
-                exitCode: r.get(9)?,
-                lineCount: r.get::<_, i64>(10)? as usize,
-                replayBlob: r.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map([], terminalRunRecordFromRow)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -534,32 +641,38 @@ pub fn listTerminalRuns(conn: &Connection) -> Result<Vec<TerminalRunRecord>> {
     })
 }
 
-pub fn getTerminalRun(conn: &Connection, runId: &str) -> Result<Option<TerminalRunRecord>> {
+pub(crate) fn getTerminalRun(conn: &Connection, runId: &str) -> Result<Option<TerminalRunRecord>> {
     sqliteBlocking(|| {
         conn.query_row(
             "SELECT run_id, terminal_name, command, purpose, impact, ephemeral, started_at,
                 ended_at, status, exit_code, line_count, replay_blob
              FROM terminal_runs WHERE run_id = ?1",
             [runId],
-            |r| {
-                Ok(TerminalRunRecord {
-                    runId: r.get(0)?,
-                    terminalName: r.get(1)?,
-                    command: r.get(2)?,
-                    purpose: r.get(3)?,
-                    impact: r.get(4)?,
-                    ephemeral: r.get::<_, i64>(5)? != 0,
-                    startedAt: r.get::<_, i64>(6)? as u64,
-                    endedAt: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                    status: r.get(8)?,
-                    exitCode: r.get(9)?,
-                    lineCount: r.get::<_, i64>(10)? as usize,
-                    replayBlob: r.get(11)?,
-                })
-            },
+            terminalRunRecordFromRow,
         )
         .optional()
         .map_err(Into::into)
+    })
+}
+
+fn terminalRunRecordFromRow(r: &Row<'_>) -> rusqlite::Result<TerminalRunRecord> {
+    let impactRaw: String = r.get(4)?;
+    let statusRaw: String = r.get(8)?;
+    Ok(TerminalRunRecord {
+        runId: r.get(0)?,
+        terminalName: r.get(1)?,
+        command: r.get(2)?,
+        purpose: r.get(3)?,
+        impact: TerminalRunImpact::fromStorageName(&impactRaw)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(e)))?,
+        ephemeral: r.get::<_, i64>(5)? != 0,
+        startedAt: r.get::<_, i64>(6)? as u64,
+        endedAt: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+        status: TerminalRunStatus::fromStorageName(&statusRaw)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(e)))?,
+        exitCode: r.get(9)?,
+        lineCount: r.get::<_, i64>(10)? as usize,
+        replayBlob: r.get(11)?,
     })
 }
 
@@ -576,11 +689,11 @@ mod tests {
             terminalName: "build".into(),
             command: "cargo test".into(),
             purpose: "run tests".into(),
-            impact: "read".into(),
+            impact: TerminalRunImpact::Read,
             ephemeral: true,
             startedAt: 10,
             endedAt: Some(20),
-            status: "completed".into(),
+            status: TerminalRunStatus::Completed,
             exitCode: Some(0),
             lineCount: 2,
             replayBlob: b"\x1b[32mok\x1b[0m\n".to_vec(),
@@ -589,13 +702,33 @@ mod tests {
 
         let loaded = getTerminalRun(&conn, "run_1").unwrap().unwrap();
         assert_eq!(loaded.terminalName, "build");
+        assert_eq!(loaded.impact, TerminalRunImpact::Read);
         assert!(loaded.ephemeral);
+        assert_eq!(loaded.status, TerminalRunStatus::Completed);
         assert_eq!(loaded.exitCode, Some(0));
         assert_eq!(loaded.replayBlob, b"\x1b[32mok\x1b[0m\n");
 
         let list = listTerminalRuns(&conn).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].runId, "run_1");
+    }
+
+    #[test]
+    fn terminalRunRejectsUnknownStatus() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = openSessionDb(dir.path()).unwrap();
+        conn.execute(
+            "INSERT INTO terminal_runs
+             (run_id, terminal_name, command, purpose, impact, ephemeral, started_at,
+              status, line_count, replay_blob)
+             VALUES ('run_bad', 'main', 'cmd', 'purpose', 'read', 0, 10,
+              'paused_maybe', 0, X'')",
+            [],
+        )
+        .unwrap();
+
+        let err = listTerminalRuns(&conn).unwrap_err();
+        assert!(format!("{err:?}").contains("unknown terminal run status"));
     }
 
     #[test]

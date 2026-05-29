@@ -161,7 +161,7 @@ enum DeckUpdate {
     ResumeResult(construct::control::CommandAck),
     /// Background-job snapshot for the `/jobs` panel.
     TasksList(Vec<construct::jobs::JobInfo>),
-    /// Terminal-run archive snapshot for the `/runs` panel.
+    /// Terminal-run archive snapshot for the terminal history panel.
     RunsList(Vec<construct::storage::TerminalRunRecord>),
     /// Wake-source snapshot for the `/jobs` panel schedules section.
     WakesList(Vec<construct::wakes::WakeSourceInfo>),
@@ -1525,6 +1525,9 @@ async fn runLoop(
     let mut unseenWorkPending = false;
     // True when a permission prompt arrived while window was not focused.
     let mut unseenPermitPending = false;
+    // When Esc closes an overlay, a queued/repeated second Esc is usually
+    // finger bounce rather than a deliberate turn cancel. Swallow it briefly.
+    let mut lastEscClosedOverlayAt: Option<Instant> = None;
     // Cap draws at ~30fps. Prevents strobing when the PTY floods us with
     // updates (rich progress bars, keystroke echo) — ratatui's buffer diff
     // absorbs all the intermediate state into one frame.
@@ -1753,12 +1756,29 @@ async fn runLoop(
                     }
                 }
 
-                // Hardware cursor for agent text input (hidden during permission prompt).
-                if *focus == Focus::Agent && !agentPanel.pendingPermit {
+                let modalOpen = helpPopupOpen
+                    || sessionPicker.is_some()
+                    || rewindPicker.is_some()
+                    || forkPicker.is_some()
+                    || mcpPanel.is_some()
+                    || lspPanel.is_some()
+                    || modelPanel.is_some()
+                    || permissionsPanel.is_some()
+                    || subagentPanel.is_some()
+                    || tasksPanel.is_some()
+                    || runsPanel.is_some()
+                    || logPanel.is_some()
+                    || layoutPanel.is_some();
+
+                // Hardware cursor for direct text/terminal input. Modal overlays
+                // suppress it so the terminal cursor cannot appear inside popup
+                // borders or content.
+                if !modalOpen && *focus == Focus::Agent && !agentPanel.pendingPermit {
                     if let Some((col, row)) = agentPanel.textArea.cursorScreenPos {
                         frame.set_cursor_position(ratatui::layout::Position::new(col, row));
                     }
-                } else if *focus == Focus::Terminal
+                } else if !modalOpen
+                    && *focus == Focus::Terminal
                     && let Some((col, row)) = termPane.activeStateRef().cursorViewportPos()
                 {
                     frame.set_cursor_position(ratatui::layout::Position::new(
@@ -2970,6 +2990,7 @@ async fn runLoop(
             &mut sessionLayoutPath,
             &mut activePresetName,
             &mut layoutPanel,
+            &mut lastEscClosedOverlayAt,
         )
         .await?;
         if quit {
@@ -2986,6 +3007,35 @@ async fn runLoop(
     }
 
     Ok(())
+}
+
+const ESC_OVERLAY_CLOSE_GUARD: Duration = Duration::from_millis(500);
+
+fn noteEscClosedOverlay(key: &event::KeyEvent, lastEscClosedOverlayAt: &mut Option<Instant>) {
+    if key.code == KeyCode::Esc {
+        *lastEscClosedOverlayAt = Some(Instant::now());
+    }
+}
+
+fn suppressEscAfterOverlayClose(
+    key: &event::KeyEvent,
+    lastEscClosedOverlayAt: &mut Option<Instant>,
+) -> bool {
+    if key.code != KeyCode::Esc {
+        *lastEscClosedOverlayAt = None;
+        return false;
+    }
+
+    let Some(closedAt) = *lastEscClosedOverlayAt else {
+        return false;
+    };
+
+    if closedAt.elapsed() < ESC_OVERLAY_CLOSE_GUARD {
+        return true;
+    }
+
+    *lastEscClosedOverlayAt = None;
+    false
 }
 
 /// Drain all pending input events. Returns (quit, hadInput).
@@ -3032,6 +3082,7 @@ async fn handleInput(
     sessionLayoutPath: &mut Option<std::path::PathBuf>,
     activePresetName: &mut Option<String>,
     layoutPanel: &mut Option<crate::layout::control_panel::ControlPanel>,
+    lastEscClosedOverlayAt: &mut Option<Instant>,
 ) -> Result<(bool, bool, bool)> {
     // Wait up to 16ms for the first event.
     if !event::poll(Duration::from_millis(16))? {
@@ -3147,6 +3198,7 @@ async fn handleInput(
 
                 // Any key dismisses the help popup (and does not propagate).
                 if *helpPopupOpen {
+                    noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                     *helpPopupOpen = false;
                     break;
                 }
@@ -3184,19 +3236,13 @@ async fn handleInput(
                     let consumed = panel.consumedKey(&key, agentPanel);
                     let shouldClose = panel.handleKey(key, agentPanel);
                     if shouldClose {
+                        noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                         *subagentPanel = None;
                         break;
                     }
                     if consumed {
                         break;
                     }
-                }
-
-                // Cancel running turn with Escape — immediate visual feedback.
-                if key.code == KeyCode::Esc && agentPanel.isActive() {
-                    let _ = cancelTx.send(true);
-                    agentPanel.finalizeCancelled();
-                    break;
                 }
 
                 if key.code == KeyCode::Tab {
@@ -3235,99 +3281,11 @@ async fn handleInput(
                     break;
                 }
 
-                // Permission prompt takes priority regardless of focus.
-                if agentPanel.pendingPermit {
-                    use construct::permissions::PermitResponse;
-
-                    // Resolve the oneshot reply stashed when SessionRequest::Permit arrived.
-                    // Same path for top-level and subagent permits — the origin is folded
-                    // into the request variant before it reaches the TUI.
-                    macro_rules! sendPermit {
-                        ($resp:expr) => {
-                            if let Some(tx) = pendingPermitReply.take() {
-                                let _ = tx.send($resp);
-                            }
-                            // Clear the unseen-permit title indicator immediately so
-                            // the user doesn't have to leave-and-refocus to dismiss it.
-                            if *unseenPermitPending {
-                                *unseenPermitPending = false;
-                                let glyph = if agentPanel.isActive() && currentTopic.is_some() {
-                                    titleSpinner.current()
-                                } else {
-                                    TITLE_IDLE_GLYPH
-                                };
-                                writeTerminalTitle(glyph, currentTopic.as_deref());
-                            }
-                        };
-                    }
-
-                    match key.code {
-                        KeyCode::Char('y') => {
-                            agentPanel.approvePending();
-                            sendPermit!(PermitResponse::Allow);
-                        }
-                        // Shift+A: always allow (persist to project config).
-                        // An empty pattern would persist `keyArg.contains("")`
-                        // — i.e. allow-all for the tool — so guard against it.
-                        KeyCode::Char('A') => match agentPanel.selectedPattern() {
-                            Some(pattern) => {
-                                agentPanel.approvePending();
-                                sendPermit!(PermitResponse::AlwaysAllow { pattern });
-                            }
-                            None => {
-                                agentPanel.pushNotice(
-                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
-                                         type one in the custom field first, or press y to allow once.",
-                                    );
-                            }
-                        },
-                        KeyCode::Char('n') => {
-                            agentPanel.denyPending();
-                            sendPermit!(PermitResponse::Deny);
-                        }
-                        // Shift+D: always deny (persist to project config).
-                        KeyCode::Char('D') => match agentPanel.selectedPattern() {
-                            Some(pattern) => {
-                                agentPanel.denyPending();
-                                sendPermit!(PermitResponse::AlwaysDeny { pattern });
-                            }
-                            None => {
-                                agentPanel.pushNotice(
-                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
-                                         type one in the custom field first, or press n to deny once.",
-                                    );
-                            }
-                        },
-                        // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
-                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            agentPanel.prevPattern();
-                        }
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            agentPanel.nextPattern();
-                        }
-                        // Custom pattern text input (when custom field is selected).
-                        KeyCode::Char(c) if agentPanel.isEditingCustom() => {
-                            agentPanel.customPatternInsert(c);
-                        }
-                        KeyCode::Backspace if agentPanel.isEditingCustom() => {
-                            agentPanel.customPatternBackspace();
-                        }
-                        KeyCode::Char('v') | KeyCode::Char('V') => {
-                            // Open the subagent panel — Live mode reads
-                            // transcript + shell from agentPanel.activeSubagent.
-                            if !agentPanel.activeSubagents.is_empty() {
-                                *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
-                            }
-                        }
-                        _ => {}
-                    }
-                    break;
-                }
-
                 // Session picker intercepts all keys when active.
                 if let Some(picker) = sessionPicker {
                     match picker.handleKey(key) {
                         PickerAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *sessionPicker = None;
                         }
                         PickerAction::Select(id) => {
@@ -3357,6 +3315,7 @@ async fn handleInput(
                     use crate::jobs_panel::PanelAction;
                     match panel.handleKey(key) {
                         PanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *tasksPanel = None;
                         }
                         PanelAction::Kill(id) => {
@@ -3410,6 +3369,7 @@ async fn handleInput(
                 if let Some(panel) = runsPanel.as_mut() {
                     match panel.handleKey(key) {
                         crate::runs_panel::RunsAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *runsPanel = None;
                         }
                         crate::runs_panel::RunsAction::None => {}
@@ -3422,6 +3382,7 @@ async fn handleInput(
                     use crate::log_panel::PanelAction;
                     match panel.handleKey(key) {
                         PanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *logPanel = None;
                         }
                         PanelAction::None => {}
@@ -3433,6 +3394,7 @@ async fn handleInput(
                 if let Some(picker) = rewindPicker {
                     match picker.handleKey(key) {
                         RewindAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *rewindPicker = None;
                         }
                         RewindAction::Rewind {
@@ -3478,6 +3440,7 @@ async fn handleInput(
                 if let Some(picker) = forkPicker {
                     match picker.handleKey(key) {
                         ForkAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *forkPicker = None;
                         }
                         ForkAction::Switch(id) => {
@@ -3496,6 +3459,7 @@ async fn handleInput(
                 if let Some(panel) = mcpPanel {
                     match panel.handleKey(key) {
                         McpPanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *mcpPanel = None;
                         }
                         McpPanelAction::None => {}
@@ -3508,6 +3472,7 @@ async fn handleInput(
                     use crate::layout::control_panel::PanelAction as LayoutAction;
                     match panel.handleKey(key) {
                         LayoutAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *layoutPanel = None;
                         }
                         LayoutAction::ApplyPreset { name, layout } => {
@@ -3579,6 +3544,7 @@ async fn handleInput(
                 if let Some(panel) = lspPanel {
                     match panel.handleKey(key) {
                         LspPanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *lspPanel = None;
                         }
                         LspPanelAction::Install { serverId, command } => {
@@ -3599,6 +3565,7 @@ async fn handleInput(
                 if let Some(panel) = modelPanel {
                     match panel.handleKey(key) {
                         ModelPanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *modelPanel = None;
                         }
                         ModelPanelAction::Save {
@@ -3741,6 +3708,7 @@ async fn handleInput(
                     use crate::permissions_panel::PermPanelAction;
                     match panel.handleKey(key) {
                         PermPanelAction::Close => {
+                            noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
                             *permissionsPanel = None;
                         }
                         PermPanelAction::Save { defaultMode, rules } => {
@@ -3794,6 +3762,116 @@ async fn handleInput(
                             *statusFocus = None;
                         }
                     }
+                }
+
+                if key.code == KeyCode::Esc
+                    && *focus == Focus::Agent
+                    && agentPanel.completionActive()
+                {
+                    agentPanel.dismissCompletion();
+                    noteEscClosedOverlay(&key, lastEscClosedOverlayAt);
+                    break;
+                }
+
+                if suppressEscAfterOverlayClose(&key, lastEscClosedOverlayAt) {
+                    break;
+                }
+
+                // Cancel running turn with Escape — immediate visual feedback.
+                if key.code == KeyCode::Esc && agentPanel.isActive() {
+                    let _ = cancelTx.send(true);
+                    agentPanel.finalizeCancelled();
+                    break;
+                }
+
+                // Permission prompt takes priority regardless of focus after
+                // visible overlays have had first chance to consume the key.
+                if agentPanel.pendingPermit {
+                    use construct::permissions::PermitResponse;
+
+                    // Resolve the oneshot reply stashed when SessionRequest::Permit arrived.
+                    // Same path for top-level and subagent permits — the origin is folded
+                    // into the request variant before it reaches the TUI.
+                    macro_rules! sendPermit {
+                        ($resp:expr) => {
+                            if let Some(tx) = pendingPermitReply.take() {
+                                let _ = tx.send($resp);
+                            }
+                            // Clear the unseen-permit title indicator immediately so
+                            // the user doesn't have to leave-and-refocus to dismiss it.
+                            if *unseenPermitPending {
+                                *unseenPermitPending = false;
+                                let glyph = if agentPanel.isActive() && currentTopic.is_some() {
+                                    titleSpinner.current()
+                                } else {
+                                    TITLE_IDLE_GLYPH
+                                };
+                                writeTerminalTitle(glyph, currentTopic.as_deref());
+                            }
+                        };
+                    }
+
+                    match key.code {
+                        KeyCode::Char('y') => {
+                            agentPanel.approvePending();
+                            sendPermit!(PermitResponse::Allow);
+                        }
+                        // Shift+A: always allow (persist to project config).
+                        // An empty pattern would persist `keyArg.contains("")`
+                        // — i.e. allow-all for the tool — so guard against it.
+                        KeyCode::Char('A') => match agentPanel.selectedPattern() {
+                            Some(pattern) => {
+                                agentPanel.approvePending();
+                                sendPermit!(PermitResponse::AlwaysAllow { pattern });
+                            }
+                            None => {
+                                agentPanel.pushNotice(
+                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
+                                         type one in the custom field first, or press y to allow once.",
+                                    );
+                            }
+                        },
+                        KeyCode::Char('n') => {
+                            agentPanel.denyPending();
+                            sendPermit!(PermitResponse::Deny);
+                        }
+                        // Shift+D: always deny (persist to project config).
+                        KeyCode::Char('D') => match agentPanel.selectedPattern() {
+                            Some(pattern) => {
+                                agentPanel.denyPending();
+                                sendPermit!(PermitResponse::AlwaysDeny { pattern });
+                            }
+                            None => {
+                                agentPanel.pushNotice(
+                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
+                                         type one in the custom field first, or press n to deny once.",
+                                    );
+                            }
+                        },
+                        // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            agentPanel.prevPattern();
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            agentPanel.nextPattern();
+                        }
+                        // Custom pattern text input (when custom field is selected).
+                        KeyCode::Char(c) if agentPanel.isEditingCustom() => {
+                            agentPanel.customPatternInsert(c);
+                        }
+                        KeyCode::Backspace if agentPanel.isEditingCustom() => {
+                            agentPanel.customPatternBackspace();
+                        }
+                        KeyCode::Char('v') | KeyCode::Char('V') => {
+                            // Open the subagent panel — Live mode reads
+                            // transcript + shell from agentPanel.activeSubagent.
+                            if !agentPanel.activeSubagents.is_empty() {
+                                *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
+                            }
+                        }
+                        _ => {}
+                    }
+                    break;
                 }
 
                 match focus {
@@ -4099,6 +4177,24 @@ async fn handleInput(
                     || layoutPanel.is_some()
                 {
                     break;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved)
+                    && termPane.setHistoryHover(mouse.column, mouse.row)
+                {
+                    hadInput = true;
+                }
+                if termPane.tabBarContains(mouse.column, mouse.row) {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                            hadInput |= termPane.wheelTabsBackward();
+                            break;
+                        }
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                            hadInput |= termPane.wheelTabsForward();
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
                 // Click on a status-bar chip opens its panel directly.
                 // Hover/move highlights without opening.
@@ -5243,9 +5339,6 @@ fn dispatchSlashCommand(
             // chip — fetch jobs + wakes and let the TasksList /
             // WakesList handlers create the panel.
             openStatusChipPanel(StatusChipKind::Jobs, &requestTx, &deckUpdateTx);
-        }
-        crate::command::CommandAction::Runs => {
-            openRunsPanel(&requestTx, &deckUpdateTx);
         }
         crate::command::CommandAction::Logs => {
             tracing::warn!("/logs reached dispatchSlashCommand — should have been handled inline");

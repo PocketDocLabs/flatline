@@ -590,12 +590,17 @@ fn unixNow() -> u64 {
         .as_secs()
 }
 
-fn shellImpactStorageName(impact: &crate::tool::ShellImpact) -> &'static str {
-    match impact {
-        crate::tool::ShellImpact::Read => "read",
-        crate::tool::ShellImpact::MinorMod => "minorMod",
-        crate::tool::ShellImpact::MajorMod => "majorMod",
-        crate::tool::ShellImpact::Delete => "delete",
+fn terminalRunStatusForExecution(
+    exec: &crate::shell::CommandExecution,
+) -> crate::storage::TerminalRunStatus {
+    if exec.output.starts_with("Terminal is busy") {
+        crate::storage::TerminalRunStatus::Rejected
+    } else if exec.timedOut && exec.exitCode.is_none() {
+        crate::storage::TerminalRunStatus::TimedOut
+    } else if exec.exitCode.unwrap_or(0) == 0 {
+        crate::storage::TerminalRunStatus::Completed
+    } else {
+        crate::storage::TerminalRunStatus::Failed
     }
 }
 
@@ -3218,7 +3223,7 @@ impl Session {
                 }) else {
                     return format!("No terminal run with id {runId}.");
                 };
-                if run.status != "running" {
+                if run.status != crate::storage::TerminalRunStatus::Running {
                     return format!(
                         "Terminal run {runId} is already {} — no signal sent.",
                         run.status
@@ -3294,7 +3299,7 @@ impl Session {
             }
         };
 
-        let impactString = shellImpactStorageName(&impact).to_string();
+        let impact = crate::storage::TerminalRunImpact::from(&impact);
         let initialRecord = crate::storage::TerminalRunRecord {
             runId: runId.clone(),
             terminalName: terminalName.clone(),
@@ -3304,19 +3309,19 @@ impl Session {
             } else {
                 purpose.clone()
             },
-            impact: impactString.clone(),
+            impact,
             ephemeral,
             startedAt,
             endedAt: None,
-            status: "running".into(),
+            status: crate::storage::TerminalRunStatus::Running,
             exitCode: None,
             lineCount: 0,
             replayBlob: Vec::new(),
         };
-        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
-            if let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord) {
-                tracing::warn!("failed to record terminal run start: {e}");
-            }
+        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir)
+            && let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord)
+        {
+            tracing::warn!("failed to record terminal run start: {e}");
         }
 
         let (wakeId, fireTx) = {
@@ -3336,33 +3341,25 @@ impl Session {
         tokio::spawn(async move {
             let dur = timeout.map(std::time::Duration::from_secs);
             let exec = shell.executeDetailed(&commandForTask, dur).await;
-            let status = if exec.output.starts_with("Terminal is busy") {
-                "rejected"
-            } else if exec.timedOut && exec.exitCode.is_none() {
-                "timed_out"
-            } else if exec.exitCode.unwrap_or(0) == 0 {
-                "completed"
-            } else {
-                "failed"
-            };
+            let status = terminalRunStatusForExecution(&exec);
             let completed = crate::storage::TerminalRunRecord {
                 runId: runIdForTask.clone(),
                 terminalName: terminalForTask.clone(),
                 command: commandForTask.clone(),
                 purpose: purposeForTask.clone(),
-                impact: impactString,
+                impact,
                 ephemeral,
                 startedAt,
                 endedAt: Some(unixNow()),
-                status: status.into(),
+                status,
                 exitCode: exec.exitCode,
                 lineCount: exec.lineCount,
                 replayBlob: exec.replayBytes.clone(),
             };
-            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
-                if let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed) {
-                    tracing::warn!("failed to record terminal run completion: {e}");
-                }
+            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir)
+                && let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed)
+            {
+                tracing::warn!("failed to record terminal run completion: {e}");
             }
 
             let payload = format!(
@@ -3412,7 +3409,7 @@ impl Session {
 
         format!(
             "Started terminal run {runId} in terminal '{terminalName}': {command}\n\n\
-             It is running asynchronously in a visible terminal. You'll be notified when it completes; do not poll. Use /runs or terminalRunList to inspect archived output."
+             It is running asynchronously in a visible terminal. You'll be notified when it completes; do not poll. Use terminalRunList to inspect archived output."
         )
     }
 
@@ -3436,6 +3433,7 @@ impl Session {
     /// run archive. This is the timeout/Ctrl+B path: the command keeps
     /// running in the same terminal and the model turn gets the run id
     /// immediately, with no hidden respawn.
+    #[allow(clippy::too_many_arguments)]
     async fn detachTerminalRunJoin(
         &mut self,
         command: String,
@@ -3449,7 +3447,7 @@ impl Session {
     ) -> String {
         let runId = crate::transcript::randomHexId("run");
         let sessionDir = self.transcript.sessionDir().to_path_buf();
-        let impactString = shellImpactStorageName(&impact).to_string();
+        let impact = crate::storage::TerminalRunImpact::from(&impact);
         let purpose = if purpose.trim().is_empty() {
             command.clone()
         } else {
@@ -3461,19 +3459,19 @@ impl Session {
             terminalName: terminalName.clone(),
             command: command.clone(),
             purpose: purpose.clone(),
-            impact: impactString.clone(),
+            impact,
             ephemeral: false,
             startedAt,
             endedAt: None,
-            status: "running".into(),
+            status: crate::storage::TerminalRunStatus::Running,
             exitCode: None,
             lineCount: 0,
             replayBlob: Vec::new(),
         };
-        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
-            if let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord) {
-                tracing::warn!("failed to record detached terminal run start: {e}");
-            }
+        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir)
+            && let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord)
+        {
+            tracing::warn!("failed to record detached terminal run start: {e}");
         }
 
         let (wakeId, fireTx) = {
@@ -3500,33 +3498,25 @@ impl Session {
                     timedOut: false,
                 },
             };
-            let status = if exec.output.starts_with("Terminal is busy") {
-                "rejected"
-            } else if exec.timedOut && exec.exitCode.is_none() {
-                "timed_out"
-            } else if exec.exitCode.unwrap_or(0) == 0 {
-                "completed"
-            } else {
-                "failed"
-            };
+            let status = terminalRunStatusForExecution(&exec);
             let completed = crate::storage::TerminalRunRecord {
                 runId: runIdForTask.clone(),
                 terminalName: terminalForTask.clone(),
                 command: commandForTask.clone(),
                 purpose: purposeForTask,
-                impact: impactString,
+                impact,
                 ephemeral: false,
                 startedAt,
                 endedAt: Some(unixNow()),
-                status: status.into(),
+                status,
                 exitCode: exec.exitCode,
                 lineCount: exec.lineCount,
                 replayBlob: exec.replayBytes.clone(),
             };
-            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
-                if let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed) {
-                    tracing::warn!("failed to record detached terminal run completion: {e}");
-                }
+            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir)
+                && let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed)
+            {
+                tracing::warn!("failed to record detached terminal run completion: {e}");
             }
 
             let payload = format!(
@@ -3552,7 +3542,7 @@ impl Session {
 
         format!(
             "DETACHED_TERMINAL_RUN: {trigger}. The command is still running in terminal '{terminalName}' as run {runId}.\n\n\
-             You will be notified when it completes; do not poll. Use /runs or terminalRunList to inspect archived output."
+             You will be notified when it completes; do not poll. Use terminalRunList to inspect archived output."
         )
     }
 
@@ -4724,7 +4714,7 @@ impl Session {
         }
     }
 
-    /// List archived visible terminal runs for `/runs`.
+    /// List archived visible terminal runs for the terminal history panel.
     pub fn listTerminalRuns(&self) -> Result<Vec<crate::storage::TerminalRunRecord>> {
         let conn = crate::storage::openSessionDb(self.transcript.sessionDir())?;
         crate::storage::listTerminalRuns(&conn)

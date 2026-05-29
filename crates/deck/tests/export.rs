@@ -176,7 +176,7 @@ fn exportSqliteOnlySessionEmitsOneExample() {
     let sessionDir = dir.path().join(sessionId);
     // Opening the DB imports the legacy fixture once. Then remove the legacy
     // files so export proves the SQLite source of truth is sufficient.
-    let _conn = construct::storage::openSessionDb(&sessionDir).unwrap();
+    construct::storage::ensureSessionDb(&sessionDir).unwrap();
     fs::remove_file(sessionDir.join("meta.json")).unwrap();
     fs::remove_file(sessionDir.join("transcript.jsonl")).unwrap();
     fs::remove_file(sessionDir.join("compaction.jsonl")).unwrap();

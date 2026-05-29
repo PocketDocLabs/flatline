@@ -554,7 +554,7 @@ pub enum TuiRequest {
         reply: oneshot::Sender<Vec<TerminalInfo>>,
     },
 
-    /// Snapshot of archived terminal-backed async runs for `/runs`.
+    /// Snapshot of archived terminal-backed async runs for terminal history.
     ListTerminalRuns {
         reply: oneshot::Sender<Vec<crate::storage::TerminalRunRecord>>,
     },
