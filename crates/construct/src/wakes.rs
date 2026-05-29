@@ -3,11 +3,11 @@
 //! A "wake" is a synthetic user-shaped message the agent receives in
 //! response to some external event. Today's sources:
 //!
-//! - [`WakeKind::Delay`]: one-shot, fires N seconds after registration
-//! - [`WakeKind::Cron`]: recurring, fires on a 5-field cron schedule
-//! - [`WakeKind::FileWatch`]: fires on fs events under a path
-//! - [`WakeKind::MonitorMatch`]: fires per matched line from a Monitor
-//! - [`WakeKind::TaskComplete`]: fires when a visible terminal run or
+//! - `Delay`: one-shot, fires N seconds after registration
+//! - `Cron`: recurring, fires on a 5-field cron schedule
+//! - `FileWatch`: fires on fs events under a path
+//! - `MonitorMatch`: fires per matched line from a Monitor
+//! - `TaskComplete`: fires when a visible terminal run or
 //!   backgrounded subagent exits
 //!
 //! Wake fires are coalesced into [`WakeBatch`] values. The session
@@ -27,7 +27,7 @@
 //!   and removes it from the registry.
 //!
 //! # Public API
-//! - [`WakeRegistry`], [`WakeKind`], [`WakeId`], [`WakeSourceInfo`]
+//! - [`WakeBatch`], [`WakeId`], [`WakeSourceInfo`]
 //!
 //! # Dependencies
 //! `cron`, `chrono`, `notify`, [`crate::control`]
@@ -64,7 +64,7 @@ pub const WAKE_BATCH_MAX_FIRES: usize = 256;
 /// format the `<wake>` element later. Constructed at the fire site and
 /// pushed through the batcher's queue.
 #[derive(Debug, Clone)]
-pub struct WakeFire {
+pub(crate) struct WakeFire {
     pub wakeId: WakeId,
     pub source: String,
     pub kind: ControlWakeKind,
@@ -77,7 +77,7 @@ pub struct WakeFire {
 /// message, one transcript entry, one model turn.
 #[derive(Debug, Clone)]
 pub struct WakeBatch {
-    pub fires: Vec<WakeFire>,
+    pub(crate) fires: Vec<WakeFire>,
     /// Wall-clock instant when the batch was closed.
     pub closedAt: Instant,
 }
@@ -85,10 +85,10 @@ pub struct WakeBatch {
 /// Monotonically increasing per-session wake source id.
 pub type WakeId = u64;
 
-pub type WakeResult<T> = std::result::Result<T, WakeError>;
+pub(crate) type WakeResult<T> = std::result::Result<T, WakeError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WakeError {
+pub(crate) enum WakeError {
     InvalidCron { spec: String, error: String },
     PathNotFound { path: PathBuf },
     FileWatchInit { error: String },
@@ -114,44 +114,6 @@ impl fmt::Display for WakeError {
 
 impl std::error::Error for WakeError {}
 
-/// Why a wake fires. The control-plane `WakeKind` is the on-the-wire
-/// shape (used in the synthetic `<wake>` message); this is the
-/// registry's internal shape with the scheduling state attached.
-#[derive(Debug, Clone)]
-pub enum WakeKind {
-    /// One-shot delay. `fireAt` is computed at registration.
-    Delay { fireAt: Instant, prompt: String },
-    /// Recurring cron schedule. `spec` is a 5- or 6-field cron string.
-    /// When `recurring` is false the source disarms after the first fire.
-    Cron {
-        spec: String,
-        recurring: bool,
-        prompt: String,
-    },
-    /// Watch a filesystem path for events. Fires the wake for each
-    /// matching event the OS reports.
-    FileWatch { path: PathBuf, prompt: String },
-    /// External event source — a Monitor regex matched a line. Has no
-    /// scheduler; `MonitorPlane` calls `fireMonitorMatch` directly.
-    MonitorMatch { monitorId: u64 },
-    /// External event source — a backgrounded subagent or visible terminal
-    /// run exited.
-    TaskComplete { taskId: u64 },
-}
-
-impl WakeKind {
-    #[allow(dead_code)]
-    fn controlKind(&self) -> ControlWakeKind {
-        match self {
-            WakeKind::Delay { .. } => ControlWakeKind::Delay,
-            WakeKind::Cron { .. } => ControlWakeKind::Cron,
-            WakeKind::FileWatch { .. } => ControlWakeKind::FileWatch,
-            WakeKind::MonitorMatch { .. } => ControlWakeKind::MonitorMatch,
-            WakeKind::TaskComplete { .. } => ControlWakeKind::TaskComplete,
-        }
-    }
-}
-
 /// Lightweight snapshot for `cronList`, `wakeList`, and the /tasks schedules panel.
 #[derive(Debug, Clone)]
 pub struct WakeSourceInfo {
@@ -174,7 +136,7 @@ struct WakeSource {
 }
 
 /// Central wake-source registry.
-pub struct WakeRegistry {
+pub(crate) struct WakeRegistry {
     sources: HashMap<WakeId, WakeSource>,
     order: Vec<WakeId>,
     nextId: WakeId,
@@ -229,12 +191,9 @@ impl WakeRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.sources.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sources.is_empty()
     }
 
     /// Disarm every wake AND stop the batcher. Use this before swapping
@@ -565,15 +524,6 @@ impl WakeRegistry {
                 firedAt: Instant::now(),
             })
             .is_ok()
-    }
-
-    /// Sync-callable handle for the per-line monitor callback. The
-    /// callback can't take an async lock on the registry, so we let it
-    /// build a `WakeFire` against a known wake id and push it directly.
-    /// `firesSoFar` is updated later by the batcher when the fire is
-    /// pulled off the queue.
-    pub fn enqueueFromCallback(sender: &mpsc::UnboundedSender<WakeFire>, fire: WakeFire) {
-        let _ = sender.send(fire);
     }
 
     /// Remove a passive source (called by MonitorPlane on monitorStop,

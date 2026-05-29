@@ -26,9 +26,4 @@ impl CheckpointManager {
     pub async fn undo(&self) -> Result<String> {
         anyhow::bail!("Checkpoint system not yet implemented.")
     }
-
-    /// Restore to a specific checkpoint by turn ID or target string.
-    pub async fn restoreTo(&self, _target: &str) -> Result<()> {
-        anyhow::bail!("Checkpoint system not yet implemented.")
-    }
 }

@@ -7,18 +7,18 @@
 //!
 //! # Public API
 //! - [`config::Config`] — user configuration
-//! - [`api::Client`] — OpenRouter API client
 //! - [`message`] — message and event types
+//! - [`session::Session`] — agent session driver
 //! - [`tool`] — tool definitions and execution
 //!
 //! # Dependencies
 //! `reqwest`, `tokio`, `serde`, `serde_json`
 
-pub mod api;
+pub(crate) mod api;
 pub mod auth;
-pub mod checkpoint;
-pub mod compaction;
-pub mod compaction_trigger;
+pub(crate) mod checkpoint;
+pub(crate) mod compaction;
+pub(crate) mod compaction_trigger;
 pub mod config;
 pub mod context;
 pub mod control;
@@ -28,14 +28,14 @@ pub mod lsp;
 pub mod mcp;
 pub mod message;
 pub mod model_catalog;
-pub mod monitors;
+pub(crate) mod monitors;
 pub mod permissions;
 pub mod prompt;
 pub mod runner;
-pub mod s1;
-pub mod s2;
-pub mod s3;
-pub mod s4;
+pub(crate) mod s1;
+pub(crate) mod s2;
+pub(crate) mod s3;
+pub(crate) mod s4;
 pub mod session;
 pub mod shell;
 pub mod shells;
@@ -43,8 +43,11 @@ pub mod snapshot;
 pub mod storage;
 pub mod text;
 pub mod tool;
-pub mod tool_preview;
+pub(crate) mod tool_preview;
 pub mod topic;
 pub mod transcript;
 pub mod wakes;
-pub mod web;
+pub(crate) mod web;
+
+#[cfg(test)]
+mod compaction_pipeline_tests;

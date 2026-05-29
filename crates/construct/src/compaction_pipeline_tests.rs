@@ -1,28 +1,21 @@
-#![allow(non_snake_case)]
-
-//! Integration tests for compaction stage no-op boundaries.
+//! Integration-style compaction no-op boundary tests.
 //!
 //! Stage eligibility details live in the unit tests beside each stage.
-//! These integration tests deliberately avoid model calls so the default
-//! test suite stays hermetic and fast.
+//! These tests deliberately avoid model calls so the default suite stays
+//! hermetic and fast, while keeping compaction internals out of the crate's
+//! public API.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use construct::api;
-use construct::compaction::CompactionLog;
-use construct::message::{Content, FunctionCall, Message, ToolCall};
-use construct::s1;
-use construct::s2;
-use construct::s3;
-use construct::s4;
-use construct::transcript::Transcript;
+use crate::api;
+use crate::compaction::CompactionLog;
+use crate::message::{Content, FunctionCall, Message, ToolCall};
+use crate::transcript::Transcript;
 
 /// Build a minimal Config with a bogus API key so `api::Client::new`
 /// doesn't reject it.
 fn dummyClient() -> api::Client {
-    use construct::config::{BudgetConfig, Config, ModelConfig, WebConfig};
-    use std::collections::BTreeMap;
-    use std::collections::HashMap;
+    use crate::config::{BudgetConfig, Config, ModelConfig, WebConfig};
 
     let model = ModelConfig {
         provider: "openrouter".into(),
@@ -80,17 +73,13 @@ fn toolResult(callId: &str, content: &str) -> Message {
     }
 }
 
-// ── S1 ─────────────────────────────────────────────────────────────
-
 #[test]
-fn test_s1_dedup_and_middle_out() {
-    // Build a history with duplicate file reads and a long tool result.
+fn s1DedupAndMiddleOut() {
     let longContent = "x".repeat(5000);
     let mut history = vec![
         Message::System {
             content: "system".into(),
         },
-        // Block 1: first readFile.
         Message::User {
             content: Content::text("read foo"),
         },
@@ -101,7 +90,6 @@ fn test_s1_dedup_and_middle_out() {
             tool_calls: None,
             reasoning: None,
         },
-        // Block 2: second readFile (same path → dedup target).
         Message::User {
             content: Content::text("read foo again"),
         },
@@ -112,7 +100,6 @@ fn test_s1_dedup_and_middle_out() {
             tool_calls: None,
             reasoning: None,
         },
-        // Block 3: long tool result (middle-out target).
         Message::User {
             content: Content::text("run it"),
         },
@@ -128,9 +115,9 @@ fn test_s1_dedup_and_middle_out() {
     let blockHints: HashMap<String, String> = HashMap::new();
     let alreadyProcessed: HashSet<String> = HashSet::new();
 
-    let result = s1::run(
+    let result = crate::s1::run(
         &mut history,
-        s1::DEFAULT_MIDDLE_OUT_THRESHOLD,
+        crate::s1::DEFAULT_MIDDLE_OUT_THRESHOLD,
         &blockHints,
         &alreadyProcessed,
     );
@@ -143,7 +130,7 @@ fn test_s1_dedup_and_middle_out() {
 }
 
 #[tokio::test]
-async fn test_s2_no_agent_blocks_is_noop_without_model_call() {
+async fn s2NoAgentBlocksIsNoopWithoutModelCall() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut transcript = Transcript::createAt(dir.path(), "test_s2").unwrap();
     let headTurn = transcript.recordUser("user-only turn", None, None).unwrap();
@@ -151,7 +138,7 @@ async fn test_s2_no_agent_blocks_is_noop_without_model_call() {
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
 
-    let result = s2::run(
+    let result = crate::s2::run(
         &transcript,
         &compactionLog,
         &headTurn,
@@ -168,7 +155,7 @@ async fn test_s2_no_agent_blocks_is_noop_without_model_call() {
 }
 
 #[tokio::test]
-async fn test_s3_no_topics_is_noop_without_model_call() {
+async fn s3NoTopicsIsNoopWithoutModelCall() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut transcript = Transcript::createAt(dir.path(), "test_s3").unwrap();
     let headTurn = transcript.recordUser("topicless turn", None, None).unwrap();
@@ -176,7 +163,7 @@ async fn test_s3_no_topics_is_noop_without_model_call() {
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
 
-    let result = s3::run(
+    let result = crate::s3::run(
         &transcript,
         &compactionLog,
         &headTurn,
@@ -194,7 +181,7 @@ async fn test_s3_no_topics_is_noop_without_model_call() {
 }
 
 #[tokio::test]
-async fn test_s4_no_inputs_is_noop_without_model_call() {
+async fn s4NoInputsIsNoopWithoutModelCall() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut transcript = Transcript::createAt(dir.path(), "test_s4").unwrap();
     let head = transcript.recordUser("kickoff", None, None).unwrap();
@@ -202,7 +189,7 @@ async fn test_s4_no_inputs_is_noop_without_model_call() {
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
 
-    let result = s4::run(&transcript, &compactionLog, &head, &client, "test-model")
+    let result = crate::s4::run(&transcript, &compactionLog, &head, &client, "test-model")
         .await
         .expect("S4 no-op should not error");
 

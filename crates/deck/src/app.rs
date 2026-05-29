@@ -579,30 +579,12 @@ pub async fn run() -> Result<()> {
         // which defeats the whole point of the control panel (inspect/kill
         // the task that's running RIGHT NOW).
         //
-        // The slot pattern (`RwLock<Arc<Mutex<JobPlane>>>`) lets us
-        // hot-swap the inner plane on /clear and /resume: the session
-        // actor writes a new Arc when it rebuilds `session`, the
-        // handler reads the current Arc on every request, and the old
-        // plane drops as soon as nothing references it (which kills its
-        // running tasks via `JobPlane::Drop`).
-        let jobPlaneSlot: std::sync::Arc<
-            std::sync::RwLock<std::sync::Arc<std::sync::Mutex<construct::jobs::JobPlane>>>,
-        > = std::sync::Arc::new(std::sync::RwLock::new(session.jobPlaneHandle()));
-        // Same hot-swap pattern for the wake registry — it lives on the
-        // session and gets a fresh instance on /clear and /resume.
-        let wakeRegistrySlot: std::sync::Arc<
-            std::sync::RwLock<std::sync::Arc<tokio::sync::Mutex<construct::wakes::WakeRegistry>>>,
-        > = std::sync::Arc::new(std::sync::RwLock::new(session.wakeRegistryHandle()));
-        // Same hot-swap pattern for monitors so user-driven terminal close can
-        // stop/disarm attach-only monitors even while the agent turn is idle
-        // or busy elsewhere.
-        let monitorPlaneSlot: std::sync::Arc<
-            std::sync::RwLock<std::sync::Arc<std::sync::Mutex<construct::monitors::MonitorPlane>>>,
-        > = std::sync::Arc::new(std::sync::RwLock::new(session.monitorPlaneHandle()));
-        // Shell registry handle stays valid across /clear and /resume
-        // because `intoShells()` returns the same Arc that gets passed
-        // to the new Session — no slot swap needed.
-        let shellsArc = session.shellsHandle();
+        // The slot pattern lets us hot-swap the session runtime facade on
+        // /clear and /resume. The request handlers read the current facade
+        // on every request, while construct owns the raw lock topology.
+        let runtimeSlot: std::sync::Arc<
+            std::sync::RwLock<construct::session::SessionRuntimeHandles>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(session.runtimeHandles()));
         let (taskPlaneReqTx, mut taskPlaneReqRx) = mpsc::channel::<TuiRequest>(16);
         let (terminalReqTx, mut terminalReqRx) = mpsc::channel::<TuiRequest>(16);
         let (otherReqTx, mut otherReqRx) = mpsc::channel::<TuiRequest>(16);
@@ -626,91 +608,56 @@ pub async fn run() -> Result<()> {
                 }
             }
         });
-        let shellsHandler = shellsArc.clone();
         let handlerLogTx = logTx.clone();
-        let monitorsForTerminalHandler = monitorPlaneSlot.clone();
-        let wakesForTerminalHandler = wakeRegistrySlot.clone();
+        let runtimeForTerminalHandler = runtimeSlot.clone();
         tokio::spawn(async move {
-            use construct::shells::SpawnedBy;
             while let Some(req) = terminalReqRx.recv().await {
+                let runtime = { runtimeForTerminalHandler.read().unwrap().clone() };
                 match req {
                     TuiRequest::SpawnTerminal { name, reply } => {
-                        let result = {
-                            let mut guard = shellsHandler.lock().await;
-                            guard.spawn(name, SpawnedBy::User).await
-                        };
-                        match result {
+                        match runtime.spawnUserTerminal(name, &handlerLogTx).await {
                             Ok(resolved) => {
-                                let _ = handlerLogTx
-                                    .send(LogEvent::TerminalSpawned {
-                                        name: resolved.clone(),
-                                        spawnedBy: SpawnedBy::User.into(),
-                                    })
-                                    .await;
                                 let _ = reply.send(Ok(resolved));
                             }
                             Err(e) => {
-                                let _ = reply.send(Err(e.to_string()));
+                                let _ = reply.send(Err(e));
                             }
                         }
                     }
                     TuiRequest::KillTerminal { name, reply } => {
-                        let result = {
-                            let mut guard = shellsHandler.lock().await;
-                            guard.kill(&name)
-                        };
-                        let ack = match result {
-                            Ok(()) => {
-                                let stopped = {
-                                    let plane = monitorsForTerminalHandler.read().unwrap().clone();
-                                    plane.lock().unwrap().stopForTerminal(&name)
-                                };
-                                for (id, wakeId) in stopped {
-                                    if let Some(wid) = wakeId {
-                                        let reg = wakesForTerminalHandler.read().unwrap().clone();
-                                        reg.lock().await.unregisterPassive(wid, &handlerLogTx);
-                                    }
-                                    let _ =
-                                        handlerLogTx.send(LogEvent::MonitorStopped { id }).await;
-                                }
-                                let _ = handlerLogTx
-                                    .send(LogEvent::TerminalClosed { name: name.clone() })
-                                    .await;
-                                construct::control::CommandAck::ok(format!(
-                                    "Killed terminal '{name}'."
-                                ))
-                            }
-                            Err(e) => construct::control::CommandAck::err(e.to_string()),
+                        let ack = match runtime.killTerminal(&name, &handlerLogTx).await {
+                            Ok(()) => construct::control::CommandAck::ok(format!(
+                                "Killed terminal '{name}'."
+                            )),
+                            Err(e) => construct::control::CommandAck::err(e),
                         };
                         let _ = reply.send(ack);
                     }
                     TuiRequest::ListTerminals { reply } => {
-                        let list = shellsHandler.lock().await.list();
+                        let list = runtime.listTerminals().await;
                         let _ = reply.send(list);
                     }
                     _ => {}
                 }
             }
         });
-        let handlerSlot = jobPlaneSlot.clone();
-        let wakeSlotForHandler = wakeRegistrySlot.clone();
+        let runtimeForTaskHandler = runtimeSlot.clone();
         tokio::spawn(async move {
             while let Some(req) = taskPlaneReqRx.recv().await {
                 // Read the slot fresh per request so /clear and /resume
                 // hot-swaps take effect immediately.
-                let plane = handlerSlot.read().unwrap().clone();
+                let runtime = runtimeForTaskHandler.read().unwrap().clone();
                 match req {
                     TuiRequest::ListJobs { reply } => {
-                        let list = plane.lock().unwrap().list();
+                        let list = runtime.listJobs();
                         let _ = reply.send(list);
                     }
                     TuiRequest::ListWakes { reply } => {
-                        let reg = wakeSlotForHandler.read().unwrap().clone();
-                        let list = reg.lock().await.list();
+                        let list = runtime.listWakes().await;
                         let _ = reply.send(list);
                     }
                     TuiRequest::KillTask { id, reply } => {
-                        let result = plane.lock().unwrap().stop(id);
+                        let result = runtime.stopJob(id);
                         let ack = match result {
                             Ok(()) => {
                                 construct::control::CommandAck::ok(format!("Killing task #{id}."))
@@ -724,7 +671,7 @@ pub async fn run() -> Result<()> {
                         sinceLine,
                         reply,
                     } => {
-                        let snap = plane.lock().unwrap().output(id, sinceLine, 500).ok();
+                        let snap = runtime.jobOutput(id, sinceLine, 500);
                         let _ = reply.send(snap);
                     }
                     _ => {}
@@ -791,8 +738,8 @@ pub async fn run() -> Result<()> {
                             // fire during the await window and enqueue a synthetic
                             // wake that hits the new session.
                             {
-                                let oldWakes = wakeRegistrySlot.read().unwrap().clone();
-                                oldWakes.lock().await.disarmAll();
+                                let oldRuntime = runtimeSlot.read().unwrap().clone();
+                                oldRuntime.disarmAllWakes().await;
                             }
                             // Consume old session, keep the shell.
                             let shells = session.intoShells();
@@ -806,16 +753,9 @@ pub async fn run() -> Result<()> {
                             ).await {
                                 Ok(s) => {
                                     session = s;
-                                    // Point the task-plane handler at the new session's
-                                    // plane so /tasks reflects the resumed state. The
-                                    // old Arc drops with the previous Session, which
-                                    // kills any tasks it was hosting via JobPlane::Drop.
-                                    *jobPlaneSlot.write().unwrap() =
-                                        session.jobPlaneHandle();
-                                    *wakeRegistrySlot.write().unwrap() =
-                                        session.wakeRegistryHandle();
-                                    *monitorPlaneSlot.write().unwrap() =
-                                        session.monitorPlaneHandle();
+                                    // Point request handlers at the new session runtime
+                                    // so /tasks and terminal cleanup reflect resumed state.
+                                    *runtimeSlot.write().unwrap() = session.runtimeHandles();
                                     // Replace the wake-batch receiver — the old one
                                     // belonged to the old session's batcher, which has
                                     // been cancelled by disarmAll above.
@@ -872,12 +812,8 @@ pub async fn run() -> Result<()> {
                                             // (Old wakes already disarmed above before
                                             // the resume attempt — no race here.)
                                             session = s;
-                                            *jobPlaneSlot.write().unwrap() =
-                                                session.jobPlaneHandle();
-                                            *wakeRegistrySlot.write().unwrap() =
-                                                session.wakeRegistryHandle();
-                                            *monitorPlaneSlot.write().unwrap() =
-                                                session.monitorPlaneHandle();
+                                            *runtimeSlot.write().unwrap() =
+                                                session.runtimeHandles();
                                             wakeBatchRx = session.takeWakeBatchRx();
                                         }
                                         Err(e2) => {
@@ -897,8 +833,8 @@ pub async fn run() -> Result<()> {
                             // replacement session so a pending delay/cron/file-watch
                             // can't fire during the construction window.
                             {
-                                let oldWakes = wakeRegistrySlot.read().unwrap().clone();
-                                oldWakes.lock().await.disarmAll();
+                                let oldRuntime = runtimeSlot.read().unwrap().clone();
+                                oldRuntime.disarmAllWakes().await;
                             }
                             let shells = session.intoShells();
                             match Session::new(
@@ -910,15 +846,10 @@ pub async fn run() -> Result<()> {
                             ) {
                                 Ok(s) => {
                                     session = s;
-                                    // Hot-swap the task-plane handler's view of the
-                                    // current plane. Dropping the old Arc cancels any
-                                    // tasks the cleared session was hosting.
-                                    *jobPlaneSlot.write().unwrap() =
-                                        session.jobPlaneHandle();
-                                    *wakeRegistrySlot.write().unwrap() =
-                                        session.wakeRegistryHandle();
-                                    *monitorPlaneSlot.write().unwrap() =
-                                        session.monitorPlaneHandle();
+                                    // Hot-swap request handlers to the replacement
+                                    // runtime. Dropping the old facade releases the
+                                    // previous planes.
+                                    *runtimeSlot.write().unwrap() = session.runtimeHandles();
                                     wakeBatchRx = session.takeWakeBatchRx();
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {

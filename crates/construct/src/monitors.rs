@@ -10,8 +10,7 @@
 //! transcript event into model context on each match.
 //!
 //! # Public API
-//! - [`MonitorPlane`] — registry of monitors keyed by [`MonitorId`]
-//! - [`Monitor`], [`MonitorState`], [`MonitorInfo`]
+//! Monitor snapshots flow through [`crate::session::Session`].
 //!
 //! # Dependencies
 //! `regex`, [`crate::shell`], [`crate::control`]
@@ -28,17 +27,16 @@ use crate::control::LogEvent;
 use crate::shell::{Shell, ShellLineCallback};
 
 /// Monotonically increasing per-session monitor id.
-pub type MonitorId = u64;
+pub(crate) type MonitorId = u64;
 
-pub type MonitorResult<T> = std::result::Result<T, MonitorError>;
+pub(crate) type MonitorResult<T> = std::result::Result<T, MonitorError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MonitorError {
+pub(crate) enum MonitorError {
     MissingDescription,
     MissingFilter,
     InvalidRegex { filter: String, error: String },
     NotFound { id: MonitorId },
-    MissingTerminal,
 }
 
 impl fmt::Display for MonitorError {
@@ -56,7 +54,6 @@ impl fmt::Display for MonitorError {
                 write!(f, "invalid regex filter `{filter}`: {error}")
             }
             MonitorError::NotFound { id } => write!(f, "no monitor #{id}"),
-            MonitorError::MissingTerminal => write!(f, "monitor terminal is required"),
         }
     }
 }
@@ -78,7 +75,7 @@ pub const FLOOD_WINDOW_SECS: f64 = 5.0;
 /// underlying [`crate::jobs::JobState`]; natural backing-task exit is
 /// mirrored into `Stopped` by the exit callback).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MonitorState {
+pub(crate) enum MonitorState {
     Running,
     Stopped,
     AutoStopped(String),
@@ -101,19 +98,16 @@ struct MonitorInner {
 }
 
 /// A registered monitor.
-pub struct Monitor {
+pub(crate) struct Monitor {
     pub id: MonitorId,
     /// Terminal whose output stream this monitor subscribes to.
     pub terminal: String,
     /// Short human-readable label ("errors in deploy.log"). Shown in
     /// every notification, tasks-panel row, and the inline MonitorChip.
     pub description: String,
-    pub command: String,
     /// Raw filter pattern for display (compiled regex lives in the
     /// per-line callback). Required at the tool-schema layer.
     pub filter: String,
-    pub autoStopThresholdEps: f64,
-    pub createdAt: Instant,
     inner: Arc<Mutex<MonitorInner>>,
     /// Wake context. The per-line callback reads this slot to push a
     /// `WakeFire` into the registry's batcher; the batcher coalesces
@@ -129,7 +123,7 @@ pub struct Monitor {
 /// immediately after register so the callback sees it from the first
 /// match.
 #[derive(Clone)]
-pub struct MonitorWakeCtx {
+pub(crate) struct MonitorWakeCtx {
     pub wakeId: crate::wakes::WakeId,
     pub registry: Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
     pub fireTx: tokio::sync::mpsc::UnboundedSender<crate::wakes::WakeFire>,
@@ -140,46 +134,34 @@ impl Monitor {
         self.inner.lock().unwrap().state.clone()
     }
 
-    pub fn eventCount(&self) -> u64 {
-        self.inner.lock().unwrap().eventCount
-    }
-
-    pub fn lastEventAt(&self) -> Option<Instant> {
-        self.inner.lock().unwrap().lastEventAt
-    }
-
     pub fn info(&self) -> MonitorInfo {
         let g = self.inner.lock().unwrap();
         MonitorInfo {
             id: self.id,
             terminal: self.terminal.clone(),
             description: self.description.clone(),
-            command: self.command.clone(),
             filter: self.filter.clone(),
             state: g.state.clone(),
             eventCount: g.eventCount,
             lastEventAt: g.lastEventAt,
-            createdAt: self.createdAt,
         }
     }
 }
 
 /// Lightweight snapshot for `monitorList` and the /tasks panel.
 #[derive(Debug, Clone)]
-pub struct MonitorInfo {
+pub(crate) struct MonitorInfo {
     pub id: MonitorId,
     pub terminal: String,
     pub description: String,
-    pub command: String,
     pub filter: String,
     pub state: MonitorState,
     pub eventCount: u64,
     pub lastEventAt: Option<Instant>,
-    pub createdAt: Instant,
 }
 
 /// Per-session registry of monitors.
-pub struct MonitorPlane {
+pub(crate) struct MonitorPlane {
     monitors: HashMap<MonitorId, Monitor>,
     /// Insertion order for stable listing.
     order: Vec<MonitorId>,
@@ -209,6 +191,7 @@ impl MonitorPlane {
     /// Register a new monitor by attaching a per-line filter callback to an
     /// existing visible terminal. Monitors do not spawn commands; command
     /// execution stays in the terminal surface.
+    #[cfg(test)]
     pub fn register(
         &mut self,
         description: String,
@@ -396,10 +379,7 @@ impl MonitorPlane {
             id,
             terminal: terminal.clone(),
             description: description.clone(),
-            command: terminal.clone(),
             filter: filter.clone(),
-            autoStopThresholdEps,
-            createdAt: Instant::now(),
             inner,
             wakeCtx: wakeCtxSlot,
             shell,
@@ -489,29 +469,14 @@ impl MonitorPlane {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, id: MonitorId) -> Option<&Monitor> {
         self.monitors.get(&id)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.monitors.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.monitors.is_empty()
-    }
-
-    pub fn isEmpty(&self) -> bool {
-        self.monitors.is_empty()
-    }
-
-    /// Snapshot of currently-running monitor ids — useful for the
-    /// status-strip live counter.
-    pub fn runningCount(&self) -> usize {
-        self.monitors
-            .values()
-            .filter(|m| matches!(m.state(), MonitorState::Running))
-            .count()
     }
 }
 

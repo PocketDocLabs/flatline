@@ -127,6 +127,111 @@ pub struct Rider {
     pub content: String,
 }
 
+/// Cloneable runtime facade for host-side status/control paths.
+///
+/// The deck needs to inspect jobs, wakes, monitors, and terminals while an
+/// agent turn owns `&mut Session`. Keeping those shared planes behind this
+/// facade lets the host hot-swap sessions without also taking dependencies
+/// on the raw `Arc<Mutex<_>>` layout.
+#[derive(Clone)]
+pub struct SessionRuntimeHandles {
+    shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
+    jobs: std::sync::Arc<std::sync::Mutex<JobPlane>>,
+    monitors: std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>>,
+    wakes: std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
+}
+
+impl SessionRuntimeHandles {
+    pub async fn spawnUserTerminal(
+        &self,
+        name: Option<String>,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> std::result::Result<String, String> {
+        let resolved = {
+            let mut guard = self.shells.lock().await;
+            guard
+                .spawn(name, SpawnedBy::User)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        let _ = logTx
+            .send(LogEvent::TerminalSpawned {
+                name: resolved.clone(),
+                spawnedBy: SpawnedBy::User.into(),
+            })
+            .await;
+        Ok(resolved)
+    }
+
+    pub async fn killTerminal(
+        &self,
+        name: &str,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> std::result::Result<(), String> {
+        {
+            let mut guard = self.shells.lock().await;
+            guard.kill(name).map_err(|e| e.to_string())?;
+        }
+        self.stopMonitorsForTerminal(name, logTx).await;
+        let _ = logTx
+            .send(LogEvent::TerminalClosed {
+                name: name.to_string(),
+            })
+            .await;
+        Ok(())
+    }
+
+    pub async fn listTerminals(&self) -> Vec<crate::shells::TerminalInfo> {
+        self.shells.lock().await.list()
+    }
+
+    pub fn listJobs(&self) -> Vec<crate::jobs::JobInfo> {
+        self.jobs.lock().unwrap().list()
+    }
+
+    pub fn stopJob(&self, id: crate::jobs::JobId) -> crate::jobs::JobResult<()> {
+        self.jobs.lock().unwrap().stop(id)
+    }
+
+    pub fn jobOutput(
+        &self,
+        id: crate::jobs::JobId,
+        sinceLine: Option<u64>,
+        maxLines: usize,
+    ) -> Option<crate::jobs::JobOutputSnapshot> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .output(id, sinceLine, maxLines)
+            .ok()
+    }
+
+    pub async fn listWakes(&self) -> Vec<crate::wakes::WakeSourceInfo> {
+        self.wakes.lock().await.list()
+    }
+
+    pub async fn disarmAllWakes(&self) {
+        self.wakes.lock().await.disarmAll();
+    }
+
+    pub async fn stopMonitorsForTerminal(
+        &self,
+        terminalName: &str,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) {
+        let stopped = {
+            let plane = self.monitors.lock().unwrap();
+            plane.stopForTerminal(terminalName)
+        };
+        for (id, wakeId) in stopped {
+            if let Some(wid) = wakeId {
+                self.wakes.lock().await.unregisterPassive(wid, logTx);
+            }
+            let _ = logTx.send(LogEvent::MonitorStopped { id }).await;
+        }
+    }
+}
+
 /// Build child (subagent) permissions by inheriting from the parent and
 /// layering the preset as a floor.
 ///
@@ -617,19 +722,17 @@ pub struct Session {
     /// `tokio::sync::Mutex` (not std) because `ShellRegistry::spawn` is
     /// async — holding a std Mutex guard across the spawn await would
     /// break Send.
-    pub shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
-    /// Background-job registry. Shared via `Arc<Mutex<>>` so the deck's
-    /// tasks-panel request handler can run concurrently with `session.send`
-    /// (the latter holds `&mut self` for the whole turn). Use
-    /// `jobPlaneHandle()` to clone the handle.
-    pub jobs: std::sync::Arc<std::sync::Mutex<JobPlane>>,
-    /// Monitor registry. Same Arc<Mutex> pattern as `tasks` so the deck
-    /// can list/inspect monitors concurrently with a turn.
-    pub monitors: std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>>,
+    shells: std::sync::Arc<tokio::sync::Mutex<ShellRegistry>>,
+    /// Background-job registry. Shared through `SessionRuntimeHandles` so
+    /// host request handlers can run concurrently with `session.send`.
+    jobs: std::sync::Arc<std::sync::Mutex<JobPlane>>,
+    /// Monitor registry. Shared through `SessionRuntimeHandles` for
+    /// terminal-lifecycle cleanup and status panels.
+    monitors: std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>>,
     /// Wake-source registry — schedule/cron/file-watch sources. Uses
     /// tokio::sync::Mutex because the wake schedulers run as tokio
     /// tasks that need to lock across .await points.
-    pub wakes: std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
+    wakes: std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
     transcript: Transcript,
     snapshots: crate::snapshot::SnapshotStore,
     compactionLog: CompactionLog,
@@ -672,27 +775,15 @@ pub struct Session {
 }
 
 impl Session {
-    /// Clone of the task-plane handle for callers that need to query or
-    /// mutate it independently of the session's `&mut self` borrow
-    /// (e.g. a dedicated tasks-panel request handler running concurrently
-    /// with `session.send`).
-    pub fn jobPlaneHandle(&self) -> std::sync::Arc<std::sync::Mutex<JobPlane>> {
-        self.jobs.clone()
-    }
-
-    /// Clone of the monitor-plane handle. Same rationale as
-    /// `jobPlaneHandle()` — for off-thread queries during a turn.
-    pub fn monitorPlaneHandle(
-        &self,
-    ) -> std::sync::Arc<std::sync::Mutex<crate::monitors::MonitorPlane>> {
-        self.monitors.clone()
-    }
-
-    /// Clone of the wake-registry handle.
-    pub fn wakeRegistryHandle(
-        &self,
-    ) -> std::sync::Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>> {
-        self.wakes.clone()
+    /// Clone of the runtime-plane facade for host-side status/control paths
+    /// that must run while an agent turn owns `&mut Session`.
+    pub fn runtimeHandles(&self) -> SessionRuntimeHandles {
+        SessionRuntimeHandles {
+            shells: self.shells.clone(),
+            jobs: self.jobs.clone(),
+            monitors: self.monitors.clone(),
+            wakes: self.wakes.clone(),
+        }
     }
 
     /// Take ownership of the wake-batch receiver. Called once by the
@@ -705,18 +796,9 @@ impl Session {
 
     /// Consume this session and return its shell registry handle. The
     /// caller hands this to `Session::new` / `Session::resume` so the
-    /// resumed session shares the same live PTYs and the deck's
-    /// dedicated terminal-request handler stays pointed at a valid
-    /// registry without needing a hot-swap.
+    /// resumed session shares the same live PTYs.
     pub fn intoShells(self) -> std::sync::Arc<tokio::sync::Mutex<ShellRegistry>> {
         self.shells
-    }
-
-    /// Clone of the shell-registry handle. Used by the deck's dedicated
-    /// terminal-request handler so spawn/kill/list operations don't
-    /// have to wait for `session.send` to release `&mut session`.
-    pub fn shellsHandle(&self) -> std::sync::Arc<tokio::sync::Mutex<ShellRegistry>> {
-        self.shells.clone()
     }
 
     /// Create a new session.

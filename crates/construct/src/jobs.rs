@@ -10,8 +10,6 @@
 //! completed tasks in phase 2; user can `jobStop` running ones.
 //!
 //! # Public API
-//! - [`JobPlane`] — registry of background jobs
-//! - [`BgJob`] — per-task state + handle
 //! - [`JobKind`], [`JobState`], [`JobInfo`], [`JobOutputSnapshot`]
 //!
 //! # Dependencies
@@ -19,15 +17,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::control::LogEvent;
+
+#[cfg(test)]
+use std::process::Stdio;
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(test)]
+use tokio::process::Command;
 
 /// Identifier for a background job, monotonically increasing per session.
 pub type JobId = u64;
@@ -60,12 +62,14 @@ pub const MAX_RESPONSE_LINES: usize = 500;
 /// Used by [`MonitorPlane`] to filter+count without duplicating the
 /// drainer logic. Must be cheap (it's called on the hot path of each
 /// stdout/stderr line).
-pub type LineCallback = Box<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+type LineCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Side-effect callback invoked once when a bash-backed task reaches a
 /// terminal state. Used by `MonitorPlane` to mirror natural backing-task
 /// exits into monitor lifecycle without polling.
-pub type ExitCallback = Box<dyn Fn(JobId, JobState) + Send + Sync>;
+#[cfg(test)]
+type ExitCallback = Box<dyn Fn(JobId, JobState) + Send + Sync>;
 
 /// Kind of background job.
 #[derive(Debug, Clone)]
@@ -193,14 +197,14 @@ struct BgJobInner {
 /// source), and the batcher's fire sender (used to enqueue the
 /// completion fire). Shared by bash bg jobs and subagent jobs.
 #[derive(Clone)]
-pub struct TaskWakeCtx {
+pub(crate) struct TaskWakeCtx {
     pub wakeId: crate::wakes::WakeId,
     pub registry: Arc<tokio::sync::Mutex<crate::wakes::WakeRegistry>>,
     pub fireTx: tokio::sync::mpsc::UnboundedSender<crate::wakes::WakeFire>,
 }
 
 /// A background job: command + drainer handle + shared state.
-pub struct BgJob {
+pub(crate) struct BgJob {
     pub id: JobId,
     pub kind: JobKind,
     pub command: String,
@@ -215,10 +219,6 @@ pub struct BgJob {
 impl BgJob {
     pub fn state(&self) -> JobState {
         self.inner.lock().unwrap().state.clone()
-    }
-
-    pub fn totalLines(&self) -> u64 {
-        self.inner.lock().unwrap().stdoutTail.totalPushed
     }
 
     pub fn info(&self) -> JobInfo {
@@ -261,7 +261,7 @@ impl BgJob {
 /// JobPlane. Owned by the runner; dropping it doesn't terminate the
 /// task — only an explicit `complete`/`error` call moves it out of
 /// `Running`.
-pub struct SubagentJobHandle {
+pub(crate) struct SubagentJobHandle {
     pub id: JobId,
     inner: Arc<Mutex<BgJobInner>>,
     logTx: mpsc::Sender<LogEvent>,
@@ -272,6 +272,7 @@ pub struct SubagentJobHandle {
 impl SubagentJobHandle {
     /// Append a line of streamed output into the task's ring buffer
     /// and emit a `TaskOutput` event for live UIs (e.g. the inspector).
+    #[cfg(test)]
     pub fn pushLine(&self, line: impl Into<String>) {
         let line = line.into();
         self.inner.lock().unwrap().stdoutTail.push(line.clone());
@@ -406,7 +407,7 @@ impl SubagentJobHandle {
 /// handle so the runner's log forwarder can own it without holding the
 /// full handle (which would otherwise block the completion path).
 #[derive(Clone)]
-pub struct SubagentLineSender {
+pub(crate) struct SubagentLineSender {
     id: JobId,
     inner: Arc<Mutex<BgJobInner>>,
     logTx: mpsc::Sender<LogEvent>,
@@ -423,13 +424,14 @@ impl SubagentLineSender {
 }
 
 /// Per-session registry of background jobs.
-pub struct JobPlane {
+pub(crate) struct JobPlane {
     jobs: HashMap<JobId, BgJob>,
     /// Insertion order for stable listing.
     order: Vec<JobId>,
     nextId: JobId,
     /// CWD newly-spawned tasks inherit. Falls back to current_dir at
     /// spawn time if None.
+    #[cfg(test)]
     cwd: Option<std::path::PathBuf>,
 }
 
@@ -445,22 +447,19 @@ impl Drop for JobPlane {
 
 impl JobPlane {
     pub fn new(cwd: Option<std::path::PathBuf>) -> Self {
+        #[cfg(not(test))]
+        let _ = &cwd;
         Self {
             jobs: HashMap::new(),
             order: Vec::new(),
             nextId: 1,
+            #[cfg(test)]
             cwd,
         }
     }
 
-    // NOTE: attachWakeCtx removed — the race it served was closed by
-    // reserveJobId + spawnBashWithId (wakeCtx set before drainer spawn).
-
     /// Reserve the next job id without spawning anything. Used when
-    /// the caller needs to register a passive wake source against a
-    /// known id BEFORE the drainer starts (so the drainer never sees
-    /// an empty `wakeCtx` for a job that should have one). Pair with
-    /// `spawnBashWithId`.
+    /// the caller needs to register a passive wake source against a known id.
     pub fn reserveJobId(&mut self) -> JobId {
         let id = self.nextId;
         self.nextId += 1;
@@ -471,6 +470,7 @@ impl JobPlane {
     /// features (pipes, redirects, env expansion, bashisms) work.
     /// Stdout and stderr are interleaved into the same ring buffer in
     /// line order of arrival.
+    #[cfg(test)]
     pub fn spawnBash(
         &mut self,
         command: String,
@@ -480,32 +480,10 @@ impl JobPlane {
         self.spawnBashInner(id, command, JobKind::Bash, "bash", None, None, logTx, None)
     }
 
-    /// Spawn a bash task with a pre-reserved id and the passive wake
-    /// context already resolved. The drainer reads `wakeCtx` from
-    /// `BgJobInner`, and we set it BEFORE the drainer is spawned —
-    /// closing the attach-after-spawn race window.
-    pub fn spawnBashWithId(
-        &mut self,
-        id: JobId,
-        command: String,
-        logTx: mpsc::Sender<LogEvent>,
-        wakeCtx: Option<TaskWakeCtx>,
-    ) -> JobResult<JobId> {
-        self.spawnBashInner(
-            id,
-            command,
-            JobKind::Bash,
-            "bash",
-            None,
-            None,
-            logTx,
-            wakeCtx,
-        )
-    }
-
     /// Shared body: build the bg task entry, emit `TaskSpawned`, then
     /// kick off the bash drainer with an optional per-line side effect.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn spawnBashInner(
         &mut self,
         id: JobId,
@@ -586,6 +564,7 @@ impl JobPlane {
     /// buffer, and return a handle the caller pushes lines/completion
     /// status into. The handle's `cancelRx` lets the runner notice
     /// `jobStop` requests cooperatively.
+    #[cfg(test)]
     pub fn spawnSubagent(
         &mut self,
         agentType: String,
@@ -597,9 +576,8 @@ impl JobPlane {
     }
 
     /// Spawn a subagent task with a pre-reserved id and a passive wake
-    /// context already resolved. Mirrors `spawnBashWithId` — used by
-    /// session.rs to register a `TaskComplete` wake against the same id
-    /// before the runner starts.
+    /// context already resolved. Used by session.rs to register a
+    /// `TaskComplete` wake against the same id before the runner starts.
     pub fn spawnSubagentWithId(
         &mut self,
         id: JobId,
@@ -685,45 +663,11 @@ impl JobPlane {
 
     /// Kill every running task. Returns the ids that received a signal.
     /// Skips already-terminal tasks. Used by the `/killall` slash command.
-    pub fn stopAll(&self) -> Vec<JobId> {
-        let mut killed = Vec::new();
-        for id in &self.order {
-            if let Some(task) = self.jobs.get(id)
-                && !task.state().isTerminal()
-            {
-                task.kill();
-                killed.push(*id);
-            }
-        }
-        killed
-    }
-
-    /// Snapshot every task in insertion order.
     pub fn list(&self) -> Vec<JobInfo> {
         self.order
             .iter()
             .filter_map(|id| self.jobs.get(id).map(|t| t.info()))
             .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.jobs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
-    }
-
-    pub fn isEmpty(&self) -> bool {
-        self.jobs.is_empty()
-    }
-
-    /// Snapshot of running task ids — useful for status-strip counts.
-    pub fn runningCount(&self) -> usize {
-        self.jobs
-            .values()
-            .filter(|t| matches!(t.state(), JobState::Running))
-            .count()
     }
 }
 
@@ -731,6 +675,7 @@ impl JobPlane {
 /// ring buffer, race the child against `killRx`. On any termination,
 /// update the task's state and emit `TaskComplete` / `TaskStopped`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn runBashTask(
     id: JobId,
     command: String,
@@ -1028,6 +973,7 @@ async fn runBashTask(
 /// Kill the entire process tree rooted at `pgid` if known; falls back to
 /// killing just the leader. On unix, sends SIGTERM to the process group
 /// (graceful), waits briefly, then SIGKILLs anything still alive.
+#[cfg(test)]
 async fn killProcessTree(pgid: Option<i32>, child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {

@@ -10,7 +10,6 @@
 //!
 //! # Public API
 //! - [`reconstruct`] — rebuild history from transcript + compaction log
-//! - [`calculateZones`] — determine S2/S3 zone boundaries for compaction
 //! - [`buildState`] — `/context` geological layer data (rendered by deck)
 //!
 //! # Dependencies
@@ -30,7 +29,7 @@ use anyhow::Result;
 /// Applies compaction operations whose targets are in the active chain,
 /// then reassembles into the grouped Message format the API expects.
 /// Does NOT include the system prompt — the caller prepends that.
-pub fn reconstruct(
+pub(crate) fn reconstruct(
     transcript: &Transcript,
     compactionLog: &CompactionLog,
     headTurnId: &str,
@@ -493,96 +492,11 @@ fn flushPending(
 }
 
 // ---------------------------------------------------------------------------
-// Zone calculation
-// ---------------------------------------------------------------------------
-
-/// Zone boundaries for compaction targeting.
-///
-/// Indices are into the history `Vec<Message>`.
-pub struct Zones {
-    /// S3 zone: oldest 30% of context by character count.
-    pub s3Zone: Vec<usize>,
-    /// S2 zone: next 30% (30%–60%) of context by character count.
-    pub s2Zone: Vec<usize>,
-}
-
-/// Calculate zone boundaries for the current history.
-///
-/// Walks messages from oldest to newest, accumulating character counts.
-/// The first 30% of total chars forms the S3 zone, the next 30% forms
-/// the S2 zone. The remaining 40% is the raw zone (untouched).
-///
-/// The system message (index 0) is excluded from zones — it's never compacted.
-pub fn calculateZones(history: &[Message], _contextWindow: usize, _compactRatio: f64) -> Zones {
-    if history.len() <= 1 {
-        return Zones {
-            s3Zone: Vec::new(),
-            s2Zone: Vec::new(),
-        };
-    }
-
-    // Calculate total character count (excluding system message).
-    let charCounts: Vec<usize> = history.iter().map(messageCharCount).collect();
-
-    let totalChars: usize = charCounts[1..].iter().sum();
-    if totalChars == 0 {
-        return Zones {
-            s3Zone: Vec::new(),
-            s2Zone: Vec::new(),
-        };
-    }
-
-    let s3Boundary = totalChars * 30 / 100;
-    let s2Boundary = totalChars * 60 / 100;
-
-    let mut s3Zone = Vec::new();
-    let mut s2Zone = Vec::new();
-    let mut cumulative: usize = 0;
-
-    // Start at index 1 to skip the system message.
-    for (i, count) in charCounts.iter().enumerate().skip(1) {
-        cumulative += *count;
-
-        if cumulative <= s3Boundary {
-            s3Zone.push(i);
-        } else if cumulative <= s2Boundary {
-            s2Zone.push(i);
-        }
-        // Past 60% = raw zone, not included.
-    }
-
-    Zones { s3Zone, s2Zone }
-}
-
-/// Rough character count for a message (used for zone calculation).
-fn messageCharCount(msg: &Message) -> usize {
-    match msg {
-        Message::System { content } => content.len(),
-        Message::User { content } => content.charCount(),
-        Message::Assistant {
-            content,
-            tool_calls,
-            ..
-        } => {
-            let textLen = content.as_ref().map_or(0, |c| c.len());
-            let callsLen = tool_calls.as_ref().map_or(0, |calls| {
-                calls
-                    .iter()
-                    .map(|c| c.function.arguments.len() + c.function.name.len())
-                    .sum()
-            });
-            textLen + callsLen
-        }
-        Message::Tool { content, .. } => content.charCount(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // /context display
 // ---------------------------------------------------------------------------
 
 /// Input parameters for building context state.
-pub struct BuildStateInput<'a> {
+pub(crate) struct BuildStateInput<'a> {
     pub contextWindow: usize,
     pub compactionLog: &'a CompactionLog,
     pub reportedTokens: usize,
@@ -644,7 +558,7 @@ pub struct ContextState {
 ///
 /// Walks the compaction log to determine what lives in each layer,
 /// then estimates token counts from the transformed turn stream.
-pub fn buildState(input: &BuildStateInput) -> ContextState {
+pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
     let ops = input.compactionLog.loadAll().unwrap_or_default();
 
     if input.headTurnId.is_empty() {
