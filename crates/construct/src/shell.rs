@@ -16,8 +16,9 @@
 //! # Dependencies
 //! `portable-pty`, `tokio`
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
 const MAX_HISTORY: usize = 50;
+
+pub type ShellLineCallback = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
 // VT render grid for turning captured PTY byte streams into the final
 // visible text the user would see at the prompt. Also used by the live
@@ -167,6 +170,35 @@ pub struct CommandRecord {
     pub lineCount: usize,
 }
 
+/// Detailed result of an agent-issued terminal command.
+#[derive(Debug, Clone)]
+pub struct CommandExecution {
+    pub command: String,
+    pub output: String,
+    pub exitCode: Option<i32>,
+    pub lineCount: usize,
+    pub replayBytes: Vec<u8>,
+    pub timedOut: bool,
+}
+
+impl CommandExecution {
+    pub fn responseText(&self) -> String {
+        let mut response = if let Some(code) = self.exitCode {
+            if code != 0 {
+                format!("{}\n(exit code: {code})", self.output)
+            } else {
+                self.output.clone()
+            }
+        } else {
+            self.output.clone()
+        };
+        if self.timedOut && self.exitCode.is_none() {
+            response.push_str("\n(command timed out and was interrupted)");
+        }
+        response
+    }
+}
+
 /// Command execution handle — send commands, get output.
 ///
 /// Held by the Session. Commands run in the stateful shell,
@@ -181,6 +213,8 @@ pub struct Shell {
     shutdownTx: mpsc::Sender<()>,
     history: Arc<Mutex<Vec<CommandRecord>>>,
     vt: Arc<Mutex<ShellVt>>,
+    busy: Arc<AtomicBool>,
+    lineListeners: Arc<Mutex<HashMap<u64, ShellLineCallback>>>,
 }
 
 impl Shell {
@@ -201,16 +235,97 @@ impl Shell {
     /// If `timeout` is Some, the command is interrupted after that duration.
     /// If None, uses the default timeout (120s).
     pub async fn execute(&self, command: &str, timeout: Option<Duration>) -> String {
+        self.executeDetailed(command, timeout).await.responseText()
+    }
+
+    /// Execute a command and return structured execution metadata. This
+    /// powers terminal-run history while `execute` preserves the old text API.
+    pub async fn executeDetailed(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> CommandExecution {
+        self.executeDetailedWithDriverTimeout(
+            command,
+            Some(timeout.unwrap_or(Duration::from_secs(SHELL_DEFAULT_TIMEOUT_SECS))),
+        )
+        .await
+    }
+
+    /// Execute a command with no shell-driver timeout. The caller is
+    /// responsible for deciding whether to keep waiting or detach the run.
+    /// This powers timeout/Ctrl+B backgrounding without killing and
+    /// restarting the foreground command in a separate process.
+    pub async fn executeDetailedNoTimeout(&self, command: &str) -> CommandExecution {
+        self.executeDetailedWithDriverTimeout(command, None).await
+    }
+
+    async fn executeDetailedWithDriverTimeout(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> CommandExecution {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return CommandExecution {
+                command: command.into(),
+                output: "Terminal is busy running another command. Wait for it to finish or choose another terminal.".into(),
+                exitCode: None,
+                lineCount: 1,
+                replayBytes: Vec::new(),
+                timedOut: false,
+            };
+        }
         let (tx, rx) = oneshot::channel();
         let req = ShellRequest {
             command: command.into(),
-            timeout: Some(timeout.unwrap_or(Duration::from_secs(SHELL_DEFAULT_TIMEOUT_SECS))),
+            timeout,
             respondTo: tx,
         };
         if self.cmdTx.send(req).await.is_err() {
-            return "Shell closed.".into();
+            self.busy.store(false, Ordering::SeqCst);
+            return CommandExecution {
+                command: command.into(),
+                output: "Shell closed.".into(),
+                exitCode: None,
+                lineCount: 1,
+                replayBytes: Vec::new(),
+                timedOut: false,
+            };
         }
-        rx.await.unwrap_or_else(|_| "Shell disconnected.".into())
+        match rx.await {
+            Ok(output) => output,
+            Err(_) => {
+                self.busy.store(false, Ordering::SeqCst);
+                CommandExecution {
+                    command: command.into(),
+                    output: "Shell disconnected.".into(),
+                    exitCode: None,
+                    lineCount: 1,
+                    replayBytes: Vec::new(),
+                    timedOut: false,
+                }
+            }
+        }
+    }
+
+    /// True while an agent-command capture is running in this terminal.
+    pub fn isBusy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Attach a normalized-line listener to this terminal's output stream.
+    /// Listeners see lines after Flatline sentinel filtering and ANSI stripping.
+    pub fn addLineListener(&self, id: u64, cb: ShellLineCallback) {
+        self.lineListeners.lock().unwrap().insert(id, cb);
+    }
+
+    /// Remove a line listener. No-op when the id is unknown.
+    pub fn removeLineListener(&self, id: u64) {
+        self.lineListeners.lock().unwrap().remove(&id);
     }
 
     /// Number of stored command records.
@@ -393,6 +508,11 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
     let historyRef = Arc::clone(&history);
     let vt: Arc<Mutex<ShellVt>> = Arc::new(Mutex::new(ShellVt::new()));
     let vtRef = Arc::clone(&vt);
+    let busy: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let busyRef = Arc::clone(&busy);
+    let lineListeners: Arc<Mutex<HashMap<u64, ShellLineCallback>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let lineListenersRef = Arc::clone(&lineListeners);
     // Size the live VT to the initial PTY dimensions so cursor
     // positioning from the shell lines up with what we track.
     vtRef.lock().unwrap().resize(cols, rows);
@@ -403,53 +523,66 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         // Pending bytes to write to the PTY, drained in chunks so
         // large commands (heredocs) don't deadlock with output echo.
         let mut pendingWrite: VecDeque<u8> = VecDeque::new();
+        let mut listenerLineBuf: Vec<u8> = Vec::new();
 
         // Feed bytes into the live VT that backs `readTerminal`.
         let feedVt = |bytes: &[u8]| {
             vtRef.lock().unwrap().feed(bytes);
         };
 
+        let feedLineListeners = |bytes: &[u8], lineBuf: &mut Vec<u8>| {
+            for &b in bytes {
+                lineBuf.push(b);
+                if b == b'\n' {
+                    let raw = String::from_utf8_lossy(lineBuf);
+                    let cleaned = stripAnsi(&raw).trim_end_matches(['\r', '\n']).to_string();
+                    lineBuf.clear();
+                    if cleaned.trim().is_empty() {
+                        continue;
+                    }
+                    let listeners: Vec<ShellLineCallback> =
+                        lineListenersRef.lock().unwrap().values().cloned().collect();
+                    for cb in listeners {
+                        cb(&cleaned);
+                    }
+                }
+            }
+        };
+
         /// Finalize a capture: extract output, store in history, resolve oneshot.
         fn finalizeCapture(
             cap: CaptureState,
             historyRef: &Arc<Mutex<Vec<CommandRecord>>>,
+            busyRef: &Arc<AtomicBool>,
             timedOut: bool,
         ) -> (String, Vec<u8>) {
             let mut cap = cap;
             let remaining = cap.filter.flush();
             let result = extractResult(&cap.buffer, &cap.uuid);
+            cap.displayBuffer.extend_from_slice(&remaining);
 
             let mut hist = historyRef.lock().unwrap();
+            let lineCount = result.output.lines().count();
             hist.push(CommandRecord {
                 command: cap.command.clone(),
                 output: result.output.clone(),
                 exitCode: result.exitCode,
-                lineCount: result.output.lines().count(),
+                lineCount,
             });
             if hist.len() > MAX_HISTORY {
                 hist.remove(0);
             }
 
-            let mut response = if let Some(code) = result.exitCode {
-                if code != 0 {
-                    format!("{}\n(exit code: {code})", result.output)
-                } else {
-                    result.output
-                }
-            } else {
-                result.output
+            let exec = CommandExecution {
+                command: cap.command,
+                output: result.output,
+                exitCode: result.exitCode,
+                lineCount,
+                replayBytes: cap.displayBuffer,
+                timedOut,
             };
-
-            // Only claim "timed out" when we genuinely couldn't extract
-            // the exit code. If `extractResult` parsed an exit code,
-            // the command's END marker reached the buffer — the run
-            // finished, our kill chain was just slow to notice. Slapping
-            // the marker on anyway would cause a false AUTO_BG_INTERRUPT.
-            if timedOut && result.exitCode.is_none() {
-                response.push_str("\n(command timed out and was interrupted)");
-            }
-
-            let _ = cap.respondTo.send(response);
+            let _ = cap.respondTo.send(exec);
+            busyRef.store(false, Ordering::SeqCst);
             (cap.uuid, remaining)
         }
 
@@ -467,10 +600,13 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         // Filtered bytes go to harness (no sentinels in display).
                         let filtered = cap.filter.process(&bytes);
                         if !filtered.is_empty() {
+                            cap.displayBuffer.extend_from_slice(&filtered);
+                            feedLineListeners(&filtered, &mut listenerLineBuf);
                             feedVt(&filtered);
                             let _ = outputTx.try_send(filtered);
                         }
                     } else {
+                        feedLineListeners(&bytes, &mut listenerLineBuf);
                         feedVt(&bytes);
                         let _ = outputTx.try_send(bytes);
                     }
@@ -486,7 +622,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                     if done {
                         let cap = captureState.take().unwrap();
-                        let (_, remaining) = finalizeCapture(cap, &historyRef, false);
+                        let (_, remaining) = finalizeCapture(cap, &historyRef, &busyRef, false);
                         if !remaining.is_empty() {
                             feedVt(&remaining);
                             let _ = outputTx.try_send(remaining);
@@ -512,7 +648,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         let endPattern = format!("__FLATLINE_END_{}_", cap.uuid);
                         if String::from_utf8_lossy(&cap.buffer).contains(&endPattern) {
                             let cap = captureState.take().unwrap();
-                            let (_, remaining) = finalizeCapture(cap, &historyRef, false);
+                            let (_, remaining) = finalizeCapture(cap, &historyRef, &busyRef, false);
                             if !remaining.is_empty() {
                                 feedVt(&remaining);
                                 let _ = outputTx.try_send(remaining);
@@ -544,7 +680,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                 // Phase 3: give up — force-extract whatever we have.
                                 tracing::error!(command = %cap.command, "kill chain exhausted, force-extracting output");
                                 let cap = captureState.take().unwrap();
-                                let (_, remaining) = finalizeCapture(cap, &historyRef, true);
+                                let (_, remaining) = finalizeCapture(cap, &historyRef, &busyRef, true);
                                 if !remaining.is_empty() {
                                     feedVt(&remaining);
                                     let _ = outputTx.try_send(remaining);
@@ -576,6 +712,19 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                 // Command execution request from session.
                 Some(req) = cmdRx.recv() => {
+                    if captureState.is_some() {
+                        let _ = req.respondTo.send(
+                            CommandExecution {
+                                command: req.command,
+                                output: "Terminal is busy running another command. Wait for it to finish or choose another terminal.".into(),
+                                exitCode: None,
+                                lineCount: 1,
+                                replayBytes: Vec::new(),
+                                timedOut: false,
+                            },
+                        );
+                        continue;
+                    }
                     let uuid = generateUuid();
 
                     // Echo the command in the terminal so the user sees what ran.
@@ -611,6 +760,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         uuid: uuid.clone(),
                         command: req.command,
                         buffer: Vec::new(),
+                        displayBuffer: Vec::new(),
                         filter: DisplayFilter::new(&uuid),
                         respondTo: req.respondTo,
                         deadline,
@@ -647,6 +797,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                 // which drops outputTx so the harness knows the shell
                 // is gone.
                 Some(()) = shutdownRx.recv() => {
+                    busyRef.store(false, Ordering::SeqCst);
                     break;
                 }
 
@@ -664,6 +815,8 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         shutdownTx,
         history,
         vt,
+        busy,
+        lineListeners,
     };
     let io = ShellIo {
         outputRx,
@@ -680,7 +833,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 struct ShellRequest {
     command: String,
     timeout: Option<Duration>,
-    respondTo: oneshot::Sender<String>,
+    respondTo: oneshot::Sender<CommandExecution>,
 }
 
 /// Escalation phase for timed-out commands.
@@ -697,8 +850,9 @@ struct CaptureState {
     uuid: String,
     command: String,
     buffer: Vec<u8>,
+    displayBuffer: Vec<u8>,
     filter: DisplayFilter,
-    respondTo: oneshot::Sender<String>,
+    respondTo: oneshot::Sender<CommandExecution>,
     /// Absolute deadline for the next escalation phase.
     deadline: Option<tokio::time::Instant>,
     /// Current kill escalation phase.

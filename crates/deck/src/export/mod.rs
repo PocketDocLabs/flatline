@@ -90,8 +90,7 @@ fn collectOne(sessionId: &str, args: &ExportArgs) -> Result<Vec<openai::Example>
     if !sessionDir.exists() {
         anyhow::bail!("session not found: {}", sessionDir.display());
     }
-    let snapshotsDir = sessionDir.join("snapshots");
-    if !snapshotsDir.exists() {
+    if !sessionHasSnapshots(&sessionDir)? {
         eprintln!("skipped: no snapshots (session {sessionId} predates the snapshot feature)");
         std::process::exit(2);
     }
@@ -136,7 +135,7 @@ fn collectAll(args: &ExportArgs) -> Result<Vec<openai::Example>> {
             None => continue,
         };
 
-        if !sessionDir.join("snapshots").exists() {
+        if !sessionHasSnapshots(&sessionDir).unwrap_or(false) {
             withoutSnapshots += 1;
             continue;
         }
@@ -190,9 +189,8 @@ fn buildExamplesForSession(
     sessionDir: &Path,
     args: &ExportArgs,
 ) -> Result<(Vec<openai::Example>, SessionStats)> {
-    let snapshotsDir = sessionDir.join("snapshots");
     let meta = Transcript::loadMeta(sessionDir)
-        .with_context(|| format!("load meta.json for {sessionId}"))?;
+        .with_context(|| format!("load session meta for {sessionId}"))?;
 
     let allTurns = {
         let t = Transcript::open(sessionId)
@@ -207,7 +205,7 @@ fn buildExamplesForSession(
         .ok_or_else(|| anyhow::anyhow!("session {sessionId} has no turns"))?;
     let branch = transcript::walkBranchTurns(&allTurns, &headTurnId);
 
-    let index = loadSnapshotIndex(&snapshotsDir)
+    let index = loadSnapshotIndex(sessionDir)
         .with_context(|| format!("load snapshot index for {sessionId}"))?;
     let segments = buildSegments(&branch, &index, args.includeCancelled);
 
@@ -220,7 +218,7 @@ fn buildExamplesForSession(
             segIdx,
             seg,
             &branch,
-            &snapshotsDir,
+            sessionDir,
             args.noReasoning,
             args.minMessages,
         )? {
@@ -255,7 +253,19 @@ pub(crate) struct Segment {
 
 use std::collections::HashMap;
 
-pub(crate) fn loadSnapshotIndex(snapshotsDir: &Path) -> Result<HashMap<String, RequestSnapshot>> {
+fn sessionHasSnapshots(sessionDir: &Path) -> Result<bool> {
+    if !construct::storage::loadSnapshotIndexForSession(sessionDir)?.is_empty() {
+        return Ok(true);
+    }
+    Ok(sessionDir.join("snapshots/index.jsonl").exists())
+}
+
+pub(crate) fn loadSnapshotIndex(sessionDir: &Path) -> Result<HashMap<String, RequestSnapshot>> {
+    let sqlite = construct::storage::loadSnapshotIndexForSession(sessionDir)?;
+    if !sqlite.is_empty() {
+        return Ok(sqlite);
+    }
+    let snapshotsDir = sessionDir.join("snapshots");
     let path = snapshotsDir.join("index.jsonl");
     let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut map = HashMap::new();

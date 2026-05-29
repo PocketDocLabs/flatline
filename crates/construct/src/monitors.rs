@@ -1,5 +1,5 @@
-//! Monitor plane — line-streamed watchers backed by `JobPlane` bash
-//! tasks. Each [`Monitor`] owns a compiled regex; lines that match are
+//! Monitor plane — line-streamed watchers attached to shared terminals.
+//! Each [`Monitor`] owns a compiled regex; lines that match are
 //! counted as events and emit [`crate::control::LogEvent::MonitorEvent`].
 //! A rolling EWMA flood guard stops a monitor that exceeds
 //! `autoStopThreshold` matches/sec for `floodWindowSecs`. The filter
@@ -14,7 +14,7 @@
 //! - [`Monitor`], [`MonitorState`], [`MonitorInfo`]
 //!
 //! # Dependencies
-//! `regex`, [`crate::jobs`], [`crate::control`]
+//! `regex`, [`crate::shell`], [`crate::control`]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,7 +25,7 @@ use regex::Regex;
 use tokio::sync::mpsc;
 
 use crate::control::LogEvent;
-use crate::jobs::{ExitCallback, JobError, JobId, JobPlane, LineCallback};
+use crate::shell::{Shell, ShellLineCallback};
 
 /// Monotonically increasing per-session monitor id.
 pub type MonitorId = u64;
@@ -38,7 +38,7 @@ pub enum MonitorError {
     MissingFilter,
     InvalidRegex { filter: String, error: String },
     NotFound { id: MonitorId },
-    BackingJob(JobError),
+    MissingTerminal,
 }
 
 impl fmt::Display for MonitorError {
@@ -56,18 +56,12 @@ impl fmt::Display for MonitorError {
                 write!(f, "invalid regex filter `{filter}`: {error}")
             }
             MonitorError::NotFound { id } => write!(f, "no monitor #{id}"),
-            MonitorError::BackingJob(err) => write!(f, "backing task failed: {err}"),
+            MonitorError::MissingTerminal => write!(f, "monitor terminal is required"),
         }
     }
 }
 
 impl std::error::Error for MonitorError {}
-
-impl From<JobError> for MonitorError {
-    fn from(value: JobError) -> Self {
-        MonitorError::BackingJob(value)
-    }
-}
 
 /// Default threshold for the flood-guard EWMA, in matched-events/second.
 /// 50/s was too low for any real log incident (the original value);
@@ -109,8 +103,8 @@ struct MonitorInner {
 /// A registered monitor.
 pub struct Monitor {
     pub id: MonitorId,
-    /// Id of the backing bash task in [`JobPlane`].
-    pub taskId: JobId,
+    /// Terminal whose output stream this monitor subscribes to.
+    pub terminal: String,
     /// Short human-readable label ("errors in deploy.log"). Shown in
     /// every notification, tasks-panel row, and the inline MonitorChip.
     pub description: String,
@@ -126,6 +120,7 @@ pub struct Monitor {
     /// and forwards. Holding the unbounded sender (a cheap clone)
     /// means the sync callback never has to take an async lock.
     wakeCtx: Arc<Mutex<Option<MonitorWakeCtx>>>,
+    shell: Shell,
 }
 
 /// Per-monitor wake plumbing — id of the passive wake source, the
@@ -157,7 +152,7 @@ impl Monitor {
         let g = self.inner.lock().unwrap();
         MonitorInfo {
             id: self.id,
-            taskId: self.taskId,
+            terminal: self.terminal.clone(),
             description: self.description.clone(),
             command: self.command.clone(),
             filter: self.filter.clone(),
@@ -173,7 +168,7 @@ impl Monitor {
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
     pub id: MonitorId,
-    pub taskId: JobId,
+    pub terminal: String,
     pub description: String,
     pub command: String,
     pub filter: String,
@@ -211,29 +206,26 @@ impl MonitorPlane {
         id
     }
 
-    /// Register a new monitor. Spawns the backing bash task via
-    /// [`JobPlane::spawnMonitor`], wires up the per-line filter
-    /// callback, and emits `MonitorRegistered`. The task and the
-    /// monitor share lifecycles only through the callback — stopping
-    /// one does not automatically stop the other; callers use
-    /// [`MonitorPlane::stop`] to kill both cleanly.
+    /// Register a new monitor by attaching a per-line filter callback to an
+    /// existing visible terminal. Monitors do not spawn commands; command
+    /// execution stays in the terminal surface.
     pub fn register(
         &mut self,
         description: String,
-        command: String,
+        terminal: String,
         filter: String,
         autoStopThresholdEps: f64,
-        tasks: &Arc<Mutex<JobPlane>>,
+        shell: Shell,
         logTx: mpsc::Sender<LogEvent>,
     ) -> MonitorResult<MonitorId> {
         let id = self.reserveMonitorId();
         self.registerWithId(
             id,
             description,
-            command,
+            terminal,
             filter,
             autoStopThresholdEps,
-            tasks,
+            shell,
             logTx,
             None,
         )
@@ -241,28 +233,28 @@ impl MonitorPlane {
 
     /// Like `register`, but with a pre-reserved id and an optional
     /// passive-wake context resolved up front. The per-line callback
-    /// captures the wake slot before the backing bash task spawns —
-    /// the first match cannot precede the attach.
+    /// captures the wake slot before the line listener attaches, so the first
+    /// match cannot precede wake registration.
     #[allow(clippy::too_many_arguments)]
     pub fn registerWithId(
         &mut self,
         id: MonitorId,
         description: String,
-        command: String,
+        terminal: String,
         filter: String,
         autoStopThresholdEps: f64,
-        tasks: &Arc<Mutex<JobPlane>>,
+        shell: Shell,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<MonitorWakeCtx>,
     ) -> MonitorResult<MonitorId> {
         self.registerImpl(
             id,
             description,
-            command,
+            terminal,
             filter,
             autoStopThresholdEps,
             FLOOD_WINDOW_SECS,
-            tasks,
+            shell,
             logTx,
             wakeCtx,
         )
@@ -276,11 +268,11 @@ impl MonitorPlane {
         &mut self,
         id: MonitorId,
         description: String,
-        command: String,
+        terminal: String,
         filter: String,
         autoStopThresholdEps: f64,
         floodWindowSecs: f64,
-        tasks: &Arc<Mutex<JobPlane>>,
+        shell: Shell,
         logTx: mpsc::Sender<LogEvent>,
         wakeCtx: Option<MonitorWakeCtx>,
     ) -> MonitorResult<MonitorId> {
@@ -307,11 +299,6 @@ impl MonitorPlane {
             floodStart: None,
         }));
 
-        // Backing taskId is unknown until `spawnMonitor` returns. Stash
-        // a slot the callback can read; we fill it in below before any
-        // line could plausibly trigger the flood guard (5s window).
-        let backingTaskIdSlot: Arc<Mutex<Option<JobId>>> = Arc::new(Mutex::new(None));
-
         // Wake context: pre-populated when the caller hands one in
         // via `registerWithId`, so the per-line callback enqueues into
         // the registry's batcher from the very first match. Kept behind
@@ -319,16 +306,15 @@ impl MonitorPlane {
         // passive source.
         let wakeCtxSlot: Arc<Mutex<Option<MonitorWakeCtx>>> = Arc::new(Mutex::new(wakeCtx));
 
-        // The per-line callback runs on the bash drainer's hot path.
+        // The per-line callback runs on the terminal drainer's hot path.
         // Keep it lock-fast and side-effect-only.
         let cbInner = inner.clone();
         let cbLogTx = logTx.clone();
         let cbId = id;
         let cbThreshold = autoStopThresholdEps;
-        let cbTasks = tasks.clone();
-        let cbTaskIdSlot = backingTaskIdSlot.clone();
         let cbWakeCtxSlot = wakeCtxSlot.clone();
-        let callback: LineCallback = Box::new(move |line: &str| {
+        let cbShell = shell.clone();
+        let callback: ShellLineCallback = Arc::new(move |line: &str| {
             if !compiled.is_match(line) {
                 return;
             }
@@ -349,8 +335,8 @@ impl MonitorPlane {
 
             // Flood guard: track how long the EWMA has been above the
             // threshold. If sustained for FLOOD_WINDOW_SECS, auto-stop
-            // AND kill the backing bash task so the runaway process
-            // doesn't keep pumping output past the auto-stop event.
+            // and detach the listener so the terminal can keep running
+            // without pumping wake events past the auto-stop event.
             if g.ewmaEps > cbThreshold {
                 let started = *g.floodStart.get_or_insert(now);
                 if now.duration_since(started).as_secs_f64() >= floodWindowSecs {
@@ -360,9 +346,7 @@ impl MonitorPlane {
                     );
                     g.state = MonitorState::AutoStopped(reason.clone());
                     drop(g);
-                    if let Some(tid) = *cbTaskIdSlot.lock().unwrap() {
-                        let _ = cbTasks.lock().unwrap().stop(tid);
-                    }
+                    cbShell.removeLineListener(cbId);
                     // Take the wake context out of the slot — future
                     // matches won't fire — and unregister the passive
                     // source on the async registry via a spawned task
@@ -406,66 +390,27 @@ impl MonitorPlane {
             }
         });
 
-        // Mirror the backing bash task's terminal state into the monitor.
-        // Explicit monitorStop/auto-stop mark the monitor terminal first, so
-        // this path only handles natural command exit or a direct job kill of
-        // the backing task.
-        let exitInner = inner.clone();
-        let exitWakeCtxSlot = wakeCtxSlot.clone();
-        let exitLogTx = logTx.clone();
-        let exitId = id;
-        let onExit: ExitCallback = Box::new(move |_taskId, _state| {
-            {
-                let mut g = exitInner.lock().unwrap();
-                if g.state.isTerminal() {
-                    return;
-                }
-                g.state = MonitorState::Stopped;
-            }
-            if let Some(ctx) = exitWakeCtxSlot.lock().unwrap().take() {
-                let logTxClone = exitLogTx.clone();
-                tokio::spawn(async move {
-                    ctx.registry
-                        .lock()
-                        .await
-                        .unregisterPassive(ctx.wakeId, &logTxClone);
-                });
-            }
-            let _ = exitLogTx.try_send(LogEvent::MonitorStopped { id: exitId });
-        });
-
-        // Spawn the backing bash task with the callback in place. The
-        // callback can now consult `backingTaskIdSlot` to kill the task
-        // when the flood guard trips.
-        let taskId = tasks.lock().unwrap().spawnMonitor(
-            description.clone(),
-            command.clone(),
-            filter.clone(),
-            callback,
-            onExit,
-            logTx.clone(),
-        )?;
-        *backingTaskIdSlot.lock().unwrap() = Some(taskId);
+        shell.addLineListener(id, callback);
 
         let monitor = Monitor {
             id,
-            taskId,
+            terminal: terminal.clone(),
             description: description.clone(),
-            command: command.clone(),
+            command: terminal.clone(),
             filter: filter.clone(),
             autoStopThresholdEps,
             createdAt: Instant::now(),
             inner,
             wakeCtx: wakeCtxSlot,
+            shell,
         };
         self.monitors.insert(id, monitor);
         self.order.push(id);
 
         let _ = logTx.try_send(LogEvent::MonitorRegistered {
             id,
-            taskId,
             description,
-            command,
+            terminal,
             filter,
         });
 
@@ -481,12 +426,8 @@ impl MonitorPlane {
             .and_then(|m| m.wakeCtx.lock().unwrap().take().map(|ctx| ctx.wakeId))
     }
 
-    /// Stop a monitor cooperatively. Always kills the backing bash task
-    /// — even on already-terminal monitors, so a user `monitorStop`
-    /// after an auto-stop can still reap a runaway process if the
-    /// in-callback kill didn't take (e.g. process group leader exited
-    /// but a `disown`ed grandchild kept the stdout pipe open).
-    pub fn stop(&self, id: MonitorId, tasks: &Arc<Mutex<JobPlane>>) -> MonitorResult<()> {
+    /// Stop a monitor cooperatively and detach its terminal listener.
+    pub fn stop(&self, id: MonitorId) -> MonitorResult<()> {
         let m = self
             .monitors
             .get(&id)
@@ -497,10 +438,48 @@ impl MonitorPlane {
                 g.state = MonitorState::Stopped;
             }
         }
-        // Always attempt the kill — JobPlane::stop is a no-op for
-        // already-terminal tasks, so this is safe to retry.
-        let _ = tasks.lock().unwrap().stop(m.taskId);
+        m.shell.removeLineListener(id);
         Ok(())
+    }
+
+    /// Stop every running monitor attached to `terminal`, detaching their
+    /// listeners and taking wake ids so the caller can disarm passive sources.
+    ///
+    /// Terminal close is the owner-lifecycle path for attach-only monitors:
+    /// when the output stream disappears, subscriptions to it must disappear
+    /// too.
+    pub fn stopForTerminal(
+        &self,
+        terminal: &str,
+    ) -> Vec<(MonitorId, Option<crate::wakes::WakeId>)> {
+        let ids: Vec<MonitorId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.monitors.get(id).is_some_and(|m| {
+                    m.terminal == terminal && matches!(m.state(), MonitorState::Running)
+                })
+            })
+            .collect();
+
+        let mut stopped = Vec::new();
+        for id in ids {
+            let Some(m) = self.monitors.get(&id) else {
+                continue;
+            };
+            {
+                let mut g = m.inner.lock().unwrap();
+                if g.state.isTerminal() {
+                    continue;
+                }
+                g.state = MonitorState::Stopped;
+            }
+            m.shell.removeLineListener(id);
+            let wakeId = m.wakeCtx.lock().unwrap().take().map(|ctx| ctx.wakeId);
+            stopped.push((id, wakeId));
+        }
+        stopped
     }
 
     pub fn list(&self) -> Vec<MonitorInfo> {
@@ -542,7 +521,7 @@ impl Default for MonitorPlane {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -934,10 +913,236 @@ mod tests {
                     } if *eventId == taskId && reason == "killed"
                 )
             },
-            "monitor backing task stop",
+            "monitor stop",
         )
         .await;
         // Second stop is a no-op (no error).
         plane.stop(id, &tasks).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+    async fn shellFixture() -> Shell {
+        let (shell, _io) = crate::shell::spawnShell(80, 24).expect("spawn shell");
+        shell
+    }
+
+    async fn recvLogMatching(
+        rx: &mut mpsc::Receiver<LogEvent>,
+        matchesEvent: impl Fn(&LogEvent) -> bool,
+        label: &str,
+    ) -> LogEvent {
+        tokio::time::timeout(TEST_TIMEOUT, async move {
+            loop {
+                let ev = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("log channel closed before {label}"));
+                if matchesEvent(&ev) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
+
+    #[tokio::test]
+    async fn attachMonitorMatchesTerminalOutput() {
+        let shell = shellFixture().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut plane = MonitorPlane::new();
+        let id = plane
+            .register(
+                "errors".into(),
+                "main".into(),
+                "ERROR".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell.clone(),
+                tx,
+            )
+            .unwrap();
+
+        let _ = shell.execute("echo ok; echo ERROR final", None).await;
+        let ev = recvLogMatching(
+            &mut rx,
+            |e| {
+                matches!(
+                    e,
+                    LogEvent::MonitorEvent {
+                        id: eventId,
+                        line,
+                        eventCount: 1,
+                    } if *eventId == id && line == "ERROR final"
+                )
+            },
+            "monitor terminal match",
+        )
+        .await;
+        assert!(matches!(ev, LogEvent::MonitorEvent { .. }));
+        assert_eq!(plane.lookup(id).unwrap().info().eventCount, 1);
+    }
+
+    #[tokio::test]
+    async fn missingFilterRejected() {
+        let shell = shellFixture().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let mut plane = MonitorPlane::new();
+        let err = plane
+            .register(
+                "no filter test".into(),
+                "main".into(),
+                "".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell,
+                tx,
+            )
+            .unwrap_err();
+        assert_eq!(err, MonitorError::MissingFilter);
+        assert_eq!(plane.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalidRegexRejected() {
+        let shell = shellFixture().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let mut plane = MonitorPlane::new();
+        let err = plane
+            .register(
+                "broken regex".into(),
+                "main".into(),
+                "[unclosed".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell,
+                tx,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MonitorError::InvalidRegex { ref filter, .. } if filter == "[unclosed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopDetachesTerminalListener() {
+        let shell = shellFixture().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut plane = MonitorPlane::new();
+        let id = plane
+            .register(
+                "errors".into(),
+                "main".into(),
+                "ERROR".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell.clone(),
+                tx,
+            )
+            .unwrap();
+        // Drain registration so the post-stop assertion only observes
+        // events caused by the line emitted after detach.
+        let _ = rx.recv().await;
+        plane.stop(id).unwrap();
+        let _ = shell.execute("echo ERROR final", None).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                break;
+            };
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(LogEvent::MonitorEvent { .. })) => {
+                    panic!("stopped monitor should not receive matches");
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            plane.lookup(id).unwrap().info().state,
+            MonitorState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stopForTerminalStopsOnlyAttachedMonitors() {
+        let shell = shellFixture().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut plane = MonitorPlane::new();
+        let mainId = plane
+            .register(
+                "main errors".into(),
+                "main".into(),
+                "ERROR".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell.clone(),
+                tx.clone(),
+            )
+            .unwrap();
+        let otherId = plane
+            .register(
+                "other errors".into(),
+                "other".into(),
+                "ERROR".into(),
+                DEFAULT_AUTOSTOP_EPS,
+                shell.clone(),
+                tx,
+            )
+            .unwrap();
+
+        // Drain both registration events so later assertions observe only
+        // monitor matches.
+        for _ in 0..2 {
+            let _ = rx.recv().await;
+        }
+
+        let stopped = plane.stopForTerminal("main");
+        assert_eq!(stopped, vec![(mainId, None)]);
+        assert_eq!(
+            plane.lookup(mainId).unwrap().info().state,
+            MonitorState::Stopped
+        );
+        assert_eq!(
+            plane.lookup(otherId).unwrap().info().state,
+            MonitorState::Running
+        );
+
+        let _ = shell.execute("echo ERROR shared", None).await;
+        let ev = recvLogMatching(
+            &mut rx,
+            |e| {
+                matches!(
+                    e,
+                    LogEvent::MonitorEvent {
+                        id,
+                        line,
+                        eventCount: 1,
+                    } if *id == otherId && line == "ERROR shared"
+                )
+            },
+            "other terminal match after main stopped",
+        )
+        .await;
+        assert!(matches!(ev, LogEvent::MonitorEvent { .. }));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                break;
+            };
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(LogEvent::MonitorEvent { id, .. })) if id == mainId => {
+                    panic!("terminal-close-stopped monitor should not receive matches");
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
     }
 }

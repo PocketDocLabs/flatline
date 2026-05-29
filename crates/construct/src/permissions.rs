@@ -43,6 +43,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "searchOutput",
     "readTerminal",
     "terminalList",
+    "terminalRunList",
     "jobOutput",
     "jobList",
     "monitorList",
@@ -110,12 +111,14 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
         ToolAction::JobList => vec!["jobList".into()],
         ToolAction::JobOutput { .. } => vec!["jobOutput".into()],
         ToolAction::JobStop { .. } => vec!["jobStop".into()],
+        ToolAction::TerminalRunList => vec!["terminalRunList".into()],
+        ToolAction::TerminalRunStop { .. } => vec!["terminalRunStop".into()],
         ToolAction::MonitorList => vec!["monitorList".into()],
         ToolAction::MonitorStop { .. } => vec!["monitorStop".into()],
 
-        // Monitors run arbitrary bash commands — same pattern shape as
-        // shell so users can scope rules to specific watches.
-        ToolAction::Monitor { command, .. } => shellPatterns(command),
+        // Monitors attach to an existing terminal stream; they do not
+        // execute commands, so scope by tool name only.
+        ToolAction::Monitor { .. } => vec!["monitor".into()],
 
         // Wake registry tools. Each creation tool's keyArg is the most
         // identifying scope: cron spec, delay duration, watched path.
@@ -200,8 +203,8 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
         | ToolAction::CronDelete { .. }
         | ToolAction::FileWatch { .. } => ShellImpact::MinorMod,
         // cronList is read-only; let it fall through to the bottom.
-        // Monitors run arbitrary commands too — treat conservatively
-        // as MinorMod even though most are reads (`tail -f` etc).
+        // Monitors subscribe to terminal output and schedule future wake
+        // turns — still a session-visible behavior change.
         ToolAction::Monitor { .. } => ShellImpact::MinorMod,
         ToolAction::MonitorStop { .. } => ShellImpact::MinorMod,
         ToolAction::WriteFile { .. }
@@ -216,6 +219,8 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
         // jobStop kills a process group — surface as MinorMod so the
         // confirm UI doesn't downgrade the prompt.
         ToolAction::JobStop { .. } => ShellImpact::MinorMod,
+        // terminalRunStop interrupts the visible terminal owning the run.
+        ToolAction::TerminalRunStop { .. } => ShellImpact::MinorMod,
         // terminalSpawn allocates a real PTY — session-visible state
         // change beyond what Read covers. MinorMod tier.
         ToolAction::TerminalSpawn { .. } => ShellImpact::MinorMod,
@@ -577,9 +582,11 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::TerminalSwitch { name } => ("terminalSwitch", name),
         ToolAction::TerminalKill { name } => ("terminalKill", name),
         ToolAction::TerminalList => ("terminalList", ""),
+        ToolAction::TerminalRunList => ("terminalRunList", ""),
+        ToolAction::TerminalRunStop { .. } => ("terminalRunStop", ""),
         ToolAction::JobOutput { .. } => ("jobOutput", ""),
         ToolAction::JobStop { .. } => ("jobStop", ""),
-        ToolAction::Monitor { command, .. } => ("monitor", command),
+        ToolAction::Monitor { .. } => ("monitor", ""),
         ToolAction::MonitorStop { .. } => ("monitorStop", ""),
         ToolAction::MonitorList => ("monitorList", ""),
         ToolAction::JobList => ("jobList", ""),

@@ -168,6 +168,37 @@ fn exportLinearSessionEmitsOneExample() {
 }
 
 #[test]
+fn exportSqliteOnlySessionEmitsOneExample() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sessionId = "ses_sqlite_only";
+    writeLinearFixture(dir.path(), sessionId);
+
+    let sessionDir = dir.path().join(sessionId);
+    // Opening the DB imports the legacy fixture once. Then remove the legacy
+    // files so export proves the SQLite source of truth is sufficient.
+    let _conn = construct::storage::openSessionDb(&sessionDir).unwrap();
+    fs::remove_file(sessionDir.join("meta.json")).unwrap();
+    fs::remove_file(sessionDir.join("transcript.jsonl")).unwrap();
+    fs::remove_file(sessionDir.join("compaction.jsonl")).unwrap();
+    fs::remove_dir_all(sessionDir.join("snapshots")).unwrap();
+
+    let out = dir.path().join("sqlite.json");
+    let status = Command::new(flatlineBin())
+        .env("FLATLINE_SESSIONS_DIR", dir.path())
+        .args(["export", sessionId, "-o"])
+        .arg(&out)
+        .status()
+        .expect("spawn flatline export");
+
+    assert!(status.success(), "sqlite export failed: {:?}", status);
+    let rendered = fs::read_to_string(&out).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let arr = parsed.as_array().expect("top-level must be an array");
+    assert_eq!(arr.len(), 1, "expected exactly one example");
+    assert_eq!(arr[0]["messages"][2]["content"], "hi there");
+}
+
+#[test]
 fn exportAllMergesSessions() {
     let dir = tempfile::TempDir::new().unwrap();
     writeLinearFixture(dir.path(), "ses_a");

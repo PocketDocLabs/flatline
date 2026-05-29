@@ -1,4 +1,4 @@
-//! Transcript storage — append-only JSONL record of every conversation turn.
+//! Transcript storage — append-only SQLite record of every conversation turn.
 //!
 //! The transcript is the permanent source of truth. All derived state
 //! (compaction summaries, live context) is reconstructable from the
@@ -20,10 +20,11 @@
 //! `serde`, `serde_json`, `dirs`
 
 use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Role of a turn in the transcript.
@@ -177,7 +178,7 @@ pub struct SessionMeta {
 pub struct Transcript {
     pub sessionId: String,
     sessionDir: PathBuf,
-    writer: BufWriter<fs::File>,
+    conn: Arc<Mutex<Connection>>,
     /// Most recently written turn ID (for within-block parent chaining).
     lastTurnId: Option<String>,
     currentBlockId: String,
@@ -188,20 +189,12 @@ impl Transcript {
     /// Create a new transcript in a fresh session directory.
     pub fn create(sessionId: &str) -> Result<Self> {
         let dir = sessionsDir().join(sessionId);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("create session dir: {}", dir.display()))?;
-
-        let path = dir.join("transcript.jsonl");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open transcript: {}", path.display()))?;
+        let conn = crate::storage::openSessionDb(&dir)?;
 
         Ok(Self {
             sessionId: sessionId.to_string(),
             sessionDir: dir,
-            writer: BufWriter::new(file),
+            conn: Arc::new(Mutex::new(conn)),
             lastTurnId: None,
             currentBlockId: String::new(),
             currentTopicId: String::new(),
@@ -210,20 +203,12 @@ impl Transcript {
 
     /// Create a transcript at an explicit directory (for tests).
     pub fn createAt(dir: &Path, sessionId: &str) -> Result<Self> {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("create session dir: {}", dir.display()))?;
-
-        let path = dir.join("transcript.jsonl");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open transcript: {}", path.display()))?;
+        let conn = crate::storage::openSessionDb(dir)?;
 
         Ok(Self {
             sessionId: sessionId.to_string(),
             sessionDir: dir.to_path_buf(),
-            writer: BufWriter::new(file),
+            conn: Arc::new(Mutex::new(conn)),
             lastTurnId: None,
             currentBlockId: String::new(),
             currentTopicId: String::new(),
@@ -233,31 +218,23 @@ impl Transcript {
     /// Open an existing transcript for append.
     pub fn open(sessionId: &str) -> Result<Self> {
         let dir = sessionsDir().join(sessionId);
-        let path = dir.join("transcript.jsonl");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open transcript for append: {}", path.display()))?;
+        let conn = crate::storage::openSessionDb(&dir)?;
 
         // Scan to find the last turn's ID and block.
-        let existingContent = fs::read_to_string(&path).unwrap_or_default();
         let mut lastTurnId: Option<String> = None;
         let mut lastBlockId = String::new();
         let mut lastTopicId = String::new();
 
-        for line in existingContent.lines() {
-            if let Ok(turn) = serde_json::from_str::<Turn>(line) {
-                lastTurnId = Some(turn.id.clone());
-                lastBlockId = turn.blockId.clone();
-                lastTopicId = turn.topicId.clone();
-            }
+        for turn in crate::storage::loadTurns(&conn)? {
+            lastTurnId = Some(turn.id.clone());
+            lastBlockId = turn.blockId.clone();
+            lastTopicId = turn.topicId.clone();
         }
 
         Ok(Self {
             sessionId: sessionId.to_string(),
             sessionDir: dir,
-            writer: BufWriter::new(file),
+            conn: Arc::new(Mutex::new(conn)),
             lastTurnId,
             currentBlockId: lastBlockId,
             currentTopicId: lastTopicId,
@@ -298,9 +275,7 @@ impl Transcript {
     }
 
     fn writeTurn(&mut self, turn: &Turn) -> Result<String> {
-        let line = serde_json::to_string(turn)?;
-        writeln!(self.writer, "{line}")?;
-        self.writer.flush()?;
+        crate::storage::insertTurn(&self.conn.lock().unwrap(), turn)?;
         let id = turn.id.clone();
         self.lastTurnId = Some(id.clone());
         Ok(id)
@@ -463,36 +438,28 @@ impl Transcript {
 
     /// Load all turns from the transcript file.
     pub fn loadAll(&self) -> Result<Vec<Turn>> {
-        let path = self.sessionDir.join("transcript.jsonl");
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("read transcript: {}", path.display()))?;
-
-        let mut turns = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let turn: Turn = serde_json::from_str(line).with_context(|| "parse transcript line")?;
-            turns.push(turn);
-        }
-        Ok(turns)
+        crate::storage::loadTurns(&self.conn.lock().unwrap())
     }
 
-    /// Write session metadata to meta.json.
+    /// Write session metadata to SQLite.
     pub fn writeMeta(&self, meta: &SessionMeta) -> Result<()> {
-        let path = self.sessionDir.join("meta.json");
-        let content = serde_json::to_string_pretty(meta)?;
-        fs::write(&path, content).with_context(|| format!("write meta: {}", path.display()))?;
-        Ok(())
+        crate::storage::upsertMeta(&self.conn.lock().unwrap(), meta)
     }
 
     /// Load session metadata from a session directory.
     pub fn loadMeta(sessionDir: &Path) -> Result<SessionMeta> {
-        let path = sessionDir.join("meta.json");
-        let content =
-            fs::read_to_string(&path).with_context(|| format!("read meta: {}", path.display()))?;
-        let meta: SessionMeta = serde_json::from_str(&content)?;
-        Ok(meta)
+        let conn = crate::storage::openSessionDb(sessionDir)?;
+        crate::storage::loadMeta(&conn)?.context("missing session metadata")
+    }
+
+    /// Export the SQLite transcript as legacy JSONL text for debugging.
+    pub fn exportJsonl(&self) -> Result<String> {
+        let mut out = String::new();
+        for turn in self.loadAll()? {
+            out.push_str(&serde_json::to_string(&turn)?);
+            out.push('\n');
+        }
+        Ok(out)
     }
 }
 
@@ -553,8 +520,9 @@ pub fn listSessions(projectDir: Option<&str>) -> Result<Vec<SessionMeta>> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
+        let dbPath = crate::storage::dbPath(&entry.path());
         let metaPath = entry.path().join("meta.json");
-        if !metaPath.exists() {
+        if !dbPath.exists() && !metaPath.exists() {
             continue;
         }
         match Transcript::loadMeta(&entry.path()) {
@@ -648,20 +616,7 @@ mod tests {
 
     /// Create a transcript in a temp directory for testing.
     fn tempTranscript(dir: &std::path::Path) -> Transcript {
-        let path = dir.join("transcript.jsonl");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
-        Transcript {
-            sessionId: "test".into(),
-            sessionDir: dir.to_path_buf(),
-            writer: std::io::BufWriter::new(file),
-            lastTurnId: None,
-            currentBlockId: String::new(),
-            currentTopicId: String::new(),
-        }
+        Transcript::createAt(dir, "test").unwrap()
     }
 
     #[test]

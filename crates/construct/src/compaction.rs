@@ -1,6 +1,6 @@
 //! Compaction log — append-only record of compaction operations.
 //!
-//! Each operation is a tagged JSON object appended to `compaction.jsonl`.
+//! Each operation is a tagged JSON object appended to the session SQLite DB.
 //! The context builder reads these to transform the raw transcript into
 //! the live message list sent to the API.
 //!
@@ -12,11 +12,11 @@
 //! `serde`, `serde_json`
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::transcript::Turn;
@@ -194,31 +194,24 @@ fn now() -> u64 {
 
 /// Write handle for the compaction log.
 pub struct CompactionLog {
+    #[allow(dead_code)]
     sessionDir: PathBuf,
-    writer: BufWriter<fs::File>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl CompactionLog {
     /// Open or create the compaction log in a session directory.
     pub fn open(sessionDir: &Path) -> Result<Self> {
-        let path = sessionDir.join("compaction.jsonl");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open compaction log: {}", path.display()))?;
+        let conn = crate::storage::openSessionDb(sessionDir)?;
         Ok(Self {
             sessionDir: sessionDir.to_path_buf(),
-            writer: BufWriter::new(file),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     /// Append an operation to the log and flush.
     fn writeOp(&mut self, op: &CompactionOp) -> Result<()> {
-        let line = serde_json::to_string(op)?;
-        writeln!(self.writer, "{line}")?;
-        self.writer.flush()?;
-        Ok(())
+        crate::storage::insertCompaction(&self.conn.lock().unwrap(), op)
     }
 
     /// S1: record that duplicate file reads were removed.
@@ -301,23 +294,6 @@ impl CompactionLog {
 
     /// Load all operations from the compaction log.
     pub fn loadAll(&self) -> Result<Vec<CompactionOp>> {
-        let path = self.sessionDir.join("compaction.jsonl");
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("read compaction log: {}", path.display()))?;
-
-        let mut ops = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let op: CompactionOp =
-                serde_json::from_str(line).with_context(|| "parse compaction log entry")?;
-            ops.push(op);
-        }
-        Ok(ops)
+        crate::storage::loadCompaction(&self.conn.lock().unwrap())
     }
 }

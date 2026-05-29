@@ -59,6 +59,8 @@ pub enum TabClick {
     Switch(String),
     /// Click hit the `[+]` add button — spawn a new terminal.
     NewTab,
+    /// Click hit the run-history button.
+    History,
     /// Click hit a tab's `[×]` close affordance (none currently).
     #[allow(dead_code)]
     Close(String),
@@ -78,6 +80,7 @@ pub struct TerminalPane {
     /// trailing `[+]` button. Set by `renderTabBar`.
     lastTabRects: Vec<(String, Rect)>,
     lastPlusRect: Rect,
+    lastHistoryRect: Rect,
 }
 
 impl TerminalPane {
@@ -90,6 +93,7 @@ impl TerminalPane {
             active: "main".into(),
             lastTabRects: Vec::new(),
             lastPlusRect: Rect::default(),
+            lastHistoryRect: Rect::default(),
         }
     }
 
@@ -271,6 +275,7 @@ impl TerminalPane {
         }
         self.lastTabRects.clear();
         self.lastPlusRect = Rect::default();
+        self.lastHistoryRect = Rect::default();
 
         let baseStyle = if focused {
             Style::default().fg(Color::White)
@@ -338,6 +343,26 @@ impl TerminalPane {
                 width: plusW,
                 height: 1,
             };
+            x += plusW;
+        }
+
+        // Run history button on the right side of the tab bar cluster.
+        let histLabel = " \u{2318}J ";
+        let histW = histLabel.chars().count() as u16;
+        if x + histW <= area.x + area.width {
+            let histSpan = Span::styled(
+                histLabel,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            buf.set_span(x, yRow, &histSpan, histW);
+            self.lastHistoryRect = Rect {
+                x,
+                y: yRow,
+                width: histW,
+                height: 1,
+            };
         }
 
         1
@@ -365,6 +390,9 @@ impl TerminalPane {
         if self.lastPlusRect.contains((col, row).into()) {
             return TabClick::NewTab;
         }
+        if self.lastHistoryRect.contains((col, row).into()) {
+            return TabClick::History;
+        }
         for (name, rect) in &self.lastTabRects {
             if rect.contains((col, row).into()) {
                 return TabClick::Switch(name.clone());
@@ -376,6 +404,9 @@ impl TerminalPane {
     /// True when a click landed inside the tab strip rect (any tab or +).
     pub fn clickInTabBar(&self, col: u16, row: u16) -> bool {
         if self.lastPlusRect.contains((col, row).into()) {
+            return true;
+        }
+        if self.lastHistoryRect.contains((col, row).into()) {
             return true;
         }
         self.lastTabRects

@@ -6,9 +6,8 @@
 //! training data without ambiguity.
 //!
 //! Bulky pieces (system prompt text, tool schemas, individual messages) are
-//! stored as SHA-1-addressed blobs on disk so identical inputs across turns
-//! collapse to one file. The snapshot itself is also content-addressed and
-//! written append-only to `index.jsonl`.
+//! stored as SHA-1-addressed blobs in SQLite so identical inputs across turns
+//! collapse to one row. The snapshot itself is also content-addressed.
 //!
 //! # Public API
 //! - [`RequestSnapshot`] — the per-turn record
@@ -22,11 +21,11 @@
 //! `serde`, `serde_json`, `sha1_smol`
 
 use std::collections::HashSet;
-use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ModelConfig;
@@ -44,19 +43,11 @@ pub enum BlobNs {
 }
 
 impl BlobNs {
-    fn dirName(self) -> &'static str {
+    pub fn storageName(self) -> &'static str {
         match self {
-            BlobNs::SystemPrompt => "sp",
-            BlobNs::Tools => "tl",
-            BlobNs::Message => "ms",
-        }
-    }
-
-    fn extension(self) -> &'static str {
-        match self {
-            BlobNs::SystemPrompt => "txt",
-            BlobNs::Tools => "json",
-            BlobNs::Message => "json",
+            BlobNs::SystemPrompt => "system_prompt",
+            BlobNs::Tools => "tools",
+            BlobNs::Message => "message",
         }
     }
 }
@@ -116,72 +107,37 @@ pub struct RequestSnapshot {
     pub ts: u64,
 }
 
-/// One line in `snapshots/index.jsonl`.
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexEntry {
-    hash: BlobHash,
-    snapshot: RequestSnapshot,
-}
-
 /// On-disk snapshot store for a session.
 pub struct SnapshotStore {
+    #[allow(dead_code)]
     dir: PathBuf,
     seenSnapshots: HashSet<BlobHash>,
-    indexWriter: BufWriter<fs::File>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SnapshotStore {
     /// Open (or create) the snapshot store for a session directory.
     pub fn open(sessionDir: &Path) -> Result<Self> {
-        let dir = sessionDir.join("snapshots");
-        let blobsDir = dir.join("blobs");
-        for ns in [BlobNs::SystemPrompt, BlobNs::Tools, BlobNs::Message] {
-            fs::create_dir_all(blobsDir.join(ns.dirName()))
-                .with_context(|| format!("create {}", ns.dirName()))?;
-        }
-
-        let indexPath = dir.join("index.jsonl");
-
-        // Scan existing index to seed the dedup set.
-        let mut seen = HashSet::new();
-        if indexPath.exists() {
-            let content = fs::read_to_string(&indexPath)
-                .with_context(|| format!("read {}", indexPath.display()))?;
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(entry) = serde_json::from_str::<IndexEntry>(line) {
-                    seen.insert(entry.hash);
-                }
-            }
-        }
-
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&indexPath)
-            .with_context(|| format!("open {}", indexPath.display()))?;
+        let conn = crate::storage::openSessionDb(sessionDir)?;
+        let seen = crate::storage::snapshotHashes(&conn)?;
 
         Ok(Self {
-            dir,
+            dir: sessionDir.join("snapshots"),
             seenSnapshots: seen,
-            indexWriter: BufWriter::new(file),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    /// Write a blob to the given namespace. Idempotent — if the file exists,
+    /// Write a blob to the given namespace. Idempotent — if the row exists,
     /// returns the hash without rewriting.
     pub fn putBlob(&mut self, ns: BlobNs, bytes: &[u8]) -> Result<BlobHash> {
         let hash = sha1Hex(bytes);
-        let path = self
-            .dir
-            .join("blobs")
-            .join(ns.dirName())
-            .join(format!("{hash}.{}", ns.extension()));
-        if !path.exists() {
-            fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
-        }
+        crate::storage::putSnapshotBlob(
+            &self.conn.lock().unwrap(),
+            ns.storageName(),
+            &hash,
+            bytes,
+        )?;
         Ok(hash)
     }
 
@@ -200,13 +156,7 @@ impl SnapshotStore {
         let hash = sha1Hex(canonical.as_bytes());
 
         if self.seenSnapshots.insert(hash.clone()) {
-            let entry = IndexEntry {
-                hash: hash.clone(),
-                snapshot: snap.clone(),
-            };
-            let line = serde_json::to_string(&entry).context("serialize index entry")?;
-            writeln!(self.indexWriter, "{line}").context("write index line")?;
-            self.indexWriter.flush().context("flush index")?;
+            crate::storage::insertSnapshot(&self.conn.lock().unwrap(), &hash, snap)?;
         }
 
         Ok(hash)
@@ -382,9 +332,17 @@ mod tests {
         let h1 = store.putBlob(BlobNs::SystemPrompt, b"hello").unwrap();
         let h2 = store.putBlob(BlobNs::SystemPrompt, b"hello").unwrap();
         assert_eq!(h1, h2);
-        let path = store.dir.join("blobs/sp").join(format!("{h1}.txt"));
-        assert!(path.exists());
-        assert_eq!(fs::read(&path).unwrap(), b"hello");
+        let bytes: Vec<u8> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT bytes FROM snapshot_blobs WHERE hash = ?1",
+                [&h1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, b"hello");
     }
 
     #[test]
@@ -410,9 +368,13 @@ mod tests {
         let h1 = store.record(&snap).unwrap();
         let h2 = store.record(&snap).unwrap();
         assert_eq!(h1, h2);
-        let idxPath = store.dir.join("index.jsonl");
-        let content = fs::read_to_string(idxPath).unwrap();
-        assert_eq!(content.lines().count(), 1);
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -464,27 +426,49 @@ mod tests {
         )
         .unwrap();
 
-        // Snapshot index has one line with our hash.
-        let idx = fs::read_to_string(store.dir.join("index.jsonl")).unwrap();
-        let entry: IndexEntry = serde_json::from_str(idx.lines().next().unwrap()).unwrap();
-        assert_eq!(entry.hash, hash);
-        let snap = entry.snapshot;
+        // Snapshot row has our hash.
+        let snapJson: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT snapshot_json FROM snapshots WHERE hash = ?1",
+                [&hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let snap: RequestSnapshot = serde_json::from_str(&snapJson).unwrap();
         assert_eq!(snap.toolsCount, 1);
         assert!(snap.systemPromptHash.is_some());
         assert!(snap.toolsHash.is_some());
         assert_eq!(snap.messages.len(), 2); // user + assistant (system split off)
 
         // System prompt blob round-trips.
-        let spPath = store
-            .dir
-            .join("blobs/sp")
-            .join(format!("{}.txt", snap.systemPromptHash.as_ref().unwrap()));
-        assert_eq!(fs::read_to_string(spPath).unwrap(), "you are helpful");
+        let spBytes: Vec<u8> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT bytes FROM snapshot_blobs WHERE hash = ?1",
+                [snap.systemPromptHash.as_ref().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(String::from_utf8(spBytes).unwrap(), "you are helpful");
 
         // Each message blob deserializes back to a Message.
         for h in &snap.messages {
-            let p = store.dir.join("blobs/ms").join(format!("{h}.json"));
-            let raw = fs::read_to_string(&p).unwrap();
+            let rawBytes: Vec<u8> = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT bytes FROM snapshot_blobs WHERE hash = ?1",
+                    [h],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let raw = String::from_utf8(rawBytes).unwrap();
             let _: Message = serde_json::from_str(&raw).unwrap();
         }
     }

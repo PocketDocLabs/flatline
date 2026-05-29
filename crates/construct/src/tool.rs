@@ -45,21 +45,16 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     in shellHistory + readOutput). Runs in the agent's \
                     target terminal \u{2014} pass `terminal` to dispatch \
                     elsewhere.\n\n\
-                    AUTO-BG: a foreground call that hits its timeout is \
-                    AUTOMATICALLY converted to a background job. You will \
-                    receive an AUTO_BG_CONVERTED result with the new job id \
-                    and any partial output captured before conversion. The \
-                    bg job is a FRESH run of the same command \u{2014} the \
-                    foreground attempt was killed and not migrated. If the \
-                    command is non-idempotent (writes files, sends network \
-                    requests, mutates shared state), prefer setting \
-                    `runInBackground: true` up front or a generous `timeout` \
-                    so it never trips auto-bg.\n\n\
+                    DETACH: a foreground call that hits its timeout keeps \
+                    running in the same visible terminal as an archived \
+                    terminal run; Ctrl+B does the same immediately. The \
+                    command is not restarted. You receive a terminal run id \
+                    and a wake when it completes.\n\n\
                     Set `runInBackground: true` for long builds, dev \
                     servers, log tails, or any command whose result you \
-                    don't need before continuing. Background calls return \
-                    a job id immediately; you'll be notified when the \
-                    job completes \u{2014} do NOT poll `jobOutput` while \
+                    don't need before continuing. Background calls run in a \
+                    visible terminal and return a terminal run id immediately; \
+                    you'll be notified when the run completes \u{2014} do NOT poll while \
                     waiting. Use foreground (default) when you need the \
                     result before you can proceed; background when you \
                     have genuinely independent work to do in parallel.\n\n\
@@ -69,9 +64,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     `grep --line-buffered`, `awk 'BEGIN {{...}}'` with \
                     `fflush()`, `stdbuf -oL <cmd>`, or `ssh host 'stdbuf \
                     -oL tail -F /path'` to keep output flowing.\n\n\
-                    Background jobs bypass the named terminal (output \
-                    buffered in a 5000-line ring; retrieve via jobOutput, \
-                    stop via jobStop)."
+                    Async terminal runs are archived in /runs. If \
+                    `runInBackground` is true and `terminal` is omitted, \
+                    Flatline creates a visible ephemeral terminal and closes \
+                    it after the run is archived."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -95,15 +91,15 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds. Default 30. When exceeded, the command is auto-converted to a background job (you receive the new job id; the fg attempt is killed and the bg job is a fresh re-run). Ignored when runInBackground is true."
+                            "description": "Timeout in seconds. Default 30. When exceeded, the command detaches into the same visible terminal as an archived terminal run; it is not restarted. Ignored when runInBackground is true."
                         },
                         "terminal": {
                             "type": "string",
-                            "description": "Name of the terminal to run in. Omit to use the agent's target terminal. Ignored when runInBackground is true."
+                            "description": "Name of the terminal to run in. Omit to use the agent's target terminal for foreground calls, or to create a visible ephemeral terminal for runInBackground."
                         },
                         "runInBackground": {
                             "type": "boolean",
-                            "description": "Spawn non-blocking. Returns a task id immediately; the command keeps running while you work. You'll be notified when it completes — do not poll. Defaults to false."
+                            "description": "Run non-blocking in a visible terminal. Returns a terminal run id immediately; the command keeps running while you work. You'll be notified when it completes — do not poll. Defaults to false."
                         }
                     },
                     "required": ["command", "explanation", "impact"]
@@ -1013,10 +1009,45 @@ pub fn builtinDefs() -> Vec<ToolDef> {
         ToolDef {
             defType: "function".into(),
             function: crate::message::FunctionDef {
+                name: "terminalRunList".into(),
+                description: "List archived visible terminal runs with run id, \
+                    purpose, impact, terminal, status, and exit code. Use this \
+                    to rediscover async run ids; /runs is the user-facing view."
+                    .into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
+                name: "terminalRunStop".into(),
+                description: "Cancel a running archived terminal run by id. \
+                    This interrupts the visible terminal that owns the run; \
+                    no-op if the run is already terminal."
+                    .into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "runId": {
+                            "type": "string",
+                            "description": "Run id returned by shell(runInBackground: true) or foreground timeout/Ctrl+B detach."
+                        }
+                    },
+                    "required": ["runId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
                 name: "jobOutput".into(),
-                description: "Read buffered output from a background job \
-                    spawned by `shell(runInBackground: true)`. Returns the \
-                    latest output lines plus the job's current state \
+                description: "Read buffered output from a background task \
+                    such as `task(runInBackground: true)`. Returns the \
+                    latest output lines plus the task's current state \
                     (running, completed, killed, errored). \n\n\
                     You generally don't need to call this proactively \u{2014} \
                     you'll receive a completion notification with the final \
@@ -1030,7 +1061,7 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                     "properties": {
                         "jobId": {
                             "type": "integer",
-                            "description": "Job id returned by shell(runInBackground: true)."
+                            "description": "Task/job id returned by task(runInBackground: true) or another JobPlane-backed tool."
                         },
                         "sinceLine": {
                             "type": "integer",
@@ -1051,17 +1082,16 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "jobStop".into(),
-                description: "Kill a running background job by id. Sends SIGTERM to \
-                    the job's process group (so the shell wrapper and any child \
-                    processes it spawned), waits briefly, then SIGKILLs anything \
-                    still alive. No-op if the job is already terminal."
+                description: "Kill a running background task by id. No-op if \
+                    the task is already terminal. Use terminalRunStop for \
+                    visible async terminal runs."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "jobId": {
                             "type": "integer",
-                            "description": "Job id from shell(runInBackground: true)."
+                            "description": "Task/job id."
                         }
                     },
                     "required": ["jobId"]
@@ -1072,9 +1102,10 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "jobList".into(),
-                description: "List all background jobs (running, completed, killed, errored) \
-                    with their command, age, total lines emitted, and state. Use to \
-                    rediscover job ids if you've lost track."
+                description: "List JobPlane-backed background tasks (running, \
+                    completed, killed, errored) with age, total lines emitted, \
+                    and state. Visible async terminal runs live in terminalRunList \
+                    and /runs."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1087,37 +1118,15 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "monitor".into(),
-                description: "Register a line-streamed watcher backed by a \
-                    long-running bash command. Each matching line is a \
-                    notification — the model is woken with the matched \
-                    line as payload (once the wake plane lands; today \
-                    matches are counted and visible via monitorList).\n\n\
-                    Pick by how many notifications you need:\n\
-                    \u{2022} One (\"tell me when the build finishes\") \u{2192} \
-                    use `shell(runInBackground: true)` with a command that \
-                    exits when the condition is true. Don't use Monitor.\n\
-                    \u{2022} One per occurrence, indefinitely (\"every ERROR \
-                    in the log\") \u{2192} Monitor with an unbounded command \
-                    like `tail -F` or `inotifywait -m`.\n\
-                    \u{2022} One per occurrence with a known end (\"each CI \
-                    step result, stop at run end\") \u{2192} Monitor with a \
-                    command that emits lines and then exits.\n\n\
-                    LINE BUFFERING: pipe-buffered output delays notifications \
-                    by kilobytes. Always pass through `grep --line-buffered`, \
-                    `awk` with `fflush()`, or wrap with `stdbuf -oL <cmd>`. \
-                    For remote ssh: `ssh host 'stdbuf -oL tail -F /path'`. \
-                    Use `tail -F` (capital F) for log rotation; `-f` silently \
-                    stops on rotation.\n\n\
-                    COVERAGE: filter must match every terminal state, not \
-                    just the happy path. Before arming, ask: if this process \
-                    crashed right now, would my filter emit anything? If not, \
-                    widen it. Use alternation to cover progress + failure \
-                    signatures (`elapsed_steps=|Traceback|Error|Killed|OOM`).\n\n\
-                    OUTPUT VOLUME: every match becomes a notification, so \
-                    keep the filter selective \u{2014} but selective means \
-                    \"lines you'd act on,\" not just success. Monitors \
-                    sustaining >500 matches/sec for 5s auto-stop; tighten \
-                    the filter and re-register."
+                description: "Register a regex watcher on an existing terminal's \
+                    output stream. A monitor does not start a command; run the \
+                    command normally in a terminal first, then attach the \
+                    monitor to that terminal. Each matching line wakes the \
+                    model with the matched line as payload.\n\n\
+                    Use `shell(runInBackground: true)` for one-shot async work \
+                    that exits. Use `monitor` when an already-running terminal \
+                    should keep notifying on matching output. Keep the regex \
+                    selective but broad enough to include failure modes."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1126,22 +1135,16 @@ pub fn builtinDefs() -> Vec<ToolDef> {
                             "type": "string",
                             "description": "Short label shown in every notification and in the tasks panel. Be specific: \"errors in deploy.log\", not \"watching logs\"."
                         },
-                        "command": {
+                        "terminal": {
                             "type": "string",
-                            "description": "Bash command to run (via `bash -c`). Should produce \
-                                line-by-line output. Examples: `tail -F /var/log/app.log`, \
-                                `inotifywait -m --format '%e %f' /watched`, \
-                                `while sleep 30; do curl -s http://x/health || true; done`."
+                            "description": "Terminal name to watch. Omit to watch the agent's current target terminal."
                         },
                         "filter": {
                             "type": "string",
-                            "description": "REQUIRED regex applied to each output line. Lines \
-                                that don't match are still kept in the backing job's ring \
-                                buffer (visible via jobOutput) but do NOT count as events \
-                                or trigger wakes. Use alternation to cover failure modes."
+                            "description": "REQUIRED regex applied to each normalized terminal output line. Non-matching lines remain only in the terminal/replay history and do not trigger wakes."
                         }
                     },
-                    "required": ["description", "command", "filter"]
+                    "required": ["description", "filter"]
                 }),
             },
         },
@@ -1149,9 +1152,8 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "monitorStop".into(),
-                description: "Stop a monitor by id. Also kills the backing bash task so \
-                    the watched process exits cleanly. No-op on already-terminal \
-                    monitors."
+                description: "Stop a monitor by id. This detaches the regex watcher from \
+                    its terminal but does not stop the terminal command itself."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1170,7 +1172,7 @@ pub fn builtinDefs() -> Vec<ToolDef> {
             function: crate::message::FunctionDef {
                 name: "monitorList".into(),
                 description: "Snapshot of every monitor (running, stopped, auto-stopped) \
-                    with command, filter, event count, last-event age, and state."
+                    with terminal, filter, event count, last-event age, and state."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1346,12 +1348,10 @@ pub enum ToolAction {
         impact: ShellImpact,
         timeout: Option<u64>,
         /// Target terminal by name. None resolves to the active terminal.
-        /// Ignored when `runInBackground` is true (background jobs bypass
-        /// the shared PTY).
+        /// For `runInBackground`, None creates a visible ephemeral terminal.
         terminal: Option<String>,
-        /// Spawn non-blocking in the background. When true, returns a
-        /// task id immediately and the command continues running under
-        /// the JobPlane; retrieve output via `jobOutput`.
+        /// Spawn non-blocking as a visible terminal run. When true, returns a
+        /// terminal run id immediately and archives replay bytes for `/runs`.
         runInBackground: bool,
     },
     ReadFile {
@@ -1424,6 +1424,12 @@ pub enum ToolAction {
     },
     /// Snapshot of all terminals.
     TerminalList,
+    /// Snapshot of archived visible terminal runs.
+    TerminalRunList,
+    /// Interrupt a running archived terminal run by id.
+    TerminalRunStop {
+        runId: String,
+    },
     /// Retrieve buffered output for a task.
     JobOutput {
         jobId: u64,
@@ -1436,16 +1442,16 @@ pub enum ToolAction {
     },
     /// Snapshot of all tasks.
     JobList,
-    /// Register a line-streamed monitor backed by a bash task. Lines
+    /// Register a line-streamed monitor attached to an existing terminal. Lines
     /// matching the regex `filter` emit `MonitorEvent`s, bump the
     /// monitor's counter, and wake the agent with a synthetic wake event.
-    /// Floods auto-stop the task.
+    /// Floods auto-stop the listener.
     Monitor {
         description: String,
-        command: String,
+        terminal: Option<String>,
         filter: String,
     },
-    /// Stop a monitor (and its backing bash task).
+    /// Stop a monitor listener.
     MonitorStop {
         monitorId: u64,
     },
@@ -1690,6 +1696,8 @@ pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
                 "searchOutput",
                 "readTerminal",
                 "terminalList",
+                "terminalRunList",
+                "terminalRunStop",
             ];
             defs.iter()
                 .filter(|d| ALLOWED.contains(&d.function.name.as_str()))
@@ -1712,13 +1720,15 @@ pub fn needsRegistry(action: &ToolAction) -> bool {
         ToolAction::TerminalSpawn { .. }
             | ToolAction::TerminalSwitch { .. }
             | ToolAction::TerminalKill { .. }
-            | ToolAction::TerminalList,
+            | ToolAction::TerminalList
+            | ToolAction::TerminalRunList
+            | ToolAction::TerminalRunStop { .. },
     )
 }
 
-/// Whether this action touches the background-job plane (handled by
-/// Session, not `execute()`). `Shell { runInBackground: true, .. }` also
-/// belongs here — backgrounded shell calls route through JobPlane.
+/// Whether this action touches async task state (handled by Session, not
+/// `execute()`). `Shell { runInBackground: true, .. }` belongs here so it can
+/// become a visible terminal-backed run instead of a blocking foreground call.
 pub fn needsJobPlane(action: &ToolAction) -> bool {
     matches!(
         action,
@@ -1732,9 +1742,8 @@ pub fn needsJobPlane(action: &ToolAction) -> bool {
 }
 
 /// True for actions that the MonitorPlane handles. Routed separately
-/// from the JobPlane handler because monitor lifecycle is decoupled
-/// from the backing bash task's lifecycle (a stopped monitor can have
-/// a still-completing task and vice-versa).
+/// from task handling because monitors are terminal-output subscriptions, not
+/// command execution.
 pub fn needsMonitor(action: &ToolAction) -> bool {
     matches!(
         action,
@@ -1909,6 +1918,8 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::TerminalSwitch { name } => format!("Switch active terminal to '{name}'"),
         ToolAction::TerminalKill { name } => format!("Kill terminal '{name}'"),
         ToolAction::TerminalList => "List terminals".into(),
+        ToolAction::TerminalRunList => "List terminal runs".into(),
+        ToolAction::TerminalRunStop { runId } => format!("terminalRunStop {runId}"),
         ToolAction::JobOutput {
             jobId, sinceLine, ..
         } => match sinceLine {
@@ -1919,15 +1930,11 @@ pub fn summarize(action: &ToolAction) -> String {
         ToolAction::JobList => "jobList".into(),
         ToolAction::Monitor {
             description,
-            command,
+            terminal,
             filter,
         } => {
-            let preview = if command.len() > 50 {
-                format!("{}\u{2026}", &command[..command.floor_char_boundary(50)])
-            } else {
-                command.clone()
-            };
-            format!("monitor \"{description}\": {preview}  | /{filter}/")
+            let target = terminal.as_deref().unwrap_or("agent target");
+            format!("monitor \"{description}\": terminal {target} | /{filter}/")
         }
         ToolAction::MonitorStop { monitorId } => format!("monitorStop #{monitorId}"),
         ToolAction::MonitorList => "monitorList".into(),
@@ -2222,8 +2229,9 @@ pub async fn execute(
             runInBackground,
             ..
         } => {
-            // Background shell calls are routed by the Session via the
-            // JobPlane handler. If we got one here, it's a bug.
+            // Background shell calls are routed by the Session so they can
+            // become visible terminal-backed runs. If we got one here, it's
+            // a bug.
             if *runInBackground {
                 return crate::message::Content::text(
                     "Error: background shell calls must be executed through the session.",
@@ -2279,18 +2287,20 @@ pub async fn execute(
         ToolAction::TerminalSpawn { .. }
         | ToolAction::TerminalSwitch { .. }
         | ToolAction::TerminalKill { .. }
-        | ToolAction::TerminalList => crate::message::Content::text(
+        | ToolAction::TerminalList
+        | ToolAction::TerminalRunList
+        | ToolAction::TerminalRunStop { .. } => crate::message::Content::text(
             "Error: terminal tools must be executed through the session.",
         ),
-        // Job plane and monitor tools are handled by Session (need
-        // direct access to JobPlane / MonitorPlane and logTx).
+        // Task and monitor tools are handled by Session (need direct access
+        // to JobPlane / MonitorPlane and logTx).
         ToolAction::JobOutput { .. }
         | ToolAction::JobStop { .. }
         | ToolAction::JobList
         | ToolAction::Monitor { .. }
         | ToolAction::MonitorStop { .. }
         | ToolAction::MonitorList => crate::message::Content::text(
-            "Error: job plane tools must be executed through the session.",
+            "Error: task/monitor tools must be executed through the session.",
         ),
         // Wake registry tools are handled by Session (need direct
         // access to WakeRegistry).
@@ -2399,7 +2409,7 @@ pub async fn execute(
 /// where the signal lives — exit codes, error summaries, final state.
 /// Head gives setup context; a middle sample helps the model tell
 /// whether something interesting sits in the elided range.
-fn truncateOutput(raw: &str, historyIndex: usize, terminalName: &str) -> String {
+pub(crate) fn truncateOutput(raw: &str, historyIndex: usize, terminalName: &str) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     let totalLines = lines.len();
 
@@ -4698,6 +4708,10 @@ pub fn parse(name: &str, argsJson: &str) -> ToolParseResult<ToolAction> {
             name: reqString(&args, "name")?,
         },
         "terminalList" => ToolAction::TerminalList,
+        "terminalRunList" => ToolAction::TerminalRunList,
+        "terminalRunStop" => ToolAction::TerminalRunStop {
+            runId: reqString(&args, "runId")?,
+        },
         "jobOutput" => ToolAction::JobOutput {
             jobId: reqU64(&args, "jobId")?,
             sinceLine: optU64(&args, "sinceLine")?,
@@ -4709,7 +4723,7 @@ pub fn parse(name: &str, argsJson: &str) -> ToolParseResult<ToolAction> {
         "jobList" => ToolAction::JobList,
         "monitor" => ToolAction::Monitor {
             description: reqString(&args, "description")?,
-            command: reqString(&args, "command")?,
+            terminal: optString(&args, "terminal")?,
             filter: reqString(&args, "filter")?,
         },
         "monitorStop" => ToolAction::MonitorStop {

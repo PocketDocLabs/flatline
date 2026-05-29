@@ -92,3 +92,4 @@ dashmap = "6"
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+rusqlite = { version = "0.32", features = ["bundled"] }

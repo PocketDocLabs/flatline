@@ -17,6 +17,7 @@ mod command;
 mod export;
 mod fork_picker;
 mod history;
+mod impact;
 mod jobs_panel;
 #[allow(dead_code)]
 mod layout;
@@ -27,6 +28,7 @@ mod mcp_panel;
 mod model_panel;
 mod permissions_panel;
 mod rewind_picker;
+mod runs_panel;
 mod selection;
 mod session_picker;
 mod subagent_panel;
@@ -652,14 +654,13 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         }),
         LogEvent::MonitorRegistered {
             id,
-            taskId,
             description,
-            command,
+            terminal,
             filter,
         } => serde_json::json!({
             "type": "monitorRegistered",
-            "id": id, "taskId": taskId,
-            "description": description, "command": command, "filter": filter,
+            "id": id,
+            "description": description, "terminal": terminal, "filter": filter,
         }),
         LogEvent::MonitorEvent {
             id,

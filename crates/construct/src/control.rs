@@ -33,8 +33,7 @@ use crate::transcript::{Fork, Turn};
 pub enum WakeKind {
     /// A monitor's filter matched a stdout line.
     MonitorMatch,
-    /// A backgrounded task finished — either a `shell(runInBackground: true)`
-    /// bash job or a `task(runInBackground: true)` subagent.
+    /// A visible terminal run or backgrounded subagent finished.
     TaskComplete,
     /// A one-shot delay timer (`scheduleWakeup`) elapsed.
     Delay,
@@ -225,14 +224,12 @@ pub enum LogEvent {
         userTriggered: bool,
     },
 
-    /// A monitor was registered via `monitor(...)`. Carries the
-    /// backing `taskId` so consumers can correlate monitor lifecycle
-    /// with the underlying bash task.
+    /// A monitor was registered via `monitor(...)`. Monitors attach to
+    /// an existing terminal output stream.
     MonitorRegistered {
         id: u64,
-        taskId: u64,
         description: String,
-        command: String,
+        terminal: String,
         filter: String,
     },
 
@@ -245,8 +242,8 @@ pub enum LogEvent {
     },
 
     /// The monitor's rolling events/sec exceeded its threshold for the
-    /// flood-guard window; the backing task is killed and the monitor
-    /// transitions to `AutoStopped`.
+    /// flood-guard window; the terminal listener is detached and the
+    /// monitor transitions to `AutoStopped`.
     MonitorAutoStopped { id: u64, reason: String },
 
     /// The monitor was stopped by the agent or user (clean exit).
@@ -557,7 +554,12 @@ pub enum TuiRequest {
         reply: oneshot::Sender<Vec<TerminalInfo>>,
     },
 
-    /// Snapshot of every background job for `/jobs`.
+    /// Snapshot of archived terminal-backed async runs for `/runs`.
+    ListTerminalRuns {
+        reply: oneshot::Sender<Vec<crate::storage::TerminalRunRecord>>,
+    },
+
+    /// Snapshot of every JobPlane-backed background task for `/jobs`.
     ListJobs {
         reply: oneshot::Sender<Vec<crate::jobs::JobInfo>>,
     },
@@ -568,7 +570,7 @@ pub enum TuiRequest {
         reply: oneshot::Sender<Vec<crate::wakes::WakeSourceInfo>>,
     },
 
-    /// Kill a background job from the tasks panel.
+    /// Kill a background task from the tasks panel.
     KillTask {
         id: u64,
         reply: oneshot::Sender<CommandAck>,

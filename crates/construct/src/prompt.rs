@@ -217,24 +217,24 @@ For work that takes more than a few seconds, pick by what you need to do while w
 \u{2022} You need the result before you can continue \u{2014} foreground `shell` (default).
   Foreground calls block the turn. Default timeout is 30s; pass `timeout` to
   extend. When the deadline elapses (or you press Ctrl+B on a slow command), the
-  foreground attempt is killed and the SAME command is auto-respawned as a fresh
-  background job; you receive an `AUTO_BG_CONVERTED` result with the new job id.
-  WARNING: the bg job restarts from scratch \u{2014} idempotency is on you. For
-  non-idempotent commands (migrations, deploys, anything with side effects), set
-  `runInBackground: true` up front or pass a generous `timeout`.
+  command keeps running in the same visible terminal as an archived terminal
+  run. It is not restarted. You'll receive the terminal run id and a wake when
+  it completes.
 
 \u{2022} You have independent work to do in parallel \u{2014} `shell(runInBackground: true)`.
-  Returns a task id immediately and keeps running. You'll be notified when it
-  finishes via a `<wake source=\"task#N\" kind=\"TaskComplete\">` message. Do NOT
-  poll `jobOutput` while waiting; the wake is the signal. Same for delegated
-  subagent work \u{2014} use `task(runInBackground: true)` and fan out.
+  Runs in a visible terminal and returns a terminal run id immediately. If no
+  terminal is named, Flatline creates a visible ephemeral terminal and closes it
+  after archiving the exact replay. You'll be notified when it finishes via a
+  `<wake source=\"terminalRun#N\" kind=\"TaskComplete\">` message. Do NOT poll
+  while waiting; the wake is the signal. For delegated subagent work, use
+  `task(runInBackground: true)` and fan out.
 
 \u{2022} You want to be notified when something happens, possibly many times \u{2014}
-  `monitor(description, command, filter)`. Each filter match becomes a separate
+  `monitor(description, terminal?, filter)`. Each filter match becomes a separate
   `<wake source=\"monitor#N\" kind=\"MonitorMatch\">` message. Use Monitor for
-  \"every ERROR in the log\" or \"every CI step result.\" Don't use Monitor for
-  \"tell me when the build finishes\" \u{2014} that's a single notification, use
-  background shell with a command that exits when the condition is true.
+  \"every ERROR in this terminal\" or \"every CI step result.\" Don't use Monitor
+  for \"tell me when the build finishes\" \u{2014} that's a single notification,
+  use an async terminal run that exits when the condition is true.
 
 For any pipe that streams output (`grep`, `tail -f`, ssh tails), use line-buffered
 tools or the OS holds output for kilobytes: `grep --line-buffered`, `awk` with
@@ -244,8 +244,8 @@ tools or the OS holds output for kilobytes: `grep --line-buffered`, `awk` with
 <wakes>
 When you receive a `<wake source=\"...\" kind=\"...\" firedAt=\"...\">...</wake>`
 message, that's the system telling you something you registered a watch for has
-happened \u{2014} a background job completed, or a monitor filter matched. The
-payload is whatever triggered the wake (final task output, or the matched line).
+happened \u{2014} a terminal run or task completed, or a monitor filter matched. The
+payload is whatever triggered the wake (terminal run/task output, or the matched line).
 Respond by acting on it; you don't need to acknowledge the wake itself.
 </wakes>
 

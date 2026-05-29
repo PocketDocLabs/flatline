@@ -664,15 +664,11 @@ impl JobsPanel {
         let bg = if isSelected { BG_SELECTED } else { BG };
         let rowStyle = Style::default().fg(FG_PRIMARY).bg(bg);
 
-        // State glyph (running/done/failed). Different "running" glyphs
-        // by kind so a quick /tasks scan tells the user which rows are
-        // agent threads (⦂) vs monitors (⊙) vs plain bash subprocesses (◴).
+        // State glyph (running/done/failed). Different "running" glyph for
+        // agent threads so /tasks stays focused on subagent-style work.
         let (glyph, glyphStyle) = match (&task.kind, &task.state) {
             (JobKind::Subagent { .. }, JobState::Running) => {
                 ("\u{2982}", Style::default().fg(FG_ACCENT).bg(bg))
-            }
-            (JobKind::Monitor { .. }, JobState::Running) => {
-                ("\u{2299}", Style::default().fg(FG_ACCENT).bg(bg))
             }
             (_, JobState::Running) => ("\u{25F4}", Style::default().fg(FG_RUNNING).bg(bg)),
             (_, JobState::Completed { exitCode: 0 }) => {

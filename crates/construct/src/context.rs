@@ -970,6 +970,7 @@ mod tests {
 
     /// Ephemeral transcript that cleans up on drop.
     struct TestSession {
+        _dir: tempfile::TempDir,
         transcript: Transcript,
         headTurnId: Option<String>,
     }
@@ -984,8 +985,10 @@ mod tests {
                 .unwrap()
                 .as_nanos() as u64;
             let id = format!("test_{ts:x}_{n:04x}");
+            let dir = tempfile::TempDir::new().unwrap();
             Self {
-                transcript: Transcript::create(&id).unwrap(),
+                transcript: Transcript::createAt(dir.path(), &id).unwrap(),
+                _dir: dir,
                 headTurnId: None,
             }
         }
@@ -1066,7 +1069,8 @@ mod tests {
 
     impl Drop for TestSession {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(self.transcript.sessionDir());
+            // `TempDir` owns cleanup. Avoid touching the real session root in
+            // sandboxed test environments.
         }
     }
 

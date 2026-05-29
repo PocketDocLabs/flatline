@@ -161,6 +161,8 @@ enum DeckUpdate {
     ResumeResult(construct::control::CommandAck),
     /// Background-job snapshot for the `/jobs` panel.
     TasksList(Vec<construct::jobs::JobInfo>),
+    /// Terminal-run archive snapshot for the `/runs` panel.
+    RunsList(Vec<construct::storage::TerminalRunRecord>),
     /// Wake-source snapshot for the `/jobs` panel schedules section.
     WakesList(Vec<construct::wakes::WakeSourceInfo>),
     /// Initial output snapshot for the inspect popup — opens the popup.
@@ -181,6 +183,20 @@ enum DeckUpdate {
         sinceLine: Option<u64>,
         snap: Option<construct::jobs::JobOutputSnapshot>,
     },
+}
+
+fn openRunsPanel(requestTx: &mpsc::Sender<TuiRequest>, deckUpdateTx: &mpsc::Sender<DeckUpdate>) {
+    let requestTx = requestTx.clone();
+    let deckUpdateTx = deckUpdateTx.clone();
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let _ = requestTx
+            .send(TuiRequest::ListTerminalRuns { reply: rTx })
+            .await;
+        if let Ok(list) = rRx.await {
+            let _ = deckUpdateTx.send(DeckUpdate::RunsList(list)).await;
+        }
+    });
 }
 
 /// Send a `ListJobs` request to the session and forward the reply
@@ -577,6 +593,12 @@ pub async fn run() -> Result<()> {
         let wakeRegistrySlot: std::sync::Arc<
             std::sync::RwLock<std::sync::Arc<tokio::sync::Mutex<construct::wakes::WakeRegistry>>>,
         > = std::sync::Arc::new(std::sync::RwLock::new(session.wakeRegistryHandle()));
+        // Same hot-swap pattern for monitors so user-driven terminal close can
+        // stop/disarm attach-only monitors even while the agent turn is idle
+        // or busy elsewhere.
+        let monitorPlaneSlot: std::sync::Arc<
+            std::sync::RwLock<std::sync::Arc<std::sync::Mutex<construct::monitors::MonitorPlane>>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(session.monitorPlaneHandle()));
         // Shell registry handle stays valid across /clear and /resume
         // because `intoShells()` returns the same Arc that gets passed
         // to the new Session — no slot swap needed.
@@ -606,6 +628,8 @@ pub async fn run() -> Result<()> {
         });
         let shellsHandler = shellsArc.clone();
         let handlerLogTx = logTx.clone();
+        let monitorsForTerminalHandler = monitorPlaneSlot.clone();
+        let wakesForTerminalHandler = wakeRegistrySlot.clone();
         tokio::spawn(async move {
             use construct::shells::SpawnedBy;
             while let Some(req) = terminalReqRx.recv().await {
@@ -637,6 +661,18 @@ pub async fn run() -> Result<()> {
                         };
                         let ack = match result {
                             Ok(()) => {
+                                let stopped = {
+                                    let plane = monitorsForTerminalHandler.read().unwrap().clone();
+                                    plane.lock().unwrap().stopForTerminal(&name)
+                                };
+                                for (id, wakeId) in stopped {
+                                    if let Some(wid) = wakeId {
+                                        let reg = wakesForTerminalHandler.read().unwrap().clone();
+                                        reg.lock().await.unregisterPassive(wid, &handlerLogTx);
+                                    }
+                                    let _ =
+                                        handlerLogTx.send(LogEvent::MonitorStopped { id }).await;
+                                }
                                 let _ = handlerLogTx
                                     .send(LogEvent::TerminalClosed { name: name.clone() })
                                     .await;
@@ -778,6 +814,8 @@ pub async fn run() -> Result<()> {
                                         session.jobPlaneHandle();
                                     *wakeRegistrySlot.write().unwrap() =
                                         session.wakeRegistryHandle();
+                                    *monitorPlaneSlot.write().unwrap() =
+                                        session.monitorPlaneHandle();
                                     // Replace the wake-batch receiver — the old one
                                     // belonged to the old session's batcher, which has
                                     // been cancelled by disarmAll above.
@@ -838,6 +876,8 @@ pub async fn run() -> Result<()> {
                                                 session.jobPlaneHandle();
                                             *wakeRegistrySlot.write().unwrap() =
                                                 session.wakeRegistryHandle();
+                                            *monitorPlaneSlot.write().unwrap() =
+                                                session.monitorPlaneHandle();
                                             wakeBatchRx = session.takeWakeBatchRx();
                                         }
                                         Err(e2) => {
@@ -877,6 +917,8 @@ pub async fn run() -> Result<()> {
                                         session.jobPlaneHandle();
                                     *wakeRegistrySlot.write().unwrap() =
                                         session.wakeRegistryHandle();
+                                    *monitorPlaneSlot.write().unwrap() =
+                                        session.monitorPlaneHandle();
                                     wakeBatchRx = session.takeWakeBatchRx();
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
@@ -1235,6 +1277,10 @@ pub async fn run() -> Result<()> {
                         Some(TuiRequest::ShowCost { reply }) => {
                             let _ = reply.send(session.formatCostBreakdown());
                         }
+                        Some(TuiRequest::ListTerminalRuns { reply }) => {
+                            let runs = session.listTerminalRuns().unwrap_or_default();
+                            let _ = reply.send(runs);
+                        }
                         Some(TuiRequest::Shutdown) => {
                             session.shutdownLsp().await;
                             session.shutdownMcp().await;
@@ -1389,6 +1435,7 @@ async fn runLoop(
     let mut permissionsPanel: Option<crate::permissions_panel::PermissionsPanel> = None;
     let mut subagentPanel: Option<crate::subagent_panel::SubagentPanel> = None;
     let mut tasksPanel: Option<crate::jobs_panel::JobsPanel> = None;
+    let mut runsPanel: Option<crate::runs_panel::RunsPanel> = None;
     let mut logPanel: Option<LogPanel> = None;
     let mut layoutPanel: Option<crate::layout::control_panel::ControlPanel> = None;
     let mut developerLog = DeveloperLog::new(1000);
@@ -1881,6 +1928,11 @@ async fn runLoop(
 
                 // Tasks panel overlay.
                 if let Some(ref mut panel) = tasksPanel {
+                    panel.render(area, frame.buffer_mut());
+                }
+
+                // Terminal run history overlay.
+                if let Some(ref panel) = runsPanel {
                     panel.render(area, frame.buffer_mut());
                 }
 
@@ -2754,6 +2806,14 @@ async fn runLoop(
                     }
                     needsRedraw = true;
                 }
+                DeckUpdate::RunsList(list) => {
+                    if let Some(ref mut panel) = runsPanel {
+                        panel.refresh(list);
+                    } else {
+                        runsPanel = Some(crate::runs_panel::RunsPanel::new(list));
+                    }
+                    needsRedraw = true;
+                }
                 DeckUpdate::WakesList(list) => {
                     if let Some(ref mut panel) = tasksPanel {
                         panel.refreshWakes(list);
@@ -2890,6 +2950,7 @@ async fn runLoop(
             &mut modelPanel,
             &mut subagentPanel,
             &mut tasksPanel,
+            &mut runsPanel,
             &mut logPanel,
             &mut permissionsPanel,
             &mut developerLog,
@@ -2951,6 +3012,7 @@ async fn handleInput(
     modelPanel: &mut Option<ModelPanel>,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     tasksPanel: &mut Option<crate::jobs_panel::JobsPanel>,
+    runsPanel: &mut Option<crate::runs_panel::RunsPanel>,
     logPanel: &mut Option<LogPanel>,
     permissionsPanel: &mut Option<crate::permissions_panel::PermissionsPanel>,
     developerLog: &mut DeveloperLog,
@@ -3067,6 +3129,16 @@ async fn handleInput(
                     break;
                 }
 
+                // Ctrl+J: terminal run history.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+                    if runsPanel.is_some() {
+                        *runsPanel = None;
+                    } else {
+                        openRunsPanel(requestTx, deckUpdateTx);
+                    }
+                    break;
+                }
+
                 // Ctrl+H: toggle the hotkey-tips popup.
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
                     *helpPopupOpen = !*helpPopupOpen;
@@ -3137,6 +3209,7 @@ async fn handleInput(
                         || modelPanel.is_some()
                         || permissionsPanel.is_some()
                         || tasksPanel.is_some()
+                        || runsPanel.is_some()
                         || logPanel.is_some()
                         || layoutPanel.is_some()
                     {
@@ -3329,6 +3402,17 @@ async fn handleInput(
                             );
                         }
                         PanelAction::None => {}
+                    }
+                    break;
+                }
+
+                // Terminal run history intercepts all keys when active.
+                if let Some(panel) = runsPanel.as_mut() {
+                    match panel.handleKey(key) {
+                        crate::runs_panel::RunsAction::Close => {
+                            *runsPanel = None;
+                        }
+                        crate::runs_panel::RunsAction::None => {}
                     }
                     break;
                 }
@@ -4010,6 +4094,7 @@ async fn handleInput(
                     || modelPanel.is_some()
                     || permissionsPanel.is_some()
                     || tasksPanel.is_some()
+                    || runsPanel.is_some()
                     || logPanel.is_some()
                     || layoutPanel.is_some()
                 {
@@ -4042,6 +4127,7 @@ async fn handleInput(
                     scrollLock,
                     subagentPanel,
                     requestTx,
+                    deckUpdateTx,
                 ) {
                     hadInput = true;
                 }
@@ -4118,6 +4204,7 @@ fn handleMouse(
     scrollLock: &mut ScrollAxisLock,
     subagentPanel: &mut Option<crate::subagent_panel::SubagentPanel>,
     requestTx: &mpsc::Sender<TuiRequest>,
+    deckUpdateTx: &mpsc::Sender<DeckUpdate>,
 ) -> bool {
     // Resolve display offset for the given panel.
     fn panelOffset(panel: PanelId, termPane: &TerminalPane, agentPanel: &AgentPanel) -> u16 {
@@ -4145,6 +4232,10 @@ fn handleMouse(
                             name: None,
                             reply: replyTx,
                         });
+                        return true;
+                    }
+                    TabClick::History => {
+                        openRunsPanel(requestTx, deckUpdateTx);
                         return true;
                     }
                     TabClick::Close(name) => {
@@ -5152,6 +5243,9 @@ fn dispatchSlashCommand(
             // chip — fetch jobs + wakes and let the TasksList /
             // WakesList handlers create the panel.
             openStatusChipPanel(StatusChipKind::Jobs, &requestTx, &deckUpdateTx);
+        }
+        crate::command::CommandAction::Runs => {
+            openRunsPanel(&requestTx, &deckUpdateTx);
         }
         crate::command::CommandAction::Logs => {
             tracing::warn!("/logs reached dispatchSlashCommand — should have been handled inline");

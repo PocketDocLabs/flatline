@@ -51,7 +51,7 @@ pub fn buildExample(
     segmentIndex: usize,
     segment: &Segment,
     branch: &[Turn],
-    snapshotsDir: &Path,
+    sessionDir: &Path,
     noReasoning: bool,
     minMessages: usize,
 ) -> Result<Option<Example>> {
@@ -62,12 +62,12 @@ pub fn buildExample(
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
     if let Some(hash) = &segment.anchor.systemPromptHash {
-        let text = readSystemPrompt(snapshotsDir, hash)?;
+        let text = readSystemPrompt(sessionDir, hash)?;
         messages.push(serde_json::json!({ "role": "system", "content": text }));
     }
 
     for hash in &segment.last.messages {
-        let msg = readMessage(snapshotsDir, hash)?;
+        let msg = readMessage(sessionDir, hash)?;
         messages.push(messageToOpenAi(&msg)?);
     }
 
@@ -83,7 +83,7 @@ pub fn buildExample(
     }
 
     let tools: Vec<ToolDef> = match &segment.anchor.toolsHash {
-        Some(hash) => readTools(snapshotsDir, hash)?,
+        Some(hash) => readTools(sessionDir, hash)?,
         None => Vec::new(),
     };
 
@@ -186,20 +186,51 @@ fn messageToOpenAi(msg: &Message) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-fn readSystemPrompt(snapshotsDir: &Path, hash: &str) -> Result<String> {
+fn readSystemPrompt(sessionDir: &Path, hash: &str) -> Result<String> {
+    let snapshotsDir = sessionDir.join("snapshots");
     let path = snapshotsDir.join("blobs/sp").join(format!("{hash}.txt"));
-    fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(s),
+        Err(fsErr) => {
+            let bytes =
+                construct::storage::snapshotBlobForSession(sessionDir, "system_prompt", hash)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("read {} or sqlite blob: {fsErr}", path.display())
+                    })?;
+            String::from_utf8(bytes).with_context(|| format!("decode system prompt blob {hash}"))
+        }
+    }
 }
 
-fn readTools(snapshotsDir: &Path, hash: &str) -> Result<Vec<ToolDef>> {
+fn readTools(sessionDir: &Path, hash: &str) -> Result<Vec<ToolDef>> {
+    let snapshotsDir = sessionDir.join("snapshots");
     let path = snapshotsDir.join("blobs/tl").join(format!("{hash}.json"));
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(fsErr) => {
+            let bytes = construct::storage::snapshotBlobForSession(sessionDir, "tools", hash)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("read {} or sqlite blob: {fsErr}", path.display())
+                })?;
+            String::from_utf8(bytes).with_context(|| format!("decode tools blob {hash}"))?
+        }
+    };
     serde_json::from_str(&raw).with_context(|| format!("parse tools {}", path.display()))
 }
 
-fn readMessage(snapshotsDir: &Path, hash: &str) -> Result<Message> {
+fn readMessage(sessionDir: &Path, hash: &str) -> Result<Message> {
+    let snapshotsDir = sessionDir.join("snapshots");
     let path = snapshotsDir.join("blobs/ms").join(format!("{hash}.json"));
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(fsErr) => {
+            let bytes = construct::storage::snapshotBlobForSession(sessionDir, "message", hash)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("read {} or sqlite blob: {fsErr}", path.display())
+                })?;
+            String::from_utf8(bytes).with_context(|| format!("decode message blob {hash}"))?
+        }
+    };
     serde_json::from_str(&raw).with_context(|| format!("parse message {}", path.display()))
 }
 

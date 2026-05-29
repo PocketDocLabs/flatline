@@ -7,9 +7,8 @@
 //! - [`WakeKind::Cron`]: recurring, fires on a 5-field cron schedule
 //! - [`WakeKind::FileWatch`]: fires on fs events under a path
 //! - [`WakeKind::MonitorMatch`]: fires per matched line from a Monitor
-//! - [`WakeKind::TaskComplete`]: fires when a backgrounded task exits —
-//!   either a `shell(runInBackground)` bash job or a
-//!   `task(runInBackground)` subagent
+//! - [`WakeKind::TaskComplete`]: fires when a visible terminal run or
+//!   backgrounded subagent exits
 //!
 //! Wake fires are coalesced into [`WakeBatch`] values. The session
 //! records each batch as a `TurnRole::Wake` transcript event, injects it
@@ -21,8 +20,9 @@
 //!   a source and return a [`WakeId`]. Delay/Cron/FileWatch spawn an
 //!   internal tokio task that schedules the fire(s); the task drops
 //!   cleanly when the source is disarmed.
-//! - MonitorMatch and TaskComplete have no scheduler — they're
-//!   enqueued by `MonitorPlane` / `JobPlane` at the appropriate moment.
+//! - MonitorMatch and TaskComplete have no scheduler — they're enqueued by
+//!   `MonitorPlane`, terminal-run archive tasks, or `JobPlane` at the
+//!   appropriate moment.
 //! - [`WakeRegistry::disarm`] cancels the source's scheduler (if any)
 //!   and removes it from the registry.
 //!
@@ -134,8 +134,8 @@ pub enum WakeKind {
     /// External event source — a Monitor regex matched a line. Has no
     /// scheduler; `MonitorPlane` calls `fireMonitorMatch` directly.
     MonitorMatch { monitorId: u64 },
-    /// External event source — a backgrounded task exited (bash job or
-    /// subagent). `JobPlane` calls into the registry directly.
+    /// External event source — a backgrounded subagent or visible terminal
+    /// run exited.
     TaskComplete { taskId: u64 },
 }
 
@@ -497,13 +497,25 @@ impl WakeRegistry {
         id
     }
 
-    /// Register a passive TaskComplete wake. Same shape as
-    /// MonitorMatch — fires are driven by JobPlane when a backgrounded
-    /// task (bash job or subagent) exits.
+    /// Register a passive TaskComplete wake for a JobPlane-backed task.
     pub fn registerTaskComplete(&mut self, taskId: u64, logTx: &mpsc::Sender<LogEvent>) -> WakeId {
+        self.registerTaskCompleteSummary(format!("task#{taskId}"), logTx)
+    }
+
+    /// Register a passive TaskComplete wake with an explicit source summary.
+    /// Used by visible terminal-run archives, whose ids are strings rather
+    /// than JobPlane numeric ids.
+    pub fn registerTerminalRun(&mut self, runId: &str, logTx: &mpsc::Sender<LogEvent>) -> WakeId {
+        self.registerTaskCompleteSummary(format!("terminalRun#{runId}"), logTx)
+    }
+
+    fn registerTaskCompleteSummary(
+        &mut self,
+        summary: String,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> WakeId {
         let id = self.nextId;
         self.nextId += 1;
-        let summary = format!("task#{taskId}");
         let info = WakeSourceInfo {
             id,
             kind: ControlWakeKind::TaskComplete,
@@ -532,7 +544,7 @@ impl WakeRegistry {
 
     /// Enqueue a `WakeFire` through the batcher. Returns true if the
     /// source is still registered. Call sites (delay/cron/fileWatch
-    /// schedulers, JobPlane bg-task watcher) use this while holding
+    /// schedulers, terminal-run archive tasks, JobPlane task watcher) use this while holding
     /// the registry lock; `firesSoFar` is bumped by the batcher when
     /// the queued fire is drained, so concurrent stampedes don't race
     /// on the counter under the registry lock.
@@ -564,8 +576,8 @@ impl WakeRegistry {
         let _ = sender.send(fire);
     }
 
-    /// Remove a passive source (called by MonitorPlane on monitorStop
-    /// and JobPlane on task removal). Emits `WakeDisarmed` so consumers
+    /// Remove a passive source (called by MonitorPlane on monitorStop,
+    /// terminal-run archive tasks, and JobPlane on task removal). Emits `WakeDisarmed` so consumers
     /// (status-strip wake counter, /jobs schedules section) stay in sync
     /// with the registry. Silently no-op if the id isn't registered.
     pub fn unregisterPassive(&mut self, id: WakeId, logTx: &mpsc::Sender<LogEvent>) {

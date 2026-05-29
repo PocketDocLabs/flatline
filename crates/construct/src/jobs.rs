@@ -78,11 +78,6 @@ pub enum JobKind {
     /// `prompt` is captured so the tasks panel can show what the agent is
     /// working on without polling.
     Subagent { agentType: String, prompt: String },
-    /// `monitor(...)` task — bash task whose lines are passed through a
-    /// regex filter and counted as events. `description` is the short
-    /// label shown in panels and notifications; `filter` is the raw
-    /// pattern string (compiled regex lives in MonitorPlane).
-    Monitor { description: String, filter: String },
 }
 
 /// Lifecycle state of a task.
@@ -505,38 +500,6 @@ impl JobPlane {
             None,
             logTx,
             wakeCtx,
-        )
-    }
-
-    /// Spawn a bash task whose output stream is also routed through a
-    /// per-line `onLine` callback (in addition to the ring buffer and
-    /// `TaskOutput` events). The callback is the integration point for
-    /// `MonitorPlane`: it filters lines through the monitor's regex
-    /// and bumps event counters without the drainer needing to know
-    /// anything about monitors.
-    pub fn spawnMonitor(
-        &mut self,
-        description: String,
-        command: String,
-        filter: String,
-        onLine: LineCallback,
-        onExit: ExitCallback,
-        logTx: mpsc::Sender<LogEvent>,
-    ) -> JobResult<JobId> {
-        let id = self.reserveJobId();
-        let kind = JobKind::Monitor {
-            description,
-            filter,
-        };
-        self.spawnBashInner(
-            id,
-            command,
-            kind,
-            "monitor",
-            Some(onLine),
-            Some(onExit),
-            logTx,
-            None,
         )
     }
 

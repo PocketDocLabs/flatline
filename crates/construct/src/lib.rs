@@ -40,6 +40,7 @@ pub mod session;
 pub mod shell;
 pub mod shells;
 pub mod snapshot;
+pub mod storage;
 pub mod text;
 pub mod tool;
 pub mod tool_preview;

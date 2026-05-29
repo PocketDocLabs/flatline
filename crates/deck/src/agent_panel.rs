@@ -2370,16 +2370,8 @@ impl AgentPanel {
     fn renderPermitHeaderInline(&self, w: u16, lines: &mut Vec<Line<'static>>) {
         use unicode_width::UnicodeWidthStr;
         let w = w as usize;
-        let (impactColor, impactSymbol) = match self.pendingToolImpact {
-            construct::tool::ShellImpact::Delete => (Color::Red, "\u{2620}\u{FE0E}"),
-            construct::tool::ShellImpact::MajorMod => {
-                (Color::Rgb(200, 140, 40), "\u{26A0}\u{FE0E}")
-            }
-            construct::tool::ShellImpact::MinorMod => {
-                (Color::Rgb(180, 160, 80), "\u{2691}\u{FE0E}")
-            }
-            construct::tool::ShellImpact::Read => (Color::Rgb(80, 160, 200), "\u{2315}"),
-        };
+        let (impactSymbol, impactColor) =
+            crate::impact::shellImpactGlyphColorForTool(self.pendingToolImpact.clone());
         let toolLabel = format!(" {} {} ", self.pendingToolName, impactSymbol);
 
         // Timeout from summary.

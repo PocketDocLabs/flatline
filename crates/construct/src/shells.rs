@@ -46,6 +46,8 @@ pub struct TerminalInfo {
     pub ageSecs: u64,
     /// Whether this is the current default target for shell-using tools.
     pub activeForAgent: bool,
+    /// Whether an agent-command capture is currently active in this terminal.
+    pub busy: bool,
 }
 
 /// A named shell entry inside the registry.
@@ -231,6 +233,7 @@ impl ShellRegistry {
                     spawnedBy: e.spawnedBy,
                     ageSecs: e.spawnedAt.elapsed().as_secs(),
                     activeForAgent: name == &self.activeForAgent,
+                    busy: e.shell.isBusy(),
                 })
             })
             .collect()

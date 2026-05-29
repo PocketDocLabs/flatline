@@ -583,6 +583,22 @@ fn prependToContent(content: &Content, prefix: &str) -> Content {
     }
 }
 
+fn unixNow() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn shellImpactStorageName(impact: &crate::tool::ShellImpact) -> &'static str {
+    match impact {
+        crate::tool::ShellImpact::Read => "read",
+        crate::tool::ShellImpact::MinorMod => "minorMod",
+        crate::tool::ShellImpact::MajorMod => "majorMod",
+        crate::tool::ShellImpact::Delete => "delete",
+    }
+}
+
 /// Agent session — owns the conversation and drives the turn loop.
 pub struct Session {
     client: api::Client,
@@ -1958,137 +1974,104 @@ impl Session {
                                                     let effectiveTimeout = modelTimeout.unwrap_or(
                                                         crate::shell::SHELL_DEFAULT_TIMEOUT_SECS,
                                                     );
-                                                    let execFut =
-                                                        tool::execute(&action, &shell, &targetName);
-                                                    tokio::pin!(execFut);
-                                                    // Build a "converted to bg" result. When the shell's
-                                                    // timeout elapses or the user presses Ctrl+B we don't
-                                                    // hand the model a "decide what to do" prompt — we
-                                                    // auto-respawn the same command as a real JobPlane
-                                                    // bg job and tell the model the new job id.
-                                                    // NOTE: the bg job restarts from scratch — the
-                                                    // foreground attempt was already killed by the
-                                                    // shell driver. Idempotency is the caller's problem.
-                                                    let buildConverted = |jobId: u64, elapsed: u64, userBg: bool, partial: &str| {
-                                                let trigger = if userBg {
-                                                    "you pressed Ctrl+B".to_string()
-                                                } else {
-                                                    format!("the shell exceeded its {elapsed}s timeout")
-                                                };
-                                                format!(
-                                                    "AUTO_BG_CONVERTED: {trigger}, so the command was auto-converted to background job #{jobId}.\n\n\
-                                                     Partial output captured from the foreground attempt before conversion:\n{partial}\n\n\
-                                                     NOTE: job #{jobId} is a FRESH run of the same command \u{2014} the foreground attempt was killed and not migrated. You will be notified when job #{jobId} completes (do not poll). Use jobOutput(jobId: {jobId}) for a mid-flight peek; jobStop(jobId: {jobId}) to cancel."
-                                                )
-                                            };
+                                                    let startedAt = unixNow();
+                                                    let shellForExec = shell.clone();
+                                                    let commandForExec = shellCommand.clone();
+                                                    let mut execTask = tokio::spawn(async move {
+                                                        shellForExec
+                                                            .executeDetailedNoTimeout(
+                                                                &commandForExec,
+                                                            )
+                                                            .await
+                                                    });
+                                                    let timeoutSleep = tokio::time::sleep(
+                                                        std::time::Duration::from_secs(
+                                                            effectiveTimeout,
+                                                        ),
+                                                    );
+                                                    tokio::pin!(timeoutSleep);
                                                     loop {
                                                         tokio::select! {
-                                                            result = &mut execFut => {
+                                                            result = &mut execTask => {
+                                                                let exec = match result {
+                                                                    Ok(exec) => exec,
+                                                                    Err(e) => crate::shell::CommandExecution {
+                                                                        command: shellCommand.clone(),
+                                                                        output: format!("Terminal command task failed to join: {e}"),
+                                                                        exitCode: None,
+                                                                        lineCount: 1,
+                                                                        replayBytes: Vec::new(),
+                                                                        timedOut: false,
+                                                                    },
+                                                                };
+                                                                let raw = exec.responseText();
+                                                                let index = shell.historyLen().saturating_sub(1);
+                                                                let result = crate::message::Content::text(
+                                                                    crate::tool::truncateOutput(&raw, index, &targetName),
+                                                                );
                                                                 tracing::debug!(
                                                                     tool = %call.function.name,
                                                                     outputLen = result.charCount(),
                                                                     "tool execution complete"
                                                                 );
-                                                                // Shell appends this suffix when its
-                                                                // deadline elapsed without an exit code.
-                                                                // Auto-convert to a bg job and return the
-                                                                // new job id to the model.
-                                                                let text = match &result {
-                                                                    crate::message::Content::Text(s) => s.clone(),
-                                                                    _ => String::new(),
-                                                                };
-                                                                let marker = "\n(command timed out and was interrupted)";
-                                                                if text.contains(marker) {
-                                                                    let stripped = text.replace(marker, "");
-                                                                    let id = self.jobs.lock().unwrap().reserveJobId();
-                                                                    let (wakeId, fireTx) = {
-                                                                        let mut g = self.wakes.lock().await;
-                                                                        let wid = g.registerTaskComplete(id, logTx);
-                                                                        (wid, g.fireSender())
-                                                                    };
-                                                                    let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
-                                                                        id,
-                                                                        shellCommand.clone(),
-                                                                        logTx.clone(),
-                                                                        Some(crate::jobs::TaskWakeCtx {
-                                                                            wakeId,
-                                                                            registry: self.wakes.clone(),
-                                                                            fireTx,
-                                                                        }),
-                                                                    );
-                                                                    match spawnResult {
-                                                                        Ok(_) => {
-                                                                            let _ = logTx
-                                                                                .send(LogEvent::AutoBgWarning {
-                                                                                    command: shellCommand.clone(),
-                                                                                    elapsedSecs: effectiveTimeout,
-                                                                                    userTriggered: false,
-                                                                                })
-                                                                                .await;
-                                                                            break crate::message::Content::text(
-                                                                                buildConverted(id, effectiveTimeout, false, &stripped)
-                                                                            );
-                                                                        }
-                                                                        Err(e) => {
-                                                                            self.wakes.lock().await.unregisterPassive(wakeId, logTx);
-                                                                            break crate::message::Content::text(format!(
-                                                                                "Command exceeded its {effectiveTimeout}s timeout. Auto-bg conversion FAILED: {e}\n\nPartial output:\n{stripped}"
-                                                                            ));
-                                                                        }
-                                                                    }
-                                                                }
                                                                 break result;
                                                             }
+                                                            _ = &mut timeoutSleep => {
+                                                                let _ = logTx
+                                                                    .send(LogEvent::AutoBgWarning {
+                                                                        command: shellCommand.clone(),
+                                                                        elapsedSecs: effectiveTimeout,
+                                                                        userTriggered: false,
+                                                                    })
+                                                                    .await;
+                                                                let trigger = format!("the shell exceeded its {effectiveTimeout}s timeout");
+                                                                let message = self
+                                                                    .detachTerminalRunJoin(
+                                                                        shellCommand.clone(),
+                                                                        match &action {
+                                                                            tool::ToolAction::Shell { explanation, .. } => explanation.clone(),
+                                                                            _ => String::new(),
+                                                                        },
+                                                                        match &action {
+                                                                            tool::ToolAction::Shell { impact, .. } => impact.clone(),
+                                                                            _ => crate::tool::ShellImpact::Read,
+                                                                        },
+                                                                        targetName.clone(),
+                                                                        startedAt,
+                                                                        execTask,
+                                                                        logTx,
+                                                                        trigger,
+                                                                    )
+                                                                    .await;
+                                                                break crate::message::Content::text(message);
+                                                            }
                                                             _ = userBgRx.recv() => {
-                                                                // User pressed Ctrl+B — interrupt the
-                                                                // foreground attempt and respawn as a
-                                                                // tracked bg job.
-                                                                shell.interrupt();
-                                                                let partial = (&mut execFut).await;
-                                                                let partialText = match &partial {
-                                                                    crate::message::Content::Text(s) => s.clone(),
-                                                                    _ => String::new(),
-                                                                };
-                                                                // Strip the shell's timeout suffix if it
-                                                                // landed (Ctrl+B may race with deadline).
-                                                                let cleaned = partialText
-                                                                    .replace("\n(command timed out and was interrupted)", "");
-                                                                let id = self.jobs.lock().unwrap().reserveJobId();
-                                                                let (wakeId, fireTx) = {
-                                                                    let mut g = self.wakes.lock().await;
-                                                                    let wid = g.registerTaskComplete(id, logTx);
-                                                                    (wid, g.fireSender())
-                                                                };
-                                                                let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
-                                                                    id,
-                                                                    shellCommand.clone(),
-                                                                    logTx.clone(),
-                                                                    Some(crate::jobs::TaskWakeCtx {
-                                                                        wakeId,
-                                                                        registry: self.wakes.clone(),
-                                                                        fireTx,
-                                                                    }),
-                                                                );
-                                                                match spawnResult {
-                                                                    Ok(_) => {
-                                                                        let _ = logTx
-                                                                            .send(LogEvent::AutoBgWarning {
-                                                                                command: shellCommand.clone(),
-                                                                                elapsedSecs: 0,
-                                                                                userTriggered: true,
-                                                                            })
-                                                                            .await;
-                                                                        break crate::message::Content::text(
-                                                                            buildConverted(id, 0, true, &cleaned)
-                                                                        );
-                                                                    }
-                                                                    Err(e) => {
-                                                                        self.wakes.lock().await.unregisterPassive(wakeId, logTx);
-                                                                        break crate::message::Content::text(format!(
-                                                                            "User-triggered bg conversion FAILED: {e}\n\nPartial output:\n{cleaned}"
-                                                                        ));
-                                                                    }
-                                                                }
+                                                                let _ = logTx
+                                                                    .send(LogEvent::AutoBgWarning {
+                                                                        command: shellCommand.clone(),
+                                                                        elapsedSecs: 0,
+                                                                        userTriggered: true,
+                                                                    })
+                                                                    .await;
+                                                                let message = self
+                                                                    .detachTerminalRunJoin(
+                                                                        shellCommand.clone(),
+                                                                        match &action {
+                                                                            tool::ToolAction::Shell { explanation, .. } => explanation.clone(),
+                                                                            _ => String::new(),
+                                                                        },
+                                                                        match &action {
+                                                                            tool::ToolAction::Shell { impact, .. } => impact.clone(),
+                                                                            _ => crate::tool::ShellImpact::Read,
+                                                                        },
+                                                                        targetName.clone(),
+                                                                        startedAt,
+                                                                        execTask,
+                                                                        logTx,
+                                                                        "you pressed Ctrl+B".to_string(),
+                                                                    )
+                                                                    .await;
+                                                                break crate::message::Content::text(message);
                                                             }
                                                             _ = cancelRx.changed() => {
                                                                 if !*cancelRx.borrow() {
@@ -2097,6 +2080,7 @@ impl Session {
                                                                 }
                                                                 tracing::info!(tool = %call.function.name, "cancelled during shell execution");
                                                                 shell.interrupt();
+                                                                let _ = (&mut execTask).await;
                                                                 self.pushToolResult(&call.id, crate::message::Content::text("Cancelled by user."));
                                                                 for remaining in &calls[callIdx + 1..] {
                                                                     self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
@@ -3165,6 +3149,7 @@ impl Session {
                 };
                 match killResult {
                     Ok(()) => {
+                        self.stopMonitorsForTerminal(name, logTx).await;
                         // TerminalClosed is needed regardless — the deck must
                         // know to drop the tab.
                         let _ = logTx
@@ -3183,19 +3168,392 @@ impl Session {
                 let mut out = String::from("Terminals:\n");
                 for info in infos {
                     let active = if info.activeForAgent { " (active)" } else { "" };
+                    let busy = if info.busy { " busy" } else { "" };
                     let by = match info.spawnedBy {
                         SpawnedBy::User => "user",
                         SpawnedBy::Agent => "agent",
                     };
                     out.push_str(&format!(
-                        "  {} — by {}, age {}s{}\n",
-                        info.name, by, info.ageSecs, active
+                        "  {} — by {}, age {}s{}{}\n",
+                        info.name, by, info.ageSecs, active, busy
                     ));
                 }
                 out
             }
+            tool::ToolAction::TerminalRunList => {
+                let runs = match self.listTerminalRuns() {
+                    Ok(runs) => runs,
+                    Err(e) => return format!("Failed to list terminal runs: {e}"),
+                };
+                if runs.is_empty() {
+                    return "No terminal runs archived yet.".into();
+                }
+                let mut out = String::from("Terminal runs:\n");
+                for run in runs.into_iter().take(50) {
+                    let exit = run
+                        .exitCode
+                        .map(|c| format!(" exit {c}"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "  {} [{}{}] {} · terminal={} · impact={} · lines={}\n",
+                        run.runId,
+                        run.status,
+                        exit,
+                        run.purpose,
+                        run.terminalName,
+                        run.impact,
+                        run.lineCount,
+                    ));
+                }
+                out
+            }
+            tool::ToolAction::TerminalRunStop { runId } => {
+                let conn = match crate::storage::openSessionDb(self.transcript.sessionDir()) {
+                    Ok(conn) => conn,
+                    Err(e) => return format!("Failed to open terminal-run archive: {e}"),
+                };
+                let Some(run) = (match crate::storage::getTerminalRun(&conn, runId) {
+                    Ok(run) => run,
+                    Err(e) => return format!("Failed to read terminal run {runId}: {e}"),
+                }) else {
+                    return format!("No terminal run with id {runId}.");
+                };
+                if run.status != "running" {
+                    return format!(
+                        "Terminal run {runId} is already {} — no signal sent.",
+                        run.status
+                    );
+                }
+                let shell = {
+                    let guard = self.shells.lock().await;
+                    guard.shellFor(Some(&run.terminalName))
+                };
+                let Some(shell) = shell else {
+                    return format!(
+                        "Terminal run {runId} is marked running, but terminal '{}' is no longer live.",
+                        run.terminalName
+                    );
+                };
+                shell.interrupt();
+                format!(
+                    "Sent interrupt to terminal run {runId} in terminal '{}'.",
+                    run.terminalName
+                )
+            }
             _ => unreachable!("non-registry action passed to executeTerminalTool"),
         }
+    }
+
+    /// Spawn a visible terminal-backed async shell run. This replaces the
+    /// old `JobPlane` bash path for `shell(runInBackground: true)`.
+    async fn spawnTerminalRun(
+        &mut self,
+        command: String,
+        purpose: String,
+        impact: crate::tool::ShellImpact,
+        timeout: Option<u64>,
+        requestedTerminal: Option<String>,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) -> String {
+        let runId = crate::transcript::randomHexId("run");
+        let startedAt = unixNow();
+        let sessionDir = self.transcript.sessionDir().to_path_buf();
+
+        let (terminalName, shell, ephemeral) = match requestedTerminal {
+            Some(name) => {
+                let guard = self.shells.lock().await;
+                let Some(shell) = guard.shellFor(Some(&name)) else {
+                    return format!(
+                        "No terminal named '{name}'. Use terminalList to see available terminals."
+                    );
+                };
+                if shell.isBusy() {
+                    return format!(
+                        "Terminal '{name}' is busy; wait for it to finish or choose another terminal."
+                    );
+                }
+                (name, shell, false)
+            }
+            None => {
+                let spawnResult = {
+                    let mut guard = self.shells.lock().await;
+                    guard.spawn(None, SpawnedBy::Agent).await
+                };
+                let name = match spawnResult {
+                    Ok(name) => name,
+                    Err(e) => return format!("Failed to spawn ephemeral terminal: {e}"),
+                };
+                let shell = {
+                    let guard = self.shells.lock().await;
+                    guard.shellFor(Some(&name))
+                };
+                let Some(shell) = shell else {
+                    return format!("Failed to resolve ephemeral terminal '{name}' after spawn.");
+                };
+                (name, shell, true)
+            }
+        };
+
+        let impactString = shellImpactStorageName(&impact).to_string();
+        let initialRecord = crate::storage::TerminalRunRecord {
+            runId: runId.clone(),
+            terminalName: terminalName.clone(),
+            command: command.clone(),
+            purpose: if purpose.trim().is_empty() {
+                command.clone()
+            } else {
+                purpose.clone()
+            },
+            impact: impactString.clone(),
+            ephemeral,
+            startedAt,
+            endedAt: None,
+            status: "running".into(),
+            exitCode: None,
+            lineCount: 0,
+            replayBlob: Vec::new(),
+        };
+        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
+            if let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord) {
+                tracing::warn!("failed to record terminal run start: {e}");
+            }
+        }
+
+        let (wakeId, fireTx) = {
+            let mut g = self.wakes.lock().await;
+            let wid = g.registerTerminalRun(&runId, logTx);
+            (wid, g.fireSender())
+        };
+
+        let wakes = self.wakes.clone();
+        let shells = self.shells.clone();
+        let monitors = self.monitors.clone();
+        let logTxClone = logTx.clone();
+        let runIdForTask = runId.clone();
+        let terminalForTask = terminalName.clone();
+        let commandForTask = command.clone();
+        let purposeForTask = initialRecord.purpose.clone();
+        tokio::spawn(async move {
+            let dur = timeout.map(std::time::Duration::from_secs);
+            let exec = shell.executeDetailed(&commandForTask, dur).await;
+            let status = if exec.output.starts_with("Terminal is busy") {
+                "rejected"
+            } else if exec.timedOut && exec.exitCode.is_none() {
+                "timed_out"
+            } else if exec.exitCode.unwrap_or(0) == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
+            let completed = crate::storage::TerminalRunRecord {
+                runId: runIdForTask.clone(),
+                terminalName: terminalForTask.clone(),
+                command: commandForTask.clone(),
+                purpose: purposeForTask.clone(),
+                impact: impactString,
+                ephemeral,
+                startedAt,
+                endedAt: Some(unixNow()),
+                status: status.into(),
+                exitCode: exec.exitCode,
+                lineCount: exec.lineCount,
+                replayBlob: exec.replayBytes.clone(),
+            };
+            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
+                if let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed) {
+                    tracing::warn!("failed to record terminal run completion: {e}");
+                }
+            }
+
+            let payload = format!(
+                "terminal run {runIdForTask} in {terminalForTask} finished with status {status}{}.\n{}",
+                exec.exitCode
+                    .map(|c| format!(" (exit code {c})"))
+                    .unwrap_or_default(),
+                if exec.output.trim().is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    exec.output.lines().take(20).collect::<Vec<_>>().join("\n")
+                },
+            );
+            let _ = fireTx.send(crate::wakes::WakeFire {
+                wakeId,
+                source: format!("terminalRun#{runIdForTask}"),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload,
+                firedAt: std::time::Instant::now(),
+            });
+            wakes.lock().await.unregisterPassive(wakeId, &logTxClone);
+
+            if ephemeral {
+                let killed = {
+                    let mut guard = shells.lock().await;
+                    guard.kill(&terminalForTask)
+                };
+                if killed.is_ok() {
+                    let stopped = {
+                        let plane = monitors.lock().unwrap();
+                        plane.stopForTerminal(&terminalForTask)
+                    };
+                    for (id, wakeId) in stopped {
+                        if let Some(wid) = wakeId {
+                            wakes.lock().await.unregisterPassive(wid, &logTxClone);
+                        }
+                        let _ = logTxClone.send(LogEvent::MonitorStopped { id }).await;
+                    }
+                    let _ = logTxClone
+                        .send(LogEvent::TerminalClosed {
+                            name: terminalForTask,
+                        })
+                        .await;
+                }
+            }
+        });
+
+        format!(
+            "Started terminal run {runId} in terminal '{terminalName}': {command}\n\n\
+             It is running asynchronously in a visible terminal. You'll be notified when it completes; do not poll. Use /runs or terminalRunList to inspect archived output."
+        )
+    }
+
+    /// Terminal-owned monitor cleanup: attach-only monitors subscribe to a
+    /// visible terminal's output stream, so closing that terminal stops and
+    /// disarms every monitor attached to it.
+    async fn stopMonitorsForTerminal(&self, terminalName: &str, logTx: &mpsc::Sender<LogEvent>) {
+        let stopped = {
+            let plane = self.monitors.lock().unwrap();
+            plane.stopForTerminal(terminalName)
+        };
+        for (id, wakeId) in stopped {
+            if let Some(wid) = wakeId {
+                self.wakes.lock().await.unregisterPassive(wid, logTx);
+            }
+            let _ = logTx.send(LogEvent::MonitorStopped { id }).await;
+        }
+    }
+
+    /// Detach an already-running visible terminal command into the terminal
+    /// run archive. This is the timeout/Ctrl+B path: the command keeps
+    /// running in the same terminal and the model turn gets the run id
+    /// immediately, with no hidden respawn.
+    async fn detachTerminalRunJoin(
+        &mut self,
+        command: String,
+        purpose: String,
+        impact: crate::tool::ShellImpact,
+        terminalName: String,
+        startedAt: u64,
+        execTask: tokio::task::JoinHandle<crate::shell::CommandExecution>,
+        logTx: &mpsc::Sender<LogEvent>,
+        trigger: String,
+    ) -> String {
+        let runId = crate::transcript::randomHexId("run");
+        let sessionDir = self.transcript.sessionDir().to_path_buf();
+        let impactString = shellImpactStorageName(&impact).to_string();
+        let purpose = if purpose.trim().is_empty() {
+            command.clone()
+        } else {
+            purpose
+        };
+
+        let initialRecord = crate::storage::TerminalRunRecord {
+            runId: runId.clone(),
+            terminalName: terminalName.clone(),
+            command: command.clone(),
+            purpose: purpose.clone(),
+            impact: impactString.clone(),
+            ephemeral: false,
+            startedAt,
+            endedAt: None,
+            status: "running".into(),
+            exitCode: None,
+            lineCount: 0,
+            replayBlob: Vec::new(),
+        };
+        if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
+            if let Err(e) = crate::storage::upsertTerminalRun(&conn, &initialRecord) {
+                tracing::warn!("failed to record detached terminal run start: {e}");
+            }
+        }
+
+        let (wakeId, fireTx) = {
+            let mut g = self.wakes.lock().await;
+            let wid = g.registerTerminalRun(&runId, logTx);
+            (wid, g.fireSender())
+        };
+
+        let wakes = self.wakes.clone();
+        let logTxClone = logTx.clone();
+        let runIdForTask = runId.clone();
+        let terminalForTask = terminalName.clone();
+        let commandForTask = command.clone();
+        let purposeForTask = purpose.clone();
+        tokio::spawn(async move {
+            let exec = match execTask.await {
+                Ok(exec) => exec,
+                Err(e) => crate::shell::CommandExecution {
+                    command: commandForTask.clone(),
+                    output: format!("Terminal run task failed to join: {e}"),
+                    exitCode: None,
+                    lineCount: 1,
+                    replayBytes: Vec::new(),
+                    timedOut: false,
+                },
+            };
+            let status = if exec.output.starts_with("Terminal is busy") {
+                "rejected"
+            } else if exec.timedOut && exec.exitCode.is_none() {
+                "timed_out"
+            } else if exec.exitCode.unwrap_or(0) == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
+            let completed = crate::storage::TerminalRunRecord {
+                runId: runIdForTask.clone(),
+                terminalName: terminalForTask.clone(),
+                command: commandForTask.clone(),
+                purpose: purposeForTask,
+                impact: impactString,
+                ephemeral: false,
+                startedAt,
+                endedAt: Some(unixNow()),
+                status: status.into(),
+                exitCode: exec.exitCode,
+                lineCount: exec.lineCount,
+                replayBlob: exec.replayBytes.clone(),
+            };
+            if let Ok(conn) = crate::storage::openSessionDb(&sessionDir) {
+                if let Err(e) = crate::storage::upsertTerminalRun(&conn, &completed) {
+                    tracing::warn!("failed to record detached terminal run completion: {e}");
+                }
+            }
+
+            let payload = format!(
+                "terminal run {runIdForTask} in {terminalForTask} finished with status {status}{}.\n{}",
+                exec.exitCode
+                    .map(|c| format!(" (exit code {c})"))
+                    .unwrap_or_default(),
+                if exec.output.trim().is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    exec.output.lines().take(20).collect::<Vec<_>>().join("\n")
+                },
+            );
+            let _ = fireTx.send(crate::wakes::WakeFire {
+                wakeId,
+                source: format!("terminalRun#{runIdForTask}"),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload,
+                firedAt: std::time::Instant::now(),
+            });
+            wakes.lock().await.unregisterPassive(wakeId, &logTxClone);
+        });
+
+        format!(
+            "DETACHED_TERMINAL_RUN: {trigger}. The command is still running in terminal '{terminalName}' as run {runId}.\n\n\
+             You will be notified when it completes; do not poll. Use /runs or terminalRunList to inspect archived output."
+        )
     }
 
     /// Handle the task-plane tools: backgrounded `shell` calls
@@ -3210,44 +3568,21 @@ impl Session {
         match action {
             tool::ToolAction::Shell {
                 command,
+                explanation,
+                impact,
+                timeout,
+                terminal,
                 runInBackground: true,
-                ..
             } => {
-                // Reserve the job id, register the wake against it,
-                // THEN spawn the drainer with wakeCtx already set.
-                // This closes the attach-after-spawn race: a fast
-                // command can't complete before its wake context is
-                // installed.
-                let id = self.jobs.lock().unwrap().reserveJobId();
-                let (wakeId, fireTx) = {
-                    let mut g = self.wakes.lock().await;
-                    let wid = g.registerTaskComplete(id, logTx);
-                    (wid, g.fireSender())
-                };
-                let spawnResult = self.jobs.lock().unwrap().spawnBashWithId(
-                    id,
+                self.spawnTerminalRun(
                     command.clone(),
-                    logTx.clone(),
-                    Some(crate::jobs::TaskWakeCtx {
-                        wakeId,
-                        registry: self.wakes.clone(),
-                        fireTx,
-                    }),
-                );
-                match spawnResult {
-                    Ok(_) => format!(
-                        "Spawned job #{id}: {command}\n\nThe command is running \
-                         in the background. You'll be notified when it completes; \
-                         do not poll. Call jobOutput(jobId: {id}) only if you \
-                         want a mid-flight peek."
-                    ),
-                    Err(e) => {
-                        // Spawn failed — roll back the wake registration
-                        // so /jobs schedules doesn't show a phantom row.
-                        self.wakes.lock().await.unregisterPassive(wakeId, logTx);
-                        format!("Failed to spawn job: {e}")
-                    }
-                }
+                    explanation.clone(),
+                    impact.clone(),
+                    *timeout,
+                    terminal.clone(),
+                    logTx,
+                )
+                .await
             }
             tool::ToolAction::JobOutput {
                 jobId,
@@ -3288,8 +3623,7 @@ impl Session {
     }
 
     /// Handle the monitor-plane tools (Monitor / MonitorStop /
-    /// MonitorList). Routes through `self.monitors` (and `self.jobs`
-    /// for the backing bash drainer).
+    /// MonitorList). Monitors attach to existing terminal output streams.
     async fn executeMonitorTool(
         &mut self,
         action: &tool::ToolAction,
@@ -3298,9 +3632,21 @@ impl Session {
         match action {
             tool::ToolAction::Monitor {
                 description,
-                command,
+                terminal,
                 filter,
             } => {
+                let (terminalName, shell) = {
+                    let guard = self.shells.lock().await;
+                    let name = terminal
+                        .clone()
+                        .unwrap_or_else(|| guard.activeForAgent().to_string());
+                    let Some(shell) = guard.shellFor(Some(&name)) else {
+                        return format!(
+                            "No terminal named '{name}'. Use terminalList to see available terminals."
+                        );
+                    };
+                    (name, shell)
+                };
                 // Reserve monitor id, register the passive wake
                 // against it, THEN call registerWithId so the per-line
                 // callback sees wakeCtx from match #1. Eliminates the
@@ -3316,10 +3662,10 @@ impl Session {
                     plane.registerWithId(
                         id,
                         description.clone(),
-                        command.clone(),
+                        terminalName.clone(),
                         filter.clone(),
                         crate::monitors::DEFAULT_AUTOSTOP_EPS,
-                        &self.jobs,
+                        shell,
                         logTx.clone(),
                         Some(crate::monitors::MonitorWakeCtx {
                             wakeId,
@@ -3331,10 +3677,9 @@ impl Session {
                 match result {
                     Ok(_) => format!(
                         "Registered monitor #{id} \"{description}\" with filter /{filter}/.\n\n\
-                         Watching: {command}\n\n\
+                         Watching terminal: {terminalName}\n\n\
                          You'll be notified when matches arrive (do not poll). \
-                         Use monitorList to check event counts, monitorStop({id}) to \
-                         stop. The underlying bash job is also tracked in jobList."
+                         Use monitorList to check event counts, monitorStop({id}) to stop."
                     ),
                     Err(e) => {
                         // Register failed — roll back the passive wake.
@@ -3350,7 +3695,7 @@ impl Session {
                 let wakeId = self.monitors.lock().unwrap().takeWakeId(*monitorId);
                 let stopResult = {
                     let plane = self.monitors.lock().unwrap();
-                    plane.stop(*monitorId, &self.jobs)
+                    plane.stop(*monitorId)
                 };
                 match stopResult {
                     Ok(()) => {
@@ -4379,6 +4724,12 @@ impl Session {
         }
     }
 
+    /// List archived visible terminal runs for `/runs`.
+    pub fn listTerminalRuns(&self) -> Result<Vec<crate::storage::TerminalRunRecord>> {
+        let conn = crate::storage::openSessionDb(self.transcript.sessionDir())?;
+        crate::storage::listTerminalRuns(&conn)
+    }
+
     /// Format the cost breakdown as a text report.
     pub fn formatCostBreakdown(&self) -> String {
         let mut out = String::new();
@@ -5146,19 +5497,11 @@ fn formatMonitorList(monitors: &[crate::monitors::MonitorInfo]) -> String {
             Some(t) => format!("{}s ago", t.elapsed().as_secs()),
             None => "never".into(),
         };
-        let cmdPreview = if info.command.len() > 60 {
-            format!(
-                "{}\u{2026}",
-                &info.command[..info.command.floor_char_boundary(60)]
-            )
-        } else {
-            info.command.clone()
-        };
         out.push_str(&format!(
-            "  #{} \"{}\" {} | /{}/ \u{2014} {} \u{00B7} {} events \u{00B7} last {}\n",
+            "  #{} \"{}\" terminal {} | /{}/ \u{2014} {} \u{00B7} {} events \u{00B7} last {}\n",
             info.id,
             info.description,
-            cmdPreview,
+            info.terminal,
             info.filter,
             stateLabel,
             info.eventCount,
