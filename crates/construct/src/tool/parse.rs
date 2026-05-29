@@ -1,6 +1,6 @@
 use super::{EditOp, ShellImpact, ToolAction, ToolParseError};
 
-pub type ToolParseResult<T> = std::result::Result<T, ToolParseError>;
+type ToolParseResult<T> = std::result::Result<T, ToolParseError>;
 
 fn reqString(args: &serde_json::Value, field: &'static str) -> ToolParseResult<String> {
     match &args[field] {
@@ -161,7 +161,7 @@ fn validateStringEnum(
 ///
 /// Returns Err with structured missing/malformed required-field details.
 /// The error's Display text is sent back to the model as the tool result so it can retry.
-pub fn parse(name: &str, argsJson: &str) -> ToolParseResult<ToolAction> {
+pub fn parse(name: &str, argsJson: &str) -> std::result::Result<ToolAction, ToolParseError> {
     let args: serde_json::Value =
         serde_json::from_str(argsJson).map_err(|e| ToolParseError::MalformedJson(e.to_string()))?;
 

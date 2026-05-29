@@ -291,7 +291,7 @@ pub fn summarize(action: &ToolAction) -> String {
 ///
 /// Returns a diff string for `editFile` and `writeFile` actions,
 /// or `None` for everything else.
-pub fn diffPreview(action: &ToolAction) -> Option<String> {
+pub(crate) fn diffPreview(action: &ToolAction) -> Option<String> {
     match action {
         ToolAction::EditFile {
             path,
@@ -373,7 +373,7 @@ pub fn diffPreview(action: &ToolAction) -> Option<String> {
 /// Returns (path, proposed_content) for editFile/writeFile/multiEdit,
 /// or None for all other actions. Used to send early LSP didChange
 /// while the user is reviewing the approval prompt.
-pub fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
+pub(crate) fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
     match action {
         ToolAction::WriteFile { path, content } => Some((path.clone(), content.clone())),
         ToolAction::EditFile {

@@ -55,8 +55,8 @@ mod subagent;
 mod terminal;
 mod tools;
 
-pub use request::{Attachment, Rider, UserInput};
-use request::{buildRequestMessages, buildRiders};
+pub use request::{Attachment, UserInput};
+use request::{Rider, buildRequestMessages, buildRiders};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShellResolveError {

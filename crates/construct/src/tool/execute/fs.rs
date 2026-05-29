@@ -340,7 +340,7 @@ pub(in crate::tool) enum ImageFormat {
 }
 
 impl ImageFormat {
-    pub fn mimeType(&self) -> &'static str {
+    fn mimeType(&self) -> &'static str {
         match self {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",

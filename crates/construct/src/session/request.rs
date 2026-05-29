@@ -38,13 +38,13 @@ impl From<String> for UserInput {
 /// All active riders render into a single `<CRITICAL_INSTRUCTIONS>` block
 /// placed above the user's text in the API request copy only.
 #[derive(Debug, Clone)]
-pub struct Rider {
+pub(super) struct Rider {
     /// Tag name used inside the `<CRITICAL_INSTRUCTIONS>` wrapper
     /// (e.g. `"THINKING"`, `"MODE"`). Kept as a `&'static str` so each
     /// rider's identity is fixed at compile time.
-    pub id: &'static str,
+    pub(super) id: &'static str,
     /// Body text. Must not contain the outer wrapper tags.
-    pub content: String,
+    pub(super) content: String,
 }
 
 /// Build the active rider list for a session from its config.

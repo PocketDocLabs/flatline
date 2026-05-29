@@ -1,7 +1,7 @@
 use crate::message::ToolDef;
 
 /// Returns the built-in tool definitions to send to the LLM.
-pub fn builtinDefs() -> Vec<ToolDef> {
+pub(crate) fn builtinDefs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             defType: "function".into(),

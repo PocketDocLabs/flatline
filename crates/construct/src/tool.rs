@@ -6,8 +6,8 @@
 //! (rg, sg, git) to keep work off the shared terminal.
 //!
 //! # Public API
-//! - [`builtinDefs`] - returns tool definitions for the LLM
-//! - [`execute`] - execute a parsed tool action
+//! - [`parse`] - parse a tool call into a typed action
+//! - [`summarize`] - format a short tool action summary
 //!
 //! # Dependencies
 //! `serde_json`, `regex`, `similar`, `tokio::process`
@@ -18,15 +18,17 @@ mod execute;
 mod parse;
 mod presentation;
 
-pub use action::{
-    EditOp, ShellImpact, ToolAction, ToolParseError, ToolSet, filterDefs, needsJobPlane, needsLsp,
-    needsMcp, needsMonitor, needsRegistry, needsTask, needsTranscript, needsWakes, needsWeb,
+pub use action::{EditOp, ShellImpact, ToolAction, ToolParseError, ToolSet};
+pub(crate) use action::{
+    filterDefs, needsJobPlane, needsLsp, needsMcp, needsMonitor, needsRegistry, needsTask,
+    needsTranscript, needsWakes, needsWeb,
 };
-pub use defs::builtinDefs;
-pub use execute::execute;
+pub(crate) use defs::builtinDefs;
+pub(crate) use execute::execute;
 pub(crate) use execute::truncateOutput;
-pub use parse::{ToolParseResult, parse};
-pub use presentation::{diffPreview, proposedContent, summarize};
+pub use parse::parse;
+pub use presentation::summarize;
+pub(crate) use presentation::{diffPreview, proposedContent};
 
 #[cfg(test)]
 use self::execute::{FileKind, ImageFormat, SubprocessError, classifyFile, executeReadFile};

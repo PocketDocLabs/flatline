@@ -42,7 +42,7 @@ const SUBPROCESS_TIMEOUT_SECS: u64 = 30;
 /// `terminalName` is the resolved display name of the shell (e.g. "main",
 /// "build") so per-terminal tools can label their output. Caller passes
 /// `action.terminal().unwrap_or(active_name)`.
-pub async fn execute(
+pub(crate) async fn execute(
     action: &ToolAction,
     shell: &Shell,
     terminalName: &str,

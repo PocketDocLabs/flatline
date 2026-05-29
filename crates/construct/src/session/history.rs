@@ -21,7 +21,7 @@ impl Session {
     }
 
     /// Load turns on the active branch by walking the parent-child chain.
-    pub fn loadBranchTurns(&self) -> Result<Vec<crate::transcript::Turn>> {
+    fn loadBranchTurns(&self) -> Result<Vec<crate::transcript::Turn>> {
         let headId = match &self.headTurnId {
             Some(id) => id.clone(),
             None => return Ok(Vec::new()),
@@ -165,7 +165,7 @@ impl Session {
 
     /// Persist session metadata to disk. Called after each user message
     /// so that `/resume` can discover and list sessions.
-    pub fn updateMeta(&self) {
+    pub(super) fn updateMeta(&self) {
         let existingMeta = Transcript::loadMeta(self.transcript.sessionDir()).ok();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

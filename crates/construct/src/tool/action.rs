@@ -335,7 +335,7 @@ pub enum ToolSet {
 }
 
 /// Filter tool definitions by a ToolSet.
-pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
+pub(crate) fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
     // Terminal-management tools are excluded from subagent toolsets in
     // phase 1 — child sessions stay single-shell.
     const SUBAGENT_DENIED: &[&str] = &[
@@ -393,13 +393,13 @@ pub fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
 }
 
 /// Whether this action is a subagent task (handled by Session, not execute()).
-pub fn needsTask(action: &ToolAction) -> bool {
+pub(crate) fn needsTask(action: &ToolAction) -> bool {
     matches!(action, ToolAction::Task { .. })
 }
 
 /// Whether this action mutates the shell registry (handled by Session,
 /// not `execute()`). Includes terminal management tools.
-pub fn needsRegistry(action: &ToolAction) -> bool {
+pub(crate) fn needsRegistry(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::TerminalSpawn { .. }
@@ -414,7 +414,7 @@ pub fn needsRegistry(action: &ToolAction) -> bool {
 /// Whether this action touches async task state (handled by Session, not
 /// `execute()`). `Shell { runInBackground: true, .. }` belongs here so it can
 /// become a visible terminal-backed run instead of a blocking foreground call.
-pub fn needsJobPlane(action: &ToolAction) -> bool {
+pub(crate) fn needsJobPlane(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::Shell {
@@ -429,7 +429,7 @@ pub fn needsJobPlane(action: &ToolAction) -> bool {
 /// True for actions that the MonitorPlane handles. Routed separately
 /// from task handling because monitors are terminal-output subscriptions, not
 /// command execution.
-pub fn needsMonitor(action: &ToolAction) -> bool {
+pub(crate) fn needsMonitor(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::Monitor { .. } | ToolAction::MonitorStop { .. } | ToolAction::MonitorList,
@@ -437,7 +437,7 @@ pub fn needsMonitor(action: &ToolAction) -> bool {
 }
 
 /// True for actions that the WakeRegistry handles (schedule/cron/fs).
-pub fn needsWakes(action: &ToolAction) -> bool {
+pub(crate) fn needsWakes(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::ScheduleWakeup { .. }
@@ -449,7 +449,7 @@ pub fn needsWakes(action: &ToolAction) -> bool {
 }
 
 /// Check if a tool action requires transcript access (handled by session, not here).
-pub fn needsTranscript(action: &ToolAction) -> bool {
+pub(crate) fn needsTranscript(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. }
@@ -457,16 +457,16 @@ pub fn needsTranscript(action: &ToolAction) -> bool {
 }
 
 /// Check if a tool action is an MCP tool (handled by session, not here).
-pub fn needsLsp(action: &ToolAction) -> bool {
+pub(crate) fn needsLsp(action: &ToolAction) -> bool {
     matches!(action, ToolAction::Diagnostics { .. })
 }
 
-pub fn needsMcp(action: &ToolAction) -> bool {
+pub(crate) fn needsMcp(action: &ToolAction) -> bool {
     matches!(action, ToolAction::Mcp { .. })
 }
 
 /// Check if a tool action requires the web client (handled by session, not here).
-pub fn needsWeb(action: &ToolAction) -> bool {
+pub(crate) fn needsWeb(action: &ToolAction) -> bool {
     matches!(
         action,
         ToolAction::WebSearch { .. } | ToolAction::WebFetch { .. } | ToolAction::WebSimilar { .. }
@@ -477,7 +477,7 @@ impl ToolAction {
     /// Optional target terminal for shell-using actions.
     /// Returns `None` for all non-shell actions and for shell actions
     /// without an explicit `terminal` field (which resolves to active).
-    pub fn terminal(&self) -> Option<&str> {
+    pub(crate) fn terminal(&self) -> Option<&str> {
         match self {
             ToolAction::Shell { terminal, .. }
             | ToolAction::ShellHistory { terminal }
