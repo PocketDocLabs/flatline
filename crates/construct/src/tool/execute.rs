@@ -1,0 +1,2251 @@
+use std::fmt;
+
+use crate::shell::Shell;
+
+use super::{EditOp, ToolAction};
+
+const MAX_READ_LINES: usize = 2000;
+const MAX_READ_BYTES: usize = 100_000;
+const MAX_LINE_LENGTH: usize = 2000;
+const MAX_GLOB_RESULTS: usize = 100;
+const MAX_GREP_FILES: usize = 100;
+const MAX_GREP_CONTENT_LINES: usize = 200;
+const MAX_LISTDIR_ENTRIES: usize = 200;
+const MAX_STRUCT_MATCHES: usize = 50;
+const MAX_FUZZY_RESULTS: usize = 20;
+const MAX_OUTLINE_ENTRIES: usize = 100;
+const MAX_RELATED_FILES: usize = 50;
+const SUBPROCESS_TIMEOUT_SECS: u64 = 30;
+
+/// Execute a tool action and return the content (text or multimodal).
+///
+/// `terminalName` is the resolved display name of the shell (e.g. "main",
+/// "build") so per-terminal tools can label their output. Caller passes
+/// `action.terminal().unwrap_or(active_name)`.
+pub async fn execute(
+    action: &ToolAction,
+    shell: &Shell,
+    terminalName: &str,
+) -> crate::message::Content {
+    match action {
+        ToolAction::Shell {
+            command,
+            timeout,
+            runInBackground,
+            ..
+        } => {
+            // Background shell calls are routed by the Session so they can
+            // become visible terminal-backed runs. If we got one here, it's
+            // a bug.
+            if *runInBackground {
+                return crate::message::Content::text(
+                    "Error: background shell calls must be executed through the session.",
+                );
+            }
+            let dur = timeout.map(std::time::Duration::from_secs);
+            let raw = shell.execute(command, dur).await;
+            // Apply same size guard as readFile. Full output is in shell history.
+            let index = shell.historyLen().saturating_sub(1);
+            crate::message::Content::text(truncateOutput(&raw, index, terminalName))
+        }
+        ToolAction::ReadFile {
+            path,
+            offset,
+            limit,
+            anchor,
+        } => executeReadFile(path, *offset, *limit, *anchor),
+        ToolAction::WriteFile { path, content } => executeWriteFile(path, content).into(),
+        ToolAction::EditFile {
+            path,
+            oldString,
+            newString,
+            replaceAll,
+        } => executeEditFile(path, oldString, newString, *replaceAll).into(),
+        ToolAction::MultiEdit { path, edits } => executeMultiEdit(path, edits).into(),
+        ToolAction::CopyFile {
+            src,
+            dest,
+            overwrite,
+        } => executeCopyFile(src, dest, *overwrite).into(),
+        ToolAction::MoveFile {
+            src,
+            dest,
+            overwrite,
+        } => executeMoveFile(src, dest, *overwrite).into(),
+        ToolAction::DeleteFile { path, recursive } => executeDeleteFile(path, *recursive).into(),
+        ToolAction::MakeDirs { path } => executeMakeDirs(path).into(),
+        ToolAction::ShellHistory { .. } => executeShellHistory(shell, terminalName).into(),
+        ToolAction::ReadOutput {
+            index,
+            offset,
+            limit,
+            ..
+        } => executeReadOutput(shell, *index, *offset, *limit, terminalName).into(),
+        ToolAction::SearchOutput {
+            index,
+            pattern,
+            context,
+            ..
+        } => executeSearchOutput(shell, *index, pattern, *context, terminalName).into(),
+        ToolAction::ReadTerminal { lines, .. } => shell.readTerminal(*lines).into(),
+        // Terminal management is handled by Session (needs ShellRegistry).
+        ToolAction::TerminalSpawn { .. }
+        | ToolAction::TerminalSwitch { .. }
+        | ToolAction::TerminalKill { .. }
+        | ToolAction::TerminalList
+        | ToolAction::TerminalRunList
+        | ToolAction::TerminalRunStop { .. } => crate::message::Content::text(
+            "Error: terminal tools must be executed through the session.",
+        ),
+        // Task and monitor tools are handled by Session (need direct access
+        // to JobPlane / MonitorPlane and logTx).
+        ToolAction::JobOutput { .. }
+        | ToolAction::JobStop { .. }
+        | ToolAction::JobList
+        | ToolAction::Monitor { .. }
+        | ToolAction::MonitorStop { .. }
+        | ToolAction::MonitorList => crate::message::Content::text(
+            "Error: task/monitor tools must be executed through the session.",
+        ),
+        // Wake registry tools are handled by Session (need direct
+        // access to WakeRegistry).
+        ToolAction::ScheduleWakeup { .. }
+        | ToolAction::CronCreate { .. }
+        | ToolAction::CronList
+        | ToolAction::CronDelete { .. }
+        | ToolAction::FileWatch { .. } => {
+            crate::message::Content::text("Error: wake tools must be executed through the session.")
+        }
+        ToolAction::Glob {
+            pattern,
+            path,
+            metadata,
+        } => executeGlob(pattern, path.as_deref(), *metadata)
+            .await
+            .into(),
+        ToolAction::Grep {
+            pattern,
+            path,
+            include,
+            fileType,
+            outputMode,
+            caseSensitive,
+            contextLines,
+            multiline,
+        } => executeGrep(
+            pattern,
+            path.as_deref(),
+            include.as_deref(),
+            fileType.as_deref(),
+            outputMode,
+            *caseSensitive,
+            *contextLines,
+            *multiline,
+        )
+        .await
+        .into(),
+        ToolAction::ListDir {
+            path,
+            depth,
+            offset,
+            limit,
+            metadata,
+        } => executeListDir(path, *depth, *offset, *limit, *metadata).into(),
+        ToolAction::StructSearch {
+            pattern,
+            language,
+            path,
+        } => executeStructSearch(pattern, language, path.as_deref())
+            .await
+            .into(),
+        ToolAction::Diff {
+            path,
+            gitRef,
+            pathA,
+            pathB,
+        } => executeDiff(
+            path.as_deref(),
+            gitRef.as_deref(),
+            pathA.as_deref(),
+            pathB.as_deref(),
+        )
+        .await
+        .into(),
+        ToolAction::FuzzyFind { query, path } => {
+            executeFuzzyFind(query, path.as_deref()).await.into()
+        }
+        ToolAction::FileOutline { path } => executeFileOutline(path).await.into(),
+        ToolAction::ViewSymbol { file, symbol } => executeViewSymbol(file, symbol).await.into(),
+        ToolAction::RelatedFiles { path } => executeRelatedFiles(path).into(),
+        // Web tools are handled by session.rs (need ExaClient + cache).
+        ToolAction::WebSearch { .. }
+        | ToolAction::WebFetch { .. }
+        | ToolAction::WebSimilar { .. } => {
+            crate::message::Content::text("Error: web tools must be executed through the session.")
+        }
+        // History tools are handled by session.rs (need transcript access).
+        ToolAction::HistoryFetch { .. } | ToolAction::HistorySearch { .. } => {
+            crate::message::Content::text(
+                "Error: history tools must be executed through the session.",
+            )
+        }
+        // LSP diagnostics are handled by session.rs (need LspManager).
+        ToolAction::Diagnostics { .. } => crate::message::Content::text(
+            "Error: diagnostics tool must be executed through the session.",
+        ),
+        // MCP tools are handled by session.rs (need McpManager).
+        ToolAction::Mcp { .. } => {
+            crate::message::Content::text("Error: MCP tools must be executed through the session.")
+        }
+        // Task tools are handled by session.rs (need to spawn child session).
+        ToolAction::Task { .. } => {
+            crate::message::Content::text("Error: task tools must be executed through the session.")
+        }
+        ToolAction::Unknown { name, .. } => {
+            crate::message::Content::text(format!("Unknown tool: {name}"))
+        }
+    }
+}
+
+/// Truncate shell output into a head/middle/tail three-piece slice with
+/// a reference to readOutput for the rest.
+///
+/// Tail-weighted (20/10/70) because for shell output the **tail** is
+/// where the signal lives — exit codes, error summaries, final state.
+/// Head gives setup context; a middle sample helps the model tell
+/// whether something interesting sits in the elided range.
+pub(crate) fn truncateOutput(raw: &str, historyIndex: usize, terminalName: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let totalLines = lines.len();
+
+    if totalLines <= MAX_READ_LINES && raw.len() <= MAX_READ_BYTES {
+        return raw.to_string();
+    }
+
+    const HEAD_RATIO: f64 = 0.20;
+    const MIDDLE_RATIO: f64 = 0.10;
+    // Tail takes the remainder (~0.70).
+
+    let headLineBudget = (MAX_READ_LINES as f64 * HEAD_RATIO) as usize;
+    let midLineBudget = (MAX_READ_LINES as f64 * MIDDLE_RATIO) as usize;
+    let tailLineBudget = MAX_READ_LINES - headLineBudget - midLineBudget;
+
+    let headByteBudget = (MAX_READ_BYTES as f64 * HEAD_RATIO) as usize;
+    let midByteBudget = (MAX_READ_BYTES as f64 * MIDDLE_RATIO) as usize;
+    let tailByteBudget = MAX_READ_BYTES - headByteBudget - midByteBudget;
+
+    // Emit lines in `start..end` until either budget is hit. Each line
+    // is clipped to MAX_LINE_LENGTH before being counted. Returns the
+    // emitted text and the index of the first line NOT emitted.
+    fn emitSlice(
+        lines: &[&str],
+        start: usize,
+        end: usize,
+        lineBudget: usize,
+        byteBudget: usize,
+    ) -> (String, usize) {
+        let mut out = String::new();
+        let mut emitted = 0usize;
+        let mut bytes = 0usize;
+        let mut idx = start;
+        while idx < end && emitted < lineBudget {
+            let line = lines[idx];
+            let display = if line.len() > MAX_LINE_LENGTH {
+                format!("{}...\n", &line[..MAX_LINE_LENGTH])
+            } else {
+                format!("{line}\n")
+            };
+            if bytes + display.len() > byteBudget {
+                break;
+            }
+            bytes += display.len();
+            out.push_str(&display);
+            emitted += 1;
+            idx += 1;
+        }
+        (out, idx)
+    }
+
+    // Head: first N lines.
+    let (head, headEnd) = emitSlice(&lines, 0, totalLines, headLineBudget, headByteBudget);
+
+    // Middle: window centered on the midpoint of the full output. Clamp
+    // the start past headEnd so the sections never overlap.
+    let midCenter = totalLines / 2;
+    let midStart = midCenter.saturating_sub(midLineBudget / 2).max(headEnd);
+    let (middle, midEnd) = emitSlice(&lines, midStart, totalLines, midLineBudget, midByteBudget);
+
+    // Tail: last N lines. Clamp past midEnd so they can't overlap.
+    let tailStart = totalLines.saturating_sub(tailLineBudget).max(midEnd);
+    let (tail, _tailEnd) = emitSlice(
+        &lines,
+        tailStart,
+        totalLines,
+        tailLineBudget,
+        tailByteBudget,
+    );
+
+    let headElided = midStart.saturating_sub(headEnd);
+    let midElided = tailStart.saturating_sub(midEnd);
+
+    let headMarker = if headElided > 0 {
+        format!("\n... [{headElided} lines elided] ...\n\n")
+    } else {
+        String::new()
+    };
+    let midMarker = if midElided > 0 {
+        format!("\n... [{midElided} lines elided] ...\n\n")
+    } else {
+        String::new()
+    };
+
+    let hint = format!(
+        "\n[truncated \u{2014} {totalLines} total lines; \
+         use readOutput(index: {historyIndex}, terminal: \"{terminalName}\") for full output]"
+    );
+
+    format!("{head}{headMarker}{middle}{midMarker}{tail}{hint}")
+}
+
+pub(super) fn executeReadFile(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    anchor: Option<usize>,
+) -> crate::message::Content {
+    use base64::Engine;
+
+    // File type detection via first 512 bytes.
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            use std::io::Read;
+            let mut probe = [0u8; 512];
+            let probeLen = match file.read(&mut probe) {
+                Ok(n) => n,
+                Err(e) => {
+                    return crate::message::Content::text(format!("Failed to read file: {e}"));
+                }
+            };
+            match classifyFile(&probe[..probeLen]) {
+                FileKind::Image(fmt) => {
+                    let fileSize = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    if fileSize > MAX_IMAGE_BYTES {
+                        return crate::message::Content::text(format!(
+                            "Image file ({fileSize} bytes). Too large to send inline \u{2014} maximum is 4 MB."
+                        ));
+                    }
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let dataUri = format!("data:{};base64,{b64}", fmt.mimeType());
+                            return crate::message::Content::withImages(
+                                &format!("[{path}]"),
+                                vec![dataUri],
+                            );
+                        }
+                        Err(e) => {
+                            return crate::message::Content::text(format!(
+                                "Failed to read file: {e}"
+                            ));
+                        }
+                    }
+                }
+                FileKind::Binary => {
+                    return crate::message::Content::text(format!(
+                        "Binary file ({} bytes). Use shell tools to inspect.",
+                        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                    ));
+                }
+                FileKind::Text => {}
+            }
+        }
+        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return crate::message::Content::text(format!("Failed to read file: {e}")),
+    };
+
+    // Anchor mode: expand from a line based on indentation.
+    if let Some(anchorLine) = anchor {
+        return crate::message::Content::text(expandFromAnchor(&content, anchorLine));
+    }
+
+    crate::message::Content::text(formatNumberedLines(&content, offset, limit))
+}
+
+/// Format text as numbered lines with offset/limit and truncation.
+/// Shared between readFile and readOutput.
+fn formatNumberedLines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let startLine = offset.unwrap_or(1).max(1);
+    let maxLines = limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
+    let totalLines = content.lines().count();
+
+    let mut output = String::new();
+    let mut byteCount = 0usize;
+    let mut linesEmitted = 0usize;
+    let mut truncatedAt: Option<usize> = None;
+
+    for (idx, line) in content.lines().enumerate() {
+        let lineNum = idx + 1;
+        if lineNum < startLine {
+            continue;
+        }
+        if linesEmitted >= maxLines {
+            truncatedAt = Some(lineNum);
+            break;
+        }
+
+        // Cap individual line length.
+        let displayLine = if line.len() > MAX_LINE_LENGTH {
+            format!("{}\u{2026}", &line[..MAX_LINE_LENGTH])
+        } else {
+            line.to_string()
+        };
+
+        let formatted = format!("{lineNum:>6}\t{displayLine}\n");
+
+        // Check byte budget.
+        if byteCount + formatted.len() > MAX_READ_BYTES {
+            truncatedAt = Some(lineNum);
+            break;
+        }
+
+        byteCount += formatted.len();
+        output.push_str(&formatted);
+        linesEmitted += 1;
+    }
+
+    // Truncation notice.
+    if let Some(cutLine) = truncatedAt {
+        let remaining = totalLines - cutLine + 1;
+        output.push_str(&format!(
+            "\n... truncated at line {cutLine} ({remaining} more lines, {totalLines} total). \
+             Use offset/limit to read more."
+        ));
+    }
+
+    if output.is_empty() {
+        if totalLines == 0 {
+            "Empty (0 lines).".into()
+        } else {
+            format!("No content in range. Total: {totalLines} lines.")
+        }
+    } else {
+        output
+    }
+}
+
+fn executeWriteFile(path: &str, content: &str) -> String {
+    // Create parent directories if needed.
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create directories: {e}");
+    }
+    match std::fs::write(path, content) {
+        Ok(()) => format!("Wrote {} bytes to {path}", content.len()),
+        Err(e) => format!("Failed to write file: {e}"),
+    }
+}
+
+fn executeEditFile(path: &str, oldString: &str, newString: &str, replaceAll: bool) -> String {
+    if oldString == newString {
+        return "old_string and new_string are identical.".into();
+    }
+    if oldString.is_empty() {
+        return "old_string cannot be empty.".into();
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read file: {e}"),
+    };
+
+    let matchCount = content.matches(oldString).count();
+
+    if matchCount == 0 {
+        return "No match found for old_string.".into();
+    }
+
+    if !replaceAll && matchCount > 1 {
+        return format!(
+            "Found {matchCount} matches for old_string. \
+             Provide more context to make a unique match, or set replace_all to true."
+        );
+    }
+
+    let newContent = if replaceAll {
+        content.replace(oldString, newString)
+    } else {
+        content.replacen(oldString, newString, 1)
+    };
+
+    match std::fs::write(path, &newContent) {
+        Ok(()) => {
+            if replaceAll && matchCount > 1 {
+                format!("Replaced {matchCount} occurrences in {path}.")
+            } else {
+                format!("Applied edit to {path}.")
+            }
+        }
+        Err(e) => format!("Failed to write file: {e}"),
+    }
+}
+
+fn executeMultiEdit(path: &str, edits: &[EditOp]) -> String {
+    if edits.is_empty() {
+        return "No edits provided.".into();
+    }
+
+    let original = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read file: {e}"),
+    };
+
+    let mut content = original;
+
+    // Validate and apply each edit sequentially against the in-memory copy.
+    for (i, edit) in edits.iter().enumerate() {
+        if edit.oldString.is_empty() {
+            return format!(
+                "Edit {}: old_string cannot be empty. No edits were applied.",
+                i + 1
+            );
+        }
+        if edit.oldString == edit.newString {
+            return format!(
+                "Edit {}: old_string and new_string are identical. No edits were applied.",
+                i + 1
+            );
+        }
+
+        let matchCount = content.matches(&edit.oldString).count();
+
+        if matchCount == 0 {
+            return format!(
+                "Edit {}: no match found for old_string. No edits were applied.",
+                i + 1
+            );
+        }
+
+        if !edit.replaceAll && matchCount > 1 {
+            return format!(
+                "Edit {}: found {matchCount} matches for old_string. \
+                 Provide more context or set replace_all. No edits were applied.",
+                i + 1
+            );
+        }
+
+        content = if edit.replaceAll {
+            content.replace(&edit.oldString, &edit.newString)
+        } else {
+            content.replacen(&edit.oldString, &edit.newString, 1)
+        };
+    }
+
+    // All edits validated — write once.
+    match std::fs::write(path, &content) {
+        Ok(()) => format!("Applied {} edits to {path}.", edits.len()),
+        Err(e) => format!("Failed to write file: {e}"),
+    }
+}
+
+fn executeCopyFile(src: &str, dest: &str, overwrite: bool) -> String {
+    let srcPath = std::path::Path::new(src);
+    let destPath = std::path::Path::new(dest);
+    if !srcPath.exists() {
+        return format!("Source does not exist: {src}");
+    }
+    if destPath.exists() && !overwrite {
+        return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
+    }
+    if let Some(parent) = destPath.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create parent directories of {dest}: {e}");
+    }
+    if srcPath.is_dir() {
+        match copyDirRecursive(srcPath, destPath) {
+            Ok(()) => format!("Copied directory {src} \u{2192} {dest}."),
+            Err(e) => format!("Failed to copy directory: {e}"),
+        }
+    } else {
+        match std::fs::copy(srcPath, destPath) {
+            Ok(bytes) => format!("Copied {src} \u{2192} {dest} ({bytes} bytes)."),
+            Err(e) => format!("Failed to copy file: {e}"),
+        }
+    }
+}
+
+fn copyDirRecursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if kind.is_dir() {
+            copyDirRecursive(&from, &to)?;
+        } else if kind.is_symlink() {
+            // Reproduce symlinks by reading the target.
+            let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to)?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &to)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &to)?;
+                }
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String {
+    let srcPath = std::path::Path::new(src);
+    let destPath = std::path::Path::new(dest);
+    if !srcPath.exists() {
+        return format!("Source does not exist: {src}");
+    }
+    if destPath.exists() && !overwrite {
+        return format!("Destination already exists: {dest}. Set overwrite=true to replace.");
+    }
+    if let Some(parent) = destPath.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("Failed to create parent directories of {dest}: {e}");
+    }
+    // Try a rename first (cheap, atomic when on the same filesystem). Fall back
+    // to copy+delete on EXDEV (cross-device link) or other rename failures.
+    match std::fs::rename(srcPath, destPath) {
+        Ok(()) => format!("Moved {src} \u{2192} {dest}."),
+        Err(_) => {
+            let copyResult = if srcPath.is_dir() {
+                copyDirRecursive(srcPath, destPath)
+            } else {
+                std::fs::copy(srcPath, destPath).map(|_| ())
+            };
+            if let Err(e) = copyResult {
+                return format!("Failed to move (copy phase): {e}");
+            }
+            let removeResult = if srcPath.is_dir() {
+                std::fs::remove_dir_all(srcPath)
+            } else {
+                std::fs::remove_file(srcPath)
+            };
+            match removeResult {
+                Ok(()) => format!("Moved {src} \u{2192} {dest} (cross-device, copy+delete)."),
+                Err(e) => format!("Copied {src} \u{2192} {dest} but failed to remove source: {e}"),
+            }
+        }
+    }
+}
+
+fn executeDeleteFile(path: &str, recursive: bool) -> String {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return format!("Path does not exist: {path}");
+    }
+    if p.is_dir() {
+        if recursive {
+            match std::fs::remove_dir_all(p) {
+                Ok(()) => format!("Deleted directory tree {path}."),
+                Err(e) => format!("Failed to delete directory: {e}"),
+            }
+        } else {
+            match std::fs::remove_dir(p) {
+                Ok(()) => format!("Deleted empty directory {path}."),
+                Err(e) => format!(
+                    "Failed to delete directory: {e}. Set recursive=true to delete contents."
+                ),
+            }
+        }
+    } else {
+        match std::fs::remove_file(p) {
+            Ok(()) => format!("Deleted {path}."),
+            Err(e) => format!("Failed to delete file: {e}"),
+        }
+    }
+}
+
+fn executeMakeDirs(path: &str) -> String {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => format!("Created directory {path}."),
+        Err(e) => format!("Failed to create directory: {e}"),
+    }
+}
+
+fn executeShellHistory(shell: &Shell, terminalName: &str) -> String {
+    let entries = shell.listHistory();
+    if entries.is_empty() {
+        return format!("No commands in history for terminal '{terminalName}'.");
+    }
+
+    let mut output = format!("History for terminal '{terminalName}':\n");
+    for (i, cmd, exitCode, lineCount) in &entries {
+        let codeStr = match exitCode {
+            Some(0) => String::new(),
+            Some(c) => format!(" (exit {c})"),
+            None => " (?)".into(),
+        };
+        // Truncate long commands for the listing.
+        let cmdPreview = if cmd.len() > 80 {
+            format!("{}\u{2026}", &cmd[..cmd.floor_char_boundary(80)])
+        } else {
+            cmd.clone()
+        };
+        output.push_str(&format!(
+            "[{i}] {cmdPreview}{codeStr}  ({lineCount} lines)\n"
+        ));
+    }
+
+    output
+}
+
+fn executeReadOutput(
+    shell: &Shell,
+    index: usize,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    terminalName: &str,
+) -> String {
+    match shell.getRecord(index) {
+        Some(record) => {
+            let header = format!(
+                "Terminal '{}', command [{}]: {}\n\n",
+                terminalName,
+                index,
+                if record.command.len() > 100 {
+                    format!("{}\u{2026}", &record.command[..100])
+                } else {
+                    record.command
+                }
+            );
+            let body = formatNumberedLines(&record.output, offset, limit);
+            format!("{header}{body}")
+        }
+        None => format!("No command at index {index}. Use shellHistory to see available commands."),
+    }
+}
+
+fn executeSearchOutput(
+    shell: &Shell,
+    index: usize,
+    pattern: &str,
+    context: usize,
+    _terminalName: &str,
+) -> String {
+    match shell.searchOutput(index, pattern, context) {
+        Some(result) => result,
+        None => format!("No command at index {index}. Use shellHistory to see available commands."),
+    }
+}
+
+/// Classification of a file's content type based on magic bytes.
+pub(super) enum FileKind {
+    Text,
+    Image(ImageFormat),
+    Binary,
+}
+
+/// Recognized image formats (by magic bytes).
+pub(super) enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Bmp,
+    Webp,
+}
+
+impl ImageFormat {
+    pub fn mimeType(&self) -> &'static str {
+        match self {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::Bmp => "image/bmp",
+            ImageFormat::Webp => "image/webp",
+        }
+    }
+}
+
+/// Maximum image file size for inline base64 encoding (4 MB).
+const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Classify file content by probing magic bytes.
+pub(super) fn classifyFile(bytes: &[u8]) -> FileKind {
+    if bytes.is_empty() {
+        return FileKind::Text;
+    }
+
+    // Image signatures — check before generic binary.
+    if bytes.starts_with(b"\x89PNG") {
+        return FileKind::Image(ImageFormat::Png);
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return FileKind::Image(ImageFormat::Jpeg);
+    }
+    if bytes.starts_with(b"GIF8") {
+        return FileKind::Image(ImageFormat::Gif);
+    }
+    if bytes.starts_with(b"BM") {
+        return FileKind::Image(ImageFormat::Bmp);
+    }
+    // WebP: starts with RIFF....WEBP.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return FileKind::Image(ImageFormat::Webp);
+    }
+
+    // Non-image binary signatures.
+    const BINARY_MAGIC: &[&[u8]] = &[
+        b"PK\x03\x04",       // ZIP/DOCX/JAR
+        b"\x7fELF",          // ELF
+        b"\xfe\xed\xfa",     // Mach-O
+        b"\xcf\xfa\xed\xfe", // Mach-O (reversed)
+        b"%PDF",             // PDF
+        b"\x1f\x8b",         // gzip
+    ];
+    for sig in BINARY_MAGIC {
+        if bytes.starts_with(sig) {
+            return FileKind::Binary;
+        }
+    }
+
+    // NUL byte check (strong binary indicator in first 512 bytes).
+    if bytes.contains(&0x00) {
+        return FileKind::Binary;
+    }
+
+    FileKind::Text
+}
+
+// --- Subprocess helper ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SubprocessError {
+    NotFound {
+        message: String,
+    },
+    Spawn {
+        program: String,
+        error: String,
+    },
+    Failed {
+        program: String,
+        status: String,
+        output: String,
+    },
+    Run {
+        program: String,
+        error: String,
+    },
+    Timeout {
+        program: String,
+        seconds: u64,
+    },
+}
+
+impl fmt::Display for SubprocessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubprocessError::NotFound { message } => f.write_str(message),
+            SubprocessError::Spawn { program, error } => {
+                write!(f, "Failed to start {program}: {error}")
+            }
+            SubprocessError::Failed {
+                program,
+                status,
+                output,
+            } => write!(f, "{program} failed (exit {status}): {}", output.trim()),
+            SubprocessError::Run { program, error } => {
+                write!(f, "Failed to run {program}: {error}")
+            }
+            SubprocessError::Timeout { program, seconds } => {
+                write!(f, "{program} timed out after {seconds}s.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubprocessError {}
+
+/// Run an external program, capture stdout+stderr, enforce timeout.
+/// Returns Ok(stdout) on success or Err(message) on failure.
+/// rg exit code 1 ("no matches") is treated as success with empty output.
+async fn runSubprocess(
+    program: &str,
+    args: &[&str],
+    notFoundMsg: &str,
+) -> std::result::Result<String, SubprocessError> {
+    use tokio::process::Command;
+
+    let result = Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let child = match result {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SubprocessError::NotFound {
+                message: notFoundMsg.to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(SubprocessError::Spawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            });
+        }
+    };
+
+    let timeout = tokio::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if output.status.success() || output.status.code() == Some(1) {
+                // rg returns 1 for "no matches" — treat as success.
+                Ok(stdout)
+            } else {
+                let msg = if stderr.is_empty() { &stdout } else { &stderr };
+                Err(SubprocessError::Failed {
+                    program: program.to_string(),
+                    status: output.status.to_string(),
+                    output: msg.to_string(),
+                })
+            }
+        }
+        Ok(Err(e)) => Err(SubprocessError::Run {
+            program: program.to_string(),
+            error: e.to_string(),
+        }),
+        Err(_) => {
+            // Process is still running but we lost ownership via wait_with_output.
+            // The child is dropped here which sends SIGKILL on Unix.
+            Err(SubprocessError::Timeout {
+                program: program.to_string(),
+                seconds: SUBPROCESS_TIMEOUT_SECS,
+            })
+        }
+    }
+}
+
+// --- Search / structure / diff execute functions ---
+
+async fn executeGlob(pattern: &str, path: Option<&str>, metadata: bool) -> String {
+    let mut args = vec![
+        "--files", "--sort", "modified", "--hidden", "--glob", pattern, "--glob", "!.git/",
+    ];
+    if let Some(p) = path {
+        args.push(p);
+    }
+
+    match runSubprocess(
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
+        Ok(stdout) => {
+            if stdout.trim().is_empty() {
+                return "No files found.".into();
+            }
+            let lines: Vec<&str> = stdout.lines().collect();
+            let total = lines.len();
+            let mut output = String::new();
+            for line in lines.iter().take(MAX_GLOB_RESULTS) {
+                output.push_str(line);
+                if metadata && let Some(meta) = formatMetadata(std::path::Path::new(line)) {
+                    output.push_str("  ");
+                    output.push_str(&meta);
+                }
+                output.push('\n');
+            }
+            if total > MAX_GLOB_RESULTS {
+                output.push_str(&format!(
+                    "\n... {total} files found, showing first {MAX_GLOB_RESULTS}."
+                ));
+            }
+            output
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Get symbol definitions for a file using ast-grep.
+/// Returns sorted (lineNumber, symbolSignature) pairs.
+fn getFileSymbols(path: &str) -> Vec<(usize, String)> {
+    let lang = detectLanguage(path);
+    let Some(rule) = outlineRule(&lang) else {
+        return Vec::new();
+    };
+
+    let output = std::process::Command::new("sg")
+        .args(["scan", "--inline-rules", &rule, "--json=stream", path])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = parseSgEntries(&stdout);
+    for (_, sig) in entries.iter_mut() {
+        if sig.len() > 80 {
+            *sig = format!("{}...", &sig[..sig.floor_char_boundary(80)]);
+        }
+    }
+    entries.sort_by_key(|(line, _)| *line);
+    entries.dedup_by_key(|(line, _)| *line);
+    entries
+}
+
+/// Find the enclosing symbol for a given line number.
+/// Returns the symbol signature from the last definition before or at that line.
+fn symbolAtLine(symbols: &[(usize, String)], line: usize) -> Option<&str> {
+    // Binary search for the last symbol with startLine <= line.
+    let idx = symbols.partition_point(|(l, _)| *l <= line);
+    if idx == 0 {
+        return None;
+    }
+    Some(&symbols[idx - 1].1)
+}
+
+/// Annotate rg content-mode output with enclosing symbol headers.
+/// Inserts `── file > symbol ──` lines when matches cross symbol boundaries.
+fn annotateGrepWithSymbols(rgOutput: &str) -> String {
+    // Parse rg output to find unique files — match lines have format file:line:content.
+    let matchLineRe = regex::Regex::new(r"^(.+?):(\d+):").unwrap();
+
+    // Collect unique files.
+    let mut fileSet = std::collections::HashSet::new();
+    for line in rgOutput.lines() {
+        if let Some(caps) = matchLineRe.captures(line) {
+            fileSet.insert(caps[1].to_string());
+        }
+    }
+
+    // Build symbol maps for each file (cap at 10 files to avoid excessive I/O).
+    let mut symbolMaps: std::collections::HashMap<String, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    for (count, file) in fileSet.iter().enumerate() {
+        if count >= 10 {
+            break;
+        }
+        let symbols = getFileSymbols(file);
+        if !symbols.is_empty() {
+            symbolMaps.insert(file.clone(), symbols);
+        }
+    }
+
+    // If no symbols found for any file, return output unchanged.
+    if symbolMaps.is_empty() {
+        return rgOutput.to_string();
+    }
+
+    // Walk through output lines, inserting symbol headers when scope changes.
+    let mut output = String::new();
+    let mut lastSymbol: Option<String> = None;
+    let mut lastFile: Option<String> = None;
+
+    for line in rgOutput.lines() {
+        if let Some(caps) = matchLineRe.captures(line) {
+            let file = &caps[1];
+            let lineNum: usize = caps[2].parse().unwrap_or(0);
+
+            if let Some(symbols) = symbolMaps.get(file) {
+                let currentSymbol = symbolAtLine(symbols, lineNum).map(String::from);
+                let fileChanged = lastFile.as_deref() != Some(file);
+                let symbolChanged = currentSymbol != lastSymbol;
+
+                if fileChanged || symbolChanged {
+                    if let Some(ref sym) = currentSymbol {
+                        output.push_str(&format!("── {file} > {sym} ──\n"));
+                    }
+                    lastSymbol = currentSymbol;
+                    lastFile = Some(file.to_string());
+                }
+            } else {
+                lastFile = Some(file.to_string());
+                lastSymbol = None;
+            }
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn executeGrep(
+    pattern: &str,
+    path: Option<&str>,
+    include: Option<&str>,
+    fileType: Option<&str>,
+    outputMode: &str,
+    caseSensitive: Option<bool>,
+    contextLines: Option<usize>,
+    multiline: bool,
+) -> String {
+    // Pre-validate pattern syntax. ripgrep uses Rust's regex crate by default,
+    // so this catches the common "I forgot to escape something" cases with a
+    // clear error rather than a silent "No matches found".
+    if let Err(e) = regex::Regex::new(pattern) {
+        return format!(
+            "Invalid regex pattern: {pattern:?}\n\nParser error: {e}\n\n\
+             Hint: ripgrep uses Rust regex syntax. Escape regex metachars \
+             (.+*?()[]{{}}|^$\\) with backslashes. Watch for stray quotes \
+             from JSON escaping."
+        );
+    }
+
+    let mut argStrings: Vec<String> = Vec::new();
+
+    // Output mode flags.
+    match outputMode {
+        "files" => argStrings.push("--files-with-matches".into()),
+        "count" => argStrings.push("--count".into()),
+        _ => {
+            // Content mode.
+            let ctx = contextLines.unwrap_or(2);
+            argStrings.push(format!("--context={ctx}"));
+            argStrings.push("--line-number".into());
+        }
+    }
+
+    // Case sensitivity.
+    match caseSensitive {
+        Some(true) => argStrings.push("--case-sensitive".into()),
+        Some(false) => argStrings.push("--ignore-case".into()),
+        None => {} // Smart-case is rg default.
+    }
+
+    // Multiline.
+    if multiline {
+        argStrings.push("--multiline".into());
+        argStrings.push("--multiline-dotall".into());
+    }
+
+    // Include glob filter.
+    if let Some(g) = include {
+        argStrings.push("--glob".into());
+        argStrings.push(g.to_string());
+    }
+
+    // Type filter.
+    if let Some(t) = fileType {
+        argStrings.push("--type".into());
+        argStrings.push(t.to_string());
+    }
+
+    // Always exclude .git.
+    argStrings.push("--hidden".into());
+    argStrings.push("--glob".into());
+    argStrings.push("!.git/".into());
+
+    // Pattern and path.
+    argStrings.push(pattern.to_string());
+    if let Some(p) = path {
+        argStrings.push(p.to_string());
+    }
+
+    let args: Vec<&str> = argStrings.iter().map(|s| s.as_str()).collect();
+
+    match runSubprocess(
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
+        Ok(stdout) => {
+            if stdout.trim().is_empty() {
+                let scope = path.unwrap_or(".");
+                let mut msg = format!("No matches for pattern {pattern:?} in {scope}.");
+                // Surface common foot-guns when a pattern looks suspect.
+                if pattern.ends_with('"') || pattern.ends_with("\\\"") {
+                    msg.push_str(
+                        "\n\nNote: pattern ends with a quote. Likely a JSON \
+                         escaping artifact rather than intended literal.",
+                    );
+                }
+                if pattern.contains("\\|") && !pattern.contains("(?") {
+                    msg.push_str(
+                        "\n\nNote: `\\|` is a literal pipe in Rust regex. \
+                         For alternation use `|` (or wrap in `(a|b)`).",
+                    );
+                }
+                return msg;
+            }
+            let lines: Vec<&str> = stdout.lines().collect();
+            let cap = match outputMode {
+                "content" => MAX_GREP_CONTENT_LINES,
+                _ => MAX_GREP_FILES,
+            };
+            let total = lines.len();
+            let mut truncated = String::new();
+            for line in lines.iter().take(cap) {
+                truncated.push_str(line);
+                truncated.push('\n');
+            }
+
+            // Annotate content-mode output with enclosing symbol context.
+            let mut output = if outputMode == "content" {
+                annotateGrepWithSymbols(&truncated)
+            } else {
+                truncated
+            };
+
+            if total > cap {
+                output.push_str(&format!("\n... {total} lines total, showing first {cap}."));
+            }
+            output
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+fn executeListDir(path: &str, depth: usize, offset: usize, limit: usize, metadata: bool) -> String {
+    const EXCLUDED: &[&str] = &[".git", "node_modules", "target", "__pycache__", ".venv"];
+
+    let rootPath = std::path::Path::new(path);
+    if !rootPath.is_dir() {
+        return format!("Not a directory: {path}");
+    }
+
+    // Collect all entries first (up to a hard cap), then paginate.
+    let hardCap = MAX_LISTDIR_ENTRIES.max(offset + limit);
+    let mut allEntries = Vec::new();
+    let mut count = 0usize;
+    let truncated = listDirRecurse(
+        rootPath,
+        0,
+        depth,
+        "",
+        &mut allEntries,
+        &mut count,
+        EXCLUDED,
+        hardCap,
+        metadata,
+    );
+    let total = allEntries.len();
+
+    if total == 0 {
+        return format!("Empty directory: {path}");
+    }
+
+    // Apply pagination.
+    let pageEntries: Vec<_> = allEntries.into_iter().skip(offset).take(limit).collect();
+
+    if pageEntries.is_empty() {
+        return format!("Offset {offset} is past the end ({total} entries total).");
+    }
+
+    let mut result = pageEntries.join("\n");
+    result.push('\n');
+
+    let shown = pageEntries.len();
+    let remaining = total.saturating_sub(offset + shown);
+    if remaining > 0 || truncated {
+        result.push_str(&format!(
+            "\nShowing {shown} of {total} entries (offset {offset})."
+        ));
+        if truncated {
+            result.push_str(" Directory has more entries beyond the scan limit.");
+        }
+    }
+    result
+}
+
+/// Recursive DFS for listDir. Returns true if truncated.
+#[allow(clippy::too_many_arguments)]
+fn listDirRecurse(
+    dir: &std::path::Path,
+    currentDepth: usize,
+    maxDepth: usize,
+    indent: &str,
+    output: &mut Vec<String>,
+    count: &mut usize,
+    excluded: &[&str],
+    hardCap: usize,
+    metadata: bool,
+) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    // Collect and sort: dirs first, then files, alphabetical within each group.
+    let mut dirs = Vec::new();
+    let mut files: Vec<(String, bool, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let fileType = entry.file_type();
+        let isDir = fileType.as_ref().map(|ft| ft.is_dir()).unwrap_or(false);
+        let isSymlink = fileType.as_ref().map(|ft| ft.is_symlink()).unwrap_or(false);
+
+        if isDir && excluded.contains(&name.as_str()) {
+            continue;
+        }
+
+        if isDir {
+            dirs.push((name, isSymlink));
+        } else {
+            files.push((name, isSymlink, entry.path()));
+        }
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Emit dirs first.
+    for (name, isSymlink) in &dirs {
+        if *count >= hardCap {
+            return true;
+        }
+        let suffix = if *isSymlink { "@ -> /" } else { "/" };
+        output.push(format!("{indent}{name}{suffix}"));
+        *count += 1;
+
+        if currentDepth + 1 < maxDepth {
+            let childIndent = format!("{indent}  ");
+            let childPath = dir.join(name);
+            if listDirRecurse(
+                &childPath,
+                currentDepth + 1,
+                maxDepth,
+                &childIndent,
+                output,
+                count,
+                excluded,
+                hardCap,
+                metadata,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    // Then files.
+    for (name, isSymlink, path) in &files {
+        if *count >= hardCap {
+            return true;
+        }
+        let suffix = if *isSymlink { "@" } else { "" };
+        let mut line = format!("{indent}{name}{suffix}");
+        if metadata && let Some(meta) = formatMetadata(path) {
+            line.push_str("  ");
+            line.push_str(&meta);
+        }
+        output.push(line);
+        *count += 1;
+    }
+
+    false
+}
+
+/// Render `<size>  <YYYY-MM-DD HH:MM>` for a file path. Returns None on error.
+fn formatMetadata(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let size = formatSize(meta.len());
+    let mtime = meta.modified().ok().map(formatMtime).unwrap_or_default();
+    Some(format!("{size:>9}  {mtime}"))
+}
+
+fn formatSize(bytes: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[(1024 * 1024 * 1024, "G"), (1024 * 1024, "M"), (1024, "K")];
+    for (threshold, suffix) in UNITS {
+        if bytes >= *threshold {
+            let value = bytes as f64 / *threshold as f64;
+            return if value >= 10.0 {
+                format!("{value:.0}{suffix}")
+            } else {
+                format!("{value:.1}{suffix}")
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
+fn formatMtime(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Local-tz aware breakdown via chrono would be cleaner, but we don't have
+    // chrono. UTC is fine — the model just needs a stable ordering.
+    let (y, mo, d, h, mi) = epochToYMDHM(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}Z")
+}
+
+/// UTC epoch seconds → (year, month, day, hour, minute). Civil-time conversion
+/// from Howard Hinnant's date algorithms (no chrono dependency).
+fn epochToYMDHM(secs: u64) -> (u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let timeOfDay = (secs % 86400) as u32;
+    let h = timeOfDay / 3600;
+    let mi = (timeOfDay % 3600) / 60;
+
+    // Hinnant: civil_from_days
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let yy = (if mo <= 2 { y + 1 } else { y }) as u32;
+    (yy, mo, d, h, mi)
+}
+
+async fn executeStructSearch(pattern: &str, language: &str, path: Option<&str>) -> String {
+    let mut args = vec!["run", "-p", pattern, "-l", language, "--json=compact"];
+    if let Some(p) = path {
+        args.push(p);
+    }
+
+    let notFound = "ast-grep (sg) not available. Install: https://ast-grep.github.io \
+                    Use grep for text-based search.";
+
+    match runSubprocess("sg", &args, notFound).await {
+        Ok(stdout) => {
+            if stdout.trim().is_empty() {
+                return "No matches found.".into();
+            }
+            formatStructSearchOutput(&stdout)
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+fn formatStructSearchOutput(jsonOutput: &str) -> String {
+    let mut output = String::new();
+
+    // ast-grep --json=compact returns a JSON array, not newline-delimited objects.
+    let matches: Vec<serde_json::Value> = match serde_json::from_str(jsonOutput) {
+        Ok(v) => v,
+        Err(e) => return format!("Failed to parse ast-grep output: {e}"),
+    };
+
+    for (_matchCount, obj) in matches.iter().enumerate().take(MAX_STRUCT_MATCHES) {
+        let file = obj["file"].as_str().unwrap_or("?");
+        let startLine = obj["range"]["start"]["line"]
+            .as_u64()
+            .map(|l| l + 1)
+            .unwrap_or(0);
+        let text = obj["text"].as_str().unwrap_or("");
+
+        output.push_str(&format!("{file}:{startLine}\n"));
+
+        // Show up to 5 lines of matched text, indented.
+        for (i, matchLine) in text.lines().enumerate() {
+            if i >= 5 {
+                output.push_str("    ...\n");
+                break;
+            }
+            output.push_str(&format!("    {matchLine}\n"));
+        }
+
+        // Show meta-variable bindings if present.
+        if let Some(metaVars) = obj["metaVariables"].as_object()
+            && !metaVars.is_empty()
+        {
+            for (name, val) in metaVars {
+                // NOTE: ast-grep meta-vars can be objects with "text" field.
+                let binding = if let Some(t) = val["single"]["text"].as_str() {
+                    t.to_string()
+                } else if let Some(arr) = val["multi"].as_array() {
+                    arr.iter()
+                        .filter_map(|v| v["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    continue;
+                };
+                if !binding.is_empty() {
+                    output.push_str(&format!("    {name} = {binding}\n"));
+                }
+            }
+        }
+
+        output.push('\n');
+    }
+
+    let totalMatches = matches.len();
+    if totalMatches > MAX_STRUCT_MATCHES {
+        output.push_str(&format!(
+            "... {totalMatches} matches total, showing first {MAX_STRUCT_MATCHES}."
+        ));
+    } else {
+        output.push_str(&format!("{totalMatches} match(es)."));
+    }
+
+    output
+}
+
+async fn executeDiff(
+    path: Option<&str>,
+    gitRef: Option<&str>,
+    pathA: Option<&str>,
+    pathB: Option<&str>,
+) -> String {
+    // File-vs-file mode.
+    if let (Some(a), Some(b)) = (pathA, pathB) {
+        return diffTwoFiles(a, b);
+    }
+
+    // Git diff mode.
+    if let Some(p) = path {
+        let reference = gitRef.unwrap_or("HEAD");
+        return diffGitRef(p, reference).await;
+    }
+
+    // Bare git diff (no path, no pathA/pathB) — show unstaged changes.
+    if pathA.is_none() && pathB.is_none() && path.is_none() {
+        let reference = gitRef.unwrap_or("HEAD");
+        let args = vec!["diff", reference];
+        match runSubprocess("git", &args, "git not found.").await {
+            Ok(stdout) => {
+                if stdout.trim().is_empty() {
+                    return format!("No differences against {reference}.");
+                }
+                return truncateDiffOutput(&stdout);
+            }
+            Err(e) => return e.to_string(),
+        }
+    }
+
+    "Provide 'path' + optional 'ref' for git diff, or 'path_a' + 'path_b' for file diff.".into()
+}
+
+fn diffTwoFiles(pathA: &str, pathB: &str) -> String {
+    let contentA = match std::fs::read_to_string(pathA) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read {pathA}: {e}"),
+    };
+    let contentB = match std::fs::read_to_string(pathB) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read {pathB}: {e}"),
+    };
+
+    let diff = similar::TextDiff::configure()
+        .algorithm(similar::Algorithm::Patience)
+        .diff_lines(&contentA, &contentB);
+
+    let unified = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(pathA, pathB)
+        .to_string();
+
+    if unified.trim().is_empty() {
+        return "Files are identical.".into();
+    }
+
+    truncateDiffOutput(&unified)
+}
+
+async fn diffGitRef(path: &str, reference: &str) -> String {
+    let args = vec!["diff", reference, "--", path];
+
+    match runSubprocess("git", &args, "git not found.").await {
+        Ok(stdout) => {
+            if stdout.trim().is_empty() {
+                return format!("No differences for {path} against {reference}.");
+            }
+            truncateDiffOutput(&stdout)
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+fn truncateDiffOutput(diff: &str) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= MAX_READ_LINES && diff.len() <= MAX_READ_BYTES {
+        return diff.to_string();
+    }
+
+    let mut output = String::new();
+    let mut byteCount = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if i >= MAX_READ_LINES || byteCount + line.len() + 1 > MAX_READ_BYTES {
+            let remaining = lines.len() - i;
+            output.push_str(&format!("\n... truncated ({remaining} more lines)."));
+            break;
+        }
+        output.push_str(line);
+        output.push('\n');
+        byteCount += line.len() + 1;
+    }
+    output
+}
+
+// --- Anchor mode for readFile ---
+
+/// Expand from an anchor line based on indentation to return the enclosing block.
+fn expandFromAnchor(content: &str, anchorLine: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let totalLines = lines.len();
+
+    if anchorLine == 0 || anchorLine > totalLines {
+        return format!("Anchor line {anchorLine} out of range (file has {totalLines} lines).");
+    }
+
+    let anchorIdx = anchorLine - 1;
+    let anchorIndent = indentLevel(lines[anchorIdx]);
+
+    // Walk backward to find the block start — a line with strictly less indentation.
+    let mut startIdx = anchorIdx;
+    for i in (0..anchorIdx).rev() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = indentLevel(line);
+        if indent < anchorIndent {
+            // This line is the parent scope — include it as context.
+            startIdx = i;
+            break;
+        }
+        startIdx = i;
+    }
+
+    // Walk forward to find the block end.
+    let mut endIdx = anchorIdx;
+    for (i, line) in lines.iter().enumerate().skip(anchorIdx + 1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = indentLevel(line);
+        if indent < anchorIndent {
+            // Include the closing line (e.g. closing brace).
+            endIdx = i;
+            break;
+        }
+        endIdx = i;
+    }
+
+    // Cap the block to MAX_READ_LINES.
+    let blockLen = endIdx - startIdx + 1;
+    let effectiveEnd = if blockLen > MAX_READ_LINES {
+        startIdx + MAX_READ_LINES - 1
+    } else {
+        endIdx
+    };
+
+    let mut output = String::new();
+    for (i, line) in lines
+        .iter()
+        .enumerate()
+        .take(effectiveEnd + 1)
+        .skip(startIdx)
+    {
+        let lineNum = i + 1;
+        let displayLine = if line.len() > MAX_LINE_LENGTH {
+            format!("{}...", &line[..MAX_LINE_LENGTH])
+        } else {
+            line.to_string()
+        };
+        output.push_str(&format!("{lineNum:>6}\t{displayLine}\n"));
+    }
+
+    if effectiveEnd < endIdx {
+        let remaining = endIdx - effectiveEnd;
+        output.push_str(&format!("\n... block truncated ({remaining} more lines)."));
+    }
+
+    output
+}
+
+/// Count leading whitespace as an indentation level (spaces + tabs*4).
+fn indentLevel(line: &str) -> usize {
+    let mut level = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => level += 1,
+            '\t' => level += 4,
+            _ => break,
+        }
+    }
+    level
+}
+
+// --- Fuzzy find ---
+
+async fn executeFuzzyFind(query: &str, path: Option<&str>) -> String {
+    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+    use nucleo_matcher::{Config, Matcher};
+
+    let mut args = vec!["--files", "--hidden", "--glob", "!.git/"];
+    if let Some(p) = path {
+        args.push(p);
+    }
+
+    let stdout = match runSubprocess(
+        "rg",
+        &args,
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep",
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e.to_string(),
+    };
+
+    if stdout.trim().is_empty() {
+        return "No files found.".into();
+    }
+
+    let files: Vec<&str> = stdout.lines().collect();
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let matches = pattern.match_list(&files, &mut matcher);
+
+    if matches.is_empty() {
+        return format!("No files matched \"{query}\".");
+    }
+
+    // match_list returns sorted by score descending already.
+    let mut output = String::new();
+    for (path, score) in matches.iter().take(MAX_FUZZY_RESULTS) {
+        output.push_str(&format!("{score:>4}  {path}\n"));
+    }
+    if matches.len() > MAX_FUZZY_RESULTS {
+        output.push_str(&format!(
+            "\n... {} more matches. Refine your query.",
+            matches.len() - MAX_FUZZY_RESULTS
+        ));
+    }
+    output
+}
+
+// --- File outline ---
+
+async fn executeFileOutline(path: &str) -> String {
+    let lang = detectLanguage(path);
+    let Some(rule) = outlineRule(&lang) else {
+        return format!("No outline support for language \"{lang}\". File: {path}");
+    };
+
+    let args = vec!["scan", "--inline-rules", &rule, "--json=stream", path];
+    let stdout = match runSubprocess(
+        "sg",
+        &args,
+        "ast-grep (sg) is required for fileOutline. Install: https://ast-grep.github.io",
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e.to_string(),
+    };
+
+    let mut entries = parseSgEntries(&stdout);
+    if entries.is_empty() {
+        return format!("No symbols found in {path}.");
+    }
+    entries.sort_by_key(|(line, _)| *line);
+    entries.dedup_by_key(|(line, _)| *line);
+
+    let mut output = String::new();
+    for (line, text) in entries.iter().take(MAX_OUTLINE_ENTRIES) {
+        output.push_str(&format!("{line:>6}  {text}\n"));
+    }
+    if entries.len() > MAX_OUTLINE_ENTRIES {
+        output.push_str(&format!(
+            "\n... {} more symbols.",
+            entries.len() - MAX_OUTLINE_ENTRIES
+        ));
+    }
+    output
+}
+
+// --- View symbol ---
+
+async fn executeViewSymbol(file: &str, symbol: &str) -> String {
+    let lang = detectLanguage(file);
+
+    // Support qualified paths like "ToolAction::Grep" or "Foo::bar::baz".
+    let parts: Vec<&str> = symbol.split("::").collect();
+
+    if parts.len() == 1 {
+        // Simple symbol lookup.
+        return viewSymbolSingle(file, symbol, &lang).await;
+    }
+
+    // Qualified path: find outermost symbol, then narrow into nested ones.
+    let content = match std::fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read {file}: {e}"),
+    };
+
+    // Find the outermost symbol first.
+    let outerName = parts[0];
+    let outerBlock = match findSymbolRange(&content, outerName, &lang).await {
+        Some(range) => range,
+        None => return format!("Symbol \"{outerName}\" not found in {file}."),
+    };
+
+    // Walk inward through the chain.
+    let currentText = outerBlock.text.clone();
+    let currentStart = outerBlock.startLine;
+
+    for &part in &parts[1..] {
+        // Search within the current block text for the next symbol.
+        let found = false;
+        for (idx, line) in currentText.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.contains(part)
+                && (looksLikeDeclaration(trimmed, part) || looksLikeVariant(trimmed, part))
+            {
+                let anchorLine = currentStart + idx;
+                let expanded = expandFromAnchor(&currentText, idx + 1);
+                // Re-anchor the expanded block to the file line numbers.
+                let mut output = String::new();
+                for expandedLine in expanded.lines() {
+                    // The expanded output has line numbers relative to currentText.
+                    // Re-number relative to the file.
+                    if let Some(tabPos) = expandedLine.find('\t') {
+                        let numStr = expandedLine[..tabPos].trim();
+                        if let Ok(relLine) = numStr.parse::<usize>() {
+                            let absLine = currentStart + relLine - 1;
+                            output.push_str(&format!(
+                                "{absLine:>6}\t{}\n",
+                                &expandedLine[tabPos + 1..]
+                            ));
+                            continue;
+                        }
+                    }
+                    output.push_str(expandedLine);
+                    output.push('\n');
+                }
+                return format!("{file}:{anchorLine} ({symbol})\n\n{output}");
+            }
+        }
+        if !found {
+            // Can't narrow further — return what we have of the outer block.
+            return format!(
+                "{file}:{currentStart} (found {outerName}, \"{part}\" not found within)\n\n{currentText}"
+            );
+        }
+    }
+
+    format!("{file}:{currentStart}\n\n{currentText}")
+}
+
+/// Find a symbol's range within a content string by declaration matching.
+struct SymbolRange {
+    startLine: usize,
+    text: String,
+}
+
+async fn findSymbolRange(content: &str, name: &str, _lang: &str) -> Option<SymbolRange> {
+    let mut foundLine: Option<usize> = None;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains(name)
+            && (looksLikeDeclaration(trimmed, name) || looksLikeVariant(trimmed, name))
+        {
+            foundLine = Some(idx + 1);
+            break;
+        }
+    }
+
+    let lineNum = foundLine?;
+    let expanded = expandFromAnchor(content, lineNum);
+
+    // Parse the expanded output to extract the text (strip line numbers).
+    let mut text = String::new();
+    for line in expanded.lines() {
+        if let Some(tabPos) = line.find('\t') {
+            text.push_str(&line[tabPos + 1..]);
+            text.push('\n');
+        }
+    }
+
+    Some(SymbolRange {
+        startLine: lineNum,
+        text,
+    })
+}
+
+/// Simple single-name symbol lookup (original behavior).
+async fn viewSymbolSingle(file: &str, symbol: &str, lang: &str) -> String {
+    let Some(rule) = symbolRule(lang, symbol) else {
+        return format!("Symbol lookup not supported for language \"{lang}\".");
+    };
+    let args = vec!["scan", "--inline-rules", &rule, "--json=stream", file];
+    let Ok(stdout) = runSubprocess("sg", &args, "").await else {
+        return format!("Symbol \"{symbol}\" not found in {file} via ast-grep.");
+    };
+
+    for line in stdout.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let text = obj["text"].as_str().unwrap_or("");
+        let startLine = obj["range"]["start"]["line"]
+            .as_u64()
+            .map(|l| l + 1)
+            .unwrap_or(0);
+        if !text.is_empty() {
+            return format!("{file}:{startLine}\n\n{text}");
+        }
+    }
+
+    format!("Symbol \"{symbol}\" not found in {file} via ast-grep.")
+}
+
+/// Heuristic: does this line look like it declares the given symbol?
+fn looksLikeDeclaration(line: &str, symbol: &str) -> bool {
+    // Check if symbol appears after common declaration keywords.
+    let declarationPrefixes = [
+        "fn ",
+        "pub fn ",
+        "async fn ",
+        "pub async fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "trait ",
+        "pub trait ",
+        "impl ",
+        "type ",
+        "pub type ",
+        "const ",
+        "pub const ",
+        "static ",
+        "pub static ",
+        "mod ",
+        "pub mod ",
+        "def ",
+        "async def ",
+        "class ",
+        "function ",
+        "export function ",
+        "export default function ",
+        "export const ",
+        "export let ",
+        "export class ",
+        "interface ",
+        "export interface ",
+        "export type ",
+        "func ",
+        "var ",
+        "let ",
+        "const ",
+    ];
+
+    for prefix in &declarationPrefixes {
+        if let Some(rest) = line.strip_prefix(prefix)
+            && rest.starts_with(symbol)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Heuristic: does this line look like an enum variant or struct field with this name?
+fn looksLikeVariant(line: &str, name: &str) -> bool {
+    // Match patterns like "Grep {", "Grep(", "Grep," (enum variants).
+    if let Some(pos) = line.find(name) {
+        let afterName = &line[pos + name.len()..].trim_start();
+        if afterName.starts_with('{')
+            || afterName.starts_with('(')
+            || afterName.starts_with(',')
+            || afterName.starts_with(';')
+            || afterName.is_empty()
+        {
+            // Make sure it's at a word boundary (not a substring of a longer name).
+            if pos == 0 || !line.as_bytes()[pos - 1].is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// --- Related files ---
+
+fn executeRelatedFiles(path: &str) -> String {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to read {path}: {e}"),
+    };
+
+    let lang = detectLanguage(path);
+    let imports = parseImports(&content, &lang);
+    let filePath = std::path::Path::new(path);
+    let fileDir = filePath.parent();
+
+    // Resolve import paths to real files.
+    let mut resolved: Vec<String> = Vec::new();
+    for imp in &imports {
+        // Try resolving relative to the file's directory.
+        if let Some(dir) = fileDir {
+            let candidate = dir.join(imp);
+            if candidate.exists() {
+                resolved.push(candidate.to_string_lossy().to_string());
+                continue;
+            }
+            // Try with common extensions.
+            for ext in &[".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go"] {
+                let withExt = dir.join(format!("{imp}{ext}"));
+                if withExt.exists() {
+                    resolved.push(withExt.to_string_lossy().to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Sibling files in the same directory.
+    let mut siblings: Vec<String> = Vec::new();
+    if let Some(dir) = fileDir
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let canonPath = filePath.canonicalize().ok();
+        for entry in entries.flatten() {
+            let entryFt = entry.file_type();
+            if entryFt.map(|ft| ft.is_file()).unwrap_or(false) {
+                let entryCanon = entry.path().canonicalize().ok();
+                if entryCanon != canonPath {
+                    siblings.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    siblings.sort();
+
+    let mut output = String::new();
+
+    if !imports.is_empty() {
+        output.push_str("Imports/dependencies:\n");
+        for imp in &imports {
+            output.push_str(&format!("  {imp}\n"));
+        }
+    }
+
+    if !resolved.is_empty() {
+        output.push_str("\nResolved files:\n");
+        for r in resolved.iter().take(MAX_RELATED_FILES) {
+            output.push_str(&format!("  {r}\n"));
+        }
+    }
+
+    if !siblings.is_empty() {
+        output.push_str("\nSibling files:\n");
+        for sib in siblings.iter().take(MAX_RELATED_FILES) {
+            output.push_str(&format!("  {sib}\n"));
+        }
+    }
+
+    if output.is_empty() {
+        "No related files found.".into()
+    } else {
+        output
+    }
+}
+
+/// Parse import statements from file content based on language.
+fn parseImports(content: &str, lang: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let patterns: Vec<&str> = match lang {
+        "rust" => vec![r"^use\s+([\w:]+)", r"^mod\s+(\w+)\s*;"],
+        "python" => vec![r"^(?:from\s+([\w.]+)\s+)?import\s+([\w.]+)"],
+        "typescript" | "javascript" | "tsx" | "jsx" => {
+            vec![r#"(?:import|require)\s*\(?[^)]*['"]([^'"]+)['"]"#]
+        }
+        "go" => vec![r#"^\s*"([^"]+)""#],
+        _ => vec![],
+    };
+
+    for pat in patterns {
+        if let Ok(re) = regex::Regex::new(pat) {
+            for line in content.lines() {
+                if let Some(caps) = re.captures(line.trim()) {
+                    // Take the last non-empty capture group.
+                    for i in (1..caps.len()).rev() {
+                        if let Some(m) = caps.get(i) {
+                            let val = m.as_str().to_string();
+                            if !val.is_empty() && !imports.contains(&val) {
+                                imports.push(val);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    imports
+}
+
+// --- Language detection and pattern helpers ---
+
+/// Detect programming language from file extension.
+fn detectLanguage(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "js" => "javascript",
+        "jsx" => "jsx",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "rb" => "ruby",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "cs" => "csharp",
+        "lua" => "lua",
+        "zig" => "zig",
+        _ => ext,
+    }
+    .into()
+}
+
+/// Tree-sitter node kinds that appear in a file outline for `lang`.
+fn outlineKinds(lang: &str) -> Option<&'static [&'static str]> {
+    match lang {
+        "rust" => Some(&[
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "impl_item",
+            "mod_item",
+            "type_item",
+            "const_item",
+            "static_item",
+            "macro_definition",
+        ]),
+        "python" => Some(&["function_definition", "class_definition"]),
+        "typescript" | "tsx" => Some(&[
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
+            "method_definition",
+            "abstract_class_declaration",
+        ]),
+        "javascript" | "jsx" => Some(&[
+            "function_declaration",
+            "class_declaration",
+            "method_definition",
+        ]),
+        "go" => Some(&[
+            "function_declaration",
+            "method_declaration",
+            "type_declaration",
+        ]),
+        _ => None,
+    }
+}
+
+/// Tree-sitter kind of "function-like" nodes in this language. Items
+/// nested inside such a node are excluded from outlines (locals,
+/// nested consts inside fn bodies). Methods inside class/impl blocks
+/// stay because their containing kind isn't this one.
+fn fnKind(lang: &str) -> Option<&'static str> {
+    match lang {
+        "rust" => Some("function_item"),
+        "python" => Some("function_definition"),
+        "typescript" | "tsx" | "javascript" | "jsx" | "go" => Some("function_declaration"),
+        _ => None,
+    }
+}
+
+/// Build an ast-grep inline YAML rule matching outline items in `lang`.
+fn outlineRule(lang: &str) -> Option<String> {
+    let kinds = outlineKinds(lang)?;
+    let mut yaml =
+        format!("id: outline\nlanguage: {lang}\nseverity: info\nmessage: outline\nrule:\n  any:\n");
+    for k in kinds {
+        yaml.push_str(&format!("    - kind: {k}\n"));
+    }
+    if let Some(fk) = fnKind(lang) {
+        yaml.push_str(&format!(
+            "  not:\n    inside:\n      kind: {fk}\n      stopBy: end\n"
+        ));
+    }
+    Some(yaml)
+}
+
+/// Build an ast-grep inline YAML rule matching a specific symbol by name.
+/// Rust impl blocks (which lack a `name` field) are matched via their
+/// `type` and `trait` fields.
+fn symbolRule(lang: &str, symbol: &str) -> Option<String> {
+    let kinds = outlineKinds(lang)?;
+    let escaped = regex::escape(symbol);
+    let mut yaml =
+        format!("id: symbol\nlanguage: {lang}\nseverity: info\nmessage: symbol\nrule:\n  any:\n",);
+
+    yaml.push_str("    - all:\n");
+    yaml.push_str("        - any:\n");
+    for k in kinds.iter().filter(|k| **k != "impl_item") {
+        yaml.push_str(&format!("            - kind: {k}\n"));
+    }
+    yaml.push_str("        - has:\n");
+    yaml.push_str("            field: name\n");
+    yaml.push_str(&format!("            regex: \"^{escaped}$\"\n"));
+
+    if lang == "rust" {
+        yaml.push_str("    - all:\n");
+        yaml.push_str("        - kind: impl_item\n");
+        yaml.push_str("        - any:\n");
+        yaml.push_str("            - has:\n");
+        yaml.push_str("                field: type\n");
+        yaml.push_str(&format!("                regex: \"^{escaped}$\"\n"));
+        yaml.push_str("            - has:\n");
+        yaml.push_str("                field: trait\n");
+        yaml.push_str(&format!("                regex: \"^{escaped}$\"\n"));
+    }
+    Some(yaml)
+}
+
+/// Parse JSONL output from `sg scan --json=stream` into (line, firstLine)
+/// pairs. Empty matches are skipped.
+fn parseSgEntries(stdout: &str) -> Vec<(usize, String)> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let lineNum = obj["range"]["start"]["line"]
+            .as_u64()
+            .map(|l| l + 1)
+            .unwrap_or(0) as usize;
+        let text = obj["text"].as_str().unwrap_or("");
+        let firstLine = text.lines().next().unwrap_or("").trim().to_string();
+        if !firstLine.is_empty() {
+            entries.push((lineNum, firstLine));
+        }
+    }
+    entries
+}
