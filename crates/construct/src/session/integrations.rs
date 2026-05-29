@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use super::Session;
+use super::request::buildRiders;
 use crate::message::Message;
-use crate::{lsp, mcp, prompt};
+use crate::{api, compaction_trigger, lsp, mcp, prompt, tool, web};
 
 impl Session {
     /// Initialize MCP server connections.
@@ -34,42 +35,117 @@ impl Session {
             );
         }
 
-        let contextBudget = self.config.heavy.contextWindow;
-        let mcpDefs = mgr.toolDefs(contextBudget).await;
-        if !mcpDefs.is_empty() {
-            self.tools.extend(mcpDefs);
-            let mcpToolCount = mgr.toolCount().await;
-            tracing::info!(
-                totalTools = self.tools.len(),
-                mcpTools = mcpToolCount,
-                "merged MCP tools"
-            );
-        }
-
-        let searchMode = mgr.isSearchMode(contextBudget).await;
-        let serverInfos: Vec<prompt::McpServerInfo> = statuses
-            .iter()
-            .map(|s| prompt::McpServerInfo {
-                name: s.name.clone(),
-                toolCount: 0,
-                status: format!("{:?}", s.state),
-            })
-            .collect();
-
-        let mcpPrompt = prompt::mcpSection(&serverInfos, searchMode);
-        if !mcpPrompt.is_empty()
-            && let Some(Message::System { content }) = self.history.first_mut()
-        {
-            content.push_str("\n\n");
-            content.push_str(&mcpPrompt);
-        }
-
         self.mcpManager = Some(mgr);
+        self.refreshToolDefs().await;
+        self.refreshSystemPrompt().await;
     }
 
     /// Replace the current permission set.
     pub fn setPermissions(&mut self, permissions: crate::permissions::Permissions) {
         self.permissions = permissions;
+    }
+
+    /// Apply a freshly loaded config to this live session.
+    ///
+    /// This hot-swaps model clients, prompt/reasoning behavior, context
+    /// thresholds, riders, and MCP tool presentation without clearing the
+    /// transcript or replacing terminals/background planes. In-flight turns
+    /// continue with the config they started with; the next turn sees this.
+    pub async fn applyConfig(&mut self, config: &crate::config::Config) -> anyhow::Result<()> {
+        let client = api::Client::new(config)?;
+        let lastTokens = self.compactionTracker.lastTokens();
+        let mut tracker =
+            compaction_trigger::Tracker::new(config.heavy.contextWindow, config.compactRatio);
+        tracker.updateTokens(lastTokens);
+
+        self.client = client;
+        self.config = config.clone();
+        self.reasoning =
+            self.config
+                .heavy
+                .reasoning
+                .as_ref()
+                .map(|r| crate::message::ReasoningConfig {
+                    effort: r.effort.clone(),
+                    summary: r.summary.clone(),
+                });
+        self.compactionTracker = tracker;
+        self.exaClient = web::ExaClient::new(&self.config.web.searchKey);
+        self.riders = buildRiders(&self.config);
+        self.refreshToolDefs().await;
+        self.refreshSystemPrompt().await;
+
+        tracing::info!(
+            model = %self.config.heavy.model,
+            provider = %self.config.heavy.provider,
+            contextWindow = self.config.heavy.contextWindow,
+            "live model config applied"
+        );
+        Ok(())
+    }
+
+    async fn refreshToolDefs(&mut self) {
+        let mut defs = tool::builtinDefs();
+        if let Some(mgr) = &self.mcpManager {
+            let mcpDefs = mgr.toolDefs(self.config.heavy.contextWindow).await;
+            if !mcpDefs.is_empty() {
+                defs.extend(mcpDefs);
+                let mcpToolCount = mgr.toolCount().await;
+                tracing::info!(
+                    totalTools = defs.len(),
+                    mcpTools = mcpToolCount,
+                    "merged MCP tools"
+                );
+            }
+        }
+        self.tools = defs;
+    }
+
+    async fn refreshSystemPrompt(&mut self) {
+        let mut systemPrompt = prompt::build(
+            self.interface,
+            &self.domains,
+            self.config.heavy.promptThinking,
+        );
+        let mcpPrompt = self.mcpPromptSection().await;
+        if !mcpPrompt.is_empty() {
+            systemPrompt.push_str("\n\n");
+            systemPrompt.push_str(&mcpPrompt);
+        }
+
+        self.systemPrompt = systemPrompt.clone();
+        match self.history.first_mut() {
+            Some(Message::System { content }) => *content = systemPrompt,
+            _ => self.history.insert(
+                0,
+                Message::System {
+                    content: systemPrompt,
+                },
+            ),
+        }
+    }
+
+    async fn mcpPromptSection(&self) -> String {
+        let Some(mgr) = &self.mcpManager else {
+            return String::new();
+        };
+
+        let searchMode = mgr.isSearchMode(self.config.heavy.contextWindow).await;
+        let statuses = mgr.serverStatuses();
+        let registry = mgr.registry().read().await;
+        let serverInfos: Vec<prompt::McpServerInfo> = statuses
+            .iter()
+            .map(|s| {
+                let toolCount = registry.search("", Some(&s.name)).len();
+                prompt::McpServerInfo {
+                    name: s.name.clone(),
+                    toolCount,
+                    status: format!("{:?}", s.state),
+                }
+            })
+            .collect();
+
+        prompt::mcpSection(&serverInfos, searchMode)
     }
 
     /// Get permissions data for the /permissions panel.

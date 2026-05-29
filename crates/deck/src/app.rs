@@ -121,6 +121,29 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
     }
 }
 
+async fn reloadAndApplyConfig(
+    config: &mut construct::config::Config,
+    session: &mut Session,
+    logTx: &mpsc::Sender<LogEvent>,
+) -> std::result::Result<(), String> {
+    let next = construct::config::load().map_err(|e| format!("Failed to reload config: {e}"))?;
+    let applyResult = session.applyConfig(&next).await;
+    *config = next;
+
+    match applyResult {
+        Ok(()) => {
+            let _ = logTx
+                .send(LogEvent::ModelConfigChanged {
+                    contextWindow: config.heavy.contextWindow,
+                    cachingEnabled: config.heavy.cachingActive(),
+                })
+                .await;
+            Ok(())
+        }
+        Err(e) => Err(format!("Saved, but failed to apply live config: {e}")),
+    }
+}
+
 /// Which panel has input focus.
 #[derive(PartialEq)]
 enum Focus {
@@ -910,20 +933,12 @@ pub async fn run() -> Result<()> {
                                 tier,
                                 &profile,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Saved model profile to {}. It will be used after /clear or restart.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Saved, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -952,21 +967,12 @@ pub async fn run() -> Result<()> {
                                 &profile,
                                 &model,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Saved model {} into profile {profile} at {}. It will be used after /clear or restart.",
-                                                model.id,
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Saved, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -988,20 +994,12 @@ pub async fn run() -> Result<()> {
                                 &profile,
                                 &sourceProfile,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Created model profile {profile} at {}.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Created, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -1023,20 +1021,12 @@ pub async fn run() -> Result<()> {
                                 &oldProfile,
                                 &newProfile,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Renamed model profile {oldProfile} to {newProfile} at {}.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Renamed, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -1052,20 +1042,12 @@ pub async fn run() -> Result<()> {
                                 scope,
                                 &profile,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Deleted model profile {profile} from {}.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Deleted, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -1087,20 +1069,12 @@ pub async fn run() -> Result<()> {
                                 &profile,
                                 contextWindow,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Saved context window for profile {profile} to {}.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Saved, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -1126,20 +1100,12 @@ pub async fn run() -> Result<()> {
                                 reasoningEffort,
                                 reasoningSummary,
                             ) {
-                                Ok(path) => match construct::config::load() {
-                                    Ok(next) => {
-                                        config = next;
-                                        let _ = reply.send(construct::control::CommandAck::ok(
-                                            format!(
-                                                "Saved thinking settings for profile {profile} to {}.",
-                                                path.display()
-                                            ),
-                                        ));
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
                                     }
                                     Err(e) => {
-                                        let _ = reply.send(construct::control::CommandAck::err(
-                                            format!("Saved, but failed to reload config: {e}"),
-                                        ));
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
                                     }
                                 },
                                 Err(e) => {
@@ -1346,9 +1312,9 @@ async fn runLoop(
     cancelTx: &watch::Sender<bool>,
     steerTx: &mpsc::Sender<construct::session::UserInput>,
     userBgTx: &mpsc::Sender<()>,
-    contextWindow: usize,
+    mut contextWindow: usize,
     rollingBaseline: f64,
-    cachingEnabled: bool,
+    mut cachingEnabled: bool,
 ) -> Result<()> {
     let mut tokenCount: usize = 0;
     let mut sessionCost: f64 = 0.0;
@@ -2042,6 +2008,14 @@ async fn runLoop(
                     if cacheReadTokens > 0 {
                         lastCacheHitAt = Some(Instant::now());
                     }
+                }
+                LogEvent::ModelConfigChanged {
+                    contextWindow: nextContextWindow,
+                    cachingEnabled: nextCachingEnabled,
+                } => {
+                    contextWindow = nextContextWindow;
+                    cachingEnabled = nextCachingEnabled;
+                    lastCacheHitAt = None;
                 }
                 LogEvent::Retrying {
                     attempt,

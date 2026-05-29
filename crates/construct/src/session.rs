@@ -249,6 +249,10 @@ pub struct Session {
     /// a `<CRITICAL_INSTRUCTIONS>` wrapper at API call time. Never stored
     /// in `history` or the transcript.
     riders: Vec<Rider>,
+    /// Prompt assembly context, retained so live config changes can rebuild
+    /// the ephemeral system prompt without clearing the session.
+    interface: InterfaceMode,
+    domains: Vec<DomainModule>,
     /// Stored for rebuild on rewind/fork switch.
     systemPrompt: String,
     /// Active branch head turn ID. None for fresh sessions with no messages yet.
@@ -378,6 +382,8 @@ impl Session {
             lspManager,
             lspWarmedUp: false,
             riders: buildRiders(config),
+            interface,
+            domains: domains.to_vec(),
             systemPrompt,
             headTurnId: None,
             pendingTopicEval: None,
@@ -611,6 +617,8 @@ impl Session {
             lspManager,
             lspWarmedUp: false,
             riders: buildRiders(config),
+            interface,
+            domains: domains.to_vec(),
             systemPrompt,
             headTurnId,
             pendingTopicEval: None,

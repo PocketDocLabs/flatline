@@ -568,6 +568,14 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
                 "cacheCreationTokens": cacheCreationTokens,
             })
         }
+        LogEvent::ModelConfigChanged {
+            contextWindow,
+            cachingEnabled,
+        } => serde_json::json!({
+            "type": "modelConfigChanged",
+            "contextWindow": contextWindow,
+            "cachingEnabled": cachingEnabled,
+        }),
         LogEvent::CompactionStarted { stage } => serde_json::json!({
             "type": "compactionStarted", "stage": stage,
         }),

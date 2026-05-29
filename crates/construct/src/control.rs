@@ -135,6 +135,12 @@ pub enum LogEvent {
         cacheCreationTokens: usize,
     },
 
+    /// Runtime model settings changed without replacing the session.
+    ModelConfigChanged {
+        contextWindow: usize,
+        cachingEnabled: bool,
+    },
+
     /// Session cost exceeded the configured warning threshold.
     BudgetWarning { sessionCost: f64, limit: f64 },
 

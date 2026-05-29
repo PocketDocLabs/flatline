@@ -159,7 +159,8 @@ files when those scopes are distinct.
 
 When Flatline is launched from a directory below the project root, the default
 save target is launch-local config. Otherwise it defaults to project-local
-config. Pressing Enter in the profile view saves the tier selection.
+config. Pressing Enter in the profile view saves the tier selection and applies
+it to the live session for the next model turn.
 
 Press `e` to open the selected profile's config view. This view exposes the
 model picker, usable context budget, thinking mode, provider effort, reasoning
