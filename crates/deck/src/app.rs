@@ -1207,7 +1207,7 @@ pub async fn run() -> Result<()> {
                                             defaultMode,
                                             rules,
                                             source: construct::permissions::PermissionsSource::Project,
-                                        });
+                                        }).await;
                                         let _ = reply.send(construct::control::CommandAck::ok(
                                             "Permissions saved.",
                                         ));
@@ -1226,7 +1226,7 @@ pub async fn run() -> Result<()> {
                         }
                         Some(TuiRequest::SetPermitMode { mode, reply }) => {
                             runtimePermitMode = mode.clone();
-                            session.setPermitMode(mode.clone());
+                            session.setPermitMode(mode.clone()).await;
                             let _ = reply.send(construct::control::CommandAck::ok(format!(
                                 "Permission mode: {}",
                                 permitModeLabel(&mode),

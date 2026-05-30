@@ -1,6 +1,6 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{Session, UserInput};
+use super::{Session, UserInput, toolDefsForPermitMode};
 use crate::control::{LogEvent, PermitOrigin, SessionRequest};
 use crate::tool;
 
@@ -333,7 +333,8 @@ impl Session {
             Err(e) => return format!("Failed to create subagent session: {e}"),
         };
 
-        let filtered = tool::filterDefs(&tool::builtinDefs(), &preset.toolSet);
+        let childDefs = toolDefsForPermitMode(&child.permissions.defaultMode);
+        let filtered = tool::filterDefs(&childDefs, &preset.toolSet);
         child.setTools(filtered);
 
         let childSessionId = child.sessionId().to_string();
@@ -565,7 +566,8 @@ impl Session {
             Err(e) => return format!("Failed to create subagent session: {e}"),
         };
 
-        let filtered = tool::filterDefs(&tool::builtinDefs(), &preset.toolSet);
+        let childDefs = toolDefsForPermitMode(&child.permissions.defaultMode);
+        let filtered = tool::filterDefs(&childDefs, &preset.toolSet);
         child.setTools(filtered);
 
         let taskId = self.jobs.lock().unwrap().reserveJobId();

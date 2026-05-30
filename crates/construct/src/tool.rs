@@ -23,7 +23,10 @@ pub(crate) use action::{
     filterDefs, needsJobPlane, needsLsp, needsMcp, needsMonitor, needsRegistry, needsTask,
     needsTranscript, needsWakes, needsWeb,
 };
-pub(crate) use defs::{addPermissionEscalationFields, builtinDefs};
+pub(crate) use defs::{
+    addPermissionEscalationFieldsToDefs, builtinDefs, builtinDefsWithPermissionEscalation,
+    stripPermissionEscalationArgs, stripPermissionEscalationObject,
+};
 pub(crate) use execute::execute;
 pub(crate) use execute::truncateOutput;
 pub use parse::parse;

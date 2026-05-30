@@ -2,7 +2,7 @@ use crate::message::ToolDef;
 
 /// Returns the built-in tool definitions to send to the LLM.
 pub(crate) fn builtinDefs() -> Vec<ToolDef> {
-    let mut defs = vec![
+    vec![
         ToolDef {
             defType: "function".into(),
             function: crate::message::FunctionDef {
@@ -1283,14 +1283,22 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
                 }),
             },
         },
-    ];
-    for def in &mut defs {
-        addPermissionEscalationFields(&mut def.function.parameters);
-    }
+    ]
+}
+
+pub(crate) fn builtinDefsWithPermissionEscalation() -> Vec<ToolDef> {
+    let mut defs = builtinDefs();
+    addPermissionEscalationFieldsToDefs(&mut defs);
     defs
 }
 
-pub(crate) fn addPermissionEscalationFields(parameters: &mut serde_json::Value) {
+pub(crate) fn addPermissionEscalationFieldsToDefs(defs: &mut [ToolDef]) {
+    for def in defs {
+        addPermissionEscalationFields(&mut def.function.parameters);
+    }
+}
+
+fn addPermissionEscalationFields(parameters: &mut serde_json::Value) {
     let Some(obj) = parameters.as_object_mut() else {
         return;
     };
@@ -1315,4 +1323,44 @@ pub(crate) fn addPermissionEscalationFields(parameters: &mut serde_json::Value) 
             "description": "Short reason to show the user when raiseToUser is true."
         }),
     );
+}
+
+pub(crate) fn stripPermissionEscalationArgs(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        stripPermissionEscalationObject(obj);
+    }
+}
+
+pub(crate) fn stripPermissionEscalationObject(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    obj.remove("raiseToUser");
+    obj.remove("raiseReason");
+    obj.remove("raise_to_user");
+    obj.remove("raise_reason");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stripPermissionEscalationObjectRemovesFlatlineOnlyFields() {
+        let mut obj = serde_json::json!({
+            "query": "rust",
+            "raiseToUser": true,
+            "raiseReason": "blocking",
+            "raise_to_user": true,
+            "raise_reason": "blocking"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        super::stripPermissionEscalationObject(&mut obj);
+
+        assert_eq!(obj.get("query").and_then(|v| v.as_str()), Some("rust"));
+        assert!(obj.get("raiseToUser").is_none());
+        assert!(obj.get("raiseReason").is_none());
+        assert!(obj.get("raise_to_user").is_none());
+        assert!(obj.get("raise_reason").is_none());
+    }
 }

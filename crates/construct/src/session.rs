@@ -46,6 +46,7 @@ use crate::topic::{TopicDecision, TopicTracker};
 use crate::transcript::{self, Transcript};
 use crate::web;
 
+mod auto_permissions;
 mod compact;
 mod format;
 mod history;
@@ -205,6 +206,14 @@ fn unixNow() -> u64 {
         .as_secs()
 }
 
+fn toolDefsForPermitMode(mode: &PermitMode) -> Vec<ToolDef> {
+    if matches!(mode, PermitMode::Auto) {
+        tool::builtinDefsWithPermissionEscalation()
+    } else {
+        tool::builtinDefs()
+    }
+}
+
 /// Agent session — owns the conversation and drives the turn loop.
 pub struct Session {
     client: api::Client,
@@ -321,7 +330,7 @@ impl Session {
         domains: &[DomainModule],
     ) -> Result<Self> {
         let client = api::Client::new(config)?;
-        let tools = tool::builtinDefs();
+        let tools = toolDefsForPermitMode(&permissions.defaultMode);
 
         let reasoning = config.heavy.reasoning.as_ref().map(|r| ReasoningConfig {
             effort: r.effort.clone(),
@@ -463,7 +472,7 @@ impl Session {
             Ok(c) => c,
             Err(e) => return Err((e, shells)),
         };
-        let tools = tool::builtinDefs();
+        let tools = toolDefsForPermitMode(&permissions.defaultMode);
 
         let reasoning = config.heavy.reasoning.as_ref().map(|r| ReasoningConfig {
             effort: r.effort.clone(),
@@ -1239,58 +1248,29 @@ impl Session {
                                         request_permit!(summary, diff, explanation, impact)
                                     }
                                     PermitMode::Auto => {
-                                        let diff = tool::diffPreview(&action);
-                                        let explanation =
-                                            crate::permissions::toolExplanation(&action)
-                                                .map(|s| s.to_string());
-                                        let impact = crate::permissions::toolImpact(&action);
-                                        let meta = crate::auto_review::permissionMeta(
-                                            &call.function.arguments,
-                                        );
-                                        let actionHash = crate::auto_review::actionHash(
-                                            &call.function.name,
-                                            &call.function.arguments,
-                                        );
-
-                                        if meta.raiseToUser {
-                                            if let Some(ticket) =
-                                                self.autoReviewTickets.remove(&actionHash)
-                                            {
-                                                let mut raisedExplanation = String::new();
-                                                if let Some(ref prior) = explanation {
-                                                    raisedExplanation.push_str(prior);
-                                                    raisedExplanation.push_str("\n\n");
-                                                }
-                                                raisedExplanation.push_str(
-                                                        "Auto reviewer allowed escalation for this exact action.",
-                                                    );
-                                                if !ticket.reason.is_empty() {
-                                                    raisedExplanation
-                                                        .push_str("\nReviewer reason: ");
-                                                    raisedExplanation.push_str(&ticket.reason);
-                                                }
-                                                if !ticket.messageToAgent.is_empty() {
-                                                    raisedExplanation
-                                                        .push_str("\nReviewer message: ");
-                                                    raisedExplanation
-                                                        .push_str(&ticket.messageToAgent);
-                                                }
-                                                if let Some(ref reason) = meta.raiseReason {
-                                                    raisedExplanation
-                                                        .push_str("\nAgent raise reason: ");
-                                                    raisedExplanation.push_str(reason);
-                                                }
-                                                request_permit!(
-                                                    format!("{summary} (auto-review escalation)"),
-                                                    diff,
-                                                    Some(raisedExplanation),
-                                                    impact
-                                                )
-                                            } else {
-                                                deniedMessage = Some(
-                                                        "raiseToUser was set, but there is no active auto-review raise ticket for this exact action. Continue without asking the user, or retry without raiseToUser to request a fresh auto review."
-                                                            .into(),
-                                                    );
+                                        let decision = self
+                                            .reviewAutoPermission(
+                                                call,
+                                                &action,
+                                                &summary,
+                                                &reviewHistory,
+                                                cancelRx,
+                                            )
+                                            .await;
+                                        match decision {
+                                            auto_permissions::AutoPermissionDecision::Approved => {
+                                                let _ = logTx
+                                                    .send(LogEvent::ToolAutoApproved {
+                                                        name: call.function.name.clone(),
+                                                        summary: summary.clone(),
+                                                    })
+                                                    .await;
+                                                true
+                                            }
+                                            auto_permissions::AutoPermissionDecision::Denied {
+                                                message,
+                                            } => {
+                                                deniedMessage = Some(message);
                                                 let _ = logTx
                                                     .send(LogEvent::ToolAutoDenied {
                                                         name: call.function.name.clone(),
@@ -1299,82 +1279,25 @@ impl Session {
                                                     .await;
                                                 false
                                             }
-                                        } else {
-                                            let client = self.client.clone();
-                                            let reviewInput = crate::auto_review::ReviewInput {
-                                                toolCallId: call.id.clone(),
-                                                toolName: call.function.name.clone(),
-                                                summary: summary.clone(),
-                                                args: call.function.arguments.clone(),
-                                                impact: impact.clone(),
-                                                explanation: explanation.clone(),
-                                                diff: diff.clone(),
-                                            };
-                                            let reviewResult = tokio::select! {
-                                                review = crate::auto_review::review(
-                                                    &client,
-                                                    &reviewHistory,
-                                                    reviewInput,
-                                                ) => review,
-                                                _ = cancelRx.changed() => {
-                                                    tracing::info!("cancelled during auto-review");
-                                                    for remaining in &calls[callIdx..] {
-                                                        self.pushToolResult(
-                                                            &remaining.id,
-                                                            crate::message::Content::text("Cancelled by user."),
-                                                        );
-                                                    }
-                                                    let _ = logTx.send(LogEvent::TurnCancelled).await;
-                                                    break 'turns Ok(());
+                                            auto_permissions::AutoPermissionDecision::AskUser {
+                                                summary,
+                                                diff,
+                                                explanation,
+                                                impact,
+                                            } => {
+                                                request_permit!(summary, diff, explanation, impact)
+                                            }
+                                            auto_permissions::AutoPermissionDecision::Cancelled => {
+                                                for remaining in &calls[callIdx..] {
+                                                    self.pushToolResult(
+                                                        &remaining.id,
+                                                        crate::message::Content::text(
+                                                            "Cancelled by user.",
+                                                        ),
+                                                    );
                                                 }
-                                            };
-
-                                            match reviewResult {
-                                                Ok(review) if review.allowed() => {
-                                                    let _ = logTx
-                                                        .send(LogEvent::ToolAutoApproved {
-                                                            name: call.function.name.clone(),
-                                                            summary: summary.clone(),
-                                                        })
-                                                        .await;
-                                                    true
-                                                }
-                                                Ok(review) => {
-                                                    if review.raiseAllowed() {
-                                                        self.autoReviewTickets.insert(
-                                                            actionHash,
-                                                            review.raiseTicket(),
-                                                        );
-                                                    }
-                                                    deniedMessage = Some(review.denialToolResult());
-                                                    let _ = logTx
-                                                        .send(LogEvent::ToolAutoDenied {
-                                                            name: call.function.name.clone(),
-                                                            summary: summary.clone(),
-                                                        })
-                                                        .await;
-                                                    false
-                                                }
-                                                Err(e) => {
-                                                    let fallbackExplanation = {
-                                                        let mut msg =
-                                                            explanation.unwrap_or_default();
-                                                        if !msg.is_empty() {
-                                                            msg.push_str("\n\n");
-                                                        }
-                                                        msg.push_str(
-                                                                "Auto reviewer failed; falling back to user approval: ",
-                                                            );
-                                                        msg.push_str(&e.to_string());
-                                                        Some(msg)
-                                                    };
-                                                    request_permit!(
-                                                        format!("{summary} (auto-review fallback)"),
-                                                        diff,
-                                                        fallbackExplanation,
-                                                        impact
-                                                    )
-                                                }
+                                                let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                                break 'turns Ok(());
                                             }
                                         }
                                     }

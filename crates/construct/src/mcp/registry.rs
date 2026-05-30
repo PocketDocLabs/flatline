@@ -127,19 +127,37 @@ impl ToolRegistry {
     ///
     /// If total token cost exceeds `contextBudget * 0.10`, returns only the
     /// search meta-tool (see `search.rs`). Otherwise returns all defs.
-    pub fn toolDefs(&self, contextBudget: usize) -> Vec<ToolDef> {
-        let threshold = contextBudget / 10;
-        if self.totalDefTokens > threshold && !self.cachedDefs.is_empty() {
-            // Context too expensive — return just the search meta-tool.
-            return vec![super::search::searchToolDef()];
+    pub fn toolDefs(
+        &self,
+        contextBudget: usize,
+        includePermissionEscalation: bool,
+    ) -> Vec<ToolDef> {
+        let mut defs = self.cachedDefs.clone();
+        if includePermissionEscalation {
+            crate::tool::addPermissionEscalationFieldsToDefs(&mut defs);
         }
-        self.cachedDefs.clone()
+
+        let threshold = contextBudget / 10;
+        let totalDefTokens = estimateToolDefTokens(&defs);
+        if totalDefTokens > threshold && !defs.is_empty() {
+            // Context too expensive — return just the search meta-tool.
+            let mut searchDefs = vec![super::search::searchToolDef()];
+            if includePermissionEscalation {
+                crate::tool::addPermissionEscalationFieldsToDefs(&mut searchDefs);
+            }
+            return searchDefs;
+        }
+        defs
     }
 
     /// Whether the search meta-tool is active (i.e. defs are deferred).
-    pub fn isSearchMode(&self, contextBudget: usize) -> bool {
+    pub fn isSearchMode(&self, contextBudget: usize, includePermissionEscalation: bool) -> bool {
         let threshold = contextBudget / 10;
-        self.totalDefTokens > threshold && !self.cachedDefs.is_empty()
+        let mut defs = self.cachedDefs.clone();
+        if includePermissionEscalation {
+            crate::tool::addPermissionEscalationFieldsToDefs(&mut defs);
+        }
+        estimateToolDefTokens(&defs) > threshold && !defs.is_empty()
     }
 
     /// Total estimated tokens for all tool defs.
@@ -210,26 +228,26 @@ impl ToolRegistry {
         self.cachedDefs = self
             .tools
             .values()
-            .map(|entry| {
-                let mut parameters = entry.schema.clone();
-                crate::tool::addPermissionEscalationFields(&mut parameters);
-                ToolDef {
-                    defType: "function".into(),
-                    function: FunctionDef {
-                        name: entry.qualifiedName.clone(),
-                        description: entry.description.clone(),
-                        parameters,
-                    },
-                }
+            .map(|entry| ToolDef {
+                defType: "function".into(),
+                function: FunctionDef {
+                    name: entry.qualifiedName.clone(),
+                    description: entry.description.clone(),
+                    parameters: entry.schema.clone(),
+                },
             })
             .collect();
         self.cachedDefs
             .sort_by(|a, b| a.function.name.cmp(&b.function.name));
 
         // Estimate token cost of all defs.
-        let jsonStr = serde_json::to_string(&self.cachedDefs).unwrap_or_default();
-        self.totalDefTokens = estimateTokens(&jsonStr);
+        self.totalDefTokens = estimateToolDefTokens(&self.cachedDefs);
     }
+}
+
+fn estimateToolDefTokens(defs: &[ToolDef]) -> usize {
+    let jsonStr = serde_json::to_string(defs).unwrap_or_default();
+    estimateTokens(&jsonStr)
 }
 
 /// A search result with relevance score.
@@ -389,7 +407,7 @@ mod tests {
         reg.registerServer("big", tools);
 
         // Small context budget should trigger search mode.
-        let defs = reg.toolDefs(1000);
+        let defs = reg.toolDefs(1000, false);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].function.name, "mcpToolSearch");
     }
@@ -400,9 +418,28 @@ mod tests {
         reg.registerServer("small", vec![makeTool("one", "Tool one")]);
 
         // Large context budget should return all defs.
-        let defs = reg.toolDefs(1_000_000);
+        let defs = reg.toolDefs(1_000_000, false);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].function.name, "mcp__small__one");
+        assert!(
+            defs[0].function.parameters["properties"]
+                .get("raiseToUser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn toolDefsCanIncludePermissionEscalationFields() {
+        let mut reg = ToolRegistry::new();
+        reg.registerServer("small", vec![makeTool("one", "Tool one")]);
+
+        let defs = reg.toolDefs(1_000_000, true);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].function.parameters["properties"]
+                .get("raiseToUser")
+                .is_some()
+        );
     }
 
     #[test]
@@ -418,14 +455,14 @@ mod tests {
         );
         reg.registerServer("alpha", vec![makeTool("bravo", "Tool B")]);
 
-        let defs = reg.toolDefs(1_000_000);
+        let defs = reg.toolDefs(1_000_000, false);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         let mut expected = names.clone();
         expected.sort();
         assert_eq!(names, expected, "tool defs not sorted by qualified name");
 
         // Run the conversion again; order must be identical.
-        let defs2 = reg.toolDefs(1_000_000);
+        let defs2 = reg.toolDefs(1_000_000, false);
         let names2: Vec<&str> = defs2.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(names, names2, "tool def order differs between calls");
     }

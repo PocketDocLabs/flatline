@@ -199,6 +199,7 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
         Permissions::askForEverything()
     };
 
+    let permitMode = permissions.defaultMode.clone();
     let mut session = Session::new(
         &config,
         permissions,
@@ -214,7 +215,11 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
 
     // Apply tool restriction (--tools flag).
     if let Some(ref toolNames) = runConfig.tools {
-        let allDefs = crate::tool::builtinDefs();
+        let allDefs = if matches!(permitMode, crate::permissions::PermitMode::Auto) {
+            crate::tool::builtinDefsWithPermissionEscalation()
+        } else {
+            crate::tool::builtinDefs()
+        };
         let filtered: Vec<_> = allDefs
             .into_iter()
             .filter(|d| toolNames.contains(&d.function.name))

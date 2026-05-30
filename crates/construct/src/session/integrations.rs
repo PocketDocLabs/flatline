@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc;
 
-use super::Session;
 use super::request::buildRiders;
+use super::{Session, toolDefsForPermitMode};
 use crate::message::Message;
-use crate::{api, compaction_trigger, lsp, mcp, prompt, tool, web};
+use crate::{api, compaction_trigger, lsp, mcp, prompt, web};
 
 impl Session {
     /// Initialize MCP server connections.
@@ -41,13 +41,17 @@ impl Session {
     }
 
     /// Replace the current permission set.
-    pub fn setPermissions(&mut self, permissions: crate::permissions::Permissions) {
+    pub async fn setPermissions(&mut self, permissions: crate::permissions::Permissions) {
         self.permissions = permissions;
+        self.refreshToolDefs().await;
+        self.refreshSystemPrompt().await;
     }
 
     /// Change only the default permission mode, preserving rules/source.
-    pub fn setPermitMode(&mut self, mode: crate::permissions::PermitMode) {
+    pub async fn setPermitMode(&mut self, mode: crate::permissions::PermitMode) {
         self.permissions.defaultMode = mode;
+        self.refreshToolDefs().await;
+        self.refreshSystemPrompt().await;
     }
 
     /// Apply a freshly loaded config to this live session.
@@ -90,9 +94,15 @@ impl Session {
     }
 
     async fn refreshToolDefs(&mut self) {
-        let mut defs = tool::builtinDefs();
+        let includePermissionEscalation = matches!(
+            self.permissions.defaultMode,
+            crate::permissions::PermitMode::Auto
+        );
+        let mut defs = toolDefsForPermitMode(&self.permissions.defaultMode);
         if let Some(mgr) = &self.mcpManager {
-            let mcpDefs = mgr.toolDefs(self.config.heavy.contextWindow).await;
+            let mcpDefs = mgr
+                .toolDefs(self.config.heavy.contextWindow, includePermissionEscalation)
+                .await;
             if !mcpDefs.is_empty() {
                 defs.extend(mcpDefs);
                 let mcpToolCount = mgr.toolCount().await;
@@ -135,7 +145,15 @@ impl Session {
             return String::new();
         };
 
-        let searchMode = mgr.isSearchMode(self.config.heavy.contextWindow).await;
+        let searchMode = mgr
+            .isSearchMode(
+                self.config.heavy.contextWindow,
+                matches!(
+                    self.permissions.defaultMode,
+                    crate::permissions::PermitMode::Auto
+                ),
+            )
+            .await;
         let statuses = mgr.serverStatuses();
         let registry = mgr.registry().read().await;
         let serverInfos: Vec<prompt::McpServerInfo> = statuses
@@ -194,7 +212,15 @@ impl Session {
 
         let statuses = mgr.serverStatuses();
         let totalTools = mgr.toolCount().await;
-        let searchMode = mgr.isSearchMode(self.config.heavy.contextWindow).await;
+        let searchMode = mgr
+            .isSearchMode(
+                self.config.heavy.contextWindow,
+                matches!(
+                    self.permissions.defaultMode,
+                    crate::permissions::PermitMode::Auto
+                ),
+            )
+            .await;
 
         let registry = mgr.registry().read().await;
 

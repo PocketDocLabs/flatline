@@ -171,13 +171,27 @@ impl McpManager {
     }
 
     /// Get tool definitions for the LLM, applying context budgeting.
-    pub async fn toolDefs(&self, contextBudget: usize) -> Vec<ToolDef> {
-        self.registry.read().await.toolDefs(contextBudget)
+    pub async fn toolDefs(
+        &self,
+        contextBudget: usize,
+        includePermissionEscalation: bool,
+    ) -> Vec<ToolDef> {
+        self.registry
+            .read()
+            .await
+            .toolDefs(contextBudget, includePermissionEscalation)
     }
 
     /// Whether tool search mode is active.
-    pub async fn isSearchMode(&self, contextBudget: usize) -> bool {
-        self.registry.read().await.isSearchMode(contextBudget)
+    pub async fn isSearchMode(
+        &self,
+        contextBudget: usize,
+        includePermissionEscalation: bool,
+    ) -> bool {
+        self.registry
+            .read()
+            .await
+            .isSearchMode(contextBudget, includePermissionEscalation)
     }
 
     /// Route a tool call to the correct server connection.
@@ -216,7 +230,10 @@ impl McpManager {
             None
         } else {
             match serde_json::from_str(argsJson) {
-                Ok(serde_json::Value::Object(m)) => Some(m),
+                Ok(serde_json::Value::Object(mut m)) => {
+                    crate::tool::stripPermissionEscalationObject(&mut m);
+                    if m.is_empty() { None } else { Some(m) }
+                }
                 Ok(_) => {
                     return format!("MCP tool arguments must be a JSON object, got: {argsJson}");
                 }

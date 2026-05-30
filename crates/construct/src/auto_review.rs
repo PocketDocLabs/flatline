@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::api;
 use crate::config::ModelTier;
@@ -104,26 +104,42 @@ pub(crate) struct PermissionMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AutoDecision {
+enum AutoDecision {
     Allow,
     Deny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RaiseToUser {
+enum RaiseToUser {
     None,
     Allowed,
     Forbidden,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum Risk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Authorization {
+    Unknown,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Review {
-    pub decision: AutoDecision,
-    pub raiseToUser: RaiseToUser,
-    pub risk: String,
-    pub authorization: String,
-    pub reason: String,
-    pub messageToAgent: String,
+    decision: AutoDecision,
+    raiseToUser: RaiseToUser,
+    risk: Risk,
+    authorization: Authorization,
+    reason: String,
+    messageToAgent: String,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +195,30 @@ impl Review {
             format!(
                 "Auto reviewer denied this action.\n\nReason: {reason}\n\nReviewer message: {agentMessage}"
             )
+        }
+    }
+}
+
+impl Risk {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            other => bail!("auto reviewer returned invalid risk: {other}"),
+        }
+    }
+}
+
+impl Authorization {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "unknown" => Ok(Self::Unknown),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => bail!("auto reviewer returned invalid authorization: {other}"),
         }
     }
 }
@@ -252,18 +292,14 @@ pub(crate) async fn review(
 }
 
 pub(crate) fn parseReview(text: &str) -> Result<Review> {
-    let decision = match tag(text, "decision")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let body = reviewBody(text)?;
+    let decision = match requiredTag(body, "decision")?.to_ascii_lowercase().as_str() {
         "allow" => AutoDecision::Allow,
         "deny" => AutoDecision::Deny,
         other => bail!("auto reviewer returned invalid decision: {other}"),
     };
 
-    let raiseToUser = match tag(text, "raise_to_user")
-        .unwrap_or_else(|| "none".into())
+    let raiseToUser = match requiredTag(body, "raise_to_user")?
         .to_ascii_lowercase()
         .as_str()
     {
@@ -276,10 +312,10 @@ pub(crate) fn parseReview(text: &str) -> Result<Review> {
     Ok(Review {
         decision,
         raiseToUser,
-        risk: tag(text, "risk").unwrap_or_default(),
-        authorization: tag(text, "authorization").unwrap_or_else(|| "unknown".into()),
-        reason: tag(text, "reason").unwrap_or_default(),
-        messageToAgent: tag(text, "message_to_agent").unwrap_or_default(),
+        risk: Risk::parse(&requiredTag(body, "risk")?)?,
+        authorization: Authorization::parse(&requiredTag(body, "authorization")?)?,
+        reason: tag(body, "reason")?.unwrap_or_default(),
+        messageToAgent: tag(body, "message_to_agent")?.unwrap_or_default(),
     })
 }
 
@@ -394,21 +430,55 @@ fn pushTag(out: &mut String, name: &str, value: &str) {
 
 fn canonicalArgsWithoutMeta(argsJson: &str) -> Option<String> {
     let mut value = serde_json::from_str::<serde_json::Value>(argsJson).ok()?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("raiseToUser");
-        obj.remove("raiseReason");
-        obj.remove("raise_to_user");
-        obj.remove("raise_reason");
-    }
+    crate::tool::stripPermissionEscalationArgs(&mut value);
     serde_json::to_string(&value).ok()
 }
 
-fn tag(text: &str, name: &str) -> Option<String> {
+fn reviewBody(text: &str) -> Result<&str> {
+    let trimmed = text.trim();
+    let open = "<review>";
+    let close = "</review>";
+    let Some(openStart) = trimmed.find(open) else {
+        bail!("auto reviewer response missing <review>");
+    };
+    if !trimmed[..openStart].trim().is_empty() {
+        bail!("auto reviewer returned prose before <review>");
+    }
+    let bodyStart = openStart + open.len();
+    let Some(closeRel) = trimmed[bodyStart..].find(close) else {
+        bail!("auto reviewer response missing </review>");
+    };
+    let bodyEnd = bodyStart + closeRel;
+    let afterEnd = bodyEnd + close.len();
+    if !trimmed[afterEnd..].trim().is_empty() {
+        bail!("auto reviewer returned prose after </review>");
+    }
+    let body = &trimmed[bodyStart..bodyEnd];
+    if body.contains(open) || body.contains(close) {
+        bail!("auto reviewer returned nested review tags");
+    }
+    Ok(body)
+}
+
+fn requiredTag(text: &str, name: &str) -> Result<String> {
+    tag(text, name)?.ok_or_else(|| anyhow!("auto reviewer response missing <{name}>"))
+}
+
+fn tag(text: &str, name: &str) -> Result<Option<String>> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(text[start..end].trim().to_string())
+    let Some(openStart) = text.find(&open) else {
+        return Ok(None);
+    };
+    let start = openStart + open.len();
+    let Some(closeRel) = text[start..].find(&close) else {
+        bail!("auto reviewer response missing closing tag for <{name}>");
+    };
+    let end = start + closeRel;
+    if text[end + close.len()..].contains(&open) {
+        bail!("auto reviewer returned duplicate <{name}>");
+    }
+    Ok(Some(text[start..end].trim().to_string()))
 }
 
 fn truncate(text: &str, maxBytes: usize) -> String {
@@ -461,9 +531,33 @@ mod tests {
 
         assert_eq!(review.decision, AutoDecision::Deny);
         assert_eq!(review.raiseToUser, RaiseToUser::Allowed);
-        assert_eq!(review.risk, "medium");
-        assert_eq!(review.authorization, "low");
+        assert_eq!(review.risk, Risk::Medium);
+        assert_eq!(review.authorization, Authorization::Low);
         assert_eq!(review.reason, "Needs user preference.");
+    }
+
+    #[test]
+    fn rejectsInvalidReviewShapeAndEnums() {
+        let withProse = parseReview(
+            r#"Sure:
+<review>
+  <decision>deny</decision>
+  <raise_to_user>none</raise_to_user>
+  <risk>medium</risk>
+  <authorization>low</authorization>
+</review>"#,
+        );
+        assert!(withProse.is_err());
+
+        let badRisk = parseReview(
+            r#"<review>
+  <decision>deny</decision>
+  <raise_to_user>none</raise_to_user>
+  <risk>tiny</risk>
+  <authorization>low</authorization>
+</review>"#,
+        );
+        assert!(badRisk.is_err());
     }
 
     #[test]
