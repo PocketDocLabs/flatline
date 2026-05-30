@@ -35,6 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::api;
 use crate::compaction::{CompactionLog, CompactionOp};
+use crate::config::ModelTier;
 use crate::message::Message;
 use crate::transcript::Transcript;
 
@@ -122,7 +123,7 @@ pub async fn run(
     ];
 
     let (response, usage) = client
-        .complete(&messages, Some(utilityModel))
+        .complete(ModelTier::Utility, &messages, Some(utilityModel))
         .await
         .context("S4 utility model call failed")?;
 

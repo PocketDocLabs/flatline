@@ -356,6 +356,9 @@ fn urlPatterns(url: &str) -> Vec<String> {
 pub enum PermitMode {
     /// Ask the supervisor (TUI user, parent agent, etc.) and wait for response.
     Ask,
+    /// Ask an automatic reviewer first; escalate to the supervisor only when
+    /// the reviewer explicitly grants a raise-to-user retry.
+    Auto,
     /// Immediately deny and continue the turn with a denial message.
     Deny,
     /// Immediately deny and abort the entire turn.

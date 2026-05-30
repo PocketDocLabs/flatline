@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::api;
-use crate::config::Config;
+use crate::config::{Config, ModelTier};
 use crate::message::Message;
 
 const EXA_BASE_URL: &str = "https://api.exa.ai";
@@ -392,7 +392,7 @@ async fn maybeSummarize(
     ];
 
     match apiClient
-        .complete(&messages, Some(&config.utility.model))
+        .complete(ModelTier::Utility, &messages, Some(&config.utility.model))
         .await
     {
         Ok((summary, _usage)) => summary,

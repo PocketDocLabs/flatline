@@ -219,6 +219,7 @@ allow = true
 `defaultMode` values:
 
 - `ask`: ask the supervisor when no rule matches
+- `auto`: use the automatic reviewer for unmatched tools; it may ask the supervisor only when the reviewer allows escalation
 - `deny`: deny unmatched tools and continue
 - `abort`: deny unmatched tools and abort the turn
 

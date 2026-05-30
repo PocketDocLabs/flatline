@@ -210,13 +210,17 @@ impl ToolRegistry {
         self.cachedDefs = self
             .tools
             .values()
-            .map(|entry| ToolDef {
-                defType: "function".into(),
-                function: FunctionDef {
-                    name: entry.qualifiedName.clone(),
-                    description: entry.description.clone(),
-                    parameters: entry.schema.clone(),
-                },
+            .map(|entry| {
+                let mut parameters = entry.schema.clone();
+                crate::tool::addPermissionEscalationFields(&mut parameters);
+                ToolDef {
+                    defType: "function".into(),
+                    function: FunctionDef {
+                        name: entry.qualifiedName.clone(),
+                        description: entry.description.clone(),
+                        parameters,
+                    },
+                }
             })
             .collect();
         self.cachedDefs

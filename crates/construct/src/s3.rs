@@ -27,6 +27,7 @@ use futures::future::join_all;
 
 use crate::api;
 use crate::compaction::{CompactionLog, CompactionOp};
+use crate::config::ModelTier;
 use crate::topic::TopicInfo;
 use crate::transcript::{Transcript, Turn, TurnRole};
 
@@ -501,7 +502,9 @@ async fn compactTopic(
         },
     ];
 
-    let (response, usage) = client.complete(&messages, Some(utilityModel)).await?;
+    let (response, usage) = client
+        .complete(ModelTier::Utility, &messages, Some(utilityModel))
+        .await?;
     let cost = usage.and_then(|u| u.cost);
     let summary = extractCompactedString(&response);
     Ok((summary, cost))

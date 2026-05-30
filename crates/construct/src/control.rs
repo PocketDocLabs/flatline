@@ -539,6 +539,12 @@ pub enum TuiRequest {
         reply: oneshot::Sender<CommandAck>,
     },
 
+    /// Change the live session permission mode without persisting config.
+    SetPermitMode {
+        mode: PermitMode,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
     /// Re-run the last user turn from scratch. Drives the turn loop.
     RetryLastTurn { reply: oneshot::Sender<CommandAck> },
 

@@ -6,7 +6,7 @@
 //! The permission system has three layers:
 //! 1. Pre-configured rules (allow/deny patterns per tool)
 //! 2. Runtime approval via the permit channel (for `NeedsApproval` verdicts)
-//! 3. A fallback mode (Ask, Deny, or Abort) when no rule matches
+//! 3. A fallback mode (Ask, Auto, Deny, or Abort) when no rule matches
 //!
 //! # Public API
 //! - [`Session`] — owns conversation state and drives the agent loop
@@ -267,6 +267,10 @@ pub struct Session {
     /// the first turn (expected cache miss) from later turns (expected hit)
     /// in the cache-watchdog trace.
     turnsWithUsage: usize,
+    /// Auto-review raise tickets keyed by the canonical tool call hash. A
+    /// later retry with `raiseToUser: true` may prompt the human only when
+    /// the exact same action has an active ticket here.
+    autoReviewTickets: HashMap<String, crate::auto_review::RaiseTicket>,
     /// Receiver for coalesced `WakeBatch` values. The session task takes
     /// this once at startup and selects on it alongside user input; each
     /// batch becomes one synthetic user-shaped turn driving the model.
@@ -390,6 +394,7 @@ impl Session {
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
             turnsWithUsage: 0,
+            autoReviewTickets: HashMap::new(),
             wakeBatchRx: Some(wakeBatchRx),
         })
     }
@@ -625,6 +630,7 @@ impl Session {
             pendingTopicBlockId: None,
             pendingCheckpoint: None,
             turnsWithUsage: 0,
+            autoReviewTickets: HashMap::new(),
             wakeBatchRx: Some(wakeBatchRx),
         })
     }
@@ -714,6 +720,7 @@ impl Session {
             // Build content — multimodal if attachments present. Riders are
             // applied later against the API-call copy; `self.history` and the
             // transcript get the clean user text.
+            self.autoReviewTickets.clear();
             let (content, turnAttachments) = buildUserContent(userMessage, &input.attachments);
             self.history.push(Message::User { content });
             match self.transcript.recordUser(
@@ -801,6 +808,7 @@ impl Session {
             // The model sees user-shaped content; the transcript stores
             // it under TurnRole::Wake so resume can render it as a
             // notice instead of a real user bubble.
+            self.autoReviewTickets.clear();
             let (content, _atts) = buildUserContent(&envelope, &[]);
             self.history.push(Message::User { content });
             match self
@@ -1049,6 +1057,11 @@ impl Session {
                             }
                         }
 
+                        // Auto-review should ride the same pre-tool-call prefix as
+                        // the topic classifier. The current assistant tool-call
+                        // message carries sibling payloads, so keep it out of the
+                        // reviewer context and present only the pending call.
+                        let reviewHistory = self.history.clone();
                         self.history.push(buildAssistantMessage(
                             content,
                             Some(calls.clone()),
@@ -1110,6 +1123,93 @@ impl Session {
                                 "checking tool permission"
                             );
 
+                            let mut deniedMessage: Option<String> = None;
+                            macro_rules! request_permit {
+                                ($permitSummary:expr, $diff:expr, $explanation:expr, $impact:expr) => {{
+                                    let (replyTx, replyRx) = oneshot::channel();
+                                    let _ = sessionRequestTx
+                                        .send(SessionRequest::Permit {
+                                            origin: PermitOrigin::Top,
+                                            name: call.function.name.clone(),
+                                            summary: $permitSummary,
+                                            args: call.function.arguments.clone(),
+                                            diff: $diff,
+                                            explanation: $explanation,
+                                            impact: $impact,
+                                            reply: replyTx,
+                                        })
+                                        .await;
+
+                                    tokio::select! {
+                                        permit = replyRx => {
+                                            use crate::permissions::PermitResponse;
+                                            match permit {
+                                                Ok(PermitResponse::Allow) => true,
+                                                Ok(PermitResponse::AlwaysAllow { pattern }) => {
+                                                    let (toolName, _) = crate::permissions::actionKey(&action);
+                                                    let rulePattern = crate::permissions::normalizeRulePattern(
+                                                        &action, &pattern,
+                                                    );
+                                                    let persistPattern = rulePattern
+                                                        .clone()
+                                                        .unwrap_or_default();
+                                                    self.permissions.addRule(crate::permissions::Rule {
+                                                        tool: toolName.into(),
+                                                        pattern: rulePattern,
+                                                        allow: true,
+                                                    });
+                                                    if let Some(ref root) = self.config.projectRoot
+                                                        && let Err(e) = crate::config::persistPermissionRule(
+                                                            root,
+                                                            &self.permissions,
+                                                            toolName,
+                                                            &persistPattern,
+                                                            true,
+                                                        ) {
+                                                            tracing::warn!("failed to persist permission rule: {e}");
+                                                        }
+                                                    true
+                                                }
+                                                Ok(PermitResponse::AlwaysDeny { pattern }) => {
+                                                    let (toolName, _) = crate::permissions::actionKey(&action);
+                                                    let rulePattern = crate::permissions::normalizeRulePattern(
+                                                        &action, &pattern,
+                                                    );
+                                                    let persistPattern = rulePattern
+                                                        .clone()
+                                                        .unwrap_or_default();
+                                                    self.permissions.addRule(crate::permissions::Rule {
+                                                        tool: toolName.into(),
+                                                        pattern: rulePattern,
+                                                        allow: false,
+                                                    });
+                                                    if let Some(ref root) = self.config.projectRoot
+                                                        && let Err(e) = crate::config::persistPermissionRule(
+                                                            root,
+                                                            &self.permissions,
+                                                            toolName,
+                                                            &persistPattern,
+                                                            false,
+                                                        ) {
+                                                            tracing::warn!("failed to persist deny rule: {e}");
+                                                        }
+                                                    false
+                                                }
+                                                Ok(PermitResponse::Deny) | Err(_) => false,
+                                            }
+                                        }
+                                        _ = cancelRx.changed() => {
+                                            tracing::info!("cancelled during permission wait");
+                                            for remaining in &calls[callIdx..] {
+                                                self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                            }
+                                            let _ = logTx.send(LogEvent::TurnCancelled).await;
+                                            break 'turns Ok(());
+                                        }
+                                    }
+                                }};
+                            }
+
                             let approved = match verdict {
                                 Verdict::Allow => {
                                     let _ = logTx
@@ -1129,118 +1229,173 @@ impl Session {
                                         .await;
                                     false
                                 }
-                                Verdict::NeedsApproval => {
-                                    match self.permissions.defaultMode {
-                                        PermitMode::Ask => {
-                                            let diff = tool::diffPreview(&action);
-                                            let explanation =
-                                                crate::permissions::toolExplanation(&action)
-                                                    .map(|s| s.to_string());
-                                            let impact = crate::permissions::toolImpact(&action);
-                                            let (replyTx, replyRx) = oneshot::channel();
-                                            let _ = sessionRequestTx
-                                                .send(SessionRequest::Permit {
-                                                    origin: PermitOrigin::Top,
-                                                    name: call.function.name.clone(),
-                                                    summary,
-                                                    args: call.function.arguments.clone(),
-                                                    diff,
-                                                    explanation,
-                                                    impact,
-                                                    reply: replyTx,
-                                                })
-                                                .await;
+                                Verdict::NeedsApproval => match self.permissions.defaultMode {
+                                    PermitMode::Ask => {
+                                        let diff = tool::diffPreview(&action);
+                                        let explanation =
+                                            crate::permissions::toolExplanation(&action)
+                                                .map(|s| s.to_string());
+                                        let impact = crate::permissions::toolImpact(&action);
+                                        request_permit!(summary, diff, explanation, impact)
+                                    }
+                                    PermitMode::Auto => {
+                                        let diff = tool::diffPreview(&action);
+                                        let explanation =
+                                            crate::permissions::toolExplanation(&action)
+                                                .map(|s| s.to_string());
+                                        let impact = crate::permissions::toolImpact(&action);
+                                        let meta = crate::auto_review::permissionMeta(
+                                            &call.function.arguments,
+                                        );
+                                        let actionHash = crate::auto_review::actionHash(
+                                            &call.function.name,
+                                            &call.function.arguments,
+                                        );
 
-                                            // Wait for supervisor response or cancellation.
-                                            tokio::select! {
-                                                permit = replyRx => {
-                                                    use crate::permissions::PermitResponse;
-                                                    match permit {
-                                                        Ok(PermitResponse::Allow) => true,
-                                                        Ok(PermitResponse::AlwaysAllow { pattern }) => {
-                                                            let (toolName, _) = crate::permissions::actionKey(&action);
-                                                            let rulePattern = crate::permissions::normalizeRulePattern(
-                                                                &action, &pattern,
-                                                            );
-                                                            let persistPattern = rulePattern
-                                                                .clone()
-                                                                .unwrap_or_default();
-                                                            self.permissions.addRule(crate::permissions::Rule {
-                                                                tool: toolName.into(),
-                                                                pattern: rulePattern,
-                                                                allow: true,
-                                                            });
-                                                            // Persist to .flatline/config.toml if we have a project root.
-                                                            if let Some(ref root) = self.config.projectRoot
-                                                                && let Err(e) = crate::config::persistPermissionRule(
-                                                                    root,
-                                                                    &self.permissions,
-                                                                    toolName,
-                                                                    &persistPattern,
-                                                                    true,
-                                                                ) {
-                                                                    tracing::warn!("failed to persist permission rule: {e}");
-                                                                }
-                                                            true
-                                                        }
-                                                        Ok(PermitResponse::AlwaysDeny { pattern }) => {
-                                                            let (toolName, _) = crate::permissions::actionKey(&action);
-                                                            let rulePattern = crate::permissions::normalizeRulePattern(
-                                                                &action, &pattern,
-                                                            );
-                                                            let persistPattern = rulePattern
-                                                                .clone()
-                                                                .unwrap_or_default();
-                                                            self.permissions.addRule(crate::permissions::Rule {
-                                                                tool: toolName.into(),
-                                                                pattern: rulePattern,
-                                                                allow: false,
-                                                            });
-                                                            if let Some(ref root) = self.config.projectRoot
-                                                                && let Err(e) = crate::config::persistPermissionRule(
-                                                                    root,
-                                                                    &self.permissions,
-                                                                    toolName,
-                                                                    &persistPattern,
-                                                                    false,
-                                                                ) {
-                                                                    tracing::warn!("failed to persist deny rule: {e}");
-                                                                }
-                                                            false
-                                                        }
-                                                        // Deny or disconnected reply → reject.
-                                                        Ok(PermitResponse::Deny) | Err(_) => false,
-                                                    }
+                                        if meta.raiseToUser {
+                                            if let Some(ticket) =
+                                                self.autoReviewTickets.remove(&actionHash)
+                                            {
+                                                let mut raisedExplanation = String::new();
+                                                if let Some(ref prior) = explanation {
+                                                    raisedExplanation.push_str(prior);
+                                                    raisedExplanation.push_str("\n\n");
                                                 }
+                                                raisedExplanation.push_str(
+                                                        "Auto reviewer allowed escalation for this exact action.",
+                                                    );
+                                                if !ticket.reason.is_empty() {
+                                                    raisedExplanation
+                                                        .push_str("\nReviewer reason: ");
+                                                    raisedExplanation.push_str(&ticket.reason);
+                                                }
+                                                if !ticket.messageToAgent.is_empty() {
+                                                    raisedExplanation
+                                                        .push_str("\nReviewer message: ");
+                                                    raisedExplanation
+                                                        .push_str(&ticket.messageToAgent);
+                                                }
+                                                if let Some(ref reason) = meta.raiseReason {
+                                                    raisedExplanation
+                                                        .push_str("\nAgent raise reason: ");
+                                                    raisedExplanation.push_str(reason);
+                                                }
+                                                request_permit!(
+                                                    format!("{summary} (auto-review escalation)"),
+                                                    diff,
+                                                    Some(raisedExplanation),
+                                                    impact
+                                                )
+                                            } else {
+                                                deniedMessage = Some(
+                                                        "raiseToUser was set, but there is no active auto-review raise ticket for this exact action. Continue without asking the user, or retry without raiseToUser to request a fresh auto review."
+                                                            .into(),
+                                                    );
+                                                let _ = logTx
+                                                    .send(LogEvent::ToolAutoDenied {
+                                                        name: call.function.name.clone(),
+                                                        summary: summary.clone(),
+                                                    })
+                                                    .await;
+                                                false
+                                            }
+                                        } else {
+                                            let client = self.client.clone();
+                                            let reviewInput = crate::auto_review::ReviewInput {
+                                                toolCallId: call.id.clone(),
+                                                toolName: call.function.name.clone(),
+                                                summary: summary.clone(),
+                                                args: call.function.arguments.clone(),
+                                                impact: impact.clone(),
+                                                explanation: explanation.clone(),
+                                                diff: diff.clone(),
+                                            };
+                                            let reviewResult = tokio::select! {
+                                                review = crate::auto_review::review(
+                                                    &client,
+                                                    &reviewHistory,
+                                                    reviewInput,
+                                                ) => review,
                                                 _ = cancelRx.changed() => {
-                                                    tracing::info!("cancelled during permission wait");
+                                                    tracing::info!("cancelled during auto-review");
                                                     for remaining in &calls[callIdx..] {
-                                                        self.pushToolResult(&remaining.id, crate::message::Content::text("Cancelled by user."));
+                                                        self.pushToolResult(
+                                                            &remaining.id,
+                                                            crate::message::Content::text("Cancelled by user."),
+                                                        );
                                                     }
                                                     let _ = logTx.send(LogEvent::TurnCancelled).await;
                                                     break 'turns Ok(());
                                                 }
+                                            };
+
+                                            match reviewResult {
+                                                Ok(review) if review.allowed() => {
+                                                    let _ = logTx
+                                                        .send(LogEvent::ToolAutoApproved {
+                                                            name: call.function.name.clone(),
+                                                            summary: summary.clone(),
+                                                        })
+                                                        .await;
+                                                    true
+                                                }
+                                                Ok(review) => {
+                                                    if review.raiseAllowed() {
+                                                        self.autoReviewTickets.insert(
+                                                            actionHash,
+                                                            review.raiseTicket(),
+                                                        );
+                                                    }
+                                                    deniedMessage = Some(review.denialToolResult());
+                                                    let _ = logTx
+                                                        .send(LogEvent::ToolAutoDenied {
+                                                            name: call.function.name.clone(),
+                                                            summary: summary.clone(),
+                                                        })
+                                                        .await;
+                                                    false
+                                                }
+                                                Err(e) => {
+                                                    let fallbackExplanation = {
+                                                        let mut msg =
+                                                            explanation.unwrap_or_default();
+                                                        if !msg.is_empty() {
+                                                            msg.push_str("\n\n");
+                                                        }
+                                                        msg.push_str(
+                                                                "Auto reviewer failed; falling back to user approval: ",
+                                                            );
+                                                        msg.push_str(&e.to_string());
+                                                        Some(msg)
+                                                    };
+                                                    request_permit!(
+                                                        format!("{summary} (auto-review fallback)"),
+                                                        diff,
+                                                        fallbackExplanation,
+                                                        impact
+                                                    )
+                                                }
                                             }
                                         }
-                                        PermitMode::Deny => {
-                                            let _ = logTx
-                                                .send(LogEvent::ToolDenied {
-                                                    name: call.function.name.clone(),
-                                                })
-                                                .await;
-                                            false
-                                        }
-                                        PermitMode::Abort => {
-                                            let _ = logTx
-                                                .send(LogEvent::TurnAborted {
-                                                    name: call.function.name.clone(),
-                                                })
-                                                .await;
-                                            aborted = true;
-                                            false
-                                        }
                                     }
-                                }
+                                    PermitMode::Deny => {
+                                        let _ = logTx
+                                            .send(LogEvent::ToolDenied {
+                                                name: call.function.name.clone(),
+                                            })
+                                            .await;
+                                        false
+                                    }
+                                    PermitMode::Abort => {
+                                        let _ = logTx
+                                            .send(LogEvent::TurnAborted {
+                                                name: call.function.name.clone(),
+                                            })
+                                            .await;
+                                        aborted = true;
+                                        false
+                                    }
+                                },
                             };
 
                             // Revert pre-emptive LSP notification if denied/aborted.
@@ -1542,7 +1697,11 @@ impl Session {
                                         name: call.function.name.clone(),
                                     })
                                     .await;
-                                crate::message::Content::text("User denied this action.")
+                                crate::message::Content::text(
+                                    deniedMessage
+                                        .take()
+                                        .unwrap_or_else(|| "User denied this action.".into()),
+                                )
                             };
 
                             // Track file reads for the edit gate (hash for staleness detection).
@@ -1712,6 +1871,7 @@ impl Session {
         let combined = allTexts.join("\n\n");
         tracing::info!(count = allTexts.len(), "injecting queued user messages");
 
+        self.autoReviewTickets.clear();
         let (content, turnAttachments) = buildUserContent(&combined, &allAttachments);
         self.history.push(Message::User { content });
 

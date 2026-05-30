@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api;
+use crate::config::ModelTier;
 use crate::message::Message;
 use crate::transcript::Turn;
 
@@ -270,7 +271,10 @@ pub async fn classifyPrepared(
     client: api::Client,
     utilityModel: String,
 ) -> TopicDecision {
-    match client.complete(&messages, Some(&utilityModel)).await {
+    match client
+        .complete(ModelTier::Utility, &messages, Some(&utilityModel))
+        .await
+    {
         Ok((response, _usage)) => parseTopicResponse(&response),
         Err(e) => {
             tracing::warn!("topic classification failed, assuming same: {e}");

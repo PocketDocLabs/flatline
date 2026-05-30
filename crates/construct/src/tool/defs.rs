@@ -2,7 +2,7 @@ use crate::message::ToolDef;
 
 /// Returns the built-in tool definitions to send to the LLM.
 pub(crate) fn builtinDefs() -> Vec<ToolDef> {
-    vec![
+    let mut defs = vec![
         ToolDef {
             defType: "function".into(),
             function: crate::message::FunctionDef {
@@ -1283,5 +1283,36 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
                 }),
             },
         },
-    ]
+    ];
+    for def in &mut defs {
+        addPermissionEscalationFields(&mut def.function.parameters);
+    }
+    defs
+}
+
+pub(crate) fn addPermissionEscalationFields(parameters: &mut serde_json::Value) {
+    let Some(obj) = parameters.as_object_mut() else {
+        return;
+    };
+    let props = obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(propsObj) = props.as_object_mut() else {
+        return;
+    };
+
+    propsObj.insert(
+        "raiseToUser".into(),
+        serde_json::json!({
+            "type": "boolean",
+            "description": "Permission retry only. Set true only after a previous auto-review denial explicitly allowed escalation for this exact same action."
+        }),
+    );
+    propsObj.insert(
+        "raiseReason".into(),
+        serde_json::json!({
+            "type": "string",
+            "description": "Short reason to show the user when raiseToUser is true."
+        }),
+    );
 }

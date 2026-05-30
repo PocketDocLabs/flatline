@@ -45,6 +45,11 @@ impl Session {
         self.permissions = permissions;
     }
 
+    /// Change only the default permission mode, preserving rules/source.
+    pub fn setPermitMode(&mut self, mode: crate::permissions::PermitMode) {
+        self.permissions.defaultMode = mode;
+    }
+
     /// Apply a freshly loaded config to this live session.
     ///
     /// This hot-swaps model clients, prompt/reasoning behavior, context

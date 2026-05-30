@@ -27,6 +27,7 @@ use futures::future::join_all;
 
 use crate::api;
 use crate::compaction::CompactionLog;
+use crate::config::ModelTier;
 use crate::transcript::{Transcript, Turn, TurnRole};
 
 /// A single block that was compacted.
@@ -373,7 +374,9 @@ async fn compactBlock(
         },
     ];
 
-    let (response, usage) = client.complete(&messages, Some(utilityModel)).await?;
+    let (response, usage) = client
+        .complete(ModelTier::Utility, &messages, Some(utilityModel))
+        .await?;
 
     // Extract from <compacted_monolithic_string> tags if present.
     let cost = usage.and_then(|u| u.cost);

@@ -26,7 +26,7 @@ use ratatui::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use construct::control::{LogEvent, SessionRequest, TuiRequest};
-use construct::permissions::Permissions;
+use construct::permissions::{Permissions, PermitMode};
 use construct::prompt::{DomainModule, InterfaceMode};
 use construct::session::Session;
 use construct::shell::ShellIo;
@@ -54,6 +54,41 @@ fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
         .permissions
         .clone()
         .unwrap_or_else(Permissions::allowReadOnly)
+}
+
+fn permissionsWithMode(config: &construct::config::Config, mode: &PermitMode) -> Permissions {
+    let mut permissions = mainAgentPermissions(config);
+    permissions.defaultMode = mode.clone();
+    permissions
+}
+
+fn toggledRuntimePermitMode(mode: &PermitMode) -> PermitMode {
+    match mode {
+        PermitMode::Auto => PermitMode::Ask,
+        _ => PermitMode::Auto,
+    }
+}
+
+fn permitModeLabel(mode: &PermitMode) -> &'static str {
+    match mode {
+        PermitMode::Ask => "ask",
+        PermitMode::Auto => "auto",
+        PermitMode::Deny => "deny",
+        PermitMode::Abort => "abort",
+    }
+}
+
+fn permitModeStyle(mode: &PermitMode, bg: Color, fg: Color) -> Style {
+    let color = match mode {
+        PermitMode::Ask => fg,
+        PermitMode::Auto => Color::Cyan,
+        PermitMode::Deny => Color::Yellow,
+        PermitMode::Abort => Color::Red,
+    };
+    Style::default()
+        .bg(bg)
+        .fg(color)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn buildModelStatus(config: &construct::config::Config) -> construct::control::ModelStatus {
@@ -206,6 +241,7 @@ enum DeckUpdate {
         sinceLine: Option<u64>,
         snap: Option<construct::jobs::JobOutputSnapshot>,
     },
+    PermitModeChanged(PermitMode),
 }
 
 fn openRunsPanel(requestTx: &mpsc::Sender<TuiRequest>, deckUpdateTx: &mpsc::Sender<DeckUpdate>) {
@@ -218,6 +254,47 @@ fn openRunsPanel(requestTx: &mpsc::Sender<TuiRequest>, deckUpdateTx: &mpsc::Send
             .await;
         if let Ok(list) = rRx.await {
             let _ = deckUpdateTx.send(DeckUpdate::RunsList(list)).await;
+        }
+    });
+}
+
+fn spawnPermitModeRequest(
+    requestTx: mpsc::Sender<TuiRequest>,
+    deckUpdateTx: mpsc::Sender<DeckUpdate>,
+    mode: PermitMode,
+) {
+    tokio::spawn(async move {
+        let (replyTx, replyRx) = oneshot::channel();
+        if requestTx
+            .send(TuiRequest::SetPermitMode {
+                mode: mode.clone(),
+                reply: replyTx,
+            })
+            .await
+            .is_err()
+        {
+            let _ = deckUpdateTx
+                .send(DeckUpdate::CommandAck(construct::control::CommandAck::err(
+                    "Failed to set permission mode: session unavailable.",
+                )))
+                .await;
+            return;
+        }
+
+        match replyRx.await {
+            Ok(ack) if ack.ok => {
+                let _ = deckUpdateTx.send(DeckUpdate::PermitModeChanged(mode)).await;
+            }
+            Ok(ack) => {
+                let _ = deckUpdateTx.send(DeckUpdate::CommandAck(ack)).await;
+            }
+            Err(_) => {
+                let _ = deckUpdateTx
+                    .send(DeckUpdate::CommandAck(construct::control::CommandAck::err(
+                        "Failed to set permission mode: session did not reply.",
+                    )))
+                    .await;
+            }
         }
     });
 }
@@ -532,6 +609,7 @@ pub async fn run() -> Result<()> {
     let mut focus = Focus::Terminal;
     let mut selState = SelectionState::new();
     let mut scrollLock = ScrollAxisLock::new();
+    let permitMode = mainAgentPermissions(&config).defaultMode;
     // Session channels — Log (session → TUI), SessionRequest (session → TUI),
     // TuiRequest (TUI → session), plus user input / cancel / steer.
     let (logTx, mut logRx) = mpsc::channel::<LogEvent>(256);
@@ -559,8 +637,9 @@ pub async fn run() -> Result<()> {
             }
         };
 
-        // Main agent auto-approves read-only tools but still prompts on writes/mutations.
+        // Main agent auto-approves read-only tools but still prompts/reviews writes.
         let permissions = mainAgentPermissions(&config);
+        let mut runtimePermitMode = permissions.defaultMode.clone();
 
         // Deck is the shared terminal harness — SWE domain by default.
         let mut session = match Session::new(
@@ -768,7 +847,7 @@ pub async fn run() -> Result<()> {
                             let shells = session.intoShells();
                             match Session::resume(
                                 &config,
-                                mainAgentPermissions(&config),
+                                permissionsWithMode(&config, &runtimePermitMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
@@ -819,7 +898,7 @@ pub async fn run() -> Result<()> {
                                     // Shell returned — recreate a fresh session.
                                     match Session::new(
                                         &config,
-                                        mainAgentPermissions(&config),
+                                        permissionsWithMode(&config, &runtimePermitMode),
                                         shell,
                                         InterfaceMode::SharedTerminal,
                                         &[DomainModule::Swe],
@@ -862,7 +941,7 @@ pub async fn run() -> Result<()> {
                             let shells = session.intoShells();
                             match Session::new(
                                 &config,
-                                mainAgentPermissions(&config),
+                                permissionsWithMode(&config, &runtimePermitMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
@@ -1123,6 +1202,7 @@ pub async fn run() -> Result<()> {
                                     &rules,
                                 ) {
                                     Ok(()) => {
+                                        runtimePermitMode = defaultMode.clone();
                                         session.setPermissions(construct::permissions::Permissions {
                                             defaultMode,
                                             rules,
@@ -1143,6 +1223,14 @@ pub async fn run() -> Result<()> {
                                     "No project root; permissions not persisted.",
                                 ));
                             }
+                        }
+                        Some(TuiRequest::SetPermitMode { mode, reply }) => {
+                            runtimePermitMode = mode.clone();
+                            session.setPermitMode(mode.clone());
+                            let _ = reply.send(construct::control::CommandAck::ok(format!(
+                                "Permission mode: {}",
+                                permitModeLabel(&mode),
+                            )));
                         }
                         Some(TuiRequest::GetRewindOptions { reply }) => {
                             let turns = session.loadDisplayTurns().unwrap_or_default();
@@ -1272,6 +1360,7 @@ pub async fn run() -> Result<()> {
         contextWindow,
         rollingBaseline,
         cachingEnabled,
+        permitMode,
     )
     .await;
 
@@ -1315,6 +1404,7 @@ async fn runLoop(
     mut contextWindow: usize,
     rollingBaseline: f64,
     mut cachingEnabled: bool,
+    mut permitMode: PermitMode,
 ) -> Result<()> {
     let mut tokenCount: usize = 0;
     let mut sessionCost: f64 = 0.0;
@@ -1710,6 +1800,13 @@ async fn runLoop(
                     let pad = barWidth.saturating_sub(hint.chars().count());
                     spans.push(Span::raw(" ".repeat(pad)));
                 } else {
+                    let modeText = format!(" mode {}", permitModeLabel(&permitMode));
+                    let modeLen = modeText.chars().count();
+                    spans.push(Span::styled(
+                        modeText,
+                        permitModeStyle(&permitMode, barBg, barFg),
+                    ));
+
                     let costStr = if sessionCost > 0.0 {
                         construct::cost::formatCost(sessionCost)
                     } else {
@@ -1803,9 +1900,9 @@ async fn runLoop(
                     }
 
                     // Trailing space + 1 char leading pad keeps the bar breathing.
-                    let pad = barWidth.saturating_sub(cursorOff + 1);
+                    let pad = barWidth.saturating_sub(modeLen + cursorOff + 1);
                     spans.push(Span::raw(" ".repeat(pad)));
-                    let leftEdge = vChunks[1].x + pad as u16;
+                    let leftEdge = vChunks[1].x + modeLen as u16 + pad as u16;
                     for (kind, off, len) in itemRanges {
                         let xs = leftEdge + off as u16;
                         let xe = xs + len as u16;
@@ -2719,6 +2816,9 @@ async fn runLoop(
                         agentPanel.pushCommandResult(&ack.message);
                     }
                 }
+                DeckUpdate::PermitModeChanged(mode) => {
+                    permitMode = mode;
+                }
                 DeckUpdate::TasksList(list) => {
                     if let Some(ref mut panel) = tasksPanel {
                         panel.refresh(list);
@@ -2891,6 +2991,7 @@ async fn runLoop(
             &titleSpinner,
             &mut statusFocus,
             &statusChipsLayout,
+            &mut permitMode,
             &mut sessionLayout,
             &mut sessionLayoutPath,
             &mut activePresetName,
@@ -2983,6 +3084,7 @@ async fn handleInput(
     titleSpinner: &TitleSpinner,
     statusFocus: &mut Option<usize>,
     statusChipsLayout: &[(StatusChipKind, u16, u16, u16)],
+    permitMode: &mut PermitMode,
     sessionLayout: &mut crate::layout::Layout,
     sessionLayoutPath: &mut Option<std::path::PathBuf>,
     activePresetName: &mut Option<String>,
@@ -3060,6 +3162,16 @@ async fn handleInput(
                         return Ok((true, true, false));
                     }
                     *lastQuitPress = Some(Instant::now());
+                    break;
+                }
+
+                // Shift+Tab: toggle the live runtime permission mode between
+                // manual ask and automatic review. It does not persist config.
+                if key.code == KeyCode::BackTab
+                    || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+                {
+                    let next = toggledRuntimePermitMode(permitMode);
+                    spawnPermitModeRequest(requestTx.clone(), deckUpdateTx.clone(), next);
                     break;
                 }
 
@@ -3617,6 +3729,7 @@ async fn handleInput(
                             *permissionsPanel = None;
                         }
                         PermPanelAction::Save { defaultMode, rules } => {
+                            *permitMode = defaultMode.clone();
                             *permissionsPanel = None;
                             spawnAckRequest(
                                 requestTx.clone(),
@@ -4626,6 +4739,7 @@ fn formatContextPct(tokens: usize, window: usize) -> String {
 fn renderHelpPopup(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     const ROWS: &[(&str, &str)] = &[
         ("Tab", "Switch focus between terminal and agent"),
+        ("Shift+Tab", "Toggle permission mode ask/auto"),
         ("Esc", "Cancel running turn / close overlay"),
         ("Ctrl+T", "Spawn a new terminal"),
         ("Ctrl+B", "Hand a running shell to the agent (background)"),

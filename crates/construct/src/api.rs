@@ -6,7 +6,7 @@
 //! # Public API
 //! - [`Client`] — HTTP client for the LLM API
 //! - [`Client::stream`] — send a prompt, get streaming events
-//! - [`Client::complete`] — non-streaming completion for utility calls
+//! - [`Client::complete`] — non-streaming completion for a selected model tier
 //!
 //! # Dependencies
 //! `reqwest`, `tokio`, `serde_json`, `backon`
@@ -20,7 +20,7 @@ use backon::{ExponentialBuilder, Retryable};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ModelConfig};
+use crate::config::{Config, ModelConfig, ModelTier};
 use crate::message::{
     Content, ContentBlock, Message, ReasoningConfig, StreamChunk, StreamEvent, TokenUsage, ToolDef,
 };
@@ -45,23 +45,26 @@ impl std::error::Error for PermanentApiError {}
 /// LLM API client. Supports OpenRouter, Fireworks, and the official DeepSeek API
 /// (any OpenAI-compatible endpoint).
 ///
-/// Holds only heavy (streaming, main session) and utility (non-streaming,
-/// compaction + topic tracking). The light tier is reached by subagents
-/// re-entering `Session::new` with `config.heavy` swapped to the light
-/// profile (see `session::executeTask`), so no light HTTP client lives
-/// on the parent.
+/// Holds HTTP clients for the configured model tiers. Streaming uses the
+/// heavy tier; non-streaming calls choose the tier explicitly.
 #[derive(Clone)]
 pub struct Client {
     heavyHttp: reqwest::Client,
+    lightHttp: reqwest::Client,
     utilityHttp: reqwest::Client,
     heavy: ModelConfig,
+    light: ModelConfig,
     utility: ModelConfig,
 }
 
 impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
-        for (tier, model) in [("heavy", &config.heavy), ("utility", &config.utility)] {
+        for (tier, model) in [
+            ("heavy", &config.heavy),
+            ("light", &config.light),
+            ("utility", &config.utility),
+        ] {
             if providerRequiresApiKey(model.provider.as_str()) && model.key.is_empty() {
                 bail!(
                     "API key not set for {tier} profile provider {}. Set the profile's key in config.toml, or the matching env var (OPENROUTER_API_KEY / FIREWORKS_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY). For ChatGPT Pro auth use provider = \"openai-codex\" and run `flatline auth login openai-codex`.",
@@ -72,13 +75,17 @@ impl Client {
 
         let heavyHttp =
             buildHttpClient(&config.heavy).context("Failed to build heavy HTTP client")?;
+        let lightHttp =
+            buildHttpClient(&config.light).context("Failed to build light HTTP client")?;
         let utilityHttp =
             buildHttpClient(&config.utility).context("Failed to build utility HTTP client")?;
 
         Ok(Self {
             heavyHttp,
+            lightHttp,
             utilityHttp,
             heavy: config.heavy.clone(),
+            light: config.light.clone(),
             utility: config.utility.clone(),
         })
     }
@@ -219,22 +226,42 @@ impl Client {
         Ok(rx)
     }
 
-    /// Non-streaming completion for utility calls (topic tracking, compaction).
+    /// Non-streaming completion for a selected model tier.
     ///
     /// Args:
+    ///     tier: Model tier to use for this call.
     ///     messages: Conversation messages (typically system + user).
     ///     model: Model override. Uses the client's configured model if None.
     pub async fn complete(
         &self,
+        tier: ModelTier,
         messages: &[Message],
         model: Option<&str>,
     ) -> Result<(String, Option<TokenUsage>)> {
-        if usesResponsesApi(&self.utility.provider) {
-            return self.completeResponses(messages, model).await;
+        let (http, cfg, tierName) = match tier {
+            ModelTier::Heavy => (&self.heavyHttp, &self.heavy, "heavy"),
+            ModelTier::Light => (&self.lightHttp, &self.light, "light"),
+            ModelTier::Utility => (&self.utilityHttp, &self.utility, "utility"),
+        };
+        self.completeWith(http, cfg, messages, model, tierName)
+            .await
+    }
+
+    async fn completeWith(
+        &self,
+        http: &reqwest::Client,
+        cfg: &ModelConfig,
+        messages: &[Message],
+        model: Option<&str>,
+        tier: &str,
+    ) -> Result<(String, Option<TokenUsage>)> {
+        if usesResponsesApi(&cfg.provider) {
+            return Self::completeResponsesWith(http.clone(), cfg.clone(), messages, model, tier)
+                .await;
         }
 
-        let url = format!("{}/chat/completions", self.utility.baseUrl);
-        let modelId = model.unwrap_or(&self.utility.model);
+        let url = format!("{}/chat/completions", cfg.baseUrl);
+        let modelId = model.unwrap_or(&cfg.model);
 
         let mut body = serde_json::json!({
             "model": modelId,
@@ -243,38 +270,39 @@ impl Client {
         });
 
         // OpenRouter-specific provider routing.
-        if self.utility.provider == "openrouter" && !self.utility.providerOrder.is_empty() {
+        if cfg.provider == "openrouter" && !cfg.providerOrder.is_empty() {
             body["provider"] = serde_json::json!({
-                "order": self.utility.providerOrder,
+                "order": cfg.providerOrder,
                 "allow_fallbacks": false,
             });
         }
 
         // DeepSeek defaults reasoning to `high` server-side, which wastes
-        // tokens on mechanical utility calls (topic naming, compaction).
-        // Honour the utility profile's reasoning.effort — including
+        // tokens when the profile wants a mechanical non-streaming call.
+        // Honour the selected profile's reasoning.effort — including
         // "disabled" — so the operator can opt out.
-        if self.utility.provider == "deepseek"
-            && let Some(ref settings) = self.utility.reasoning
+        if cfg.provider == "deepseek"
+            && let Some(ref settings) = cfg.reasoning
             && let Some(ref effort) = settings.effort
         {
             body["thinking"] = deepseekThinking(effort);
         }
 
         tracing::debug!(
+            completionTier = %tier,
             model = %modelId,
             messageCount = messages.len(),
-            "sending utility completion request"
+            "sending completion request"
         );
 
-        let http = self.utilityHttp.clone();
+        let http = http.clone();
         let response = (|| async {
             let response = http
                 .post(&url)
                 .json(&body)
                 .send()
                 .await
-                .context("Failed to send utility request")?;
+                .context("Failed to send completion request")?;
 
             if response.status().is_success() {
                 return Ok(response);
@@ -284,11 +312,11 @@ impl Client {
             let errorBody = response.text().await.unwrap_or_default();
 
             if status.as_u16() == 429 || status.is_server_error() {
-                tracing::warn!(%status, body = %errorBody, "retryable utility API error");
+                tracing::warn!(%status, body = %errorBody, "retryable completion API error");
                 bail!("API error {status}: {errorBody}");
             }
 
-            tracing::error!(%status, body = %errorBody, "utility API error (not retryable)");
+            tracing::error!(%status, body = %errorBody, "completion API error (not retryable)");
             Err(PermanentApiError(format!("API error {status}: {errorBody}")).into())
         })
         .retry(
@@ -300,14 +328,14 @@ impl Client {
         )
         .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
         .notify(|err, dur| {
-            tracing::warn!(error = %err, delay = ?dur, "retrying utility request");
+            tracing::warn!(error = %err, delay = ?dur, "retrying completion request");
         })
         .await?;
 
         let responseBody: serde_json::Value = response
             .json()
             .await
-            .context("Failed to parse utility response")?;
+            .context("Failed to parse completion response")?;
 
         let content = responseBody["choices"][0]["message"]["content"]
             .as_str()
@@ -332,10 +360,11 @@ impl Client {
         });
 
         tracing::debug!(
+            completionTier = %tier,
             model = %modelId,
             responseLen = content.len(),
             cost = ?usage.as_ref().and_then(|u| u.cost),
-            "utility completion received"
+            "completion received"
         );
 
         Ok((content, usage))
@@ -392,15 +421,23 @@ impl Client {
         Ok(rx)
     }
 
-    async fn completeResponses(
-        &self,
+    async fn completeResponsesWith(
+        http: reqwest::Client,
+        cfg: ModelConfig,
         messages: &[Message],
         model: Option<&str>,
+        tier: &str,
     ) -> Result<(String, Option<TokenUsage>)> {
-        let url = format!("{}/responses", self.utility.baseUrl);
-        let body = buildResponsesBody(&self.utility, messages, &[], None, false, model)?;
-        let http = self.utilityHttp.clone();
-        let cfg = self.utility.clone();
+        let url = format!("{}/responses", cfg.baseUrl);
+        let body = buildResponsesBody(&cfg, messages, &[], None, false, model)?;
+
+        tracing::debug!(
+            completionTier = %tier,
+            provider = %cfg.provider,
+            model = %model.unwrap_or(&cfg.model),
+            messageCount = messages.len(),
+            "sending Responses completion request"
+        );
 
         let response = (|| {
             let http = http.clone();
@@ -418,16 +455,24 @@ impl Client {
         )
         .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
         .notify(|err, dur| {
-            tracing::warn!(error = %err, delay = ?dur, "retrying Responses utility request");
+            tracing::warn!(error = %err, delay = ?dur, "retrying Responses completion request");
         })
         .await?;
 
         let responseBody: serde_json::Value = response
             .json()
             .await
-            .context("Failed to parse Responses utility response")?;
+            .context("Failed to parse Responses completion response")?;
         let content = extractResponsesText(&responseBody);
         let usage = responseBody.get("usage").and_then(usageFromResponses);
+
+        tracing::debug!(
+            completionTier = %tier,
+            model = %model.unwrap_or(&cfg.model),
+            responseLen = content.len(),
+            cost = ?usage.as_ref().and_then(|u| u.cost),
+            "Responses completion received"
+        );
 
         Ok((content, usage))
     }

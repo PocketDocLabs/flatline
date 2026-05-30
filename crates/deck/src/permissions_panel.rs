@@ -234,6 +234,7 @@ impl PermissionsPanel {
         // Default mode.
         let modeStr = match self.defaultMode {
             PermitMode::Ask => "ask",
+            PermitMode::Auto => "auto",
             PermitMode::Deny => "deny",
             PermitMode::Abort => "abort",
         };

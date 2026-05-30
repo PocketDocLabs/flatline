@@ -1535,6 +1535,7 @@ pub fn savePermissions(projectRoot: &Path, defaultMode: &PermitMode, rules: &[Ru
 fn permitModeToStr(mode: &PermitMode) -> &'static str {
     match mode {
         PermitMode::Ask => "ask",
+        PermitMode::Auto => "auto",
         PermitMode::Deny => "deny",
         PermitMode::Abort => "abort",
     }

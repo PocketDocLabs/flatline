@@ -16,6 +16,7 @@
 
 pub(crate) mod api;
 pub mod auth;
+pub(crate) mod auto_review;
 pub(crate) mod checkpoint;
 pub(crate) mod compaction;
 pub(crate) mod compaction_trigger;
