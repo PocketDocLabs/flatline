@@ -5,8 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/pocketdoc/flatline"
-homepage = "https://github.com/pocketdoc/flatline"
+repository = "https://github.com/PocketDocLabs/flatline"
+homepage = "https://github.com/PocketDocLabs/flatline"
 
 [workspace.dependencies]
 # TUI
