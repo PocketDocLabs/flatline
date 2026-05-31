@@ -3880,12 +3880,12 @@ async fn handleInput(
                         KeyCode::Backspace if agentPanel.isEditingCustom() => {
                             agentPanel.customPatternBackspace();
                         }
-                        KeyCode::Char('v') | KeyCode::Char('V') => {
+                        KeyCode::Char('v') | KeyCode::Char('V')
+                            if !agentPanel.activeSubagents.is_empty() =>
+                        {
                             // Open the subagent panel — Live mode reads
                             // transcript + shell from agentPanel.activeSubagent.
-                            if !agentPanel.activeSubagents.is_empty() {
-                                *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
-                            }
+                            *subagentPanel = Some(crate::subagent_panel::SubagentPanel::live());
                         }
                         _ => {}
                     }

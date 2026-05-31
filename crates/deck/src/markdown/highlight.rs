@@ -338,11 +338,10 @@ pub fn renderCodeBlock(
         let trackLen = innerWidth;
         let scrollMax = maxContentWidth.saturating_sub(innerWidth);
         let thumbLen = (trackLen * trackLen / maxContentWidth).max(1);
-        let thumbPos = if scrollMax > 0 {
-            (scroll * (trackLen.saturating_sub(thumbLen))) / scrollMax
-        } else {
-            0
-        };
+        let thumbPos = scroll
+            .checked_mul(trackLen.saturating_sub(thumbLen))
+            .and_then(|position| position.checked_div(scrollMax))
+            .unwrap_or(0);
         let thumbEnd = (thumbPos + thumbLen).min(trackLen);
 
         let mut bottomSpans: Vec<Span<'static>> = vec![Span::styled("\u{2570}", borderStyle)];

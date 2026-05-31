@@ -2005,11 +2005,9 @@ impl AgentPanel {
             let headerLine: u16 = if hasCmd { 1 } else { 0 };
             let availW = inner.width.saturating_sub(6) as usize;
             let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
-                if availW == 0 {
-                    1
-                } else {
-                    (e.len() / availW + 1) as u16
-                }
+                e.len()
+                    .checked_div(availW)
+                    .map_or(1, |lines| (lines + 1) as u16)
             });
             let patternLines = self.permitPatterns.len() as u16 + 1; // +1 for custom field.
             // code block + header + explanation + blank + 2 keys + blank + patterns.

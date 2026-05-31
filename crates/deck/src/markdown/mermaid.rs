@@ -133,13 +133,9 @@ fn parseMermaid(code: &str) -> Option<MermaidGraph> {
 /// Parse the header line: `graph|flowchart [direction]`.
 fn parseHeader(line: &str) -> Option<Direction> {
     let lower = line.to_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix("graph") {
-        r
-    } else if let Some(r) = lower.strip_prefix("flowchart") {
-        r
-    } else {
-        return None;
-    };
+    let rest = lower
+        .strip_prefix("graph")
+        .or_else(|| lower.strip_prefix("flowchart"))?;
 
     let dirStr = rest.trim();
     let direction = match dirStr {

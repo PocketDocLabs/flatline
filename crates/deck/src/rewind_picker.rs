@@ -419,21 +419,17 @@ fn buildBlocks(turns: &[Turn]) -> Vec<BlockData> {
         lastTurnId = turn.id.clone();
 
         match turn.role {
-            TurnRole::User => {
-                if userPreview.is_empty() {
-                    userPreview = firstLine(&turn.content, 120);
-                    userMessage = Some(turn.content.clone());
-                    userAttachments = turn.attachments.clone();
-                }
+            TurnRole::User if userPreview.is_empty() => {
+                userPreview = firstLine(&turn.content, 120);
+                userMessage = Some(turn.content.clone());
+                userAttachments = turn.attachments.clone();
             }
-            TurnRole::Wake => {
-                if !blockStartedByWake && userPreview.is_empty() {
-                    blockStartedByWake = true;
-                    firstWakeTurnId = Some(turn.id.clone());
-                    let payloads = wakePayloads(&turn.content);
-                    userPreview = wakePreview(&turn.content, &payloads);
-                    userAttachments = None;
-                }
+            TurnRole::Wake if !blockStartedByWake && userPreview.is_empty() => {
+                blockStartedByWake = true;
+                firstWakeTurnId = Some(turn.id.clone());
+                let payloads = wakePayloads(&turn.content);
+                userPreview = wakePreview(&turn.content, &payloads);
+                userAttachments = None;
             }
             TurnRole::Assistant if assistantPreview.is_empty() => {
                 assistantPreview = firstLine(&turn.content, 120);

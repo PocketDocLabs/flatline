@@ -209,9 +209,8 @@ fn renderList(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut index = startIndex.unwrap_or(1);
 
-    for item in items {
+    for (index, item) in (startIndex.unwrap_or(1)..).zip(items.iter()) {
         let marker = if ordered {
             format!("{index}. ")
         } else {
@@ -235,8 +234,6 @@ fn renderList(
             spans.extend(line.spans);
             lines.push(Line::from(spans));
         }
-
-        index += 1;
     }
 
     lines
