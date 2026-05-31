@@ -41,6 +41,26 @@ cargo run -p deck -- auth login openai-codex
 See [Getting Started](docs/getting-started.md) for first-run setup and common
 commands.
 
+An example config is available at [docs/examples/config.toml](docs/examples/config.toml).
+
+## Install From Source
+
+Flatline is currently distributed from source. Install the `flatline` binary
+with Cargo:
+
+```sh
+cargo install --path crates/deck --locked
+```
+
+Then run:
+
+```sh
+flatline
+```
+
+Running without a subcommand starts the interactive terminal UI. Use
+`flatline exec` for headless/non-interactive runs.
+
 ## Documentation
 
 - [Getting Started](docs/getting-started.md): install, run, first session
@@ -71,6 +91,20 @@ MCP servers are configured in `~/.config/flatline/mcp.json` and project
 
 LSP project overrides are configured in `.flatline/lsp.toml`.
 
+## Current Limitations
+
+Flatline is pre-1.0 software. The main TUI, headless runner, permissions,
+model profiles, MCP, LSP diagnostics, background jobs, and transcript storage
+are implemented, but a few user expectations are still intentionally scoped:
+
+- `/undo` is present in the command surface, but project file restore is not
+  implemented yet.
+- `@file` insertion, external-editor prompt composition, and theme
+  configuration are not implemented yet.
+- Code navigation features that use `structSearch`, `fileOutline`, and
+  `viewSymbol` require `sg` from ast-grep.
+- File/content search features work best with `rg` from ripgrep.
+
 ## Development
 
 Run the test suite:
@@ -84,3 +118,7 @@ optional tools depend on external binaries:
 
 - `rg` for file search and content search
 - `sg` for structural search, file outlines, and symbol lookup
+
+## License
+
+Flatline is licensed under the [Apache License 2.0](LICENSE).

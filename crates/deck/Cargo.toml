@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "TUI harness — pair programmer interface for flatline agents."
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "flatline"

@@ -27,7 +27,8 @@ Use these phrases when looking for a specific feature:
 
 - API keys: `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`
 - Config files: `config.toml`, `.flatline/config.toml`,
-  `.flatline/config.local.toml`, launch directory config
+  `.flatline/config.local.toml`, launch directory config,
+  `examples/config.toml`
 - Model profiles: `heavyProfile`, `lightProfile`, `utilityProfile`
 - Permissions: `allowReadOnly`, `defaultMode`, permission rules
 - Web tools: `EXA_API_KEY`, `web.searchKey`, `webSearch`, `webFetch`

@@ -18,6 +18,9 @@ Resolution order:
 Set `FLATLINE_CONFIG=/path/to/config.toml` to load one explicit file instead
 of using normal layer discovery.
 
+For a complete starter file that mirrors the generated defaults, see
+[examples/config.toml](examples/config.toml).
+
 Project root discovery walks upward from the current directory until it finds
 `.git`. If no `.git` is found, the current directory is used.
 

@@ -51,7 +51,8 @@ Slash commands are handled by the TUI before text is sent to the agent.
 
 - `/help`: show available commands
 - `/context` or `/ctx`: show context usage and compaction state
-- `/undo`: restore the project to before the last file-modifying tool
+- `/undo`: reserved for project restore; currently reports that checkpoint
+  restore is not implemented
 - `/rewind`: rewind conversation, optionally to a specific turn id
 - `/resume`: list or resume a previous session
 - `/clear`, `/cls`, or `/new`: clear display and start a fresh session

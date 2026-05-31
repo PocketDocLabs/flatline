@@ -28,6 +28,18 @@ cargo run -p deck
 The `deck` crate builds the `flatline` binary. Running without a subcommand
 starts the interactive terminal UI.
 
+To install the binary into your Cargo bin directory:
+
+```sh
+cargo install --path crates/deck --locked
+```
+
+After that, run:
+
+```sh
+flatline
+```
+
 ## Run Headless
 
 Use `exec` to run a prompt without the TUI:
@@ -102,6 +114,7 @@ profile create/rename/delete, usable context budget, thinking mode, and
 provider-native reasoning settings.
 
 See [Configuration](configuration.md) for profile examples and config layering.
+For a full starter config, see [examples/config.toml](examples/config.toml).
 
 For practical examples, see [Workflows](workflows.md).
 
@@ -121,6 +134,14 @@ Run tests:
 
 ```sh
 cargo test
+```
+
+Before sharing a release, also run:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 If a tool appears unavailable, check [Troubleshooting](troubleshooting.md).

@@ -4,7 +4,9 @@
 .DS_Store
 .claude/
 /bench/
-/research/
+/research/*
+!/research/reports/
+!/research/reports/*.md
 __pycache__/
 *.pyc
 /.flatline/
