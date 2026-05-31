@@ -13,6 +13,7 @@
 
 mod agent_panel;
 mod app;
+mod auth_helper;
 mod command;
 mod export;
 mod fork_picker;
@@ -61,7 +62,7 @@ enum Commands {
     /// Manage provider authentication.
     Auth {
         #[command(subcommand)]
-        command: AuthCommands,
+        command: Option<AuthCommands>,
     },
 
     /// Start MCP server.
@@ -339,7 +340,10 @@ async fn main() -> Result<()> {
                 .with_env_filter(envFilter)
                 .init();
 
-            runAuthCommand(command).await
+            match command {
+                Some(command) => runAuthCommand(command).await,
+                None => auth_helper::run().await,
+            }
         }
 
         Some(Commands::Exec(args)) => {

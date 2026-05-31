@@ -7,7 +7,6 @@
 # API keys can live in this file, but environment variables are safer:
 #
 #   OPENROUTER_API_KEY=...
-#   FIREWORKS_API_KEY=...
 #   DEEPSEEK_API_KEY=...
 #   OPENAI_API_KEY=...
 #   EXA_API_KEY=...
@@ -64,9 +63,27 @@ model = "gpt-5.3-codex"
 contextWindow = 272000
 reasoning = { effort = "high", summary = "auto" }
 
+[profile.openaiCodexFrontier]
+provider = "openai-codex"
+model = "gpt-5.5"
+contextWindow = 272000
+reasoning = { effort = "medium", summary = "auto" }
+
+[profile.openaiCodexMini]
+provider = "openai-codex"
+model = "gpt-5.4-mini"
+contextWindow = 272000
+reasoning = { effort = "medium", summary = "auto" }
+
 [profile.openaiGpt54]
 provider = "openai"
 model = "gpt-5.4"
+contextWindow = 1050000
+reasoning = { effort = "high" }
+
+[profile.openaiGpt55]
+provider = "openai"
+model = "gpt-5.5"
 contextWindow = 1050000
 reasoning = { effort = "high" }
 

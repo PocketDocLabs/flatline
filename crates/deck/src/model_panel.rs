@@ -635,17 +635,12 @@ impl ModelPanel {
     }
 
     fn providerChoices(&self) -> Vec<String> {
-        let mut providers = vec![
+        let providers = vec![
             "openrouter".to_string(),
             "deepseek".to_string(),
             "openai".to_string(),
             "openai-codex".to_string(),
         ];
-        for profile in &self.status.profiles {
-            if !providers.contains(&profile.provider) {
-                providers.push(profile.provider.clone());
-            }
-        }
         providers
     }
 

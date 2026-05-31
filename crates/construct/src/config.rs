@@ -31,7 +31,7 @@
 //! - `FLATLINE_HEAVY_PROFILE` — override `heavyProfile` selection
 //! - `FLATLINE_LIGHT_PROFILE` — override `lightProfile` selection
 //! - `FLATLINE_UTILITY_PROFILE` — override `utilityProfile` selection
-//! - `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY` — API keys
+//! - `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY` — API keys
 //!
 //! # Dependencies
 //! `serde`, `toml`, `dirs`
@@ -168,8 +168,7 @@ pub struct WebConfig {
 /// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// API provider: "openrouter", "fireworks", "deepseek", "openai", or
-    /// "openai-codex".
+    /// API provider: "openrouter", "deepseek", "openai", or "openai-codex".
     pub provider: String,
 
     /// API key.
@@ -191,8 +190,8 @@ pub struct ModelConfig {
     /// summarization.
     pub promptThinking: bool,
 
-    /// Preferred OpenRouter providers in priority order (e.g. ["Moonshot",
-    /// "Fireworks"]). When set, disables fallbacks automatically.
+    /// Preferred OpenRouter providers in priority order (e.g. ["Anthropic",
+    /// "Moonshot"]). When set, disables fallbacks automatically.
     /// Only meaningful for the OpenRouter provider; defaults to empty for
     /// other providers.
     #[serde(default)]
@@ -255,26 +254,13 @@ enum Tier {
 ///
 /// `baseUrl` and `providerOrder` default based on the provider — this is
 /// the root fix for the old leak where e.g. `providerOrder = ["Anthropic"]`
-/// would flow into a Fireworks config.
+/// would flow into a non-OpenRouter config.
 ///
 /// `promptThinking` defaults to `false` regardless of provider or model —
 /// it's an instruction-tuned technique that works with anything, so the
 /// safe default is off and users flip it on per profile when they want it.
 fn modelDefaults(provider: &str) -> ModelConfig {
     match provider {
-        "fireworks" => ModelConfig {
-            provider: "fireworks".into(),
-            key: String::new(),
-            model: "accounts/fireworks/models/kimi-k2p5".into(),
-            baseUrl: "https://api.fireworks.ai/inference/v1".into(),
-            reasoning: None,
-            promptThinking: false,
-            providerOrder: Vec::new(),
-            maxTokens: Some(8_000),
-            contextWindow: 256_000,
-            maxContextWindow: Some(256_000),
-            supportsAnthropicCache: None,
-        },
         "deepseek" => ModelConfig {
             provider: "deepseek".into(),
             key: String::new(),
@@ -459,8 +445,8 @@ pub fn defaultModelSaveScope(config: &Config) -> ConfigScope {
 /// 5. Project local (`.flatline/config.local.toml`, gitignored)
 /// 6. Launch directory local (`<launch-dir>/.flatline/config.local.toml`, when distinct)
 /// 7. Env vars (`FLATLINE_HEAVY_PROFILE`, `FLATLINE_LIGHT_PROFILE`,
-///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`,
-///    `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `EXA_API_KEY`)
+///    `FLATLINE_UTILITY_PROFILE`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`,
+///    `OPENAI_API_KEY`, `EXA_API_KEY`)
 pub fn load() -> Result<Config> {
     // Explicit-path override: FLATLINE_CONFIG=/path/to/config.toml bypasses
     // user/project/local discovery and loads exactly that file.
@@ -625,7 +611,6 @@ fn applyEnvKey(config: &mut ModelConfig) {
     }
 
     let envVar = match config.provider.as_str() {
-        "fireworks" => "FIREWORKS_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "openai-codex" => return,
@@ -988,15 +973,14 @@ fn resolveWeb(partial: Option<PartialWebConfig>) -> WebConfig {
 
 /// TOML text written when no user config exists yet.
 ///
-/// Three-tier starter config: Opus (heavy), Sonnet (light), Kimi K2.5 via
+/// Three-tier starter config: Opus (heavy), Sonnet (light), Kimi K2.6 via
 /// OpenRouter (utility). All three active profiles share the OpenRouter
 /// provider so a user with only `OPENROUTER_API_KEY` gets a working setup
 /// out of the box.
 ///
-/// DeepSeek V4 Pro/Flash profiles are also defined but not selected by
-/// default — switch `heavyProfile` / `lightProfile` / `utilityProfile` to
-/// `deepseekPro` / `deepseekFlash` / `deepseekUtility` and set
-/// `DEEPSEEK_API_KEY` to use the official DeepSeek API instead.
+/// Additional provider-specific profiles are also defined but not selected by
+/// default, so `/model` can offer useful choices across DeepSeek, OpenAI API,
+/// and ChatGPT/Codex OAuth as soon as the matching auth is set up.
 fn defaultConfigToml() -> String {
     format!(
         "heavyProfile   = \"opus\"\n\
@@ -1039,9 +1023,24 @@ fn defaultConfigToml() -> String {
          model          = \"gpt-5.3-codex\"\n\
          contextWindow  = 272000\n\
          reasoning      = {{ effort = \"high\", summary = \"auto\" }}\n\n\
+         [profile.openaiCodexFrontier]\n\
+         provider       = \"openai-codex\"\n\
+         model          = \"gpt-5.5\"\n\
+         contextWindow  = 272000\n\
+         reasoning      = {{ effort = \"medium\", summary = \"auto\" }}\n\n\
+         [profile.openaiCodexMini]\n\
+         provider       = \"openai-codex\"\n\
+         model          = \"gpt-5.4-mini\"\n\
+         contextWindow  = 272000\n\
+         reasoning      = {{ effort = \"medium\", summary = \"auto\" }}\n\n\
          [profile.openaiGpt54]\n\
          provider       = \"openai\"\n\
          model          = \"gpt-5.4\"\n\
+         contextWindow  = 1050000\n\
+         reasoning      = {{ effort = \"high\" }}\n\n\
+         [profile.openaiGpt55]\n\
+         provider       = \"openai\"\n\
+         model          = \"gpt-5.5\"\n\
          contextWindow  = 1050000\n\
          reasoning      = {{ effort = \"high\" }}\n",
         compact = defaultCompactRatio(),
@@ -1882,7 +1881,7 @@ mod tests {
     #[test]
     fn atomicProfileReplace() {
         // Base defines provider=openrouter + providerOrder. Overlay redefines
-        // profile.foo to fireworks/kimi with no providerOrder. Merge must NOT
+        // profile.foo to DeepSeek with no providerOrder. Merge must NOT
         // carry over base's providerOrder — that's the leak we're killing.
         let base = parseToml(
             r#"
@@ -1896,16 +1895,16 @@ mod tests {
         let overlay = parseToml(
             r#"
             [profile.foo]
-            provider = "fireworks"
-            model = "accounts/fireworks/models/kimi-k2p5"
+            provider = "deepseek"
+            model = "deepseek-v4-pro"
             "#,
         );
         let merged = base.merge(overlay);
         let cfg = resolveOk(merged);
 
-        assert_eq!(cfg.heavy.provider, "fireworks");
+        assert_eq!(cfg.heavy.provider, "deepseek");
         assert_eq!(cfg.heavy.providerOrder, Vec::<String>::new());
-        assert_eq!(cfg.heavy.baseUrl, "https://api.fireworks.ai/inference/v1");
+        assert_eq!(cfg.heavy.baseUrl, "https://api.deepseek.com");
     }
 
     #[test]
@@ -1920,7 +1919,7 @@ mod tests {
         let overlay = parseToml(
             r#"
             [profile.bar]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "b"
             "#,
         );
@@ -1936,7 +1935,7 @@ mod tests {
             r#"
             heavyProfile = "x"
             [profile.x]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "my-model"
             "#,
         ));
@@ -1955,10 +1954,10 @@ mod tests {
             heavyProfile = "big"
             lightProfile = "mid"
             [profile.big]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "big-model"
             [profile.mid]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "mid-model"
             "#,
         ));
@@ -1976,13 +1975,13 @@ mod tests {
             lightProfile = "mid"
             utilityProfile = "small"
             [profile.big]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "big-model"
             [profile.mid]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "mid-model"
             [profile.small]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "small-model"
             "#,
         ));
@@ -2000,11 +1999,11 @@ mod tests {
             r#"
             heavyProfile = "x"
             [profile.x]
-            provider = "fireworks"
+            provider = "deepseek"
             model = "m"
             "#,
         ));
-        assert_eq!(cfg.heavy.baseUrl, "https://api.fireworks.ai/inference/v1");
+        assert_eq!(cfg.heavy.baseUrl, "https://api.deepseek.com");
         assert!(cfg.heavy.providerOrder.is_empty());
         assert!(!cfg.heavy.promptThinking);
     }
@@ -2041,7 +2040,7 @@ mod tests {
                 [profile.default]
                 model = "wrong"
                 [profile.picked]
-                provider = "fireworks"
+                provider = "deepseek"
                 model = "right"
                 "#,
             ),
@@ -2140,7 +2139,10 @@ mod tests {
             "deepseekFlash",
             "deepseekUtility",
             "openaiCodex",
+            "openaiCodexFrontier",
+            "openaiCodexMini",
             "openaiGpt54",
+            "openaiGpt55",
         ] {
             assert!(
                 partial.profile.contains_key(name),
@@ -2171,6 +2173,24 @@ mod tests {
         let codex = partial.profile.get("openaiCodex").unwrap();
         assert_eq!(codex.provider.as_deref(), Some("openai-codex"));
         assert_eq!(codex.model.as_deref(), Some("gpt-5.3-codex"));
+
+        let codexMini = partial.profile.get("openaiCodexMini").unwrap();
+        assert_eq!(codexMini.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(codexMini.model.as_deref(), Some("gpt-5.4-mini"));
+
+        let gpt55 = partial.profile.get("openaiGpt55").unwrap();
+        assert_eq!(gpt55.provider.as_deref(), Some("openai"));
+        assert_eq!(gpt55.model.as_deref(), Some("gpt-5.5"));
+
+        let providers = partial
+            .profile
+            .values()
+            .filter_map(|profile| profile.provider.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            providers,
+            std::collections::BTreeSet::from(["deepseek", "openai", "openai-codex", "openrouter",])
+        );
     }
 
     #[test]

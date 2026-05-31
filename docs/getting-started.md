@@ -74,7 +74,7 @@ calls. Use `--allowed-tools` when the task needs tools.
 ## First Config
 
 Flatline creates `~/.config/flatline/config.toml` on first load if it does not
-exist. The generated default uses OpenRouter profiles:
+exist. The generated default selects OpenRouter profiles:
 
 - heavy: Claude Opus through OpenRouter
 - light: Claude Sonnet through OpenRouter
@@ -86,24 +86,28 @@ Set an API key:
 export OPENROUTER_API_KEY=...
 ```
 
-Flatline also supports Fireworks and DeepSeek profile defaults:
+The same starter config also includes inactive DeepSeek, OpenAI API, and
+ChatGPT/Codex OAuth profiles. Set whichever credentials match the profiles you
+want to use:
 
 ```sh
-export FIREWORKS_API_KEY=...
 export DEEPSEEK_API_KEY=...
-```
-
-OpenAI API profiles use:
-
-```sh
 export OPENAI_API_KEY=...
 ```
 
 ChatGPT/Codex OAuth profiles do not use an API key. Sign in with:
 
 ```sh
+cargo run -p deck -- auth
 cargo run -p deck -- auth login openai-codex
 ```
+
+The bare auth command opens a small guided helper for Codex OAuth. The longer
+command path stays available when you want the direct scriptable flow.
+
+If the selected default OpenRouter profiles do not have an API key yet, the TUI
+still starts. The first attempted model call reports the missing key and opens
+`/model` so you can switch profiles or save credentials.
 
 Inside the TUI, use `/model` to inspect configured profiles and save a
 heavy/light/utility profile choice. Press `[` or `]` in the panel to choose

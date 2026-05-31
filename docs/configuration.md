@@ -60,6 +60,12 @@ model = "moonshotai/kimi-k2.6"
 contextWindow = 256000
 ```
 
+The generated starter config also includes inactive profiles for the other
+supported providers: `deepseekPro`, `deepseekFlash`, `deepseekUtility`,
+`openaiCodex`, `openaiCodexFrontier`, `openaiCodexMini`, `openaiGpt54`, and
+`openaiGpt55`. Switch to them from `/model` after setting the matching API key
+or Codex OAuth login.
+
 Profile fallback:
 
 - `lightProfile` defaults to `heavyProfile`
@@ -74,7 +80,6 @@ merging field by field.
 Documented provider modes:
 
 - `openrouter`
-- `fireworks`
 - `deepseek`
 - `openai`
 - `openai-codex`
@@ -85,7 +90,6 @@ Provider defaults fill fields such as `baseUrl`, `maxTokens`, and
 API key environment variables:
 
 - `OPENROUTER_API_KEY`: used by `openrouter`
-- `FIREWORKS_API_KEY`: used by `fireworks`
 - `DEEPSEEK_API_KEY`: used by `deepseek`
 - `OPENAI_API_KEY`: used by `openai`
 - `EXA_API_KEY`: used by web tools
@@ -93,8 +97,14 @@ API key environment variables:
 The `openai-codex` provider uses ChatGPT/Codex OAuth instead of an API key:
 
 ```sh
+flatline auth
 flatline auth login openai-codex
 ```
+
+Bare `flatline auth` opens a small terminal helper for OAuth setup. Today it
+walks through OpenAI Codex OAuth, with room for additional OAuth providers as
+they become supported. The explicit subcommands remain available for scripts and
+direct use.
 
 Profile selection environment variables:
 
@@ -159,6 +169,10 @@ Use `/model` to inspect configured profiles and assign one to the heavy, light,
 or utility tier. The panel has an explicit save target; press `[` or `]` to
 cycle between user, project, project-local, launch-dir, and launch-local config
 files when those scopes are distinct.
+
+If the active provider is missing an API key or Codex OAuth session, Flatline
+still starts so `/model` remains available. The first attempted model call shows
+the auth error and opens the model panel automatically.
 
 When Flatline is launched from a directory below the project root, the default
 save target is launch-local config. Otherwise it defaults to project-local

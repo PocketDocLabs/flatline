@@ -156,6 +156,22 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
     }
 }
 
+fn requestModelPanel(requestTx: mpsc::Sender<TuiRequest>, deckUpdateTx: mpsc::Sender<DeckUpdate>) {
+    tokio::spawn(async move {
+        let (rTx, rRx) = oneshot::channel();
+        let _ = requestTx.send(TuiRequest::GetModels { reply: rTx }).await;
+        if let Ok(status) = rRx.await {
+            let _ = deckUpdateTx.send(DeckUpdate::ModelStatus(status)).await;
+        }
+    });
+}
+
+fn isModelAuthSetupError(message: &str) -> bool {
+    message.contains("API key not set for ")
+        || message.contains("OpenAI Codex auth is not configured")
+        || message.contains("OpenAI Codex access token expired")
+}
+
 async fn reloadAndApplyConfig(
     config: &mut construct::config::Config,
     session: &mut Session,
@@ -2131,6 +2147,9 @@ async fn runLoop(
                     );
                 }
                 LogEvent::Error(msg) => {
+                    if isModelAuthSetupError(&msg) && modelPanel.is_none() {
+                        requestModelPanel(requestTx.clone(), deckUpdateTx.clone());
+                    }
                     pushOperationalLog(
                         &mut developerLog,
                         &mut toastCenter,
@@ -5336,13 +5355,7 @@ fn dispatchSlashCommand(
             });
         }
         crate::command::CommandAction::Model => {
-            tokio::spawn(async move {
-                let (rTx, rRx) = oneshot::channel();
-                let _ = requestTx.send(TuiRequest::GetModels { reply: rTx }).await;
-                if let Ok(status) = rRx.await {
-                    let _ = deckUpdateTx.send(DeckUpdate::ModelStatus(status)).await;
-                }
-            });
+            requestModelPanel(requestTx, deckUpdateTx);
         }
         crate::command::CommandAction::ShowCost => {
             tokio::spawn(async move {

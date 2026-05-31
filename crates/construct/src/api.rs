@@ -1,4 +1,4 @@
-//! Multi-provider chat completion client (OpenRouter, Fireworks, DeepSeek).
+//! Multi-provider chat completion client (OpenRouter, DeepSeek, OpenAI).
 //!
 //! Speaks the OpenAI-compatible chat completions format with provider-
 //! specific extensions for reasoning, caching, and routing.
@@ -42,8 +42,7 @@ impl std::fmt::Display for PermanentApiError {
 
 impl std::error::Error for PermanentApiError {}
 
-/// LLM API client. Supports OpenRouter, Fireworks, and the official DeepSeek API
-/// (any OpenAI-compatible endpoint).
+/// LLM API client. Supports OpenRouter, DeepSeek, OpenAI, and OpenAI Codex.
 ///
 /// Holds HTTP clients for the configured model tiers. Streaming uses the
 /// heavy tier; non-streaming calls choose the tier explicitly.
@@ -60,19 +59,6 @@ pub struct Client {
 impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
-        for (tier, model) in [
-            ("heavy", &config.heavy),
-            ("light", &config.light),
-            ("utility", &config.utility),
-        ] {
-            if providerRequiresApiKey(model.provider.as_str()) && model.key.is_empty() {
-                bail!(
-                    "API key not set for {tier} profile provider {}. Set the profile's key in config.toml, or the matching env var (OPENROUTER_API_KEY / FIREWORKS_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY). For ChatGPT Pro auth use provider = \"openai-codex\" and run `flatline auth login openai-codex`.",
-                    model.provider,
-                );
-            }
-        }
-
         let heavyHttp =
             buildHttpClient(&config.heavy).context("Failed to build heavy HTTP client")?;
         let lightHttp =
@@ -102,6 +88,7 @@ impl Client {
         tools: &[ToolDef],
         reasoning: Option<&ReasoningConfig>,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
+        ensureProviderConfigured("heavy", &self.heavy)?;
         if usesResponsesApi(&self.heavy.provider) {
             return self.streamResponses(messages, tools, reasoning).await;
         }
@@ -133,12 +120,6 @@ impl Client {
 
         if let Some(r) = reasoning {
             match self.heavy.provider.as_str() {
-                "fireworks" => {
-                    // Fireworks uses a top-level `reasoning_effort` string.
-                    if let Some(ref effort) = r.effort {
-                        body["reasoning_effort"] = serde_json::json!(effort);
-                    }
-                }
                 "deepseek" => {
                     // DeepSeek wraps reasoning in a `thinking` object with
                     // `type` ("enabled" | "disabled") and `reasoning_effort`
@@ -255,6 +236,7 @@ impl Client {
         model: Option<&str>,
         tier: &str,
     ) -> Result<(String, Option<TokenUsage>)> {
+        ensureProviderConfigured(tier, cfg)?;
         if usesResponsesApi(&cfg.provider) {
             return Self::completeResponsesWith(http.clone(), cfg.clone(), messages, model, tier)
                 .await;
@@ -493,6 +475,16 @@ impl Client {
 
 fn providerRequiresApiKey(provider: &str) -> bool {
     provider != "openai-codex"
+}
+
+fn ensureProviderConfigured(tier: &str, model: &ModelConfig) -> Result<()> {
+    if providerRequiresApiKey(model.provider.as_str()) && model.key.is_empty() {
+        bail!(
+            "API key not set for {tier} profile provider {}. Set the profile's key in config.toml, or the matching env var (OPENROUTER_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY). For ChatGPT Pro auth use provider = \"openai-codex\" and run `flatline auth login openai-codex`.",
+            model.provider,
+        );
+    }
+    Ok(())
 }
 
 fn usesResponsesApi(provider: &str) -> bool {
@@ -814,8 +806,8 @@ fn warnIfProviderNotPinned(cfg: &ModelConfig) {
         return;
     }
 
-    // Only meaningful for OpenRouter — Fireworks/direct Anthropic don't
-    // have multi-provider routing.
+    // Only meaningful for OpenRouter — direct providers don't have
+    // multi-provider routing.
     if cfg.provider != "openrouter" {
         return;
     }
@@ -832,12 +824,12 @@ fn warnIfProviderNotPinned(cfg: &ModelConfig) {
 
 /// Serialize messages with provider-specific field names.
 ///
-/// Fireworks and DeepSeek use `reasoning_content` where OpenRouter uses
-/// `reasoning` on assistant messages. This translates at the JSON boundary
-/// so the internal Message type stays provider-agnostic.
+/// DeepSeek uses `reasoning_content` where OpenRouter uses `reasoning` on
+/// assistant messages. This translates at the JSON boundary so the internal
+/// Message type stays provider-agnostic.
 fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
     let mut value = serde_json::to_value(messages).unwrap_or_default();
-    if (provider == "fireworks" || provider == "deepseek")
+    if provider == "deepseek"
         && let serde_json::Value::Array(ref mut arr) = value
     {
         for msg in arr.iter_mut() {
@@ -1483,7 +1475,7 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
 
                 // Reasoning tokens arrive under different field names per provider:
                 //   - `reasoning` — OpenRouter (DeepSeek, Kimi)
-                //   - `reasoning_content` — Fireworks (Kimi, DeepSeek, etc.)
+                //   - `reasoning_content` — OpenAI-compatible providers
                 //   - `reasoning_details` — OpenRouter (Claude structured)
                 // Check all three, but only emit once to avoid duplicates.
                 let mut hadReasoning = false;
@@ -1497,7 +1489,7 @@ fn parseChunk(chunk: StreamChunk) -> Vec<StreamEvent> {
                     hadReasoning = true;
                 }
 
-                // Fireworks reasoning_content field.
+                // OpenAI-compatible reasoning_content field.
                 if !hadReasoning
                     && let Some(reasoning) = delta.reasoning_content
                     && !reasoning.is_empty()
@@ -1569,6 +1561,41 @@ mod tests {
         adaptMessages(msgs, "openrouter")
     }
 
+    fn testModel(provider: &str, key: &str) -> ModelConfig {
+        ModelConfig {
+            provider: provider.into(),
+            key: key.into(),
+            model: "test-model".into(),
+            baseUrl: "https://example.invalid".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: None,
+            contextWindow: 100_000,
+            maxContextWindow: Some(100_000),
+            supportsAnthropicCache: None,
+        }
+    }
+
+    fn testConfig(model: ModelConfig) -> crate::config::Config {
+        crate::config::Config {
+            heavyProfile: "test".into(),
+            lightProfile: "test".into(),
+            utilityProfile: "test".into(),
+            heavy: model.clone(),
+            light: model.clone(),
+            utility: model.clone(),
+            profiles: std::collections::BTreeMap::from([("test".into(), model)]),
+            compactRatio: 0.8,
+            web: crate::config::WebConfig::default(),
+            lsp: std::collections::HashMap::new(),
+            permissions: None,
+            budget: crate::config::BudgetConfig::default(),
+            projectRoot: None,
+            launchDir: std::path::PathBuf::from("."),
+        }
+    }
+
     #[test]
     fn deepseekThinkingShapes() {
         assert_eq!(
@@ -1591,6 +1618,25 @@ mod tests {
             deepseekThinking("DISABLED"),
             serde_json::json!({ "type": "disabled" }),
         );
+    }
+
+    #[test]
+    fn clientConstructionAllowsMissingApiKey() {
+        let model = testModel("openrouter", "");
+        let config = testConfig(model.clone());
+
+        Client::new(&config).expect("missing provider keys should not block UI startup");
+
+        let err = ensureProviderConfigured("heavy", &model).expect_err("request should fail later");
+        let msg = err.to_string();
+        assert!(msg.contains("API key not set for heavy profile provider openrouter"));
+        assert!(msg.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn codexProviderDoesNotRequireApiKey() {
+        let model = testModel("openai-codex", "");
+        ensureProviderConfigured("heavy", &model).expect("Codex uses OAuth at request time");
     }
 
     #[test]

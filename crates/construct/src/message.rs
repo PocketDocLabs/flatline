@@ -322,7 +322,7 @@ pub(crate) struct ChunkDelta {
     pub content: Option<String>,
     /// Simple reasoning string (DeepSeek/Kimi via OpenRouter).
     pub reasoning: Option<String>,
-    /// Reasoning content (Fireworks format — Kimi, DeepSeek, etc.).
+    /// OpenAI-compatible reasoning content field (DeepSeek, Kimi, etc.).
     pub reasoning_content: Option<String>,
     /// Structured reasoning details (Claude via OpenRouter).
     pub reasoning_details: Option<Vec<ReasoningDetail>>,

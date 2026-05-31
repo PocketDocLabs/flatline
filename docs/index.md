@@ -25,7 +25,7 @@ tools, MCP client support, and headless execution.
 
 Use these phrases when looking for a specific feature:
 
-- API keys: `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`
+- API keys: `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`
 - Config files: `config.toml`, `.flatline/config.toml`,
   `.flatline/config.local.toml`, launch directory config,
   `examples/config.toml`
