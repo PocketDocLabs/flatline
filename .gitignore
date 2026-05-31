@@ -1,13 +1,19 @@
-/target
-/_reference
+/target/
+/_reference/
+/bench/
+/research/
+/.flatline/
+
+# Local/editor state
 *.log
 .DS_Store
 .claude/
-/bench/
-/research/*
-!/research/reports/
-!/research/reports/*.md
+
+# Python scratch tooling and environments
 __pycache__/
-*.pyc
-/.flatline/
+*.py[cod]
+.venv/
+/throbberDesigner.py
+
+# Local-only configuration seed from early development
 config.template.toml
