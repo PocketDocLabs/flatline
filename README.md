@@ -75,36 +75,6 @@ Running without a subcommand starts the interactive terminal UI. Use
 
 Roadmap notes will move into GitHub issues and release notes as they stabilize.
 
-## Configuration Files
-
-Flatline reads layered configuration:
-
-1. User config: `~/.config/flatline/config.toml`
-2. Project config: `<project-root>/.flatline/config.toml`
-3. Launch directory config: `<launch-dir>/.flatline/config.toml`
-4. Local project overrides: `<project-root>/.flatline/config.local.toml`
-5. Local launch directory overrides: `<launch-dir>/.flatline/config.local.toml`
-6. Environment variables such as `OPENROUTER_API_KEY` and `OPENAI_API_KEY`
-
-MCP servers are configured in `~/.config/flatline/mcp.json` and project
-`.mcp.json` files.
-
-LSP project overrides are configured in `.flatline/lsp.toml`.
-
-## Current Limitations
-
-Flatline is pre-1.0 software. The main TUI, headless runner, permissions,
-model profiles, MCP, LSP diagnostics, background jobs, and transcript storage
-are implemented, but a few user expectations are still intentionally scoped:
-
-- `/undo` is present in the command surface, but project file restore is not
-  implemented yet.
-- `@file` insertion, external-editor prompt composition, and theme
-  configuration are not implemented yet.
-- Code navigation features that use `structSearch`, `fileOutline`, and
-  `viewSymbol` require `sg` from ast-grep.
-- File/content search features work best with `rg` from ripgrep.
-
 ## Development
 
 Run the test suite:
