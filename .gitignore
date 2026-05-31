@@ -3,6 +3,7 @@
 /bench/
 /research/
 /.flatline/
+/STATUS.md
 
 # Local/editor state
 *.log
