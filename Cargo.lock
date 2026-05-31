@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "construct"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "deck"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
