@@ -429,7 +429,8 @@ impl Client {
         tier: &str,
     ) -> Result<(String, Option<TokenUsage>)> {
         let url = format!("{}/responses", cfg.baseUrl);
-        let body = buildResponsesBody(&cfg, messages, &[], None, false, model)?;
+        let stream = responsesCompletionUsesStreaming(&cfg);
+        let body = buildResponsesBody(&cfg, messages, &[], None, stream, model)?;
 
         tracing::debug!(
             completionTier = %tier,
@@ -459,6 +460,18 @@ impl Client {
         })
         .await?;
 
+        if stream {
+            let (content, usage) = collectResponsesStream(response).await?;
+            tracing::debug!(
+                completionTier = %tier,
+                model = %model.unwrap_or(&cfg.model),
+                responseLen = content.len(),
+                cost = ?usage.as_ref().and_then(|u| u.cost),
+                "Responses streaming completion received"
+            );
+            return Ok((content, usage));
+        }
+
         let responseBody: serde_json::Value = response
             .json()
             .await
@@ -484,6 +497,10 @@ fn providerRequiresApiKey(provider: &str) -> bool {
 
 fn usesResponsesApi(provider: &str) -> bool {
     matches!(provider, "openai" | "openai-codex")
+}
+
+fn responsesCompletionUsesStreaming(cfg: &ModelConfig) -> bool {
+    cfg.provider == "openai-codex"
 }
 
 async fn sendJsonRequest(
@@ -986,6 +1003,82 @@ async fn readResponsesStream(
     }
 
     Ok(())
+}
+
+async fn collectResponsesStream(
+    response: reqwest::Response,
+) -> Result<(String, Option<TokenUsage>)> {
+    use futures::StreamExt;
+
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let mut state = ResponsesStreamState::default();
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut content = String::new();
+    let mut usage = None;
+
+    loop {
+        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk.context("Responses completion stream read error")?,
+            Ok(None) => break,
+            Err(_) => {
+                bail!("Responses completion stream stalled — no data received for {IDLE_TIMEOUT:?}")
+            }
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(lineEnd) = buffer.find('\n') {
+            let line = buffer[..lineEnd].trim().to_string();
+            buffer = buffer[lineEnd + 1..].to_string();
+
+            if line.is_empty() || line.starts_with(':') || line.starts_with("event: ") {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data.trim() == "[DONE]" {
+                    return Ok((content, usage));
+                }
+
+                match serde_json::from_str::<serde_json::Value>(data) {
+                    Ok(value) => {
+                        if value.get("type").and_then(|v| v.as_str()) == Some("response.completed")
+                        {
+                            let response = value.get("response").unwrap_or(&value);
+                            if content.is_empty() {
+                                content.push_str(&extractResponsesText(response));
+                            }
+                        }
+
+                        for event in parseResponsesEvent(&mut state, value) {
+                            match event {
+                                StreamEvent::ContentDelta(delta) => content.push_str(&delta),
+                                StreamEvent::Done {
+                                    usage: doneUsage, ..
+                                } => {
+                                    if doneUsage.is_some() {
+                                        usage = doneUsage;
+                                    }
+                                }
+                                StreamEvent::Error(message) => bail!("{message}"),
+                                StreamEvent::ReasoningDelta(_)
+                                | StreamEvent::ToolCallDelta { .. } => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            data = %data,
+                            "failed to parse Responses completion SSE chunk: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((content, usage))
 }
 
 #[derive(Default)]
@@ -1726,6 +1819,28 @@ mod tests {
         assert_eq!(body["input"][3]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["name"], "shell");
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn codexResponsesCompletionsUseStreaming() {
+        let mut cfg = ModelConfig {
+            provider: "openai-codex".into(),
+            key: String::new(),
+            model: "gpt-5.3-codex".into(),
+            baseUrl: "https://chatgpt.com/backend-api/codex".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: None,
+            contextWindow: 272_000,
+            maxContextWindow: Some(272_000),
+            supportsAnthropicCache: Some(false),
+        };
+
+        assert!(responsesCompletionUsesStreaming(&cfg));
+
+        cfg.provider = "openai".into();
+        assert!(!responsesCompletionUsesStreaming(&cfg));
     }
 
     #[test]
