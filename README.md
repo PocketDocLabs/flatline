@@ -73,7 +73,7 @@ Running without a subcommand starts the interactive terminal UI. Use
 - [MCP](docs/mcp.md): using MCP servers and exposing Flatline as an MCP server
 - [Troubleshooting](docs/troubleshooting.md): common setup and runtime problems
 
-The current implementation status and roadmap live in [STATUS.md](STATUS.md).
+Roadmap notes will move into GitHub issues and release notes as they stabilize.
 
 ## Configuration Files
 
