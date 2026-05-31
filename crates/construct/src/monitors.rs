@@ -1015,11 +1015,7 @@ mod terminal_tests {
         plane.stop(id).unwrap();
         let _ = shell.execute("echo ERROR final", None).await;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
-            else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(LogEvent::MonitorEvent { .. })) => {
                     panic!("stopped monitor should not receive matches");
@@ -1096,11 +1092,7 @@ mod terminal_tests {
         assert!(matches!(ev, LogEvent::MonitorEvent { .. }));
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
-            else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(LogEvent::MonitorEvent { id, .. })) if id == mainId => {
                     panic!("terminal-close-stopped monitor should not receive matches");

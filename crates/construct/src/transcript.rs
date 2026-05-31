@@ -539,7 +539,7 @@ pub fn listSessions(projectDir: Option<&str>) -> Result<Vec<SessionMeta>> {
     }
 
     // Sort by updatedAt descending (most recent first).
-    sessions.sort_by(|a, b| b.updatedAt.cmp(&a.updatedAt));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updatedAt));
     Ok(sessions)
 }
 

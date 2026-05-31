@@ -657,11 +657,11 @@ pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
                     }
                 }
             }
-            CompactionOp::BlockCompact { blockId, .. } => {
-                // Only count if not already covered by S3 or S4.
-                if !s4Blocks.contains(blockId.as_str()) && !s3Blocks.contains(blockId.as_str()) {
-                    s2Blocks.insert(blockId.as_str());
-                }
+            // Only count if not already covered by S3 or S4.
+            CompactionOp::BlockCompact { blockId, .. }
+                if !s4Blocks.contains(blockId.as_str()) && !s3Blocks.contains(blockId.as_str()) =>
+            {
+                s2Blocks.insert(blockId.as_str());
             }
             _ => {}
         }
