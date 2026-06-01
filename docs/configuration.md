@@ -120,7 +120,7 @@ Profiles can set official reasoning options:
 [profile.deepseekPro]
 provider = "deepseek"
 model = "deepseek-v4-pro"
-contextWindow = 128000
+contextWindow = 400000
 reasoning = { effort = "max" }
 ```
 

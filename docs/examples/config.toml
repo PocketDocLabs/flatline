@@ -42,19 +42,19 @@ contextWindow = 256000
 [profile.deepseekPro]
 provider = "deepseek"
 model = "deepseek-v4-pro"
-contextWindow = 128000
+contextWindow = 400000
 reasoning = { effort = "max" }
 
 [profile.deepseekFlash]
 provider = "deepseek"
 model = "deepseek-v4-flash"
-contextWindow = 128000
+contextWindow = 400000
 reasoning = { effort = "high" }
 
 [profile.deepseekUtility]
 provider = "deepseek"
 model = "deepseek-v4-flash"
-contextWindow = 128000
+contextWindow = 400000
 reasoning = { effort = "disabled" }
 
 [profile.openaiCodex]

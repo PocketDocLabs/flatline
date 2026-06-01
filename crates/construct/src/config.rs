@@ -270,8 +270,8 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             promptThinking: false,
             providerOrder: Vec::new(),
             maxTokens: Some(8_000),
-            contextWindow: 128_000,
-            maxContextWindow: Some(128_000),
+            contextWindow: 400_000,
+            maxContextWindow: None,
             supportsAnthropicCache: None,
         },
         "openai" => ModelConfig {
@@ -287,7 +287,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(128_000),
             contextWindow: 1_050_000,
-            maxContextWindow: Some(1_050_000),
+            maxContextWindow: None,
             supportsAnthropicCache: Some(false),
         },
         "openai-codex" => ModelConfig {
@@ -303,7 +303,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: None,
             contextWindow: 272_000,
-            maxContextWindow: Some(272_000),
+            maxContextWindow: None,
             supportsAnthropicCache: Some(false),
         },
         // Default to OpenRouter for anything unrecognized.
@@ -317,7 +317,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
-            maxContextWindow: Some(250_000),
+            maxContextWindow: None,
             supportsAnthropicCache: None,
         },
     }
@@ -338,7 +338,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
-            maxContextWindow: Some(250_000),
+            maxContextWindow: None,
             supportsAnthropicCache: None,
         },
         Tier::Light => ModelConfig {
@@ -351,7 +351,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: vec!["Anthropic".into()],
             maxTokens: Some(100_000),
             contextWindow: 250_000,
-            maxContextWindow: Some(250_000),
+            maxContextWindow: None,
             supportsAnthropicCache: None,
         },
         Tier::Utility => ModelConfig {
@@ -364,7 +364,7 @@ fn tierDefaults(tier: Tier) -> ModelConfig {
             providerOrder: Vec::new(),
             maxTokens: Some(8_000),
             contextWindow: 256_000,
-            maxContextWindow: Some(256_000),
+            maxContextWindow: None,
             supportsAnthropicCache: None,
         },
     }
@@ -939,8 +939,7 @@ fn resolveModel(partial: Option<PartialModelConfig>) -> ModelConfig {
     let model = partial.model.unwrap_or(defaults.model);
     let maxContextWindow = partial
         .maxContextWindow
-        .or_else(|| crate::model_catalog::knownModelContextWindow(&provider, &model))
-        .or(defaults.maxContextWindow);
+        .or_else(|| crate::model_catalog::knownModelContextWindow(&provider, &model));
     let mut contextWindow = partial.contextWindow.unwrap_or(defaults.contextWindow);
     if let Some(max) = maxContextWindow {
         contextWindow = contextWindow.min(max);
@@ -1006,17 +1005,17 @@ fn defaultConfigToml() -> String {
          [profile.deepseekPro]\n\
          provider       = \"deepseek\"\n\
          model          = \"deepseek-v4-pro\"\n\
-         contextWindow  = 128000\n\
+         contextWindow  = 400000\n\
          reasoning      = {{ effort = \"max\" }}\n\n\
          [profile.deepseekFlash]\n\
          provider       = \"deepseek\"\n\
          model          = \"deepseek-v4-flash\"\n\
-         contextWindow  = 128000\n\
+         contextWindow  = 400000\n\
          reasoning      = {{ effort = \"high\" }}\n\n\
          [profile.deepseekUtility]\n\
          provider       = \"deepseek\"\n\
          model          = \"deepseek-v4-flash\"\n\
-         contextWindow  = 128000\n\
+         contextWindow  = 400000\n\
          reasoning      = {{ effort = \"disabled\" }}\n\n\
          [profile.openaiCodex]\n\
          provider       = \"openai-codex\"\n\
@@ -2006,6 +2005,22 @@ mod tests {
         assert_eq!(cfg.heavy.baseUrl, "https://api.deepseek.com");
         assert!(cfg.heavy.providerOrder.is_empty());
         assert!(!cfg.heavy.promptThinking);
+        assert!(cfg.heavy.maxContextWindow.is_none());
+    }
+
+    #[test]
+    fn uncatalogedProviderModelDoesNotGetClampedByFallbackDefaults() {
+        let cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "x"
+            [profile.x]
+            provider = "deepseek"
+            model = "flatline-test-uncataloged-deepseek-model"
+            contextWindow = 999000
+            "#,
+        ));
+        assert_eq!(cfg.heavy.contextWindow, 999_000);
+        assert!(cfg.heavy.maxContextWindow.is_none());
     }
 
     #[test]
@@ -2153,18 +2168,21 @@ mod tests {
         let pro = partial.profile.get("deepseekPro").unwrap();
         assert_eq!(pro.provider.as_deref(), Some("deepseek"));
         assert_eq!(pro.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(pro.contextWindow, Some(400_000));
         assert_eq!(
             pro.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("max")
         );
 
         let flash = partial.profile.get("deepseekFlash").unwrap();
+        assert_eq!(flash.contextWindow, Some(400_000));
         assert_eq!(
             flash.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("high")
         );
 
         let util = partial.profile.get("deepseekUtility").unwrap();
+        assert_eq!(util.contextWindow, Some(400_000));
         assert_eq!(
             util.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("disabled")
