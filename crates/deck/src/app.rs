@@ -5132,15 +5132,15 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                     let diff = replayedDiff.as_deref();
                     let review = meta.and_then(|m| m.review.clone());
                     let duration = replayToolDuration(turn, result, meta);
-                    panel.pushReplayedToolBlock(
+                    panel.pushReplayedToolBlock(crate::agent_panel::ReplayedToolBlock {
                         name,
-                        &summary,
+                        summary: &summary,
                         diff,
                         review,
                         outcome,
-                        result.map(|r| r.content.as_str()),
+                        output: result.map(|r| r.content.as_str()),
                         duration,
-                    );
+                    });
                     if let Some(ref callId) = turn.toolCallId {
                         replayedToolResults.insert(callId.clone());
                     }
@@ -5630,8 +5630,10 @@ mod tests {
 
     #[test]
     fn replayToolDiffPrefersStoredTranscriptDiff() {
-        let mut meta = ToolCallMeta::default();
-        meta.diff = Some("stored diff".into());
+        let meta = ToolCallMeta {
+            diff: Some("stored diff".into()),
+            ..Default::default()
+        };
         let turn = toolCallTurn(
             "editFile",
             serde_json::json!({

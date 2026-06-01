@@ -135,6 +135,16 @@ enum ToolBlockStatus {
     Complete { duration: Option<Duration> },
 }
 
+pub struct ReplayedToolBlock<'a> {
+    pub name: &'a str,
+    pub summary: &'a str,
+    pub diff: Option<&'a str>,
+    pub review: Option<construct::control::AutoReviewReport>,
+    pub outcome: Option<construct::transcript::ToolCallOutcome>,
+    pub output: Option<&'a str>,
+    pub duration: Option<Duration>,
+}
+
 #[derive(Debug, Clone)]
 struct ToolBlockSection {
     kind: ToolSectionKind,
@@ -459,6 +469,11 @@ type BuiltLines = (
     Vec<ToolSectionRange>,
     HashSet<usize>,
 );
+
+struct RenderTracking<'a> {
+    codeBlockRanges: &'a mut Vec<CodeBlockRange>,
+    toolSectionRanges: &'a mut Vec<ToolSectionRange>,
+}
 
 /// Agent panel state.
 pub struct AgentPanel {
@@ -1953,16 +1968,16 @@ impl AgentPanel {
     /// Rehydrate a historical tool call from transcript metadata. This
     /// preserves semantic tool UX while leaving ephemeral UI state at fresh
     /// defaults.
-    pub fn pushReplayedToolBlock(
-        &mut self,
-        name: &str,
-        summary: &str,
-        diff: Option<&str>,
-        review: Option<construct::control::AutoReviewReport>,
-        outcome: Option<construct::transcript::ToolCallOutcome>,
-        output: Option<&str>,
-        duration: Option<Duration>,
-    ) {
+    pub fn pushReplayedToolBlock(&mut self, replay: ReplayedToolBlock<'_>) {
+        let ReplayedToolBlock {
+            name,
+            summary,
+            diff,
+            review,
+            outcome,
+            output,
+            duration,
+        } = replay;
         let hasOutput = output.is_some_and(|o| !o.trim().is_empty());
         let status = match outcome {
             Some(construct::transcript::ToolCallOutcome::Denied)
@@ -2279,9 +2294,8 @@ impl AgentPanel {
             .iter()
             .find(|range| {
                 range.collapsible
-                    && ((!range.expanded && visualLine == range.startLine)
-                        || (range.expanded
-                            && (visualLine == range.startLine || visualLine == range.endLine)))
+                    && (visualLine == range.startLine
+                        || (range.expanded && visualLine == range.endLine))
             })
             .map(|range| (range.id, range.expanded, range.hiddenLines));
         if let Some((id, wasExpanded, delta)) = toolSection
@@ -3481,14 +3495,17 @@ impl AgentPanel {
         for (idx, entry) in self.entries.iter().enumerate() {
             let mut entryLines: Vec<Line<'static>> = Vec::new();
             let mut entryCont: Vec<bool> = Vec::new();
+            let mut tracking = RenderTracking {
+                codeBlockRanges: &mut dummyRanges,
+                toolSectionRanges: &mut dummyToolRanges,
+            };
             self.renderEntry(
                 entry,
                 &mut entryLines,
                 &mut entryCont,
                 w as u16,
                 idx,
-                &mut dummyRanges,
-                &mut dummyToolRanges,
+                &mut tracking,
             );
 
             let entryStart = cursor;
@@ -3890,15 +3907,11 @@ impl AgentPanel {
                 PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. }
             );
             let linesBefore = lines.len();
-            self.renderEntry(
-                entry,
-                &mut lines,
-                &mut cont,
-                width,
-                i,
-                &mut codeBlockRanges,
-                &mut toolSectionRanges,
-            );
+            let mut tracking = RenderTracking {
+                codeBlockRanges: &mut codeBlockRanges,
+                toolSectionRanges: &mut toolSectionRanges,
+            };
+            self.renderEntry(entry, &mut lines, &mut cont, width, i, &mut tracking);
             if isNotice {
                 for idx in linesBefore..lines.len() {
                     nonCopyable.insert(idx);
@@ -4115,8 +4128,7 @@ impl AgentPanel {
         cont: &mut Vec<bool>,
         width: u16,
         entryIndex: usize,
-        codeBlockRanges: &mut Vec<CodeBlockRange>,
-        toolSectionRanges: &mut Vec<ToolSectionRange>,
+        tracking: &mut RenderTracking<'_>,
     ) {
         match entry {
             PanelEntry::User(text) => {
@@ -4159,7 +4171,7 @@ impl AgentPanel {
                     entryIndex,
                     &self.codeScrollX,
                     &self.codeExpanded,
-                    codeBlockRanges,
+                    tracking.codeBlockRanges,
                     &self.copiedFlash,
                 );
             }
@@ -4217,7 +4229,7 @@ impl AgentPanel {
                         entryIndex,
                         &self.codeScrollX,
                         &self.codeExpanded,
-                        codeBlockRanges,
+                        tracking.codeBlockRanges,
                         &self.copiedFlash,
                     );
                 } else if command.is_some() {
@@ -4308,7 +4320,14 @@ impl AgentPanel {
                 cont.push(true);
             }
             PanelEntry::ToolBlock(block) => {
-                self.renderToolBlock(block, lines, cont, width, entryIndex, toolSectionRanges);
+                self.renderToolBlock(
+                    block,
+                    lines,
+                    cont,
+                    width,
+                    entryIndex,
+                    tracking.toolSectionRanges,
+                );
             }
             PanelEntry::WakeSchedule {
                 id,
@@ -4386,6 +4405,7 @@ impl AgentPanel {
                 contentExpanded,
                 ..
             } => {
+                let codeBlockRanges = &mut *tracking.codeBlockRanges;
                 let prefixPad: usize = 2; // Match other entries' prefix indent.
                 let w = (width as usize).saturating_sub(prefixPad);
                 let innerW = w.saturating_sub(2); // Inside the left+right borders.
@@ -4786,7 +4806,7 @@ impl AgentPanel {
                     entryIndex,
                     &self.codeScrollX,
                     &self.codeExpanded,
-                    codeBlockRanges,
+                    tracking.codeBlockRanges,
                     &self.copiedFlash,
                 );
             }
@@ -4803,7 +4823,7 @@ impl AgentPanel {
                     entryIndex,
                     &self.codeScrollX,
                     &self.codeExpanded,
-                    codeBlockRanges,
+                    tracking.codeBlockRanges,
                     &self.copiedFlash,
                 );
             }
