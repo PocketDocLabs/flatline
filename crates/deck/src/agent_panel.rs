@@ -36,6 +36,7 @@ pub enum PanelEntry {
         text: String,
         expanded: bool,
     },
+    #[allow(dead_code)]
     ToolRequest {
         summary: String,
         diff: Option<String>,
@@ -43,20 +44,34 @@ pub enum PanelEntry {
     },
     ToolApproved {
         name: String,
+        review: Option<construct::control::AutoReviewReport>,
     },
+    #[allow(dead_code)]
     ToolDenied {
         name: String,
+        review: Option<construct::control::AutoReviewReport>,
     },
     /// A tool was auto-denied by a permission rule (shown with red background).
+    #[allow(dead_code)]
     ToolAutoDenied {
         name: String,
         summary: String,
+        review: Option<construct::control::AutoReviewReport>,
     },
+    /// A tool is currently being reviewed by the automatic permission reviewer.
+    #[allow(dead_code)]
+    ToolReviewing {
+        name: String,
+        summary: String,
+    },
+    /// Framed tool lifecycle block with collapsible invocation/reviewer/result sections.
+    ToolBlock(ToolBlock),
     ToolResult {
         name: String,
         output: String,
     },
     /// A tool is currently executing (shown with throbber + elapsed time).
+    #[allow(dead_code)]
     ToolActive {
         summary: String,
     },
@@ -100,6 +115,79 @@ pub enum PanelEntry {
         stage: String,
     },
     Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolBlock {
+    name: String,
+    summary: String,
+    status: ToolBlockStatus,
+    sections: Vec<ToolBlockSection>,
+}
+
+#[derive(Debug, Clone)]
+enum ToolBlockStatus {
+    Pending,
+    Reviewing { startedAt: Instant },
+    Approved,
+    Active { startedAt: Instant },
+    Denied,
+    Complete { duration: Option<Duration> },
+}
+
+#[derive(Debug, Clone)]
+struct ToolBlockSection {
+    kind: ToolSectionKind,
+    label: String,
+    rawText: String,
+    renderKind: ToolSectionRender,
+    expanded: bool,
+    copyable: bool,
+    previewWhenCollapsed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSectionRender {
+    Plain,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToolSectionKind {
+    Invocation,
+    Reviewer,
+    Diff,
+    Result,
+}
+
+impl ToolSectionKind {
+    fn rank(self) -> u8 {
+        match self {
+            ToolSectionKind::Invocation => 0,
+            ToolSectionKind::Reviewer => 1,
+            ToolSectionKind::Diff => 2,
+            ToolSectionKind::Result => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ToolSectionId {
+    entryIndex: usize,
+    sectionIndex: usize,
+}
+
+struct ToolSectionRange {
+    startLine: usize,
+    endLine: usize,
+    id: ToolSectionId,
+    copyLabelCol: Option<u16>,
+    rawText: String,
+    collapsible: bool,
+    expanded: bool,
+    hiddenLines: u16,
+    maxContentWidth: usize,
+    innerWidth: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +246,186 @@ struct CompletionState {
 
 /// Maximum visible content lines before a code block is collapsed.
 const MAX_CODE_BLOCK_LINES: usize = 6;
+const MAX_INVOCATION_PREVIEW_LINES: usize = 2;
+
+impl ToolBlock {
+    fn new(name: &str, summary: &str, status: ToolBlockStatus) -> Self {
+        let (headline, invocation) = toolBlockSummaryParts(name, summary);
+        let mut block = Self {
+            name: name.into(),
+            summary: headline,
+            status,
+            sections: Vec::new(),
+        };
+        if let Some(rawText) = invocation {
+            block.upsertSection(ToolBlockSection {
+                kind: ToolSectionKind::Invocation,
+                label: name.into(),
+                rawText,
+                renderKind: ToolSectionRender::Plain,
+                expanded: false,
+                copyable: true,
+                previewWhenCollapsed: true,
+            });
+        } else {
+            block.upsertSection(ToolBlockSection {
+                kind: ToolSectionKind::Invocation,
+                label: name.into(),
+                rawText: String::new(),
+                renderKind: ToolSectionRender::Plain,
+                expanded: false,
+                copyable: false,
+                previewWhenCollapsed: false,
+            });
+        }
+        block
+    }
+
+    fn updateSummary(&mut self, summary: &str) {
+        let (headline, invocation) = toolBlockSummaryParts(&self.name, summary);
+        if !headline.trim().is_empty() {
+            self.summary = headline;
+        }
+        if let Some(rawText) = invocation {
+            self.upsertSectionPreservingExpansion(
+                ToolSectionKind::Invocation,
+                self.name.clone(),
+                rawText,
+                false,
+                true,
+                true,
+            );
+        }
+    }
+
+    fn upsertReviewer(&mut self, report: construct::control::AutoReviewReport) {
+        let rawText = reviewerReportText(&report).join("\n");
+        self.upsertSectionPreservingExpansion(
+            ToolSectionKind::Reviewer,
+            "reviewer".into(),
+            rawText,
+            false,
+            false,
+            false,
+        );
+    }
+
+    fn setOutput(&mut self, output: &str) {
+        let mut rawText = output.trim_end().to_string();
+        if rawText.is_empty() {
+            return;
+        }
+        if self
+            .sections
+            .iter()
+            .any(|section| section.kind == ToolSectionKind::Diff)
+        {
+            if let Some(displayText) = stripRoutineMutationOutput(&self.name, &rawText) {
+                rawText = displayText;
+            } else {
+                return;
+            }
+        }
+        let totalLines = rawText.lines().count().max(1);
+        self.upsertSectionPreservingExpansion(
+            ToolSectionKind::Result,
+            "result".into(),
+            rawText,
+            totalLines <= MAX_CODE_BLOCK_LINES,
+            true,
+            totalLines > MAX_CODE_BLOCK_LINES,
+        );
+    }
+
+    fn upsertSection(&mut self, section: ToolBlockSection) {
+        if let Some(existing) = self.sections.iter_mut().find(|s| s.kind == section.kind) {
+            *existing = section;
+        } else {
+            self.sections.push(section);
+        }
+        self.sortSections();
+    }
+
+    fn upsertSectionPreservingExpansion(
+        &mut self,
+        kind: ToolSectionKind,
+        label: String,
+        rawText: String,
+        defaultExpanded: bool,
+        copyable: bool,
+        previewWhenCollapsed: bool,
+    ) {
+        if let Some(existing) = self.sections.iter_mut().find(|s| s.kind == kind) {
+            existing.label = label;
+            existing.rawText = rawText;
+            existing.renderKind = ToolSectionRender::Plain;
+            existing.copyable = copyable;
+            existing.previewWhenCollapsed = previewWhenCollapsed;
+        } else {
+            self.sections.push(ToolBlockSection {
+                kind,
+                label,
+                rawText,
+                renderKind: ToolSectionRender::Plain,
+                expanded: defaultExpanded,
+                copyable,
+                previewWhenCollapsed,
+            });
+        }
+        self.sortSections();
+    }
+
+    fn upsertDiffSection(&mut self, label: String, rawText: String) {
+        let totalLines = rawText.lines().count().max(1);
+        if let Some(existing) = self
+            .sections
+            .iter_mut()
+            .find(|s| s.kind == ToolSectionKind::Diff)
+        {
+            existing.label = label;
+            existing.rawText = rawText;
+            existing.renderKind = ToolSectionRender::Diff;
+            existing.copyable = true;
+            existing.previewWhenCollapsed = true;
+        } else {
+            self.sections.push(ToolBlockSection {
+                kind: ToolSectionKind::Diff,
+                label,
+                rawText,
+                renderKind: ToolSectionRender::Diff,
+                expanded: totalLines <= MAX_CODE_BLOCK_LINES,
+                copyable: true,
+                previewWhenCollapsed: true,
+            });
+        }
+        self.sortSections();
+    }
+
+    fn sortSections(&mut self) {
+        self.sections.sort_by_key(|section| section.kind.rank());
+    }
+}
+
+impl ToolBlockStatus {
+    fn startedAt(&self) -> Option<Instant> {
+        match self {
+            ToolBlockStatus::Reviewing { startedAt } | ToolBlockStatus::Active { startedAt } => {
+                Some(*startedAt)
+            }
+            _ => None,
+        }
+    }
+
+    fn isTransient(&self) -> bool {
+        matches!(
+            self,
+            ToolBlockStatus::Pending
+                | ToolBlockStatus::Reviewing { .. }
+                | ToolBlockStatus::Approved
+                | ToolBlockStatus::Active { .. }
+        )
+    }
+}
 
 /// Metadata for a rendered code block in the visual line buffer.
 struct CodeBlockRange {
@@ -188,6 +456,7 @@ type BuiltLines = (
     Vec<bool>,
     Vec<(Option<usize>, usize)>,
     Vec<CodeBlockRange>,
+    Vec<ToolSectionRange>,
     HashSet<usize>,
 );
 
@@ -234,10 +503,14 @@ pub struct AgentPanel {
     pendingToolName: String,
     /// Human-readable summary of the tool call (key arg + description).
     pendingToolSummary: String,
+    /// Raw shell command for the active permission prompt, if any.
+    pendingToolCommand: Option<String>,
     /// Model-provided explanation (shell commands only).
     pendingToolExplanation: Option<String>,
     /// Impact tier for visual treatment (color/symbol).
     pendingToolImpact: construct::tool::ShellImpact,
+    /// Auto-review report attached to an escalated permit prompt.
+    pendingReviewerReport: Option<construct::control::AutoReviewReport>,
     /// Suggested "always allow" patterns for the pending permission prompt.
     permitPatterns: Vec<String>,
     /// Currently selected pattern index (last = custom).
@@ -303,10 +576,16 @@ pub struct AgentPanel {
     pub lastInputRect: Rect,
     /// Horizontal scroll offset per code block: (entryIndex, codeBlockOrdinal) -> scrollX.
     codeScrollX: HashMap<(usize, usize), u16>,
+    /// Horizontal scroll offset per framed tool section.
+    toolSectionScrollX: HashMap<ToolSectionId, u16>,
     /// Code block metadata from the last buildLines (for hit-testing and copy).
     lastCodeBlockRanges: Vec<CodeBlockRange>,
+    /// Tool block section metadata from the last buildLines.
+    lastToolSectionRanges: Vec<ToolSectionRange>,
     /// Click-to-copy visual feedback: (blockId, when copied).
     copiedFlash: Option<((usize, usize), Instant)>,
+    /// Click-to-copy visual feedback for tool block sections.
+    toolSectionCopiedFlash: Option<(ToolSectionId, Instant)>,
     /// Code blocks toggled to expanded (shows all lines).
     codeExpanded: HashSet<(usize, usize)>,
     /// Visual line index of the last subagent header (for click-to-view).
@@ -345,8 +624,10 @@ impl AgentPanel {
             permitDisplaySuppressed: false,
             pendingToolName: String::new(),
             pendingToolSummary: String::new(),
+            pendingToolCommand: None,
             pendingToolExplanation: None,
             pendingToolImpact: construct::tool::ShellImpact::Read,
+            pendingReviewerReport: None,
             permitPatterns: Vec::new(),
             permitSelectedPattern: 0,
             permitCustomPattern: String::new(),
@@ -376,8 +657,11 @@ impl AgentPanel {
             nonCopyableLines: HashSet::new(),
             lastInputRect: Rect::default(),
             codeScrollX: HashMap::new(),
+            toolSectionScrollX: HashMap::new(),
             lastCodeBlockRanges: Vec::new(),
+            lastToolSectionRanges: Vec::new(),
             copiedFlash: None,
+            toolSectionCopiedFlash: None,
             codeExpanded: HashSet::new(),
             lastSubagentHeaderLine: std::cell::Cell::new(None),
             lastSubagentToggleLine: std::cell::Cell::new(None),
@@ -404,6 +688,9 @@ impl AgentPanel {
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
+        self.pendingToolSummary.clear();
+        self.pendingToolCommand = None;
+        self.pendingReviewerReport = None;
         self.pendingToolCalls.clear();
         self.pendingToolCallStartTime = None;
         self.thinkingStartTime = None;
@@ -419,8 +706,11 @@ impl AgentPanel {
         self.lastLineTexts.clear();
         self.nonCopyableLines.clear();
         self.codeScrollX.clear();
+        self.toolSectionScrollX.clear();
         self.lastCodeBlockRanges.clear();
+        self.lastToolSectionRanges.clear();
         self.copiedFlash = None;
+        self.toolSectionCopiedFlash = None;
         self.codeExpanded.clear();
         self.attachments.clear();
         self.queuedMessages.clear();
@@ -773,6 +1063,9 @@ impl AgentPanel {
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
+        self.pendingToolSummary.clear();
+        self.pendingToolCommand = None;
+        self.pendingReviewerReport = None;
         self.queuedMessages.clear();
         self.clearToolActiveEntries();
         self.textArea.placeholder = "Type a message...";
@@ -788,12 +1081,14 @@ impl AgentPanel {
         diff: Option<String>,
         explanation: Option<String>,
         impact: construct::tool::ShellImpact,
+        review: Option<construct::control::AutoReviewReport>,
         origin: construct::control::PermitOrigin,
     ) {
         if !self.turnActive {
             return;
         }
         self.finalizeStreaming();
+        self.removeLatestToolReviewingEntry();
         // Extract raw command for shell tools so the approval prompt
         // shows the full command in a code block, not just the summary
         // line. Foreground and background shell share the same shape.
@@ -804,17 +1099,32 @@ impl AgentPanel {
                 _ => None,
             });
 
-        self.entries.push(PanelEntry::ToolRequest {
-            summary: summary.into(),
-            diff,
-            command,
-        });
+        let mut block = ToolBlock::new(name, summary, ToolBlockStatus::Pending);
+        if let Some(commandText) = command.as_ref() {
+            block.upsertSectionPreservingExpansion(
+                ToolSectionKind::Invocation,
+                name.into(),
+                format!("Run: {commandText}"),
+                false,
+                true,
+                true,
+            );
+        }
+        if let Some(diffText) = diff.as_ref() {
+            block.upsertDiffSection(name.into(), diffText.clone());
+        }
+        if let Some(report) = review.clone() {
+            block.upsertReviewer(report);
+        }
+        self.entries.push(PanelEntry::ToolBlock(block));
         self.pendingPermit = true;
         self.pendingPermitOrigin = Some(origin);
         self.pendingToolName = name.into();
         self.pendingToolSummary = summary.into();
+        self.pendingToolCommand = command;
         self.pendingToolExplanation = explanation;
         self.pendingToolImpact = impact;
+        self.pendingReviewerReport = review;
         // Generate pattern suggestions (re-parse — the action was consumed above).
         self.permitPatterns = construct::tool::parse(name, args)
             .map(|a| construct::permissions::suggestPatterns(&a))
@@ -847,15 +1157,44 @@ impl AgentPanel {
     }
 
     pub fn approvePending(&mut self) {
+        let pendingCommand = self.pendingToolCommand.take();
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
+        let pendingSummary = std::mem::take(&mut self.pendingToolSummary);
         let name = std::mem::take(&mut self.pendingToolName);
+        self.pendingReviewerReport = None;
         self.permitPatterns.clear();
         self.permitEditingCustom = false;
         // Don't push ToolApproved for task or wake scheduling tools —
         // both render as purpose-built timeline entries.
         if name != "task" && !isWakeToolName(&name) {
-            self.entries.push(PanelEntry::ToolApproved { name });
+            if let Some(block) = self.latestTransientToolBlockMut(&name) {
+                block.updateSummary(&pendingSummary);
+                block.status = ToolBlockStatus::Approved;
+                if let Some(command) = pendingCommand {
+                    block.upsertSectionPreservingExpansion(
+                        ToolSectionKind::Invocation,
+                        name.clone(),
+                        format!("Run: {command}"),
+                        false,
+                        true,
+                        true,
+                    );
+                }
+            } else {
+                let mut block = ToolBlock::new(&name, &pendingSummary, ToolBlockStatus::Approved);
+                if let Some(command) = pendingCommand {
+                    block.upsertSectionPreservingExpansion(
+                        ToolSectionKind::Invocation,
+                        name.clone(),
+                        format!("Run: {command}"),
+                        false,
+                        true,
+                        true,
+                    );
+                }
+                self.entries.push(PanelEntry::ToolBlock(block));
+            }
         }
     }
 
@@ -867,6 +1206,8 @@ impl AgentPanel {
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
+        self.pendingToolCommand = None;
+        self.pendingReviewerReport = None;
         self.permitPatterns.clear();
         self.permitEditingCustom = false;
     }
@@ -941,15 +1282,36 @@ impl AgentPanel {
     }
 
     /// Toggle custom pattern editing.
-    /// Get the pending shell command (if the active ToolRequest has one).
+    /// Get the pending shell command, if the active permission prompt has one.
     pub fn pendingCommand(&self) -> Option<&String> {
         if !self.pendingPermit {
             return None;
         }
-        self.entries.last().and_then(|e| match e {
-            PanelEntry::ToolRequest { command, .. } => command.as_ref(),
-            _ => None,
-        })
+        self.pendingToolCommand.as_ref()
+    }
+
+    pub fn permitInlineHeight(&self, width: u16) -> u16 {
+        self.permitPromptHeight(width, true)
+    }
+
+    fn permitPromptHeight(&self, width: u16, headerInBody: bool) -> u16 {
+        if !self.pendingPermit {
+            return 0;
+        }
+        let hasCmd = self.pendingCommand().is_some();
+        let codeBlockLines: u16 = if hasCmd { 2 } else { 0 };
+        let headerLine: u16 = if headerInBody { 1 } else { 0 };
+        let availW = width.saturating_sub(6) as usize;
+        let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
+            e.len()
+                .checked_div(availW)
+                .map_or(1, |lines| (lines + 1) as u16)
+        });
+        let reviewLines: u16 = self.pendingReviewerReport.as_ref().map_or(0, |report| {
+            reviewerReportLines(report, availW).len() as u16 + 1
+        });
+        let patternLines = self.permitPatterns.len() as u16 + 1;
+        codeBlockLines + headerLine + explanationLines + reviewLines + 1 + 2 + 1 + patternLines
     }
 
     /// Flash "copied" on the permission code block's top border.
@@ -992,8 +1354,15 @@ impl AgentPanel {
         // a backgrounded subagent stays visually "running" forever even
         // though JobPlane has correctly completed it.
         self.finalizeStreaming();
-        // Remove the preceding ToolRequest for the task tool — the SubagentBlock replaces it.
-        if let Some(PanelEntry::ToolRequest { .. }) = self.entries.last() {
+        // Remove the preceding task tool receipt — the SubagentBlock replaces it.
+        let removeTaskReceipt = match self.entries.last() {
+            Some(PanelEntry::ToolRequest { .. }) => true,
+            Some(PanelEntry::ToolBlock(block)) => {
+                block.name == "task" && block.status.isTransient()
+            }
+            _ => false,
+        };
+        if removeTaskReceipt {
             self.entries.pop();
         }
         // Push a new ActiveSubagent and focus it. With parallel subagents
@@ -1032,6 +1401,7 @@ impl AgentPanel {
         if let Some(sub) = self.findSubagentMut(sessionId) {
             sub.transcript.push(PanelEntry::ToolApproved {
                 name: format!("{name}: {summary}"),
+                review: None,
             });
         }
         self.newContentWhileScrolled = self.scrollOffset != 0;
@@ -1226,14 +1596,38 @@ impl AgentPanel {
         })
     }
 
-    pub fn toolApproved(&mut self, name: &str) {
+    pub fn toolApproved(
+        &mut self,
+        name: &str,
+        summary: &str,
+        diff: Option<String>,
+        review: Option<construct::control::AutoReviewReport>,
+    ) {
         if !self.turnActive {
             return;
         }
         self.finalizeStreaming();
+        self.removeLatestToolReviewingEntry();
         self.clearPendingToolCalls();
-        self.entries
-            .push(PanelEntry::ToolApproved { name: name.into() });
+        if let Some(block) = self.latestTransientToolBlockMut(name) {
+            block.updateSummary(summary);
+            if let Some(diff) = diff {
+                block.upsertDiffSection(name.to_string(), diff);
+            }
+            block.status = ToolBlockStatus::Approved;
+            if let Some(report) = review {
+                block.upsertReviewer(report);
+            }
+        } else {
+            let mut block = ToolBlock::new(name, summary, ToolBlockStatus::Approved);
+            if let Some(diff) = diff {
+                block.upsertDiffSection(name.to_string(), diff);
+            }
+            if let Some(report) = review {
+                block.upsertReviewer(report);
+            }
+            self.entries.push(PanelEntry::ToolBlock(block));
+        }
     }
 
     /// A tool call's name was just revealed in the stream. Register it so the
@@ -1280,18 +1674,44 @@ impl AgentPanel {
         self.pendingToolCallStartTime = None;
     }
 
-    pub fn toolStarted(&mut self, _name: &str, summary: &str) {
+    pub fn toolStarted(&mut self, name: &str, summary: &str) {
         if !self.turnActive {
             return;
         }
         self.finalizeStreaming();
         self.clearPendingToolCalls();
         self.toolActive = true;
-        self.toolStartTime = Some(Instant::now());
-        self.entries.push(PanelEntry::ToolActive {
-            summary: summary.into(),
-        });
+        let startedAt = Instant::now();
+        self.toolStartTime = Some(startedAt);
+        if let Some(block) = self.latestTransientToolBlockMut(name) {
+            block.updateSummary(summary);
+            block.status = ToolBlockStatus::Active { startedAt };
+        } else {
+            self.entries.push(PanelEntry::ToolBlock(ToolBlock::new(
+                name,
+                summary,
+                ToolBlockStatus::Active { startedAt },
+            )));
+        }
         // Tool started — DO NOT snap scroll
+        self.newContentWhileScrolled = self.scrollOffset != 0;
+        self.idleWhileScrolled = false;
+    }
+
+    pub fn toolAutoReviewStarted(&mut self, name: &str, summary: &str, diff: Option<String>) {
+        if !self.turnActive {
+            return;
+        }
+        self.finalizeStreaming();
+        self.clearPendingToolCalls();
+        self.toolActive = true;
+        let startedAt = Instant::now();
+        self.toolStartTime = Some(startedAt);
+        let mut block = ToolBlock::new(name, summary, ToolBlockStatus::Reviewing { startedAt });
+        if let Some(diff) = diff {
+            block.upsertDiffSection(name.to_string(), diff);
+        }
+        self.entries.push(PanelEntry::ToolBlock(block));
         self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
     }
@@ -1300,22 +1720,84 @@ impl AgentPanel {
         if !self.turnActive {
             return;
         }
+        self.removeLatestToolReviewingEntry();
         self.toolActive = false;
         self.toolStartTime = None;
-        self.entries
-            .push(PanelEntry::ToolDenied { name: name.into() });
+        if let Some(block) = self.latestTransientToolBlockMut(name) {
+            block.status = ToolBlockStatus::Denied;
+        } else {
+            let requestEntry =
+                if matches!(self.entries.last(), Some(PanelEntry::ToolRequest { .. })) {
+                    self.entries.pop()
+                } else {
+                    None
+                };
+            let (requestSummary, requestDiff, requestCommand) = match requestEntry {
+                Some(PanelEntry::ToolRequest {
+                    summary,
+                    diff,
+                    command,
+                }) => (summary, diff, command),
+                _ => (String::new(), None, None),
+            };
+            let summary = if !self.pendingToolSummary.trim().is_empty() {
+                self.pendingToolSummary.clone()
+            } else if !requestSummary.trim().is_empty() {
+                requestSummary
+            } else {
+                name.to_string()
+            };
+            let mut block = ToolBlock::new(name, &summary, ToolBlockStatus::Denied);
+            if let Some(command) = requestCommand {
+                block.upsertSectionPreservingExpansion(
+                    ToolSectionKind::Invocation,
+                    name.to_string(),
+                    format!("Run: {command}"),
+                    false,
+                    true,
+                    true,
+                );
+            }
+            if let Some(diff) = requestDiff {
+                block.upsertDiffSection(name.to_string(), diff);
+            }
+            self.entries.push(PanelEntry::ToolBlock(block));
+        }
+        self.pendingToolSummary.clear();
     }
 
-    pub fn toolAutoDenied(&mut self, name: &str, summary: &str) {
+    pub fn toolAutoDenied(
+        &mut self,
+        name: &str,
+        summary: &str,
+        diff: Option<String>,
+        review: Option<construct::control::AutoReviewReport>,
+    ) {
         if !self.turnActive {
             return;
         }
+        self.removeLatestToolReviewingEntry();
         self.toolActive = false;
         self.toolStartTime = None;
-        self.entries.push(PanelEntry::ToolAutoDenied {
-            name: name.into(),
-            summary: summary.into(),
-        });
+        if let Some(block) = self.latestTransientToolBlockMut(name) {
+            block.updateSummary(summary);
+            if let Some(diff) = diff {
+                block.upsertDiffSection(name.to_string(), diff);
+            }
+            block.status = ToolBlockStatus::Denied;
+            if let Some(report) = review {
+                block.upsertReviewer(report);
+            }
+        } else {
+            let mut block = ToolBlock::new(name, summary, ToolBlockStatus::Denied);
+            if let Some(diff) = diff {
+                block.upsertDiffSection(name.to_string(), diff);
+            }
+            if let Some(report) = review {
+                block.upsertReviewer(report);
+            }
+            self.entries.push(PanelEntry::ToolBlock(block));
+        }
     }
 
     pub fn pushToolResult(&mut self, name: &str, output: &str) {
@@ -1329,12 +1811,22 @@ impl AgentPanel {
         // tolerates other entries that may have been pushed between
         // ToolStarted and ToolResult — e.g. terminal lifecycle notices.
         self.removeLatestToolActiveEntry();
+        self.removeLatestToolReviewingEntry();
         // Commit any in-flight streaming before the tool result.
         self.finalizeStreaming();
-        self.entries.push(PanelEntry::ToolResult {
-            name: name.into(),
-            output: output.into(),
-        });
+        if let Some(block) = self.latestTransientToolBlockMut(name) {
+            let duration = block
+                .status
+                .startedAt()
+                .map(|startedAt| startedAt.elapsed());
+            block.status = ToolBlockStatus::Complete { duration };
+            block.setOutput(output);
+        } else {
+            let mut block =
+                ToolBlock::new(name, name, ToolBlockStatus::Complete { duration: None });
+            block.setOutput(output);
+            self.entries.push(PanelEntry::ToolBlock(block));
+        }
         // Tool result — DO NOT snap scroll
         self.newContentWhileScrolled = self.scrollOffset != 0;
         self.idleWhileScrolled = false;
@@ -1350,6 +1842,8 @@ impl AgentPanel {
         self.toolActive = false;
         self.toolStartTime = None;
         self.removeLatestToolActiveEntry();
+        self.removeLatestToolReviewingEntry();
+        self.removeLatestTransientToolBlock();
         self.finalizeStreaming();
         self.markTimelineActivity();
         self.isStreaming = true;
@@ -1366,9 +1860,46 @@ impl AgentPanel {
         }
     }
 
+    fn removeLatestToolReviewingEntry(&mut self) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, PanelEntry::ToolReviewing { .. }))
+        {
+            self.entries.remove(pos);
+        }
+    }
+
+    fn latestTransientToolBlockMut(&mut self, name: &str) -> Option<&mut ToolBlock> {
+        self.entries.iter_mut().rev().find_map(|entry| match entry {
+            PanelEntry::ToolBlock(block) if block.name == name && block.status.isTransient() => {
+                Some(block)
+            }
+            _ => None,
+        })
+    }
+
+    fn removeLatestTransientToolBlock(&mut self) {
+        if let Some(pos) = self.entries.iter().rposition(|entry| {
+            matches!(
+                entry,
+                PanelEntry::ToolBlock(block) if block.status.isTransient()
+            )
+        }) {
+            self.entries.remove(pos);
+        }
+    }
+
     fn clearToolActiveEntries(&mut self) {
-        self.entries
-            .retain(|entry| !matches!(entry, PanelEntry::ToolActive { .. }));
+        self.entries.retain(|entry| {
+            !matches!(
+                entry,
+                PanelEntry::ToolActive { .. } | PanelEntry::ToolReviewing { .. }
+            ) && !matches!(
+                entry,
+                PanelEntry::ToolBlock(block) if block.status.isTransient()
+            )
+        });
     }
 
     fn markTimelineActivity(&mut self) {
@@ -1417,6 +1948,43 @@ impl AgentPanel {
     /// next streamed content keeps flowing.
     pub fn pushNotice(&mut self, text: &str) {
         self.entries.push(PanelEntry::CommandResult(text.into()));
+    }
+
+    /// Rehydrate a historical tool call from transcript metadata. This
+    /// preserves semantic tool UX while leaving ephemeral UI state at fresh
+    /// defaults.
+    pub fn pushReplayedToolBlock(
+        &mut self,
+        name: &str,
+        summary: &str,
+        diff: Option<&str>,
+        review: Option<construct::control::AutoReviewReport>,
+        outcome: Option<construct::transcript::ToolCallOutcome>,
+        output: Option<&str>,
+        duration: Option<Duration>,
+    ) {
+        let hasOutput = output.is_some_and(|o| !o.trim().is_empty());
+        let status = match outcome {
+            Some(construct::transcript::ToolCallOutcome::Denied)
+            | Some(construct::transcript::ToolCallOutcome::Aborted) => ToolBlockStatus::Denied,
+            _ if hasOutput => ToolBlockStatus::Complete { duration },
+            Some(construct::transcript::ToolCallOutcome::Approved) | None => {
+                ToolBlockStatus::Approved
+            }
+        };
+        let mut block = ToolBlock::new(name, summary, status.clone());
+        if let Some(diff) = diff {
+            block.upsertDiffSection(name.to_string(), diff.to_string());
+        }
+        if let Some(report) = review {
+            block.upsertReviewer(report);
+        }
+        if matches!(status, ToolBlockStatus::Complete { .. })
+            && let Some(output) = output
+        {
+            block.setOutput(output);
+        }
+        self.entries.push(PanelEntry::ToolBlock(block));
     }
 
     /// Push a /context display and reset turn state.
@@ -1584,6 +2152,36 @@ impl AgentPanel {
         }
     }
 
+    pub(crate) fn scrollToolSectionH(&mut self, sectionId: ToolSectionId, delta: i16) {
+        let range = match self
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| range.id == sectionId)
+        {
+            Some(range) => range,
+            None => return,
+        };
+        let maxScroll = range.maxContentWidth.saturating_sub(range.innerWidth) as u16;
+        if maxScroll == 0 {
+            return;
+        }
+        let current = self
+            .toolSectionScrollX
+            .get(&sectionId)
+            .copied()
+            .unwrap_or(0);
+        let new = if delta > 0 {
+            current.saturating_add(delta as u16).min(maxScroll)
+        } else {
+            current.saturating_sub((-delta) as u16)
+        };
+        if new == 0 {
+            self.toolSectionScrollX.remove(&sectionId);
+        } else {
+            self.toolSectionScrollX.insert(sectionId, new);
+        }
+    }
+
     /// Find the code block at a given grid line (for mouse hit-testing).
     pub fn codeBlockAtGridLine(&self, gridLine: i32) -> Option<(usize, usize)> {
         let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
@@ -1594,6 +2192,15 @@ impl AgentPanel {
             }
         }
         None
+    }
+
+    pub(crate) fn toolSectionAtGridLine(&self, gridLine: i32) -> Option<ToolSectionId> {
+        let maxScroll = self.scrollOffset as i32 + self.lastScrollY as i32;
+        let visualLine = (gridLine + maxScroll) as usize;
+        self.lastToolSectionRanges
+            .iter()
+            .find(|range| visualLine >= range.startLine && visualLine <= range.endLine)
+            .map(|range| range.id)
     }
 
     /// Try to copy a code block's content via the "copy" label hit-test.
@@ -1617,6 +2224,20 @@ impl AgentPanel {
             if contentCol >= range.copyLabelCol {
                 selection::copyToClipboard(&range.rawCode);
                 self.copiedFlash = Some((range.blockId, Instant::now()));
+                return true;
+            }
+        }
+        for range in &self.lastToolSectionRanges {
+            if visualLine != range.startLine {
+                continue;
+            }
+            let Some(copyLabelCol) = range.copyLabelCol else {
+                continue;
+            };
+            let contentCol = col + 2;
+            if contentCol >= copyLabelCol {
+                selection::copyToClipboard(&range.rawText);
+                self.toolSectionCopiedFlash = Some((range.id, Instant::now()));
                 return true;
             }
         }
@@ -1652,6 +2273,32 @@ impl AgentPanel {
                 self.lastMaxScroll = self.lastMaxScroll.saturating_sub(hiddenLines);
                 return true;
             }
+        }
+        let toolSection = self
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| {
+                range.collapsible
+                    && ((!range.expanded && visualLine == range.startLine)
+                        || (range.expanded
+                            && (visualLine == range.startLine || visualLine == range.endLine)))
+            })
+            .map(|range| (range.id, range.expanded, range.hiddenLines));
+        if let Some((id, wasExpanded, delta)) = toolSection
+            && let Some(PanelEntry::ToolBlock(block)) = self.entries.get_mut(id.entryIndex)
+            && let Some(section) = block.sections.get_mut(id.sectionIndex)
+        {
+            section.expanded = !section.expanded;
+            if self.scrollOffset > 0 {
+                if wasExpanded {
+                    self.scrollOffset = self.scrollOffset.saturating_sub(delta);
+                    self.lastMaxScroll = self.lastMaxScroll.saturating_sub(delta);
+                } else {
+                    self.scrollOffset = self.scrollOffset.saturating_add(delta);
+                    self.lastMaxScroll = self.lastMaxScroll.saturating_add(delta);
+                }
+            }
+            return true;
         }
         false
     }
@@ -1997,21 +2644,7 @@ impl AgentPanel {
         // Dynamic input height based on content.
         // Width accounts for: 2 right padding + 2 prompt prefix.
         let inputHeight = if self.permitVisible() {
-            // code block (top border + content, no bottom) + header + explanation + blank + 2 keys + blank + patterns + custom.
-            let hasCmd = self.pendingCommand().is_some();
-            let codeBlockLines: u16 = if hasCmd { 2 } else { 0 };
-            // Header is in the input area only for shell (code block present).
-            // Non-shell header is in the separator slot.
-            let headerLine: u16 = if hasCmd { 1 } else { 0 };
-            let availW = inner.width.saturating_sub(6) as usize;
-            let explanationLines: u16 = self.pendingToolExplanation.as_ref().map_or(0, |e| {
-                e.len()
-                    .checked_div(availW)
-                    .map_or(1, |lines| (lines + 1) as u16)
-            });
-            let patternLines = self.permitPatterns.len() as u16 + 1; // +1 for custom field.
-            // code block + header + explanation + blank + 2 keys + blank + patterns.
-            (codeBlockLines + headerLine + explanationLines + 1 + 2 + 1 + patternLines)
+            self.permitPromptHeight(inner.width, self.pendingCommand().is_some())
                 .min(inner.height * 2 / 3)
                 .max(5)
         } else {
@@ -2109,11 +2742,12 @@ impl AgentPanel {
         };
 
         // Build all display lines (pre-wrapped to fit paddedChat width).
-        let (lines, contMap, reasoningHeaders, cbRanges, nonCopyable) =
+        let (lines, contMap, reasoningHeaders, cbRanges, toolRanges, nonCopyable) =
             self.buildLines(paddedChat.width);
         self.lastContinuationMap = contMap;
         self.lastReasoningHeaders = reasoningHeaders;
         self.lastCodeBlockRanges = cbRanges;
+        self.lastToolSectionRanges = toolRanges;
         // Clear stale copied flash after 2 seconds.
         if self
             .copiedFlash
@@ -2121,6 +2755,13 @@ impl AgentPanel {
             .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
         {
             self.copiedFlash = None;
+        }
+        if self
+            .toolSectionCopiedFlash
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
+        {
+            self.toolSectionCopiedFlash = None;
         }
         // Cache plain text of each visual line for scrollback copy.
         self.lastLineTexts = lines
@@ -2209,11 +2850,12 @@ impl AgentPanel {
             return;
         }
 
-        let (chatLines, contMap, reasoningHeaders, cbRanges, nonCopyable) =
+        let (chatLines, contMap, reasoningHeaders, cbRanges, toolRanges, nonCopyable) =
             self.buildLines(padded.width);
         self.lastContinuationMap = contMap;
         self.lastReasoningHeaders = reasoningHeaders;
         self.lastCodeBlockRanges = cbRanges;
+        self.lastToolSectionRanges = toolRanges;
         self.lastLineTexts = chatLines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2312,6 +2954,14 @@ impl AgentPanel {
                 spans.extend(wLine.spans);
                 lines.push(Line::from(spans));
             }
+            lines.push(Line::from(""));
+        }
+
+        if let Some(ref report) = self.pendingReviewerReport {
+            lines.extend(reviewerReportLines(
+                report,
+                area.width.saturating_sub(4) as usize,
+            ));
             lines.push(Line::from(""));
         }
 
@@ -2553,6 +3203,14 @@ impl AgentPanel {
                     spans.extend(wLine.spans);
                     lines.push(Line::from(spans));
                 }
+                lines.push(Line::from(""));
+            }
+
+            if let Some(ref report) = self.pendingReviewerReport {
+                lines.extend(reviewerReportLines(
+                    report,
+                    area.width.saturating_sub(4) as usize,
+                ));
                 lines.push(Line::from(""));
             }
 
@@ -2819,6 +3477,7 @@ impl AgentPanel {
         let mut cursor: u32 = 0;
 
         let mut dummyRanges: Vec<CodeBlockRange> = Vec::new();
+        let mut dummyToolRanges: Vec<ToolSectionRange> = Vec::new();
         for (idx, entry) in self.entries.iter().enumerate() {
             let mut entryLines: Vec<Line<'static>> = Vec::new();
             let mut entryCont: Vec<bool> = Vec::new();
@@ -2829,6 +3488,7 @@ impl AgentPanel {
                 w as u16,
                 idx,
                 &mut dummyRanges,
+                &mut dummyToolRanges,
             );
 
             let entryStart = cursor;
@@ -2937,11 +3597,288 @@ impl AgentPanel {
         (ranges[startIdx].0, ranges[endIdx].1)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn renderToolBlock(
+        &self,
+        block: &ToolBlock,
+        lines: &mut Vec<Line<'static>>,
+        cont: &mut Vec<bool>,
+        width: u16,
+        entryIndex: usize,
+        toolSectionRanges: &mut Vec<ToolSectionRange>,
+    ) {
+        let prefixPad: usize = 2;
+        let outerW = (width as usize).saturating_sub(prefixPad);
+        if outerW < 6 {
+            let style = Style::default().fg(Color::Yellow);
+            prefixFirstLine(
+                lines,
+                cont,
+                vec![Line::from(Span::styled(
+                    format!("{}: {}", block.name, block.summary),
+                    style,
+                ))],
+                "\u{2699}\u{FE0E} ",
+                style,
+                width,
+            );
+            return;
+        }
+
+        let innerW = outerW.saturating_sub(2);
+        let indent = " ".repeat(prefixPad);
+        let borderStyle = Style::default().fg(Color::DarkGray);
+        let summaryStyle = Style::default().fg(Color::White);
+
+        let plainBorder = |left: &str, right: &str| -> Line<'static> {
+            Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(left.to_string(), borderStyle),
+                Span::styled("\u{2500}".repeat(innerW), borderStyle),
+                Span::styled(right.to_string(), borderStyle),
+            ])
+        };
+
+        let hasSummary = !block.summary.trim().is_empty();
+        let leadingEmptyInvocation = hasSummary
+            && block.sections.first().is_some_and(|section| {
+                section.kind == ToolSectionKind::Invocation
+                    && section.rawText.trim().is_empty()
+                    && !section.copyable
+                    && !section.previewWhenCollapsed
+            });
+        if hasSummary {
+            if leadingEmptyInvocation {
+                if let Some(section) = block.sections.first() {
+                    let label = self.toolSectionLabel(block, section);
+                    toolSectionHeaderCopyCol(
+                        lines,
+                        cont,
+                        &indent,
+                        innerW,
+                        "\u{256D}",
+                        "\u{256E}",
+                        &label,
+                        section.kind,
+                        None,
+                        false,
+                        false,
+                        borderStyle,
+                    );
+                }
+            } else {
+                lines.push(plainBorder("\u{256D}", "\u{256E}"));
+                cont.push(false);
+            }
+        }
+
+        if hasSummary {
+            let summaryInnerW = innerW.saturating_sub(2).max(1);
+            let wrappedSummary = wrapSpannedLine(
+                Line::from(Span::styled(block.summary.clone(), summaryStyle)),
+                summaryInnerW,
+            );
+            for wrapped in wrappedSummary {
+                let textW = wrapped.width();
+                let pad = summaryInnerW.saturating_sub(textW);
+                let mut spans = vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("\u{2502} ".to_string(), borderStyle),
+                ];
+                spans.extend(wrapped.spans);
+                spans.push(Span::styled(
+                    format!("{} \u{2502}", " ".repeat(pad)),
+                    borderStyle,
+                ));
+                lines.push(Line::from(spans));
+                cont.push(false);
+            }
+        }
+
+        let mut renderedBottomBorder = false;
+        for (sectionIndex, section) in block.sections.iter().enumerate() {
+            if leadingEmptyInvocation && sectionIndex == 0 {
+                continue;
+            }
+            let sectionStyle = toolSectionContentStyle(section.kind);
+            let contentInnerW = innerW.saturating_sub(2).max(1);
+            let sectionId = ToolSectionId {
+                entryIndex,
+                sectionIndex,
+            };
+            let renderedContent = renderToolSectionContent(section, contentInnerW, sectionStyle);
+            let totalLines = renderedContent.len();
+            let collapsible = toolSectionIsCollapsible(section, totalLines);
+            let previewLines = toolSectionPreviewLines(section);
+            let collapsedVisibleLines = if section.previewWhenCollapsed {
+                totalLines.min(previewLines)
+            } else {
+                0
+            };
+            let visibleLines = if section.expanded {
+                totalLines
+            } else if section.previewWhenCollapsed {
+                collapsedVisibleLines
+            } else {
+                0
+            };
+            let expandDelta = totalLines
+                .saturating_sub(collapsedVisibleLines)
+                .saturating_add(usize::from(collapsible));
+            let hiddenLines = totalLines.saturating_sub(visibleLines);
+            let extra = if !collapsible {
+                None
+            } else if section.expanded {
+                Some("\u{25B4}".to_string())
+            } else if section.previewWhenCollapsed && hiddenLines > 0 {
+                Some(format!("\u{25BE}{hiddenLines}"))
+            } else if totalLines > 0 {
+                Some(format!("\u{25B8}{totalLines}"))
+            } else {
+                None
+            };
+            let showCopied = self
+                .toolSectionCopiedFlash
+                .as_ref()
+                .is_some_and(|(id, copiedAt)| *id == sectionId && copiedAt.elapsed().as_secs() < 2);
+            let label = self.toolSectionLabel(block, section);
+            let useTopEdge = !hasSummary && sectionIndex == 0;
+            let copyLabelCol = toolSectionHeaderCopyCol(
+                lines,
+                cont,
+                &indent,
+                innerW,
+                if useTopEdge { "\u{256D}" } else { "\u{251C}" },
+                if useTopEdge { "\u{256E}" } else { "\u{2524}" },
+                &label,
+                section.kind,
+                extra.as_deref(),
+                section.copyable,
+                showCopied,
+                borderStyle,
+            );
+            let startLine = lines.len().saturating_sub(1);
+            let maxContentWidth = renderedContent
+                .iter()
+                .map(|line| line.width())
+                .max()
+                .unwrap_or(0);
+            let scrollX = self
+                .toolSectionScrollX
+                .get(&sectionId)
+                .copied()
+                .unwrap_or(0)
+                .min(maxContentWidth.saturating_sub(contentInnerW) as u16);
+            let hasHorizontalScroll = visibleLines > 0 && maxContentWidth > contentInnerW;
+            let hasCollapseFooter = collapsible && section.expanded;
+            let isLastSection = sectionIndex + 1 == block.sections.len();
+            let hasTerminator = isLastSection && (hasHorizontalScroll || hasCollapseFooter);
+            toolSectionRanges.push(ToolSectionRange {
+                startLine,
+                endLine: startLine + visibleLines + usize::from(hasTerminator),
+                id: sectionId,
+                copyLabelCol,
+                rawText: section.rawText.clone(),
+                collapsible,
+                expanded: section.expanded,
+                hiddenLines: expandDelta as u16,
+                maxContentWidth,
+                innerWidth: contentInnerW,
+            });
+
+            for rendered in renderedContent.into_iter().take(visibleLines) {
+                let rendered = scrollSpannedLineToWidth(rendered, scrollX as usize, contentInnerW);
+                let textW = rendered.width();
+                let pad = contentInnerW.saturating_sub(textW);
+                let mut spans = vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("\u{2502} ".to_string(), borderStyle),
+                ];
+                spans.extend(rendered.spans);
+                spans.push(Span::styled(
+                    format!("{} \u{2502}", " ".repeat(pad)),
+                    borderStyle,
+                ));
+                lines.push(Line::from(spans));
+                cont.push(false);
+            }
+
+            if hasTerminator {
+                lines.push(toolSectionTerminator(
+                    &indent,
+                    innerW,
+                    borderStyle,
+                    isLastSection,
+                    hasCollapseFooter,
+                    hasHorizontalScroll.then_some((maxContentWidth, contentInnerW, scrollX)),
+                ));
+                cont.push(false);
+                renderedBottomBorder = isLastSection;
+            }
+        }
+
+        if !renderedBottomBorder {
+            lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled("\u{2570}".to_string(), borderStyle),
+                Span::styled("\u{2500}".repeat(innerW), borderStyle),
+                Span::styled("\u{256F}".to_string(), borderStyle),
+            ]));
+            cont.push(false);
+        }
+    }
+
+    fn toolSectionLabel(&self, block: &ToolBlock, section: &ToolBlockSection) -> String {
+        match section.kind {
+            ToolSectionKind::Invocation => {
+                let (glyph, _) = self.toolStatusMarker(&block.status);
+                let label = if section.label.trim().is_empty() {
+                    block.name.as_str()
+                } else {
+                    section.label.as_str()
+                };
+                format!("{glyph} {label}")
+            }
+            ToolSectionKind::Reviewer => section.label.clone(),
+            ToolSectionKind::Diff => "diff".to_string(),
+            ToolSectionKind::Result => match block.status {
+                ToolBlockStatus::Complete {
+                    duration: Some(duration),
+                } => durationLabel(duration),
+                _ => section.label.clone(),
+            },
+        }
+    }
+
+    fn toolStatusMarker(&self, status: &ToolBlockStatus) -> (String, Style) {
+        match status {
+            ToolBlockStatus::Pending => ("\u{25CC}".into(), Style::default().fg(Color::Yellow)),
+            ToolBlockStatus::Reviewing { .. } | ToolBlockStatus::Active { .. } => {
+                let glyph = self
+                    .throbber
+                    .renderLines()
+                    .first()
+                    .and_then(|line| line.spans.first())
+                    .map(|span| span.content.to_string())
+                    .unwrap_or_else(|| "\u{25CC}".into());
+                (glyph, Style::default().fg(Color::Yellow))
+            }
+            ToolBlockStatus::Approved => {
+                ("\u{2713}\u{FE0E}".into(), Style::default().fg(Color::Green))
+            }
+            ToolBlockStatus::Denied => ("\u{2717}\u{FE0E}".into(), Style::default().fg(Color::Red)),
+            ToolBlockStatus::Complete { .. } => {
+                ("\u{2713}\u{FE0E}".into(), Style::default().fg(Color::Green))
+            }
+        }
+    }
+
     fn buildLines(&self, width: u16) -> BuiltLines {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cont: Vec<bool> = Vec::new();
         let mut reasoningHeaders: Vec<(Option<usize>, usize)> = Vec::new();
         let mut codeBlockRanges: Vec<CodeBlockRange> = Vec::new();
+        let mut toolSectionRanges: Vec<ToolSectionRange> = Vec::new();
 
         let mut nonCopyable = HashSet::new();
         for (i, entry) in self.entries.iter().enumerate() {
@@ -2953,7 +3890,15 @@ impl AgentPanel {
                 PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. }
             );
             let linesBefore = lines.len();
-            self.renderEntry(entry, &mut lines, &mut cont, width, i, &mut codeBlockRanges);
+            self.renderEntry(
+                entry,
+                &mut lines,
+                &mut cont,
+                width,
+                i,
+                &mut codeBlockRanges,
+                &mut toolSectionRanges,
+            );
             if isNotice {
                 for idx in linesBefore..lines.len() {
                     nonCopyable.insert(idx);
@@ -3153,7 +4098,14 @@ impl AgentPanel {
             }
         }
 
-        (lines, cont, reasoningHeaders, codeBlockRanges, nonCopyable)
+        (
+            lines,
+            cont,
+            reasoningHeaders,
+            codeBlockRanges,
+            toolSectionRanges,
+            nonCopyable,
+        )
     }
 
     fn renderEntry(
@@ -3164,6 +4116,7 @@ impl AgentPanel {
         width: u16,
         entryIndex: usize,
         codeBlockRanges: &mut Vec<CodeBlockRange>,
+        toolSectionRanges: &mut Vec<ToolSectionRange>,
     ) {
         match entry {
             PanelEntry::User(text) => {
@@ -3283,24 +4236,59 @@ impl AgentPanel {
                     prefixFirstLine(lines, cont, content, "\u{2699}\u{FE0E} ", style, width);
                 }
             }
-            PanelEntry::ToolApproved { name } => {
+            PanelEntry::ToolApproved { name, review } => {
                 let style = Style::default().fg(Color::Green);
                 let content = vec![Line::from(Span::styled(name.clone(), style))];
                 prefixFirstLine(lines, cont, content, "\u{2713}\u{FE0E} ", style, width);
+                if let Some(report) = review {
+                    pushReviewerReport(lines, cont, report, width);
+                }
             }
-            PanelEntry::ToolDenied { name } => {
+            PanelEntry::ToolDenied { name, review } => {
                 let style = Style::default().fg(Color::Red);
                 let content = vec![Line::from(Span::styled(format!("{name} (denied)"), style))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
+                if let Some(report) = review {
+                    pushReviewerReport(lines, cont, report, width);
+                }
             }
-            PanelEntry::ToolAutoDenied { name, summary } => {
+            PanelEntry::ToolAutoDenied {
+                name,
+                summary,
+                review,
+            } => {
                 // Red-tinted background for rule-blocked tool calls.
                 let style = Style::default().fg(Color::Red).bg(Color::Rgb(60, 20, 20));
+                let suffix = if review.is_some() {
+                    "denied by reviewer"
+                } else {
+                    "blocked by rule"
+                };
                 let content = vec![Line::from(Span::styled(
-                    format!("{name}: {summary} (blocked by rule)"),
+                    format!("{name}: {summary} ({suffix})"),
                     style,
                 ))];
                 prefixFirstLine(lines, cont, content, "\u{2717}\u{FE0E} ", style, width);
+                if let Some(report) = review {
+                    pushReviewerReport(lines, cont, report, width);
+                }
+            }
+            PanelEntry::ToolReviewing { name, summary } => {
+                let elapsed = self
+                    .toolStartTime
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let style = Style::default().fg(Color::Yellow);
+                let blobLines = self.throbber.renderLines();
+                let statusText = format!("reviewing {name}: {summary}  ({elapsed}s)");
+                lines.push(Line::from(vec![
+                    blobLines[0].spans.first().cloned().unwrap_or_default(),
+                    Span::raw(" "),
+                    Span::styled(statusText, style),
+                ]));
+                cont.push(false);
+                lines.push(blobLines[1].clone());
+                cont.push(true);
             }
             PanelEntry::ToolActive { summary } => {
                 let elapsed = self
@@ -3318,6 +4306,9 @@ impl AgentPanel {
                 cont.push(false);
                 lines.push(blobLines[1].clone());
                 cont.push(true);
+            }
+            PanelEntry::ToolBlock(block) => {
+                self.renderToolBlock(block, lines, cont, width, entryIndex, toolSectionRanges);
             }
             PanelEntry::WakeSchedule {
                 id,
@@ -4045,6 +5036,492 @@ fn formatBytes(bytes: usize) -> String {
     }
 }
 
+fn toolBlockSummaryParts(name: &str, summary: &str) -> (String, Option<String>) {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    if isFileInputToolName(name) {
+        return (String::new(), Some(trimmed.to_string()));
+    }
+
+    if let Some((invocation, reason)) = trimmed.split_once(" \u{2014} ") {
+        let headline = reason.trim();
+        let invocation = invocation.trim();
+        if !headline.is_empty() && !invocation.is_empty() {
+            return (headline.to_string(), Some(invocation.to_string()));
+        }
+    }
+
+    (trimmed.to_string(), None)
+}
+
+fn isFileInputToolName(name: &str) -> bool {
+    matches!(
+        name,
+        "readFile"
+            | "editFile"
+            | "multiEdit"
+            | "writeFile"
+            | "copyFile"
+            | "moveFile"
+            | "deleteFile"
+            | "grep"
+            | "glob"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn toolSectionHeaderCopyCol(
+    lines: &mut Vec<Line<'static>>,
+    cont: &mut Vec<bool>,
+    indent: &str,
+    innerW: usize,
+    leftEdge: &str,
+    rightEdge: &str,
+    label: &str,
+    kind: ToolSectionKind,
+    extra: Option<&str>,
+    copyable: bool,
+    showCopied: bool,
+    borderStyle: Style,
+) -> Option<u16> {
+    use unicode_width::UnicodeWidthStr;
+
+    let labelStyle = match kind {
+        ToolSectionKind::Invocation => Style::default().fg(Color::Cyan),
+        ToolSectionKind::Reviewer => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        ToolSectionKind::Diff => Style::default().fg(Color::Green),
+        ToolSectionKind::Result => Style::default().fg(Color::Green),
+    };
+    let extraStyle = Style::default().fg(Color::Gray);
+    let copyStyle = if showCopied {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+
+    let mut extraText = extra.map(|s| format!(" {s} ")).unwrap_or_default();
+    // Keep the copy hit target and neighboring collapse indicator stable when
+    // the visible label flips between "copy" and "copied".
+    let mut copyText = if copyable {
+        if showCopied {
+            "copied".to_string()
+        } else {
+            " copy ".to_string()
+        }
+    } else {
+        String::new()
+    };
+    let copyW = UnicodeWidthStr::width(copyText.as_str());
+    if copyW > innerW.saturating_sub(1) {
+        copyText.clear();
+    }
+
+    let extraW = UnicodeWidthStr::width(extraText.as_str());
+    let copyW = UnicodeWidthStr::width(copyText.as_str());
+    if extraW + copyW > innerW.saturating_sub(1) {
+        extraText.clear();
+    }
+
+    let nonLabelW =
+        UnicodeWidthStr::width(extraText.as_str()) + UnicodeWidthStr::width(copyText.as_str());
+    let prospectiveSegments =
+        1 + usize::from(!extraText.is_empty()) + usize::from(!copyText.is_empty());
+    let desiredRules = if prospectiveSegments == 0 {
+        0
+    } else {
+        1 + prospectiveSegments.saturating_sub(1) + 1
+    };
+    let maxLabelW = innerW.saturating_sub(nonLabelW + desiredRules);
+    let labelText = if maxLabelW > 0 {
+        truncateToWidth(&format!(" {label} "), maxLabelW)
+    } else {
+        String::new()
+    };
+
+    let mut segments: Vec<(String, Style, bool)> = Vec::new();
+    if !labelText.is_empty() {
+        segments.push((labelText, labelStyle, false));
+    }
+    if !extraText.is_empty() {
+        segments.push((extraText, extraStyle, false));
+    }
+    if !copyText.is_empty() {
+        segments.push((copyText, copyStyle, true));
+    }
+
+    if segments.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(leftEdge.to_string(), borderStyle),
+            Span::styled("\u{2500}".repeat(innerW), borderStyle),
+            Span::styled(rightEdge.to_string(), borderStyle),
+        ]));
+        cont.push(false);
+        return None;
+    }
+
+    let fixedW: usize = segments
+        .iter()
+        .map(|(text, _, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum();
+    let mut ruleTotal = innerW.saturating_sub(fixedW);
+    let mut rules = vec![0usize; segments.len() + 1];
+    let hasCopy = segments.last().is_some_and(|(_, _, isCopy)| *isCopy);
+    let trailingRule = 1;
+
+    if !rules.is_empty() && ruleTotal > 0 {
+        let desired = 1 + segments.len().saturating_sub(1) + trailingRule;
+        if ruleTotal >= desired {
+            rules[0] = 1;
+            for slot in rules.iter_mut().take(segments.len()).skip(1) {
+                *slot = 1;
+            }
+            if let Some(last) = rules.last_mut() {
+                *last = trailingRule;
+            }
+            ruleTotal -= desired;
+
+            if segments.len() == 1 {
+                if hasCopy {
+                    rules[0] += ruleTotal;
+                } else if let Some(last) = rules.last_mut() {
+                    *last += ruleTotal;
+                }
+            } else {
+                while ruleTotal > 0 {
+                    for slotIndex in (1..segments.len()).rev() {
+                        rules[slotIndex] += 1;
+                        ruleTotal -= 1;
+                        if ruleTotal == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Tight rows still stay exact-width. Prefer a little lead-in
+            // before the label, then preserve a right rule near copy if
+            // there is enough room left.
+            rules[0] = 1.min(ruleTotal);
+            ruleTotal = ruleTotal.saturating_sub(rules[0]);
+            if hasCopy && ruleTotal > 0 {
+                let take = trailingRule.min(ruleTotal);
+                if let Some(last) = rules.last_mut() {
+                    *last = take;
+                }
+                ruleTotal -= take;
+            }
+            let mut slot = 1;
+            while ruleTotal > 0 && slot < rules.len() {
+                rules[slot] += 1;
+                ruleTotal -= 1;
+                slot += 1;
+            }
+        }
+    }
+
+    let mut spans = vec![
+        Span::raw(indent.to_string()),
+        Span::styled(leftEdge.to_string(), borderStyle),
+    ];
+    let mut col = UnicodeWidthStr::width(indent) + 1;
+    let mut copyLabelCol = None;
+
+    spans.push(Span::styled("\u{2500}".repeat(rules[0]), borderStyle));
+    col += rules[0];
+    for (idx, (text, style, isCopy)) in segments.into_iter().enumerate() {
+        if isCopy {
+            copyLabelCol = Some(col as u16);
+        }
+        col += UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(text, style));
+
+        let ruleLen = rules[idx + 1];
+        spans.push(Span::styled("\u{2500}".repeat(ruleLen), borderStyle));
+        col += ruleLen;
+    }
+
+    let expected = UnicodeWidthStr::width(indent) + 1 + innerW;
+    if col < expected {
+        let fill = expected - col;
+        spans.push(Span::styled("\u{2500}".repeat(fill), borderStyle));
+        col += fill;
+    }
+    debug_assert_eq!(col, expected);
+    spans.push(Span::styled(rightEdge.to_string(), borderStyle));
+    lines.push(Line::from(spans));
+    cont.push(false);
+
+    copyLabelCol
+}
+
+fn toolSectionContentStyle(kind: ToolSectionKind) -> Style {
+    match kind {
+        ToolSectionKind::Invocation => Style::default().fg(Color::Gray),
+        ToolSectionKind::Reviewer => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        ToolSectionKind::Diff => Style::default().fg(Color::Gray),
+        ToolSectionKind::Result => Style::default().fg(Color::Gray),
+    }
+}
+
+fn toolSectionPreviewLines(section: &ToolBlockSection) -> usize {
+    match section.kind {
+        ToolSectionKind::Invocation => MAX_INVOCATION_PREVIEW_LINES,
+        ToolSectionKind::Reviewer => 0,
+        ToolSectionKind::Diff | ToolSectionKind::Result => MAX_CODE_BLOCK_LINES,
+    }
+}
+
+fn toolSectionIsCollapsible(section: &ToolBlockSection, totalLines: usize) -> bool {
+    if totalLines == 0 {
+        return false;
+    }
+    section.kind == ToolSectionKind::Reviewer || totalLines > toolSectionPreviewLines(section)
+}
+
+fn toolSectionTerminator(
+    indent: &str,
+    innerW: usize,
+    borderStyle: Style,
+    isBottom: bool,
+    collapseControl: bool,
+    horizontalScroll: Option<(usize, usize, u16)>,
+) -> Line<'static> {
+    let left = if isBottom { "\u{2570}" } else { "\u{251C}" };
+    let right = if isBottom { "\u{256F}" } else { "\u{2524}" };
+    let thumbStyle = Style::default().fg(Color::Gray);
+    let mut cells = vec![(borderStyle, '\u{2500}'); innerW];
+
+    if let Some((maxContentWidth, viewportWidth, scrollX)) = horizontalScroll {
+        let scrollMax = maxContentWidth.saturating_sub(viewportWidth);
+        if innerW > 0 && scrollMax > 0 {
+            let thumbLen = (innerW * viewportWidth / maxContentWidth)
+                .max(1)
+                .min(innerW);
+            let thumbPos = (scrollX as usize)
+                .checked_mul(innerW.saturating_sub(thumbLen))
+                .and_then(|position| position.checked_div(scrollMax))
+                .unwrap_or(0)
+                .min(innerW.saturating_sub(thumbLen));
+            for cell in cells.iter_mut().skip(thumbPos).take(thumbLen) {
+                cell.0 = thumbStyle;
+            }
+        }
+    }
+
+    if collapseControl {
+        let label = " \u{25B4} ";
+        let labelW = unicode_width::UnicodeWidthStr::width(label);
+        if labelW <= innerW {
+            let start = (innerW - labelW) / 2;
+            for (offset, ch) in label.chars().enumerate() {
+                if let Some(cell) = cells.get_mut(start + offset) {
+                    *cell = (thumbStyle, ch);
+                }
+            }
+        }
+    }
+
+    let mut spans = vec![
+        Span::raw(indent.to_string()),
+        Span::styled(left.to_string(), borderStyle),
+    ];
+    for (style, ch) in cells {
+        if let Some(last) = spans.last_mut()
+            && last.style == style
+            && last.content.chars().all(|existing| existing == ch)
+        {
+            last.content.to_mut().push(ch);
+            continue;
+        }
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    spans.push(Span::styled(right.to_string(), borderStyle));
+    Line::from(spans)
+}
+
+fn renderToolSectionContent(
+    section: &ToolBlockSection,
+    maxWidth: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    match section.renderKind {
+        ToolSectionRender::Plain => match section.kind {
+            ToolSectionKind::Invocation | ToolSectionKind::Reviewer => {
+                renderWrappedToolSectionContent(&section.rawText, maxWidth, style)
+            }
+            ToolSectionKind::Diff | ToolSectionKind::Result => {
+                renderUnwrappedToolSectionContent(&section.rawText, section.kind, style)
+            }
+        },
+        ToolSectionRender::Diff => renderDiffToolSectionContent(&section.rawText),
+    }
+}
+
+fn renderWrappedToolSectionContent(
+    rawText: &str,
+    maxWidth: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    if rawText.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for logical in rawText.lines() {
+        let logical = sanitizeTerminalControls(logical);
+        if logical.is_empty() {
+            out.push(Line::from(Span::styled(String::new(), style)));
+            continue;
+        }
+        out.extend(wrapSpannedLine(
+            Line::from(Span::styled(logical, style)),
+            maxWidth,
+        ));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(String::new(), style)));
+    }
+    out
+}
+
+fn renderUnwrappedToolSectionContent(
+    rawText: &str,
+    kind: ToolSectionKind,
+    style: Style,
+) -> Vec<Line<'static>> {
+    if rawText.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for logical in rawText.lines() {
+        let logical = if kind == ToolSectionKind::Result {
+            normalizeToolOutputLine(logical)
+        } else {
+            logical.to_string()
+        };
+        out.push(Line::from(Span::styled(
+            sanitizeTerminalControls(&logical),
+            style,
+        )));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(String::new(), style)));
+    }
+    out
+}
+
+fn renderDiffToolSectionContent(diffText: &str) -> Vec<Line<'static>> {
+    if diffText.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Line<'static>> = crate::markdown::highlight::diffLines(diffText)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+fn normalizeToolOutputLine(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let digitBytes = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digitBytes > 0 && trimmed.as_bytes().get(digitBytes) == Some(&b'\t') {
+        let number = &trimmed[..digitBytes];
+        let rest = &trimmed[digitBytes + 1..];
+        format!("{number} {rest}")
+    } else {
+        line.to_string()
+    }
+}
+
+fn stripRoutineMutationOutput(toolName: &str, output: &str) -> Option<String> {
+    if !matches!(toolName, "editFile" | "multiEdit" | "writeFile") {
+        return Some(output.trim_end().to_string());
+    }
+
+    let mut lines = output.lines();
+    let first = lines.next().unwrap_or_default().trim();
+    let isRoutine = first.starts_with("Applied edit to ")
+        || (first.starts_with("Replaced ") && first.contains(" occurrences in "))
+        || (first.starts_with("Applied ") && first.contains(" edits to "))
+        || (first.starts_with("Wrote ") && first.contains(" bytes to "));
+    if !isRoutine {
+        return Some(output.trim_end().to_string());
+    }
+
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    let rest = rest.trim_start_matches('\n').trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+fn sanitizeTerminalControls(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn scrollSpannedLineToWidth(
+    line: Line<'static>,
+    skipCols: usize,
+    maxWidth: usize,
+) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    if maxWidth == 0 {
+        return Line::from("");
+    }
+
+    let mut skipped = 0usize;
+    let mut taken = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let mut text = String::new();
+        for grapheme in span.content.as_ref().graphemes(true) {
+            let sanitized = sanitizeTerminalControls(grapheme);
+            let width = UnicodeWidthStr::width(sanitized.as_str());
+            if skipped + width <= skipCols {
+                skipped += width;
+                continue;
+            }
+            if taken + width > maxWidth {
+                break;
+            }
+            text.push_str(&sanitized);
+            taken += width;
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+        if taken >= maxWidth {
+            break;
+        }
+    }
+    Line::from(spans)
+}
+
+fn durationLabel(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else {
+        elapsedCompact(duration)
+    }
+}
+
 /// Accounts for multi-width characters. Returns the trimmed slice between
 /// `colStart` and `colEnd` (exclusive) in display columns.
 fn sliceByDisplayColumn(text: &str, colStart: u16, colEnd: u16) -> String {
@@ -4219,6 +5696,63 @@ fn prefixFirstLine(
             spans.extend(wLine.spans);
             out.push(Line::from(spans));
         }
+    }
+}
+
+fn reviewerReportText(report: &construct::control::AutoReviewReport) -> Vec<String> {
+    let mut facts = vec![
+        format!("{} risk", report.risk),
+        format!("{} auth", report.authorization),
+    ];
+    if report.raiseToUser != "none" {
+        facts.push(format!("raise {}", report.raiseToUser));
+    }
+
+    let reason = if report.reason.trim().is_empty() {
+        "no reason provided"
+    } else {
+        report.reason.trim()
+    };
+
+    let mut lines = vec![format!(
+        "reviewer: {} \u{00B7} {reason}",
+        facts.join(" \u{00B7} ")
+    )];
+    if !report.messageToAgent.trim().is_empty() {
+        lines.push(format!("agent: {}", report.messageToAgent.trim()));
+    }
+    lines
+}
+
+fn reviewerReportLines(
+    report: &construct::control::AutoReviewReport,
+    maxWidth: usize,
+) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let textWidth = maxWidth.saturating_sub(2).max(1);
+    let mut out = Vec::new();
+    for logical in reviewerReportText(report) {
+        let wrapped = wrapSpannedLine(Line::from(Span::styled(logical, style)), textWidth);
+        for wLine in wrapped {
+            let mut spans = vec![Span::styled("  ".to_string(), style)];
+            spans.extend(wLine.spans);
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
+fn pushReviewerReport(
+    out: &mut Vec<Line<'static>>,
+    cont: &mut Vec<bool>,
+    report: &construct::control::AutoReviewReport,
+    width: u16,
+) {
+    for line in reviewerReportLines(report, width as usize) {
+        cont.push(false);
+        out.push(line);
     }
 }
 
@@ -4469,17 +6003,29 @@ fn truncateToWidth(s: &str, maxWidth: usize) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
+
+    if UnicodeWidthStr::width(sanitized.as_str()) <= maxWidth {
+        return sanitized;
+    }
+    if maxWidth == 0 {
+        return String::new();
+    }
+
+    let ellipsis = "\u{2026}";
+    let ellipsisW = UnicodeWidthStr::width(ellipsis);
+    let bodyLimit = maxWidth.saturating_sub(ellipsisW);
     let mut width = 0;
     let mut out = String::with_capacity(sanitized.len());
     for g in sanitized.graphemes(true) {
         let cw = UnicodeWidthStr::width(g);
-        // Reserve 1 column for the ellipsis.
-        if width + cw > maxWidth.saturating_sub(1) {
-            let tail: &str = if width == 0 { &sanitized } else { &out };
-            return format!("{}\u{2026}", tail);
+        if width + cw > bodyLimit {
+            break;
         }
         width += cw;
         out.push_str(g);
+    }
+    if ellipsisW <= maxWidth {
+        out.push_str(ellipsis);
     }
     out
 }
@@ -4514,7 +6060,7 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
 
     if maxWidth == 0 {
-        return vec![line];
+        return vec![Line::from("")];
     }
 
     // Flatten spans into (grapheme, Style) atoms so emoji sequences stay
@@ -4525,9 +6071,14 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
         .iter()
         .flat_map(|span| {
             let style = span.style;
-            span.content
-                .graphemes(true)
-                .map(move |g| (g.to_string(), style))
+            span.content.graphemes(true).map(move |g| {
+                let sanitized = sanitizeTerminalControls(g);
+                if UnicodeWidthStr::width(sanitized.as_str()) > maxWidth {
+                    ("\u{2026}".to_string(), style)
+                } else {
+                    (sanitized, style)
+                }
+            })
         })
         .collect();
 
@@ -4536,7 +6087,7 @@ fn wrapSpannedLine(line: Line<'static>, maxWidth: usize) -> Vec<Line<'static>> {
         .map(|(g, _)| UnicodeWidthStr::width(g.as_str()))
         .sum();
     if totalWidth <= maxWidth {
-        return vec![line];
+        return vec![styledGraphemesToLine(&atoms)];
     }
 
     let mut result: Vec<Line<'static>> = Vec::new();
@@ -4622,6 +6173,52 @@ mod wrapTests {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn lineWidth(l: &Line<'_>) -> usize {
+        UnicodeWidthStr::width(lineText(l).as_str())
+    }
+
+    fn scrollbarThumbStartCol(l: &Line<'_>) -> Option<usize> {
+        let mut col = 0;
+        for span in &l.spans {
+            let text = span.content.as_ref();
+            let width = UnicodeWidthStr::width(text);
+            if !text.is_empty()
+                && span.style.fg == Some(Color::Gray)
+                && text.chars().all(|ch| ch == '\u{2500}')
+            {
+                return Some(col);
+            }
+            col += width;
+        }
+        None
+    }
+
+    fn assertToolBlockLinesRenderCleanly(
+        lines: &[Line<'static>],
+        width: u16,
+        case: impl std::fmt::Display,
+    ) {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+
+        let area = Rect::new(0, 0, width, lines.len() as u16);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Paragraph::new(lines.to_vec()).render(area, &mut buf);
+
+        for (lineIndex, line) in lines.iter().enumerate() {
+            let text = lineText(line);
+            let expected = text.chars().last().unwrap_or(' ');
+            let actual = buf[(width.saturating_sub(1), lineIndex as u16)]
+                .symbol()
+                .chars()
+                .next()
+                .unwrap_or(' ');
+            assert_eq!(
+                actual, expected,
+                "{case}: row {lineIndex} right edge rendered as {actual:?}, expected {expected:?}; line={text:?}"
+            );
+        }
+    }
+
     #[test]
     fn wrapsEmojiParagraphCorrectly() {
         let text = "The \u{26A0}\u{FE0F} tells user: \"If you rewind past here, those .bak files stay deleted. We can't bring them back.\"";
@@ -4659,7 +6256,7 @@ mod wrapTests {
     #[test]
     fn truncateWithEmojiRespectsLimit() {
         let text = "The \u{26A0}\u{FE0F} warning text";
-        for w in [5usize, 6, 7, 10, 20] {
+        for w in [0usize, 1, 2, 5, 6, 7, 10, 20] {
             let t = truncateToWidth(text, w);
             let width = UnicodeWidthStr::width(t.as_str());
             assert!(
@@ -4793,23 +6390,20 @@ mod wrapTests {
         let mut panel = AgentPanel::new();
         panel.pushUser("set a wake");
         panel.toolStarted("scheduleWakeup", "scheduleWakeup 90s: Good morning");
-        assert!(
-            panel
-                .entries
-                .iter()
-                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
-        );
+        assert!(panel.entries.iter().any(|e| matches!(
+            e,
+            PanelEntry::ToolBlock(block)
+                if matches!(block.status, ToolBlockStatus::Active { .. })
+        )));
 
         assert!(panel.finishWakeToolResult(
             "scheduleWakeup",
             "Armed wake #3 — will fire in 90s with prompt: Good morning."
         ));
-        assert!(
-            !panel
-                .entries
-                .iter()
-                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
-        );
+        assert!(!panel.entries.iter().any(|e| matches!(
+            e,
+            PanelEntry::ToolBlock(block) if block.status.isTransient()
+        )));
         assert!(
             !panel
                 .entries
@@ -4823,21 +6417,773 @@ mod wrapTests {
         let mut panel = AgentPanel::new();
         panel.pushUser("run df");
         panel.toolStarted("shell", "Run (30s): df -h /System/Volumes/Data");
-        assert!(
-            panel
-                .entries
-                .iter()
-                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
-        );
+        assert!(panel.entries.iter().any(|e| matches!(
+            e,
+            PanelEntry::ToolBlock(block)
+                if matches!(block.status, ToolBlockStatus::Active { .. })
+        )));
 
         panel.finalizeCancelled();
-        assert!(
-            !panel
-                .entries
-                .iter()
-                .any(|e| matches!(e, PanelEntry::ToolActive { .. }))
-        );
+        assert!(!panel.entries.iter().any(|e| matches!(
+            e,
+            PanelEntry::ToolBlock(block) if block.status.isTransient()
+        )));
         assert!(matches!(panel.entries.last(), Some(PanelEntry::Cancelled)));
+    }
+
+    #[test]
+    fn reviewedToolLifecycleKeepsSectionsInOneBlock() {
+        let mut panel = AgentPanel::new();
+        panel.pushUser("run a command");
+        let report = construct::control::AutoReviewReport {
+            decision: "allow".into(),
+            raiseToUser: "none".into(),
+            risk: "low".into(),
+            authorization: "inline".into(),
+            reason: "request is safe".into(),
+            messageToAgent: "ok".into(),
+        };
+
+        panel.toolAutoReviewStarted("shell", "Run: echo hi — check output", None);
+        panel.toolApproved("shell", "Run: echo hi — check output", None, Some(report));
+        panel.toolStarted("shell", "Run: echo hi — check output");
+        panel.pushToolResult("shell", "hello\nworld");
+
+        let block = panel.entries.iter().find_map(|entry| match entry {
+            PanelEntry::ToolBlock(block) => Some(block),
+            _ => None,
+        });
+        let block = block.expect("tool lifecycle should render as a ToolBlock");
+        assert!(matches!(block.status, ToolBlockStatus::Complete { .. }));
+        assert_eq!(block.summary, "check output");
+        assert!(block.sections.iter().any(|section| {
+            section.kind == ToolSectionKind::Invocation && section.rawText == "Run: echo hi"
+        }));
+        assert!(block.sections.iter().any(|section| {
+            section.kind == ToolSectionKind::Reviewer
+                && !section.expanded
+                && section.rawText.contains("request is safe")
+        }));
+        assert!(block.sections.iter().any(|section| {
+            section.kind == ToolSectionKind::Result && section.rawText == "hello\nworld"
+        }));
+    }
+
+    #[test]
+    fn toolBlockRowsStayFixedWidthAcrossLabelsAndCopyFlash() {
+        let mut block = ToolBlock::new(
+            "shell",
+            "Run: python3 -c \"import requests; print(requests.get('https://m.vk.com').text[:4096])\" — Debug raw VK mobile page HTML to see what is actually returned",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(5100)),
+            },
+        );
+        block.upsertSectionPreservingExpansion(
+            ToolSectionKind::Reviewer,
+            "reviewer".into(),
+            "Request is safe and inline with the user's stated debugging goal.".into(),
+            false,
+            false,
+            false,
+        );
+        block.setOutput(
+            "/Users/pocketdoc/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning\nStatus: 200\nContent length: 395970\n      <!DOCTYPE html>",
+        );
+
+        for width in [18u16, 24, 32, 48, 72] {
+            for copiedSection in [None, Some(0usize), Some(2usize)] {
+                let mut panel = AgentPanel::new();
+                if let Some(sectionIndex) = copiedSection {
+                    panel.toolSectionCopiedFlash = Some((
+                        ToolSectionId {
+                            entryIndex: 0,
+                            sectionIndex,
+                        },
+                        Instant::now(),
+                    ));
+                }
+
+                let mut lines = Vec::new();
+                let mut cont = Vec::new();
+                let mut ranges = Vec::new();
+                panel.renderToolBlock(&block, &mut lines, &mut cont, width, 0, &mut ranges);
+
+                for (lineIndex, line) in lines.iter().enumerate() {
+                    assert_eq!(
+                        lineWidth(line),
+                        width as usize,
+                        "width={width} copied={copiedSection:?} line={lineIndex}: {:?}",
+                        lineText(line)
+                    );
+                }
+                assertToolBlockLinesRenderCleanly(
+                    &lines,
+                    width,
+                    format_args!("width={width} copied={copiedSection:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toolSectionCopyColumnDoesNotMoveWhenFlashChanges() {
+        let label = "\u{2713}\u{FE0E} shell";
+        for innerW in [12usize, 18, 28, 44, 70] {
+            let mut lines = Vec::new();
+            let mut cont = Vec::new();
+            let plainCol = toolSectionHeaderCopyCol(
+                &mut lines,
+                &mut cont,
+                "  ",
+                innerW,
+                "\u{251C}",
+                "\u{2524}",
+                label,
+                ToolSectionKind::Invocation,
+                Some("\u{25BE}10"),
+                true,
+                false,
+                Style::default().fg(Color::DarkGray),
+            );
+            let plainText = lineText(lines.last().expect("plain header"));
+            assert_eq!(
+                UnicodeWidthStr::width(plainText.as_str()),
+                innerW + 4,
+                "innerW={innerW} plain header width mismatch: {plainText:?}"
+            );
+
+            let flashCol = toolSectionHeaderCopyCol(
+                &mut lines,
+                &mut cont,
+                "  ",
+                innerW,
+                "\u{251C}",
+                "\u{2524}",
+                label,
+                ToolSectionKind::Invocation,
+                Some("\u{25BE}10"),
+                true,
+                true,
+                Style::default().fg(Color::DarkGray),
+            );
+            let flashText = lineText(lines.last().expect("flash header"));
+            assert_eq!(
+                UnicodeWidthStr::width(flashText.as_str()),
+                innerW + 4,
+                "innerW={innerW} flash header width mismatch: {flashText:?}"
+            );
+            assert_eq!(plainCol, flashCol, "innerW={innerW}");
+            if plainCol.is_some() && innerW >= 18 {
+                let expected = 2 + 1 + innerW - 1 - UnicodeWidthStr::width(" copy ");
+                assert_eq!(
+                    plainCol,
+                    Some(expected as u16),
+                    "innerW={innerW} copy should be anchored near the right edge; header={plainText:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editToolBlockRendersInvocationAndDiffSections() {
+        let diff = "diff --git a/config b/config\n@@ -49,5 +49,5 @@\n-font-family = Berkeley Mono\n+font-family = TX-02\n+tab\tand emoji \u{26A0}\u{FE0F}\n";
+        let mut block = ToolBlock::new(
+            "editFile",
+            "Edit /Users/pocketdoc/Library/Application Support/com.mitchellh.ghostty/config: replace \"font-family = TX-02\"",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(1000)),
+            },
+        );
+        block.upsertDiffSection("editFile".into(), diff.into());
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 72, 0, &mut ranges);
+        let rendered = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        let firstLine = lineText(lines.first().expect("rendered first line"));
+
+        assert!(block.summary.is_empty());
+        assert!(firstLine.contains("\u{256D}"));
+        assert!(firstLine.contains("\u{2713}\u{FE0E} editFile"));
+        assert!(firstLine.contains("\u{256E}"));
+        assert!(rendered.contains("\u{2713}\u{FE0E} editFile"));
+        assert!(rendered.contains("Edit /Users/pocketdoc"));
+        assert!(rendered.contains(" diff "));
+        assert!(rendered.contains("-font-family = Berkeley Mono"));
+        assert!(rendered.contains("+font-family = TX-02"));
+        assert!(
+            !lines
+                .iter()
+                .take_while(|line| !lineText(line).contains("\u{2713}\u{FE0E} editFile"))
+                .any(|line| lineText(line).contains("Edit /Users/pocketdoc")),
+            "edit path/action should not render above the invocation header as a summary row"
+        );
+        for (idx, line) in lines.iter().enumerate() {
+            assert_eq!(
+                lineWidth(line),
+                72,
+                "diff row {idx} should keep the panel box intact: {:?}",
+                lineText(line)
+            );
+        }
+        assertToolBlockLinesRenderCleanly(&lines, 72, "edit diff");
+    }
+
+    #[test]
+    fn editDiffSurvivesLifecycleSummaryAndRoutineOutputIsHidden() {
+        let diff = "--- a/tmp/config\n+++ b/tmp/config\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let mut block = ToolBlock::new(
+            "editFile",
+            "Edit /tmp/config: replace \"old\"",
+            ToolBlockStatus::Approved,
+        );
+        block.upsertDiffSection("editFile".into(), diff.into());
+        block.updateSummary("Edit /tmp/config: replace \"old\"");
+        block.status = ToolBlockStatus::Complete {
+            duration: Some(Duration::from_millis(30)),
+        };
+        block.setOutput("Applied edit to /tmp/config.");
+
+        assert!(block.sections.iter().any(|section| {
+            section.kind == ToolSectionKind::Invocation && section.rawText.contains("/tmp/config")
+        }));
+        assert!(block.sections.iter().any(|section| {
+            section.kind == ToolSectionKind::Diff && section.rawText.contains("+new")
+        }));
+        assert!(
+            !block
+                .sections
+                .iter()
+                .any(|section| section.kind == ToolSectionKind::Result),
+            "routine edit success should not displace the diff"
+        );
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 56, 0, &mut ranges);
+        let rendered = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("+new"));
+        assert!(!rendered.contains("Applied edit"));
+    }
+
+    #[test]
+    fn invocationSectionPreviewsOnlyTwoWrappedLines() {
+        let block = ToolBlock::new(
+            "readFile",
+            "Read: /Users/pocketdoc/Library/Application Support/com.mitchellh.ghostty/config/some/really/long/path/that/wraps/multiple/times.rs (from line 49)",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 42, 0, &mut ranges);
+        let invocationRange = ranges
+            .iter()
+            .find(|range| {
+                matches!(
+                    block.sections[range.id.sectionIndex].kind,
+                    ToolSectionKind::Invocation
+                )
+            })
+            .expect("invocation range");
+
+        assert!(invocationRange.collapsible);
+        assert!(!invocationRange.expanded);
+        assert_eq!(
+            invocationRange.endLine - invocationRange.startLine,
+            MAX_INVOCATION_PREVIEW_LINES
+        );
+        assert!(invocationRange.hiddenLines > 0);
+    }
+
+    #[test]
+    fn readFileOutputNormalizesNumberedLineIndent() {
+        let mut block = ToolBlock::new(
+            "readFile",
+            "Read: /tmp/config (from line 49)",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+        block.setOutput("    49\t# resize-overlay-duration = 4s 200ms\n    50\tfont-size = 13");
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 72, 0, &mut ranges);
+        let rendered = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("49 # resize-overlay-duration"));
+        assert!(!rendered.contains("    49 # resize-overlay-duration"));
+    }
+
+    #[test]
+    fn toolResultSectionsScrollHorizontallyLikeCodeBlocks() {
+        let mut panel = AgentPanel::new();
+        let mut block = ToolBlock::new(
+            "shell",
+            "Run: printf long — inspect output",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+        block.setOutput("abcdefghijklmnopqrstuvwxyz0123456789");
+        panel.entries.push(PanelEntry::ToolBlock(block));
+
+        let (lines, _, _, _, ranges, _) = panel.buildLines(24);
+        panel.lastToolSectionRanges = ranges;
+        let resultId = panel
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| {
+                matches!(
+                    panel.entries[range.id.entryIndex],
+                    PanelEntry::ToolBlock(ref block)
+                        if block.sections[range.id.sectionIndex].kind == ToolSectionKind::Result
+                )
+            })
+            .expect("result range")
+            .id;
+        let before = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        assert!(before.contains("abcdef"));
+        let (bottomBefore, thumbBefore) = {
+            let bottomLine = lines
+                .iter()
+                .rev()
+                .find(|line| !lineText(line).is_empty())
+                .expect("bottom border");
+            let text = lineText(bottomLine);
+            let thumb = scrollbarThumbStartCol(bottomLine)
+                .expect("overflowing tool result should render a horizontal scrollbar");
+            (text, thumb)
+        };
+        assert!(
+            !bottomBefore.contains("\u{2501}"),
+            "tool scrollbar should stay on the regular border baseline: {bottomBefore:?}"
+        );
+
+        panel.scrollToolSectionH(resultId, 5);
+        let (lines, _, _, _, _, _) = panel.buildLines(24);
+        let after = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        assert!(after.contains("fghijk"));
+        assert!(!after.contains("abcdefghijklmnopqrstuvwxyz"));
+        let thumbAfter = {
+            let bottomLine = lines
+                .iter()
+                .rev()
+                .find(|line| !lineText(line).is_empty())
+                .expect("bottom border after scroll");
+            assert_eq!(
+                lineWidth(bottomLine),
+                24,
+                "bottom scrollbar should keep the tool block width fixed"
+            );
+            scrollbarThumbStartCol(bottomLine).expect("bottom scrollbar thumb after scroll")
+        };
+        assert!(
+            thumbAfter > thumbBefore,
+            "scrollbar thumb should move right with horizontal scroll: before={thumbBefore}, after={thumbAfter}"
+        );
+    }
+
+    #[test]
+    fn expandedOverflowingToolSectionUsesSingleTerminatorRow() {
+        let mut block = ToolBlock::new(
+            "shell",
+            "Run: curl -sL \"https://pixeldrain.com/api/file/gBNWHDr6\" | xxd — Hex dump pixeldrain API response",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(1000)),
+            },
+        );
+        block.setOutput(
+            "00000000: 377a bcaf 271c 0004 4a54 5d20 80a\n\
+             00000010: 0000 0000 4000 0000 0000 0000 397\n\
+             00000020: a012 b5c5 0483 4c2e f341 95f5 551\n\
+             00000030: 2348 1f1c 4dbb 8816 af6d 4a53 5c8\n\
+             00000040: fda8 8c59 53fe 71b4 6d15 a8b7 bce\n\
+             00000050: 3244 8a29 2574 c670 0347 2263 4e0\n\
+             00000060: fff2 f13b 487b c3fc 24de 14d8 b4b\n\
+             00000070: 8dfd 3626 f9eb 8515 f93f 7db7 3b2\n\
+             00000080: 71bc d32d 57e9 6dde 2815 dfb4 954",
+        );
+        let result = block
+            .sections
+            .iter_mut()
+            .find(|section| section.kind == ToolSectionKind::Result)
+            .expect("result section");
+        result.expanded = true;
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 44, 0, &mut ranges);
+
+        let nonEmpty = lines
+            .iter()
+            .filter(|line| !lineText(line).is_empty())
+            .collect::<Vec<_>>();
+        let bottom = nonEmpty.last().expect("bottom line");
+        let beforeBottom = nonEmpty
+            .get(nonEmpty.len().saturating_sub(2))
+            .expect("line before bottom");
+        let bottomText = lineText(bottom);
+        let beforeText = lineText(beforeBottom);
+
+        assert!(bottomText.contains("\u{2570}"));
+        assert!(bottomText.contains("\u{25B4}"));
+        assert!(scrollbarThumbStartCol(bottom).is_some());
+        assert!(
+            beforeText.contains("\u{2502}") && !beforeText.contains("\u{251C}"),
+            "expanded overflowing section should not render a separate footer before the bottom scrollbar: {beforeText:?}"
+        );
+        assertToolBlockLinesRenderCleanly(&lines, 44, "expanded overflowing tool section");
+    }
+
+    #[test]
+    fn expandedOverflowingMiddleSectionDoesNotStackAboveNextHeader() {
+        let mut block = ToolBlock::new(
+            "shell",
+            "Run: curl -sL \"https://pixeldrain.com/api/file/gBNWHDr6\" -H \"Accept: application/json\" 2>&1 | python3 -m json.tool 2>&1 | head -20 — Try pixeldrain API directly for file info",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(1000)),
+            },
+        );
+        block.setOutput("'utf-8' codec can't decode byte 0xbc in position 1");
+        let invocation = block
+            .sections
+            .iter_mut()
+            .find(|section| section.kind == ToolSectionKind::Invocation)
+            .expect("invocation section");
+        invocation.expanded = true;
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 44, 0, &mut ranges);
+        let texts = lines.iter().map(lineText).collect::<Vec<_>>();
+        let resultHeader = texts
+            .iter()
+            .position(|text| text.contains("1.0s"))
+            .expect("result header");
+        let beforeResult = texts
+            .get(resultHeader.saturating_sub(1))
+            .expect("line before result header");
+
+        assert!(
+            beforeResult.contains("\u{2502}") && !beforeResult.contains("\u{251C}"),
+            "expanded middle section should not insert a separate footer above the next section header: {beforeResult:?}"
+        );
+        assertToolBlockLinesRenderCleanly(&lines, 44, "expanded overflowing middle section");
+    }
+
+    #[test]
+    fn summarizedToolWithoutInvocationUsesTopHeaderOnly() {
+        let mut block = ToolBlock::new(
+            "webSearch",
+            "Web search: \"Berkeley Mono TX-02 stylistic sets ss01 ss02 ss03\"",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(1000)),
+            },
+        );
+        block.setOutput("Berkeley Mono Variable (TX-02) in Ghostty\n## AI Summary");
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 62, 0, &mut ranges);
+        let texts = lines.iter().map(lineText).collect::<Vec<_>>();
+        let rendered = texts.join("\n");
+
+        assert!(texts.first().is_some_and(|text| {
+            text.contains("\u{256D}") && text.contains("\u{2713}\u{FE0E} webSearch")
+        }));
+        assert_eq!(
+            rendered.matches("\u{2713}\u{FE0E} webSearch").count(),
+            1,
+            "empty invocation should be merged into the top border instead of rendering a second divider"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("\u{251C} \u{2713}\u{FE0E} webSearch")),
+            "empty invocation should not render as its own section header"
+        );
+        assertToolBlockLinesRenderCleanly(&lines, 62, "summary-only invocation");
+    }
+
+    #[test]
+    fn fileToolActionRendersInInvocationSectionNotSummary() {
+        let block = ToolBlock::new(
+            "readFile",
+            "Read: /Users/pocketdoc/Library/Application Support/com.mitchellh.ghostty/config (from line 49)",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+
+        assert!(block.summary.is_empty());
+        let invocation = block
+            .sections
+            .iter()
+            .find(|section| section.kind == ToolSectionKind::Invocation)
+            .expect("file tool should render an invocation section");
+        assert_eq!(invocation.label, "readFile");
+        assert!(invocation.rawText.starts_with("Read: /Users/pocketdoc"));
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 72, 0, &mut ranges);
+        let rendered = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        let firstLine = lineText(lines.first().expect("rendered first line"));
+        assert!(firstLine.contains("\u{256D}"));
+        assert!(firstLine.contains("\u{2713}\u{FE0E} readFile"));
+        assert!(firstLine.contains("\u{256E}"));
+        assert!(rendered.contains("\u{2713}\u{FE0E} readFile"));
+        assert!(rendered.contains("Read: /Users/pocketdoc"));
+    }
+
+    #[test]
+    fn everyToolBlockGetsAnInvocationHeader() {
+        let block = ToolBlock::new(
+            "terminalRunList",
+            "List terminal runs",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+
+        assert_eq!(block.summary, "List terminal runs");
+        let invocation = block
+            .sections
+            .iter()
+            .find(|section| section.kind == ToolSectionKind::Invocation)
+            .expect("every tool should render an invocation header");
+        assert_eq!(invocation.label, "terminalRunList");
+        assert!(invocation.rawText.is_empty());
+
+        let panel = AgentPanel::new();
+        let mut lines = Vec::new();
+        let mut cont = Vec::new();
+        let mut ranges = Vec::new();
+        panel.renderToolBlock(&block, &mut lines, &mut cont, 72, 0, &mut ranges);
+        let rendered = lines.iter().map(lineText).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("\u{2713}\u{FE0E} terminalRunList"));
+    }
+
+    #[test]
+    fn shortToolOutputDoesNotCollapseClosed() {
+        let mut panel = AgentPanel::new();
+        let mut block = ToolBlock::new(
+            "readFile",
+            "Read: /tmp/config (from line 49)",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(20)),
+            },
+        );
+        block.setOutput("49 # resize-overlay-duration = 4s 200ms\n50\n51 # Berkeley Mono TX-02");
+        panel.entries.push(PanelEntry::ToolBlock(block));
+
+        let (_, _, _, _, ranges, _) = panel.buildLines(72);
+        panel.lastToolSectionRanges = ranges;
+        let resultRange = panel
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| {
+                matches!(
+                    panel.entries[range.id.entryIndex],
+                    PanelEntry::ToolBlock(ref block)
+                        if block.sections[range.id.sectionIndex].kind == ToolSectionKind::Result
+                )
+            })
+            .expect("result range");
+        assert!(!resultRange.collapsible);
+        assert!(!panel.tryToggleCodeBlock(resultRange.startLine as i32));
+        assert!(matches!(
+            panel.entries[0],
+            PanelEntry::ToolBlock(ref block)
+                if block.sections.iter().any(|section| {
+                    section.kind == ToolSectionKind::Result && section.expanded
+                })
+        ));
+    }
+
+    #[test]
+    fn longToolOutputUsesTopAndBottomCollapseControlsWithScrollCompensation() {
+        let mut panel = AgentPanel::new();
+        let mut block = ToolBlock::new(
+            "shell",
+            "Run: printf lines — inspect output",
+            ToolBlockStatus::Complete {
+                duration: Some(Duration::from_millis(1200)),
+            },
+        );
+        block.setOutput("1\n2\n3\n4\n5\n6\n7\n8\n9");
+        panel.entries.push(PanelEntry::ToolBlock(block));
+        panel.scrollOffset = 10;
+        panel.lastMaxScroll = 10;
+
+        let (_, _, _, _, ranges, _) = panel.buildLines(72);
+        panel.lastToolSectionRanges = ranges;
+        let resultRange = panel
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| {
+                matches!(
+                    panel.entries[range.id.entryIndex],
+                    PanelEntry::ToolBlock(ref block)
+                        if block.sections[range.id.sectionIndex].kind == ToolSectionKind::Result
+                )
+            })
+            .expect("result range");
+        assert!(resultRange.collapsible);
+        assert!(!resultRange.expanded);
+        let header = resultRange.startLine as i32 - panel.scrollOffset as i32;
+        let delta = resultRange.hiddenLines;
+
+        assert!(panel.tryToggleCodeBlock(header));
+        assert_eq!(panel.scrollOffset, 10 + delta);
+        assert!(matches!(
+            panel.entries[0],
+            PanelEntry::ToolBlock(ref block)
+                if block.sections.iter().any(|section| {
+                    section.kind == ToolSectionKind::Result && section.expanded
+                })
+        ));
+
+        let (_, _, _, _, ranges, _) = panel.buildLines(72);
+        panel.lastToolSectionRanges = ranges;
+        let resultRange = panel
+            .lastToolSectionRanges
+            .iter()
+            .find(|range| {
+                matches!(
+                    panel.entries[range.id.entryIndex],
+                    PanelEntry::ToolBlock(ref block)
+                        if block.sections[range.id.sectionIndex].kind == ToolSectionKind::Result
+                )
+            })
+            .expect("expanded result range");
+        assert!(resultRange.expanded);
+        let footer = resultRange.endLine as i32 - panel.scrollOffset as i32;
+        assert!(panel.tryToggleCodeBlock(footer));
+        assert_eq!(panel.scrollOffset, 10);
+        assert!(matches!(
+            panel.entries[0],
+            PanelEntry::ToolBlock(ref block)
+                if block.sections.iter().any(|section| {
+                    section.kind == ToolSectionKind::Result && !section.expanded
+                })
+        ));
+    }
+
+    #[test]
+    fn toolBlockCellWidthFuzzKeepsRightBorderIntact() {
+        let atoms = [
+            "alpha",
+            "字",
+            "\u{26A0}\u{FE0F}",
+            "e\u{301}",
+            "\t",
+            "/Users/pocketdoc/Library/Application Support/com.mitchellh.ghostty/config",
+            "\u{2713}\u{FE0E}",
+            "\u{25BE}",
+            "👩\u{200D}💻",
+            "━━━━━━━━",
+        ];
+
+        fn fuzzText(mut seed: u64, atoms: &[&str], count: usize) -> String {
+            let mut out = String::new();
+            for _ in 0..count {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(atoms[(seed as usize) % atoms.len()]);
+            }
+            out
+        }
+
+        for width in 8u16..90 {
+            for seed in 0..96u64 {
+                let summary = format!(
+                    "Run: {} — {}",
+                    fuzzText(seed, &atoms, 5),
+                    fuzzText(seed ^ 0x5eed, &atoms, 10)
+                );
+                let mut block = ToolBlock::new(
+                    if seed % 3 == 0 { "editFile" } else { "shell" },
+                    &summary,
+                    ToolBlockStatus::Complete {
+                        duration: Some(Duration::from_millis((seed % 12_000) + 50)),
+                    },
+                );
+                block.upsertReviewer(construct::control::AutoReviewReport {
+                    decision: "allow".into(),
+                    raiseToUser: "none".into(),
+                    risk: "low".into(),
+                    authorization: "inline".into(),
+                    reason: fuzzText(seed ^ 0xa11ce, &atoms, 8),
+                    messageToAgent: String::new(),
+                });
+                if seed % 3 == 0 {
+                    block.upsertDiffSection(
+                        "editFile".into(),
+                        format!(
+                            "@@ -1,2 +1,2 @@\n-{}\n+{}\n",
+                            fuzzText(seed ^ 0xd1ff, &atoms, 8),
+                            fuzzText(seed ^ 0xbeef, &atoms, 8)
+                        ),
+                    );
+                } else {
+                    block.setOutput(&format!(
+                        "{}\n{}",
+                        fuzzText(seed ^ 0xc0de, &atoms, 12),
+                        fuzzText(seed ^ 0xface, &atoms, 12)
+                    ));
+                }
+
+                let mut panel = AgentPanel::new();
+                if seed % 5 == 0 {
+                    panel.toolSectionCopiedFlash = Some((
+                        ToolSectionId {
+                            entryIndex: 0,
+                            sectionIndex: (seed as usize) % 3,
+                        },
+                        Instant::now(),
+                    ));
+                }
+                let mut lines = Vec::new();
+                let mut cont = Vec::new();
+                let mut ranges = Vec::new();
+                panel.renderToolBlock(&block, &mut lines, &mut cont, width, 0, &mut ranges);
+                for (idx, line) in lines.iter().enumerate() {
+                    assert_eq!(
+                        lineWidth(line),
+                        width as usize,
+                        "width={width} seed={seed} row={idx} text={:?}",
+                        lineText(line)
+                    );
+                }
+                assertToolBlockLinesRenderCleanly(
+                    &lines,
+                    width,
+                    format_args!("width={width} seed={seed}"),
+                );
+            }
+        }
     }
 
     fn snapshotBuffer(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {

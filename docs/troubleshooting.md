@@ -125,6 +125,25 @@ Press `Ctrl+L` to force a redraw.
 
 If the layout feels wrong, use `Ctrl+O` or `/layout` to open layout controls.
 
+## Windows TUI Startup Fails
+
+Use Windows Terminal or VS Code's integrated terminal for the native Windows
+build. Older console hosts may not support every terminal enhancement Flatline
+uses; unsupported keyboard enhancement is skipped on Windows, but mouse,
+bracketed paste, and rendering support still depend on the host terminal.
+
+If startup fails with a shell error, make sure a supported POSIX shell is
+available. Flatline needs bash or zsh for the shared terminal's command tracking.
+Install Git for Windows or MSYS2, then either put `bash.exe` on `PATH` or set:
+
+```powershell
+$env:FLATLINE_SHELL = "C:\Program Files\Git\bin\bash.exe"
+flatline
+```
+
+If you prefer WSL, run Flatline inside WSL from a Linux checkout. Do not set
+`FLATLINE_SHELL` to `wsl.exe`; the Windows binary expects a local PTY shell.
+
 ## A Shell Command Ran Too Long
 
 Foreground shell calls may be auto-converted to background jobs after timeout.

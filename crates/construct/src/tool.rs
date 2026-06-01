@@ -30,8 +30,8 @@ pub(crate) use defs::{
 pub(crate) use execute::execute;
 pub(crate) use execute::truncateOutput;
 pub use parse::parse;
-pub use presentation::summarize;
-pub(crate) use presentation::{diffPreview, proposedContent};
+pub(crate) use presentation::proposedContent;
+pub use presentation::{diffPreview, summarize};
 
 #[cfg(test)]
 use self::execute::{FileKind, ImageFormat, SubprocessError, classifyFile, executeReadFile};

@@ -407,7 +407,7 @@ async fn main() -> Result<()> {
                             LogEvent::ToolStarted { name, summary } => {
                                 eprint!("\x1b[2m\u{25b8} {name}: {summary}...\x1b[0m");
                             }
-                            LogEvent::ToolAutoApproved { name, summary } => {
+                            LogEvent::ToolAutoApproved { name, summary, .. } => {
                                 eprintln!("\x1b[2m\u{25b8} {name}: {summary}\x1b[0m");
                             }
                             LogEvent::ToolResult { name, .. } => {
@@ -528,8 +528,20 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::ToolCallPreview { index, preview } => serde_json::json!({
             "type": "toolCallPreview", "index": index, "preview": preview,
         }),
-        LogEvent::ToolAutoApproved { name, summary } => serde_json::json!({
-            "type": "toolAutoApproved", "name": name, "summary": summary,
+        LogEvent::ToolAutoReviewStarted {
+            name,
+            summary,
+            diff,
+        } => serde_json::json!({
+            "type": "toolAutoReviewStarted", "name": name, "summary": summary, "diff": diff,
+        }),
+        LogEvent::ToolAutoApproved {
+            name,
+            summary,
+            diff,
+            review,
+        } => serde_json::json!({
+            "type": "toolAutoApproved", "name": name, "summary": summary, "diff": diff, "review": review,
         }),
         LogEvent::ToolResult { name, output } => serde_json::json!({
             "type": "toolResult", "name": name, "output": output,
@@ -537,8 +549,13 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         LogEvent::ToolDenied { name } => serde_json::json!({
             "type": "toolDenied", "name": name,
         }),
-        LogEvent::ToolAutoDenied { name, summary } => serde_json::json!({
-            "type": "toolAutoDenied", "name": name, "summary": summary,
+        LogEvent::ToolAutoDenied {
+            name,
+            summary,
+            diff,
+            review,
+        } => serde_json::json!({
+            "type": "toolAutoDenied", "name": name, "summary": summary, "diff": diff, "review": review,
         }),
         LogEvent::TurnAborted { name } => serde_json::json!({
             "type": "turnAborted", "name": name,

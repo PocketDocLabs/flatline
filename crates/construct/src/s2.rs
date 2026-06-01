@@ -599,6 +599,7 @@ mod tests {
             toolCallId: None,
             reasoning: None,
             attachments: None,
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,

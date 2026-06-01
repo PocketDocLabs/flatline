@@ -656,17 +656,8 @@ impl SubagentPanel {
 
         // Reserve bottom rows for an inline subagent permit prompt.
         let permitHeight = if agentPanel.pendingPermit && agentPanel.pendingPermitIsSubagent() {
-            // Match the layout used by agent_panel's permit prompt: code
-            // block (if shell) + header + explanation + 2 keys + patterns +
-            // custom field + breathing room.
-            let hasCmd = agentPanel.pendingCommand().is_some();
-            let codeBlockLines: u16 = if hasCmd { 2 } else { 0 };
-            let headerLine: u16 = 1;
-            let explanationLines: u16 = 1;
-            let keyGrid: u16 = 2;
-            let blank: u16 = 1;
-            let patterns: u16 = 4; // up to 3 patterns + custom.
-            (codeBlockLines + headerLine + explanationLines + blank + keyGrid + blank + patterns)
+            agentPanel
+                .permitInlineHeight(inner.width)
                 .min(inner.height.saturating_sub(3))
                 .max(8)
         } else {

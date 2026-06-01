@@ -29,6 +29,11 @@ the shared terminal unless a tool routes them through the background job plane.
 Mouse support includes terminal tab clicks, status-chip clicks, scrolling, and
 selection in the agent panel.
 
+On Windows, keyboard progressive enhancement is skipped because Crossterm does
+not implement it for the Windows console API. Standard key events and shortcuts
+still work; host-terminal features such as mouse capture and bracketed paste are
+best in Windows Terminal or VS Code's integrated terminal.
+
 ## Agent Input
 
 When the agent panel has focus:

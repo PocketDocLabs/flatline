@@ -265,6 +265,10 @@ pub(crate) fn insertTurn(conn: &Connection, turn: &Turn) -> Result<()> {
     sqliteBlocking(|| insertTurnTx(conn, turn))
 }
 
+pub(crate) fn updateTurn(conn: &Connection, turn: &Turn) -> Result<()> {
+    sqliteBlocking(|| updateTurnTx(conn, turn))
+}
+
 fn insertTurnTx(conn: &Connection, turn: &Turn) -> Result<()> {
     let role = serde_json::to_value(&turn.role)?
         .as_str()
@@ -275,6 +279,40 @@ fn insertTurnTx(conn: &Connection, turn: &Turn) -> Result<()> {
         "INSERT OR REPLACE INTO turns
          (id, block_id, topic_id, role, ts, parent_id, tool, tool_call_id, snapshot_hash, turn_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            turn.id,
+            turn.blockId,
+            turn.topicId,
+            role,
+            turn.ts as i64,
+            turn.parentId,
+            turn.tool,
+            turn.toolCallId,
+            turn.snapshotHash,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn updateTurnTx(conn: &Connection, turn: &Turn) -> Result<()> {
+    let role = serde_json::to_value(&turn.role)?
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let json = serde_json::to_string(turn)?;
+    conn.execute(
+        "UPDATE turns
+         SET block_id = ?2,
+             topic_id = ?3,
+             role = ?4,
+             ts = ?5,
+             parent_id = ?6,
+             tool = ?7,
+             tool_call_id = ?8,
+             snapshot_hash = ?9,
+             turn_json = ?10
+         WHERE id = ?1",
         params![
             turn.id,
             turn.blockId,

@@ -484,6 +484,30 @@ fn resetTerminalTitle() {
     let _ = io::stdout().flush();
 }
 
+fn enableBracketedPaste<W: io::Write>(writer: &mut W) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        match execute!(writer, crossterm::event::EnableBracketedPaste) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        execute!(writer, crossterm::event::EnableBracketedPaste)?;
+        Ok(true)
+    }
+}
+
+fn disableBracketedPaste<W: io::Write>(writer: &mut W, enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(writer, crossterm::event::DisableBracketedPaste)?;
+    }
+    Ok(())
+}
+
 /// Animated card-flip spinner for the terminal title. Cycles through a
 /// pre-built frame list with per-frame dwell times, advanced by a wall-clock
 /// tick on the main render loop.
@@ -558,18 +582,41 @@ pub async fn run() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-        ),
-        crossterm::cursor::SetCursorStyle::SteadyBar,
-        crossterm::event::EnableFocusChange,
-    )?;
+    let mut bracketedPasteEnabled = false;
+    let terminalInitResult = (|| -> Result<()> {
+        execute!(stdout, EnterAlternateScreen)?;
+        bracketedPasteEnabled = enableBracketedPaste(&mut stdout)?;
+        execute!(stdout, crossterm::event::EnableMouseCapture)?;
+        #[cfg(not(windows))]
+        execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            ),
+        )?;
+        execute!(
+            stdout,
+            crossterm::cursor::SetCursorStyle::SteadyBar,
+            crossterm::event::EnableFocusChange,
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = terminalInitResult {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, crossterm::cursor::SetCursorStyle::DefaultUserShape);
+        #[cfg(not(windows))]
+        let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+        let _ = execute!(
+            stdout,
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange,
+        );
+        let _ = disableBracketedPaste(&mut stdout, bracketedPasteEnabled);
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        resetTerminalTitle();
+        return Err(e);
+    }
     writeTerminalTitle(TITLE_IDLE_GLYPH, None);
 
     // From here until cleanup, any `?` bypasses terminal restore — wrap
@@ -598,13 +645,17 @@ pub async fn run() -> Result<()> {
                 let _ = disable_raw_mode();
                 let _ = execute!(
                     io::stdout(),
-                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
-                    crossterm::event::PopKeyboardEnhancementFlags,
+                    crossterm::cursor::SetCursorStyle::DefaultUserShape
+                );
+                #[cfg(not(windows))]
+                let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+                let _ = execute!(
+                    io::stdout(),
                     crossterm::event::DisableMouseCapture,
                     crossterm::event::DisableFocusChange,
-                    crossterm::event::DisableBracketedPaste,
-                    LeaveAlternateScreen,
                 );
+                let _ = disableBracketedPaste(&mut io::stdout(), bracketedPasteEnabled);
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 resetTerminalTitle();
                 return Err(e);
             }
@@ -1387,12 +1438,19 @@ pub async fn run() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
+    )?;
+    #[cfg(not(windows))]
+    execute!(
+        terminal.backend_mut(),
         crossterm::event::PopKeyboardEnhancementFlags,
+    )?;
+    execute!(
+        terminal.backend_mut(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableFocusChange,
-        crossterm::event::DisableBracketedPaste,
-        LeaveAlternateScreen,
     )?;
+    disableBracketedPaste(terminal.backend_mut(), bracketedPasteEnabled)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen,)?;
     terminal.show_cursor()?;
     resetTerminalTitle();
 
@@ -2052,16 +2110,33 @@ async fn runLoop(
                 LogEvent::ToolCallPreview { index, preview } => {
                     agentPanel.toolCallPreview(index, &preview);
                 }
-                LogEvent::ToolAutoApproved { name, summary } => {
+                LogEvent::ToolAutoReviewStarted {
+                    name,
+                    summary,
+                    diff,
+                } => {
+                    agentPanel.toolAutoReviewStarted(&name, &summary, diff);
+                }
+                LogEvent::ToolAutoApproved {
+                    name,
+                    summary,
+                    diff,
+                    review,
+                } => {
                     if !crate::agent_panel::isWakeToolName(&name) {
-                        agentPanel.toolApproved(&format!("{name}: {summary}"));
+                        agentPanel.toolApproved(&name, &summary, diff, review);
                     }
                 }
                 LogEvent::ToolDenied { name } => {
                     agentPanel.toolDenied(&name);
                 }
-                LogEvent::ToolAutoDenied { name, summary } => {
-                    agentPanel.toolAutoDenied(&name, &summary);
+                LogEvent::ToolAutoDenied {
+                    name,
+                    summary,
+                    diff,
+                    review,
+                } => {
+                    agentPanel.toolAutoDenied(&name, &summary, diff, review);
                 }
                 LogEvent::TurnAborted { name } => {
                     agentPanel.pushError(&format!("Turn aborted: {name} not permitted"));
@@ -2323,9 +2398,21 @@ async fn runLoop(
                     agentPanel.subagentStarted(&sessionId, &agentType, &prompt);
                 }
                 LogEvent::SubagentEvent { sessionId, event } => match *event {
+                    LogEvent::ToolAutoReviewStarted {
+                        ref name,
+                        ref summary,
+                        ..
+                    } => {
+                        agentPanel.subagentToolLine(
+                            &sessionId,
+                            name,
+                            &format!("reviewing {summary}"),
+                        );
+                    }
                     LogEvent::ToolAutoApproved {
                         ref name,
                         ref summary,
+                        ..
                     } => {
                         agentPanel.subagentToolLine(&sessionId, name, summary);
                     }
@@ -2334,6 +2421,20 @@ async fn runLoop(
                         ref summary,
                     } => {
                         agentPanel.subagentToolLine(&sessionId, name, summary);
+                    }
+                    LogEvent::ToolDenied { ref name } => {
+                        agentPanel.subagentToolLine(&sessionId, name, "denied");
+                    }
+                    LogEvent::ToolAutoDenied {
+                        ref name,
+                        ref summary,
+                        ..
+                    } => {
+                        agentPanel.subagentToolLine(
+                            &sessionId,
+                            name,
+                            &format!("denied: {summary}"),
+                        );
                     }
                     LogEvent::ToolResult {
                         ref name,
@@ -2731,6 +2832,7 @@ async fn runLoop(
                     diff,
                     explanation,
                     impact,
+                    review,
                     reply,
                 } => {
                     let isSubagent =
@@ -2751,6 +2853,7 @@ async fn runLoop(
                         diff,
                         explanation,
                         impact,
+                        review,
                         origin,
                     );
                     pendingPermitReply = Some(reply);
@@ -4573,6 +4676,8 @@ fn handleMouse(
                         let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                         if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                             agentPanel.scrollCodeBlockH(blockId, -3);
+                        } else if let Some(sectionId) = agentPanel.toolSectionAtGridLine(gridLine) {
+                            agentPanel.scrollToolSectionH(sectionId, -3);
                         } else {
                             agentPanel.scrollUp(3);
                         }
@@ -4608,6 +4713,8 @@ fn handleMouse(
                         let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                         if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                             agentPanel.scrollCodeBlockH(blockId, 3);
+                        } else if let Some(sectionId) = agentPanel.toolSectionAtGridLine(gridLine) {
+                            agentPanel.scrollToolSectionH(sectionId, 3);
                         } else {
                             agentPanel.scrollDown(3);
                         }
@@ -4645,6 +4752,8 @@ fn handleMouse(
                 let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                 if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                     agentPanel.scrollCodeBlockH(blockId, -3);
+                } else if let Some(sectionId) = agentPanel.toolSectionAtGridLine(gridLine) {
+                    agentPanel.scrollToolSectionH(sectionId, -3);
                 }
             }
         }
@@ -4663,6 +4772,8 @@ fn handleMouse(
                 let gridLine = selection::toGridLine(screenRow, agentPanel.displayOffset());
                 if let Some(blockId) = agentPanel.codeBlockAtGridLine(gridLine) {
                     agentPanel.scrollCodeBlockH(blockId, 3);
+                } else if let Some(sectionId) = agentPanel.toolSectionAtGridLine(gridLine) {
+                    agentPanel.scrollToolSectionH(sectionId, 3);
                 }
             }
         }
@@ -4914,6 +5025,18 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
     // Track pending task (subagent) calls: toolCallId -> entry index.
     let mut pendingTasks: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let toolResults: std::collections::HashMap<String, &construct::transcript::Turn> = turns
+        .iter()
+        .filter_map(|turn| {
+            if matches!(turn.role, TurnRole::ToolResult) {
+                turn.toolCallId.as_ref().map(|id| (id.clone(), turn))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut replayedToolResults: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for turn in turns {
         match turn.role {
@@ -4998,23 +5121,29 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                         pendingTasks.insert(callId.clone(), entryIdx);
                     }
                 } else {
-                    let summary = turn
-                        .args
+                    let result = turn
+                        .toolCallId
                         .as_ref()
-                        .map(|a| {
-                            let s = a.to_string();
-                            if s.len() > 80 {
-                                format!("{}\u{2026}", &s[..s.floor_char_boundary(79)])
-                            } else {
-                                s
-                            }
-                        })
-                        .unwrap_or_default();
-                    panel
-                        .entries
-                        .push(crate::agent_panel::PanelEntry::ToolApproved {
-                            name: format!("{name}: {summary}"),
-                        });
+                        .and_then(|id| toolResults.get(id).copied());
+                    let summary = replayToolSummary(turn);
+                    let meta = turn.toolMeta.as_ref();
+                    let outcome = meta.and_then(|m| m.outcome);
+                    let replayedDiff = replayToolDiff(turn);
+                    let diff = replayedDiff.as_deref();
+                    let review = meta.and_then(|m| m.review.clone());
+                    let duration = replayToolDuration(turn, result, meta);
+                    panel.pushReplayedToolBlock(
+                        name,
+                        &summary,
+                        diff,
+                        review,
+                        outcome,
+                        result.map(|r| r.content.as_str()),
+                        duration,
+                    );
+                    if let Some(ref callId) = turn.toolCallId {
+                        replayedToolResults.insert(callId.clone());
+                    }
                 }
             }
             TurnRole::ToolResult => {
@@ -5069,6 +5198,11 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
                     // Skip pushing a ToolResult — SubagentBlock handles display.
                     continue;
                 }
+                if let Some(ref callId) = turn.toolCallId
+                    && replayedToolResults.contains(callId)
+                {
+                    continue;
+                }
 
                 let name = turn.tool.as_deref().unwrap_or("tool");
                 panel
@@ -5082,6 +5216,63 @@ fn replayTranscript(panel: &mut AgentPanel, turns: &[construct::transcript::Turn
             TurnRole::System => {}
         }
     }
+}
+
+fn replayToolDiff(turn: &construct::transcript::Turn) -> Option<String> {
+    if let Some(diff) = turn
+        .toolMeta
+        .as_ref()
+        .and_then(|meta| meta.diff.as_ref())
+        .filter(|diff| !diff.trim().is_empty())
+    {
+        return Some(diff.clone());
+    }
+
+    let name = turn.tool.as_deref()?;
+    let argsJson = turn.args.as_ref()?.to_string();
+    construct::tool::parse(name, &argsJson)
+        .ok()
+        .and_then(|action| construct::tool::diffPreview(&action))
+}
+
+fn replayToolSummary(turn: &construct::transcript::Turn) -> String {
+    if let Some(summary) = turn
+        .toolMeta
+        .as_ref()
+        .and_then(|meta| meta.summary.as_ref())
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        return summary.clone();
+    }
+
+    let name = turn.tool.as_deref().unwrap_or("tool");
+    let argsJson = turn
+        .args
+        .as_ref()
+        .map(|args| args.to_string())
+        .unwrap_or_default();
+    if let Ok(action) = construct::tool::parse(name, &argsJson) {
+        return construct::tool::summarize(&action);
+    }
+    if argsJson.len() > 80 {
+        format!("{}\u{2026}", &argsJson[..argsJson.floor_char_boundary(79)])
+    } else {
+        argsJson
+    }
+}
+
+fn replayToolDuration(
+    call: &construct::transcript::Turn,
+    result: Option<&construct::transcript::Turn>,
+    meta: Option<&construct::transcript::ToolCallMeta>,
+) -> Option<Duration> {
+    let started = meta
+        .and_then(|m| m.startedAtMs)
+        .or_else(|| Some(call.ts.saturating_mul(1000)))?;
+    let completed = meta
+        .and_then(|m| m.completedAtMs)
+        .or_else(|| result.map(|r| r.ts.saturating_mul(1000)))?;
+    completed.checked_sub(started).map(Duration::from_millis)
 }
 
 /// Load tool lines and turn count from a child session transcript.
@@ -5384,5 +5575,74 @@ fn dispatchSlashCommand(
                 "/layout reached dispatchSlashCommand — should have been handled inline"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use construct::transcript::{ToolCallMeta, Turn, TurnRole, TurnStatus};
+
+    fn toolCallTurn(name: &str, args: serde_json::Value, toolMeta: Option<ToolCallMeta>) -> Turn {
+        Turn {
+            id: "turn".into(),
+            blockId: "block".into(),
+            topicId: "topic".into(),
+            role: TurnRole::ToolCall,
+            content: String::new(),
+            ts: 1,
+            parentId: None,
+            tool: Some(name.into()),
+            args: Some(args),
+            toolCallId: Some("call".into()),
+            reasoning: None,
+            attachments: None,
+            toolMeta,
+            cost: None,
+            promptTokens: None,
+            completionTokens: None,
+            model: None,
+            finishReason: None,
+            snapshotHash: None,
+            status: TurnStatus::Completed,
+        }
+    }
+
+    #[test]
+    fn replayToolDiffFallsBackToEditArgsWhenMetaDiffIsMissing() {
+        let turn = toolCallTurn(
+            "editFile",
+            serde_json::json!({
+                "path": "replay-missing-file.txt",
+                "old_string": "font-family = Berkeley Mono",
+                "new_string": "font-family = TX-02",
+                "replace_all": false
+            }),
+            None,
+        );
+
+        let diff = replayToolDiff(&turn).expect("edit args should reconstruct a diff");
+
+        assert!(diff.contains("--- a/replay-missing-file.txt"));
+        assert!(diff.contains("-font-family = Berkeley Mono"));
+        assert!(diff.contains("+font-family = TX-02"));
+    }
+
+    #[test]
+    fn replayToolDiffPrefersStoredTranscriptDiff() {
+        let mut meta = ToolCallMeta::default();
+        meta.diff = Some("stored diff".into());
+        let turn = toolCallTurn(
+            "editFile",
+            serde_json::json!({
+                "path": "replay-missing-file.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "replace_all": false
+            }),
+            Some(meta),
+        );
+
+        assert_eq!(replayToolDiff(&turn).as_deref(), Some("stored diff"));
     }
 }

@@ -18,6 +18,11 @@ Resolution order:
 Set `FLATLINE_CONFIG=/path/to/config.toml` to load one explicit file instead
 of using normal layer discovery.
 
+Set `FLATLINE_SHELL=/path/to/bash-or-zsh` to choose the embedded shared shell.
+This is most useful on Windows when `bash.exe` is installed but not on `PATH`.
+The shell setting is intentionally an environment variable because it affects
+the PTY process that Flatline starts before project-level interaction begins.
+
 For a complete starter file that mirrors the generated defaults, see
 [examples/config.toml](examples/config.toml).
 

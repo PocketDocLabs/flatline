@@ -1,19 +1,24 @@
 use tokio::sync::watch;
 
 use super::Session;
+use crate::control::AutoReviewReport;
 use crate::message::{Message, ToolCall};
 use crate::tool::{self, ShellImpact};
 
 pub(super) enum AutoPermissionDecision {
-    Approved,
+    Approved {
+        review: AutoReviewReport,
+    },
     Denied {
         message: String,
+        review: Option<AutoReviewReport>,
     },
     AskUser {
         summary: String,
         diff: Option<String>,
         explanation: Option<String>,
         impact: ShellImpact,
+        review: Option<AutoReviewReport>,
     },
     Cancelled,
 }
@@ -45,13 +50,13 @@ impl Session {
                     }
                     raisedExplanation
                         .push_str("Auto reviewer allowed escalation for this exact action.");
-                    if !ticket.reason.is_empty() {
+                    if !ticket.report.reason.is_empty() {
                         raisedExplanation.push_str("\nReviewer reason: ");
-                        raisedExplanation.push_str(&ticket.reason);
+                        raisedExplanation.push_str(&ticket.report.reason);
                     }
-                    if !ticket.messageToAgent.is_empty() {
+                    if !ticket.report.messageToAgent.is_empty() {
                         raisedExplanation.push_str("\nReviewer message: ");
-                        raisedExplanation.push_str(&ticket.messageToAgent);
+                        raisedExplanation.push_str(&ticket.report.messageToAgent);
                     }
                     if let Some(ref reason) = meta.raiseReason {
                         raisedExplanation.push_str("\nAgent raise reason: ");
@@ -62,10 +67,12 @@ impl Session {
                         diff,
                         explanation: Some(raisedExplanation),
                         impact,
+                        review: Some(ticket.report),
                     }
                 }
                 None => AutoPermissionDecision::Denied {
                     message: "raiseToUser was set, but there is no active auto-review raise ticket for this exact action. Continue without asking the user, or retry without raiseToUser to request a fresh auto review.".into(),
+                    review: None,
                 },
             };
         }
@@ -93,7 +100,9 @@ impl Session {
         };
 
         match reviewResult {
-            Ok(review) if review.allowed() => AutoPermissionDecision::Approved,
+            Ok(review) if review.allowed() => AutoPermissionDecision::Approved {
+                review: review.report(),
+            },
             Ok(review) => {
                 if review.raiseAllowed() {
                     self.autoReviewTickets
@@ -101,6 +110,7 @@ impl Session {
                 }
                 AutoPermissionDecision::Denied {
                     message: review.denialToolResult(),
+                    review: Some(review.report()),
                 }
             }
             Err(e) => {
@@ -118,6 +128,7 @@ impl Session {
                     diff,
                     explanation: fallbackExplanation,
                     impact,
+                    review: None,
                 }
             }
         }

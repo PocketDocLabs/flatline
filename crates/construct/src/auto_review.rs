@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::api;
 use crate::config::ModelTier;
+use crate::control::AutoReviewReport;
 use crate::message::{Content, Message};
 use crate::tool::ShellImpact;
 
@@ -155,8 +156,7 @@ pub(crate) struct ReviewInput {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RaiseTicket {
-    pub reason: String,
-    pub messageToAgent: String,
+    pub report: AutoReviewReport,
 }
 
 impl Review {
@@ -170,6 +170,16 @@ impl Review {
 
     pub(crate) fn raiseTicket(&self) -> RaiseTicket {
         RaiseTicket {
+            report: self.report(),
+        }
+    }
+
+    pub(crate) fn report(&self) -> AutoReviewReport {
+        AutoReviewReport {
+            decision: self.decision.asStr().to_string(),
+            raiseToUser: self.raiseToUser.asStr().to_string(),
+            risk: self.risk.asStr().to_string(),
+            authorization: self.authorization.asStr().to_string(),
             reason: self.reason.clone(),
             messageToAgent: self.messageToAgent.clone(),
         }
@@ -199,7 +209,35 @@ impl Review {
     }
 }
 
+impl AutoDecision {
+    fn asStr(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+impl RaiseToUser {
+    fn asStr(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allowed => "allowed",
+            Self::Forbidden => "forbidden",
+        }
+    }
+}
+
 impl Risk {
+    fn asStr(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "low" => Ok(Self::Low),
@@ -212,6 +250,15 @@ impl Risk {
 }
 
 impl Authorization {
+    fn asStr(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "unknown" => Ok(Self::Unknown),
@@ -534,6 +581,17 @@ mod tests {
         assert_eq!(review.risk, Risk::Medium);
         assert_eq!(review.authorization, Authorization::Low);
         assert_eq!(review.reason, "Needs user preference.");
+        assert_eq!(
+            review.report(),
+            AutoReviewReport {
+                decision: "deny".into(),
+                raiseToUser: "allowed".into(),
+                risk: "medium".into(),
+                authorization: "low".into(),
+                reason: "Needs user preference.".into(),
+                messageToAgent: "Retry with raiseToUser only if blocking.".into(),
+            }
+        );
     }
 
     #[test]

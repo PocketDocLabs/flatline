@@ -291,27 +291,35 @@ pub fn summarize(action: &ToolAction) -> String {
 ///
 /// Returns a diff string for `editFile` and `writeFile` actions,
 /// or `None` for everything else.
-pub(crate) fn diffPreview(action: &ToolAction) -> Option<String> {
+pub fn diffPreview(action: &ToolAction) -> Option<String> {
     match action {
         ToolAction::EditFile {
             path,
             oldString,
             newString,
-            ..
+            replaceAll,
         } => {
-            let diff = similar::TextDiff::configure()
-                .algorithm(similar::Algorithm::Patience)
-                .diff_lines(oldString, newString);
-            let unified = diff
-                .unified_diff()
-                .context_radius(3)
-                .header(&format!("a/{path}"), &format!("b/{path}"))
-                .to_string();
-            if unified.trim().is_empty() {
-                None
-            } else {
-                Some(unified)
+            if let Ok(original) = std::fs::read_to_string(path) {
+                let proposed = if *replaceAll {
+                    original.replace(oldString, newString)
+                } else {
+                    original.replacen(oldString, newString, 1)
+                };
+                if let Some(diff) = unifiedDiff(
+                    &original,
+                    &proposed,
+                    &format!("a/{path}"),
+                    &format!("b/{path}"),
+                ) {
+                    return Some(diff);
+                }
             }
+            unifiedDiff(
+                oldString,
+                newString,
+                &format!("a/{path}"),
+                &format!("b/{path}"),
+            )
         }
         ToolAction::WriteFile { path, content } => {
             let old = std::fs::read_to_string(path).unwrap_or_default();
@@ -322,19 +330,7 @@ pub(crate) fn diffPreview(action: &ToolAction) -> Option<String> {
                 let additions: String = content.lines().map(|l| format!("+{l}\n")).collect();
                 Some(format!("{header}\n{additions}"))
             } else {
-                let diff = similar::TextDiff::configure()
-                    .algorithm(similar::Algorithm::Patience)
-                    .diff_lines(&old, content);
-                let unified = diff
-                    .unified_diff()
-                    .context_radius(3)
-                    .header(&format!("a/{path}"), &format!("b/{path}"))
-                    .to_string();
-                if unified.trim().is_empty() {
-                    None
-                } else {
-                    Some(unified)
-                }
+                unifiedDiff(&old, content, &format!("a/{path}"), &format!("b/{path}"))
             }
         }
         ToolAction::MultiEdit { path, edits } => {
@@ -350,21 +346,30 @@ pub(crate) fn diffPreview(action: &ToolAction) -> Option<String> {
                     content = content.replacen(&edit.oldString, &edit.newString, 1);
                 }
             }
-            let diff = similar::TextDiff::configure()
-                .algorithm(similar::Algorithm::Patience)
-                .diff_lines(&original, &content);
-            let unified = diff
-                .unified_diff()
-                .context_radius(3)
-                .header(&format!("a/{path}"), &format!("b/{path}"))
-                .to_string();
-            if unified.trim().is_empty() {
-                None
-            } else {
-                Some(unified)
-            }
+            unifiedDiff(
+                &original,
+                &content,
+                &format!("a/{path}"),
+                &format!("b/{path}"),
+            )
         }
         _ => None,
+    }
+}
+
+fn unifiedDiff(old: &str, new: &str, oldHeader: &str, newHeader: &str) -> Option<String> {
+    let diff = similar::TextDiff::configure()
+        .algorithm(similar::Algorithm::Patience)
+        .diff_lines(old, new);
+    let unified = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(oldHeader, newHeader)
+        .to_string();
+    if unified.trim().is_empty() {
+        None
+    } else {
+        Some(unified)
     }
 }
 
@@ -405,5 +410,33 @@ pub(crate) fn proposedContent(action: &ToolAction) -> Option<(String, String)> {
             Some((path.clone(), content))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editFileDiffPreviewUsesWholeFileContext() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "# Berkeley Mono TX-02 (v2)\nfont-family = Berkeley Mono\nfont-size = 13\n",
+        )
+        .unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let action = ToolAction::EditFile {
+            path: path.clone(),
+            oldString: "font-family = Berkeley Mono".into(),
+            newString: "font-family = TX-02".into(),
+            replaceAll: false,
+        };
+
+        let diff = diffPreview(&action).expect("edit diff");
+        assert!(diff.contains(&format!("--- a/{path}")));
+        assert!(diff.contains("-font-family = Berkeley Mono"));
+        assert!(diff.contains("+font-family = TX-02"));
+        assert!(diff.contains("font-size = 13"));
     }
 }

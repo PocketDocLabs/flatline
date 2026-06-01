@@ -87,6 +87,10 @@ pub struct Turn {
     /// Image attachments persisted for session resume.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attachments: Option<Vec<TurnAttachment>>,
+    /// Tool-call display metadata persisted for session resume. This is
+    /// semantic state, not ephemeral UI state like collapse/copy/scroll.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub toolMeta: Option<ToolCallMeta>,
     /// USD cost of this turn (assistant turns only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost: Option<f64>,
@@ -126,6 +130,33 @@ pub struct AssistantMeta<'a> {
     pub finishReason: Option<&'a str>,
     pub snapshotHash: Option<&'a str>,
     pub status: TurnStatus,
+}
+
+/// Persisted display-relevant metadata for a tool call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallMeta {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub outcome: Option<ToolCallOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub review: Option<crate::control::AutoReviewReport>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub startedAtMs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completedAtMs: Option<u64>,
+}
+
+/// Persisted permission/execution outcome for a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallOutcome {
+    Approved,
+    Denied,
+    Aborted,
 }
 
 /// An image attachment stored in the transcript.
@@ -306,6 +337,7 @@ impl Transcript {
             toolCallId: None,
             reasoning: None,
             attachments,
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -337,6 +369,7 @@ impl Transcript {
             toolCallId: None,
             reasoning: None,
             attachments: None,
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -363,6 +396,7 @@ impl Transcript {
             toolCallId: None,
             reasoning: meta.reasoning.map(|s| s.to_string()),
             attachments: None,
+            toolMeta: None,
             cost: meta.cost,
             promptTokens: meta.promptTokens,
             completionTokens: meta.completionTokens,
@@ -394,6 +428,7 @@ impl Transcript {
             toolCallId: Some(callId.to_string()),
             reasoning: None,
             attachments: None,
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -425,6 +460,7 @@ impl Transcript {
             toolCallId: Some(callId.to_string()),
             reasoning: None,
             attachments,
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -439,6 +475,24 @@ impl Transcript {
     /// Load all turns from the transcript file.
     pub fn loadAll(&self) -> Result<Vec<Turn>> {
         crate::storage::loadTurns(&self.conn.lock().unwrap())
+    }
+
+    /// Update persisted semantic metadata for a recorded tool call.
+    pub fn updateToolCallMeta(
+        &mut self,
+        callId: &str,
+        f: impl FnOnce(&mut ToolCallMeta),
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut turns = crate::storage::loadTurns(&conn)?;
+        let Some(turn) = turns.iter_mut().find(|turn| {
+            matches!(turn.role, TurnRole::ToolCall) && turn.toolCallId.as_deref() == Some(callId)
+        }) else {
+            return Ok(());
+        };
+        let meta = turn.toolMeta.get_or_insert_with(ToolCallMeta::default);
+        f(meta);
+        crate::storage::updateTurn(&conn, turn)
     }
 
     /// Write session metadata to SQLite.
@@ -586,6 +640,7 @@ mod tests {
                 mimeType: "image/png".into(),
                 data: "iVBORw0KGgo=".into(),
             }]),
+            toolMeta: None,
             cost: None,
             promptTokens: None,
             completionTokens: None,
@@ -611,6 +666,7 @@ mod tests {
         let json = r#"{"id":"t_1","blockId":"b_1","topicId":"","role":"user","content":"hello","ts":1000}"#;
         let turn: Turn = serde_json::from_str(json).unwrap();
         assert!(turn.attachments.is_none());
+        assert!(turn.toolMeta.is_none());
         assert_eq!(turn.content, "hello");
     }
 
@@ -663,5 +719,49 @@ mod tests {
         let atts = toolTurn.attachments.as_ref().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].mimeType, "image/png");
+    }
+
+    #[test]
+    fn updateToolCallMetaPersistsReviewerOutcomeAndTiming() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut transcript = tempTranscript(dir.path());
+
+        transcript.recordUser("start", None, None).unwrap();
+        transcript
+            .recordToolCall(
+                "call_1",
+                "shell",
+                &serde_json::json!({"command": "echo hi"}),
+            )
+            .unwrap();
+        transcript
+            .updateToolCallMeta("call_1", |meta| {
+                meta.summary = Some("Run: echo hi".into());
+                meta.diff = Some("--- before\n+++ after\n@@\n-old\n+new".into());
+                meta.outcome = Some(ToolCallOutcome::Approved);
+                meta.startedAtMs = Some(100);
+                meta.completedAtMs = Some(250);
+                meta.review = Some(crate::control::AutoReviewReport {
+                    decision: "allow".into(),
+                    raiseToUser: "none".into(),
+                    risk: "low".into(),
+                    authorization: "inline".into(),
+                    reason: "safe".into(),
+                    messageToAgent: String::new(),
+                });
+            })
+            .unwrap();
+
+        let turns = transcript.loadAll().unwrap();
+        let meta = turns[1].toolMeta.as_ref().expect("tool meta");
+        assert_eq!(meta.summary.as_deref(), Some("Run: echo hi"));
+        assert_eq!(
+            meta.diff.as_deref(),
+            Some("--- before\n+++ after\n@@\n-old\n+new")
+        );
+        assert_eq!(meta.outcome, Some(ToolCallOutcome::Approved));
+        assert_eq!(meta.startedAtMs, Some(100));
+        assert_eq!(meta.completedAtMs, Some(250));
+        assert_eq!(meta.review.as_ref().unwrap().reason, "safe");
     }
 }

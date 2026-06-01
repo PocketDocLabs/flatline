@@ -70,6 +70,17 @@ impl From<crate::shells::SpawnedBy> for TerminalSpawnedBy {
     }
 }
 
+/// Structured report returned by the automatic permission reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoReviewReport {
+    pub decision: String,
+    pub raiseToUser: String,
+    pub risk: String,
+    pub authorization: String,
+    pub reason: String,
+    pub messageToAgent: String,
+}
+
 /// Monotone log events emitted by the session during a turn.
 ///
 /// Fire-and-forget: no reply is expected for any variant. Consumers drain
@@ -97,8 +108,20 @@ pub enum LogEvent {
     /// field refines the preview.
     ToolCallPreview { index: usize, preview: String },
 
-    /// A tool was auto-approved by the permission config.
-    ToolAutoApproved { name: String, summary: String },
+    /// A tool is waiting on the automatic permission reviewer.
+    ToolAutoReviewStarted {
+        name: String,
+        summary: String,
+        diff: Option<String>,
+    },
+
+    /// A tool was auto-approved by the permission config or reviewer.
+    ToolAutoApproved {
+        name: String,
+        summary: String,
+        diff: Option<String>,
+        review: Option<AutoReviewReport>,
+    },
 
     /// A tool has started executing (after approval, before result).
     ToolStarted { name: String, summary: String },
@@ -109,8 +132,13 @@ pub enum LogEvent {
     /// A tool call was denied by a user action.
     ToolDenied { name: String },
 
-    /// A tool call was auto-denied by a permission rule.
-    ToolAutoDenied { name: String, summary: String },
+    /// A tool call was auto-denied by a permission rule or reviewer.
+    ToolAutoDenied {
+        name: String,
+        summary: String,
+        diff: Option<String>,
+        review: Option<AutoReviewReport>,
+    },
 
     /// Turn aborted because a tool call was denied under Abort mode.
     TurnAborted { name: String },
@@ -626,6 +654,7 @@ pub enum SessionRequest {
         diff: Option<String>,
         explanation: Option<String>,
         impact: ShellImpact,
+        review: Option<AutoReviewReport>,
         reply: oneshot::Sender<PermitResponse>,
     },
 }

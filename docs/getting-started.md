@@ -17,6 +17,34 @@ Optional integrations:
 - Language server binaries for LSP diagnostics
 - MCP servers configured in `.mcp.json`
 
+## OS Notes
+
+macOS and Linux work best from a modern terminal with bash or zsh available.
+Flatline uses that shell for the shared PTY and injects lightweight shell
+integration so agent-run commands can be captured reliably.
+
+On Windows, use Windows Terminal, VS Code's integrated terminal, or another
+terminal with ANSI support. Flatline's shared shell currently needs a
+POSIX-compatible bash or zsh. The native Windows build will auto-use `bash.exe`
+when it is on `PATH`; Git for Windows and MSYS2 are the common options. If
+Flatline cannot find it, set `FLATLINE_SHELL` before launching:
+
+```powershell
+$env:FLATLINE_SHELL = "C:\Program Files\Git\bin\bash.exe"
+cargo run -p deck
+```
+
+In `cmd.exe`:
+
+```bat
+set FLATLINE_SHELL=C:\Program Files\Git\bin\bash.exe
+cargo run -p deck
+```
+
+PowerShell and `cmd.exe` can still launch Flatline, but they are not currently
+supported as the embedded shared shell. For a Linux-like environment on Windows,
+run Flatline inside WSL rather than pointing the Windows binary at `wsl.exe`.
+
 ## Run the TUI
 
 From the repository root:

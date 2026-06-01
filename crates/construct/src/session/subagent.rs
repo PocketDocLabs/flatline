@@ -96,6 +96,7 @@ async fn runSubagentTaskInBackground(
                 LogEvent::ContentDelta(_)
                 | LogEvent::ReasoningDelta(_)
                 | LogEvent::ToolStarted { .. }
+                | LogEvent::ToolAutoReviewStarted { .. }
                 | LogEvent::ToolAutoApproved { .. }
                 | LogEvent::ToolResult { .. }
                 | LogEvent::ToolDenied { .. }
@@ -134,6 +135,7 @@ async fn runSubagentTaskInBackground(
                     diff,
                     explanation,
                     impact,
+                    review,
                     reply: childReply,
                 } => {
                     let (parentReplyTx, parentReplyRx) = oneshot::channel();
@@ -148,6 +150,7 @@ async fn runSubagentTaskInBackground(
                             diff,
                             explanation,
                             impact,
+                            review,
                             reply: parentReplyTx,
                         })
                         .await
@@ -394,6 +397,7 @@ impl Session {
                     LogEvent::ContentDelta(_)
                     | LogEvent::ReasoningDelta(_)
                     | LogEvent::ToolStarted { .. }
+                    | LogEvent::ToolAutoReviewStarted { .. }
                     | LogEvent::ToolAutoApproved { .. }
                     | LogEvent::ToolResult { .. }
                     | LogEvent::ToolDenied { .. }
@@ -428,6 +432,7 @@ impl Session {
                         diff,
                         explanation,
                         impact,
+                        review,
                         reply: childReply,
                     } => {
                         let (parentReplyTx, parentReplyRx) = oneshot::channel();
@@ -442,6 +447,7 @@ impl Session {
                                 diff,
                                 explanation,
                                 impact,
+                                review,
                                 reply: parentReplyTx,
                             })
                             .await

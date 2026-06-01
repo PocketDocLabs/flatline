@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,12 +31,13 @@ use alacritty_terminal::{
     term::Config as VtConfig,
     vte::ansi::Processor,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
 const MAX_HISTORY: usize = 50;
+const FLATLINE_SHELL_ENV: &str = "FLATLINE_SHELL";
 
 pub type ShellLineCallback = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
@@ -434,6 +436,78 @@ pub struct ShellIo {
     pub killTx: mpsc::Sender<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Bash,
+    Zsh,
+}
+
+fn resolveShellBin() -> Result<String> {
+    if let Some(shell) = envVar(FLATLINE_SHELL_ENV).or_else(|| envVar("SHELL")) {
+        return Ok(shell);
+    }
+
+    if let Some(shell) = findOnPath(&["bash.exe", "bash", "zsh.exe", "zsh"]) {
+        return Ok(shell);
+    }
+
+    #[cfg(windows)]
+    bail!(
+        "could not find a supported shell. Install Git for Windows or MSYS2, or set {FLATLINE_SHELL_ENV} to a bash/zsh executable before starting Flatline."
+    );
+
+    #[cfg(not(windows))]
+    bail!(
+        "could not find a supported shell. Install bash or zsh, or set {FLATLINE_SHELL_ENV} to a bash/zsh executable before starting Flatline."
+    );
+}
+
+fn envVar(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn findOnPath(candidates: &[&str]) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        for candidate in candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn supportedShellKind(shell: &str) -> Option<ShellKind> {
+    match shellProgramName(shell).as_str() {
+        "bash" => Some(ShellKind::Bash),
+        "zsh" => Some(ShellKind::Zsh),
+        _ => None,
+    }
+}
+
+fn shellProgramName(shell: &str) -> String {
+    let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let file = file.to_ascii_lowercase();
+    file.strip_suffix(".exe").unwrap_or(&file).to_string()
+}
+
+fn pathForShellArg(path: &Path) -> String {
+    let path = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 /// Create a shell session.
 ///
 /// Spawns a PTY with the user's default shell and a background
@@ -456,18 +530,25 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         })
         .context("Failed to open PTY")?;
 
-    let shellBin = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+    let shellBin = resolveShellBin()?;
+    let shellKind = supportedShellKind(&shellBin).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported shell '{}'. Flatline's shared terminal currently needs bash or zsh for command tracking. Set {FLATLINE_SHELL_ENV} to a bash/zsh executable, such as Git Bash on Windows.",
+            shellBin
+        )
+    })?;
     let mut cmd = CommandBuilder::new(&shellBin);
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
+    cmd.env("SHELL", &shellBin);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("GIT_PAGER", "cat");
     cmd.env("PAGER", "cat");
 
     // Inject OSC 133 shell integration for command boundary tracking.
-    injectShellIntegration(&shellBin, &mut cmd)?;
+    injectShellIntegration(shellKind, &mut cmd)?;
 
     slave.spawn_command(cmd).context("Failed to spawn shell")?;
 
@@ -1093,33 +1174,34 @@ fn stripAnsi(input: &str) -> String {
 /// For zsh: overrides ZDOTDIR with a temp directory containing init files
 /// that source the originals and add precmd/preexec hooks.
 /// For bash: uses --rcfile pointing to a wrapper that sources .bashrc first.
-fn injectShellIntegration(shell: &str, cmd: &mut CommandBuilder) -> Result<()> {
+fn injectShellIntegration(shellKind: ShellKind, cmd: &mut CommandBuilder) -> Result<()> {
     let integrationDir = std::env::temp_dir().join(format!("flatline-si-{}", std::process::id()));
     std::fs::create_dir_all(&integrationDir)?;
 
-    if shell.ends_with("zsh") {
-        let originalZdotdir =
-            std::env::var("ZDOTDIR").unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default());
+    match shellKind {
+        ShellKind::Zsh => {
+            let originalZdotdir = std::env::var("ZDOTDIR")
+                .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default());
 
-        // Forward all zsh init files to originals.
-        for file in &[".zshenv", ".zprofile", ".zlogin"] {
-            let content = format!(
-                "[[ -f \"{originalZdotdir}/{file}\" ]] && source \"{originalZdotdir}/{file}\"\n"
-            );
-            std::fs::write(integrationDir.join(file), content)?;
-        }
+            // Forward all zsh init files to originals.
+            for file in &[".zshenv", ".zprofile", ".zlogin"] {
+                let content = format!(
+                    "[[ -f \"{originalZdotdir}/{file}\" ]] && source \"{originalZdotdir}/{file}\"\n"
+                );
+                std::fs::write(integrationDir.join(file), content)?;
+            }
 
-        // .zshrc: source original, restore ZDOTDIR, add hooks. The
-        // precmd hook does double duty: emits the standard OSC 133
-        // boundary markers, AND when the caller has set
-        // `_flatline_uuid`, emits a per-command END marker carrying
-        // that uuid and the just-finished command's exit code. That
-        // lets the wrapper be a single line (no need for a follow-up
-        // "; printf END" statement that the shell would have to read
-        // as a second line — which always raced with the prompt and
-        // hung until timeout).
-        let zshrc = format!(
-            r#"[[ -f "{originalZdotdir}/.zshrc" ]] && source "{originalZdotdir}/.zshrc"
+            // .zshrc: source original, restore ZDOTDIR, add hooks. The
+            // precmd hook does double duty: emits the standard OSC 133
+            // boundary markers, AND when the caller has set
+            // `_flatline_uuid`, emits a per-command END marker carrying
+            // that uuid and the just-finished command's exit code. That
+            // lets the wrapper be a single line (no need for a follow-up
+            // "; printf END" statement that the shell would have to read
+            // as a second line — which always raced with the prompt and
+            // hung until timeout).
+            let zshrc = format!(
+                r#"[[ -f "{originalZdotdir}/.zshrc" ]] && source "{originalZdotdir}/.zshrc"
 ZDOTDIR="{originalZdotdir}"
 # Agent shell has no interactive history — disable ! expansion
 # so globs like [!.]* don't trigger "event not found".
@@ -1147,11 +1229,12 @@ flatline_preexec() {{ printf '\e]133;C\a' }}
 precmd_functions+=(flatline_precmd)
 preexec_functions+=(flatline_preexec)
 "#
-        );
-        std::fs::write(integrationDir.join(".zshrc"), zshrc)?;
-        cmd.env("ZDOTDIR", integrationDir.to_str().unwrap_or_default());
-    } else if shell.ends_with("bash") {
-        let bashrc = r#"[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
+            );
+            std::fs::write(integrationDir.join(".zshrc"), zshrc)?;
+            cmd.env("ZDOTDIR", pathForShellArg(&integrationDir));
+        }
+        ShellKind::Bash => {
+            let bashrc = r#"[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
 # Agent shell has no interactive history — disable ! expansion
 # so globs like [!.]* don't trigger "event not found".
 set +H
@@ -1166,10 +1249,11 @@ flatline_prompt_command() {
 PROMPT_COMMAND="flatline_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 trap 'printf "\033]133;C\a"' DEBUG
 "#;
-        let bashrcPath = integrationDir.join("flatline_bashrc");
-        std::fs::write(&bashrcPath, bashrc)?;
-        cmd.arg("--rcfile");
-        cmd.arg(bashrcPath.to_str().unwrap_or_default());
+            let bashrcPath = integrationDir.join("flatline_bashrc");
+            std::fs::write(&bashrcPath, bashrc)?;
+            cmd.arg("--rcfile");
+            cmd.arg(pathForShellArg(&bashrcPath));
+        }
     }
 
     Ok(())
@@ -1184,4 +1268,31 @@ fn generateUuid() -> String {
         .subsec_nanos();
     let pid = std::process::id();
     format!("{pid:x}{nanos:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shellProgramNameHandlesWindowsAndUnixPaths() {
+        assert_eq!(shellProgramName("/bin/bash"), "bash");
+        assert_eq!(shellProgramName("/opt/homebrew/bin/zsh"), "zsh");
+        assert_eq!(
+            shellProgramName(r"C:\Program Files\Git\bin\bash.exe"),
+            "bash"
+        );
+        assert_eq!(shellProgramName(r"C:\Tools\BASH.EXE"), "bash");
+        assert_eq!(shellProgramName("pwsh.exe"), "pwsh");
+    }
+
+    #[test]
+    fn supportedShellKindAcceptsBashAndZshExecutables() {
+        assert_eq!(
+            supportedShellKind(r"C:\Program Files\Git\bin\bash.exe"),
+            Some(ShellKind::Bash)
+        );
+        assert_eq!(supportedShellKind("/bin/zsh"), Some(ShellKind::Zsh));
+        assert_eq!(supportedShellKind("powershell.exe"), None);
+    }
 }

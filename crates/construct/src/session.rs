@@ -43,7 +43,7 @@ use crate::prompt::{self, DomainModule, InterfaceMode};
 use crate::shells::{ShellRegistry, SpawnedBy};
 use crate::tool;
 use crate::topic::{TopicDecision, TopicTracker};
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, ToolCallOutcome, Transcript};
 use crate::web;
 
 mod auto_permissions;
@@ -204,6 +204,13 @@ fn unixNow() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn unixNowMs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn toolDefsForPermitMode(mode: &PermitMode) -> Vec<ToolDef> {
@@ -1111,6 +1118,11 @@ impl Session {
                                     }
                                 };
                             let summary = tool::summarize(&action);
+                            let diff = tool::diffPreview(&action);
+                            let _ = self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                meta.summary = Some(summary.clone());
+                                meta.diff = diff.clone();
+                            });
 
                             // Pre-emptive LSP notification: send didChange with proposed
                             // content so RA starts analyzing while the user reviews.
@@ -1134,7 +1146,7 @@ impl Session {
 
                             let mut deniedMessage: Option<String> = None;
                             macro_rules! request_permit {
-                                ($permitSummary:expr, $diff:expr, $explanation:expr, $impact:expr) => {{
+                                ($permitSummary:expr, $diff:expr, $explanation:expr, $impact:expr, $review:expr) => {{
                                     let (replyTx, replyRx) = oneshot::channel();
                                     let _ = sessionRequestTx
                                         .send(SessionRequest::Permit {
@@ -1145,6 +1157,7 @@ impl Session {
                                             diff: $diff,
                                             explanation: $explanation,
                                             impact: $impact,
+                                            review: $review,
                                             reply: replyTx,
                                         })
                                         .await;
@@ -1221,33 +1234,69 @@ impl Session {
 
                             let approved = match verdict {
                                 Verdict::Allow => {
+                                    let _ = self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                        meta.outcome = Some(ToolCallOutcome::Approved);
+                                    });
                                     let _ = logTx
                                         .send(LogEvent::ToolAutoApproved {
                                             name: call.function.name.clone(),
                                             summary: summary.clone(),
+                                            diff: diff.clone(),
+                                            review: None,
                                         })
                                         .await;
                                     true
                                 }
                                 Verdict::Deny => {
+                                    let _ = self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                        meta.outcome = Some(ToolCallOutcome::Denied);
+                                    });
                                     let _ = logTx
                                         .send(LogEvent::ToolAutoDenied {
                                             name: call.function.name.clone(),
                                             summary: summary.clone(),
+                                            diff: diff.clone(),
+                                            review: None,
                                         })
                                         .await;
                                     false
                                 }
                                 Verdict::NeedsApproval => match self.permissions.defaultMode {
                                     PermitMode::Ask => {
-                                        let diff = tool::diffPreview(&action);
                                         let explanation =
                                             crate::permissions::toolExplanation(&action)
                                                 .map(|s| s.to_string());
                                         let impact = crate::permissions::toolImpact(&action);
-                                        request_permit!(summary, diff, explanation, impact)
+                                        let allowed = request_permit!(
+                                            summary,
+                                            diff.clone(),
+                                            explanation,
+                                            impact,
+                                            None
+                                        );
+                                        let _ =
+                                            self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                                meta.outcome = Some(if allowed {
+                                                    ToolCallOutcome::Approved
+                                                } else {
+                                                    ToolCallOutcome::Denied
+                                                });
+                                            });
+                                        allowed
                                     }
                                     PermitMode::Auto => {
+                                        let meta = crate::auto_review::permissionMeta(
+                                            &call.function.arguments,
+                                        );
+                                        if !meta.raiseToUser {
+                                            let _ = logTx
+                                                .send(LogEvent::ToolAutoReviewStarted {
+                                                    name: call.function.name.clone(),
+                                                    summary: summary.clone(),
+                                                    diff: diff.clone(),
+                                                })
+                                                .await;
+                                        }
                                         let decision = self
                                             .reviewAutoPermission(
                                                 call,
@@ -1258,23 +1307,48 @@ impl Session {
                                             )
                                             .await;
                                         match decision {
-                                            auto_permissions::AutoPermissionDecision::Approved => {
+                                            auto_permissions::AutoPermissionDecision::Approved {
+                                                review,
+                                            } => {
+                                                let reviewForMeta = review.clone();
+                                                let _ = self.transcript.updateToolCallMeta(
+                                                    &call.id,
+                                                    |meta| {
+                                                        meta.outcome =
+                                                            Some(ToolCallOutcome::Approved);
+                                                        meta.review = Some(reviewForMeta);
+                                                    },
+                                                );
                                                 let _ = logTx
                                                     .send(LogEvent::ToolAutoApproved {
                                                         name: call.function.name.clone(),
                                                         summary: summary.clone(),
+                                                        diff: diff.clone(),
+                                                        review: Some(review),
                                                     })
                                                     .await;
                                                 true
                                             }
                                             auto_permissions::AutoPermissionDecision::Denied {
                                                 message,
+                                                review,
                                             } => {
+                                                let reviewForMeta = review.clone();
+                                                let _ = self.transcript.updateToolCallMeta(
+                                                    &call.id,
+                                                    |meta| {
+                                                        meta.outcome =
+                                                            Some(ToolCallOutcome::Denied);
+                                                        meta.review = reviewForMeta;
+                                                    },
+                                                );
                                                 deniedMessage = Some(message);
                                                 let _ = logTx
                                                     .send(LogEvent::ToolAutoDenied {
                                                         name: call.function.name.clone(),
                                                         summary: summary.clone(),
+                                                        diff: diff.clone(),
+                                                        review,
                                                     })
                                                     .await;
                                                 false
@@ -1284,8 +1358,29 @@ impl Session {
                                                 diff,
                                                 explanation,
                                                 impact,
+                                                review,
                                             } => {
-                                                request_permit!(summary, diff, explanation, impact)
+                                                let reviewForPermit = review.clone();
+                                                let allowed = request_permit!(
+                                                    summary,
+                                                    diff.clone(),
+                                                    explanation,
+                                                    impact,
+                                                    reviewForPermit
+                                                );
+                                                let _ = self.transcript.updateToolCallMeta(
+                                                    &call.id,
+                                                    |meta| {
+                                                        meta.outcome = Some(if allowed {
+                                                            ToolCallOutcome::Approved
+                                                        } else {
+                                                            ToolCallOutcome::Denied
+                                                        });
+                                                        meta.diff = diff;
+                                                        meta.review = review;
+                                                    },
+                                                );
+                                                allowed
                                             }
                                             auto_permissions::AutoPermissionDecision::Cancelled => {
                                                 for remaining in &calls[callIdx..] {
@@ -1302,6 +1397,10 @@ impl Session {
                                         }
                                     }
                                     PermitMode::Deny => {
+                                        let _ =
+                                            self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                                meta.outcome = Some(ToolCallOutcome::Denied);
+                                            });
                                         let _ = logTx
                                             .send(LogEvent::ToolDenied {
                                                 name: call.function.name.clone(),
@@ -1310,6 +1409,10 @@ impl Session {
                                         false
                                     }
                                     PermitMode::Abort => {
+                                        let _ =
+                                            self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                                meta.outcome = Some(ToolCallOutcome::Aborted);
+                                            });
                                         let _ = logTx
                                             .send(LogEvent::TurnAborted {
                                                 name: call.function.name.clone(),
@@ -1364,6 +1467,10 @@ impl Session {
 
                             let output = if approved {
                                 tracing::info!(tool = %call.function.name, "executing tool");
+                                let startedAtMs = unixNowMs();
+                                let _ = self.transcript.updateToolCallMeta(&call.id, |meta| {
+                                    meta.startedAtMs.get_or_insert(startedAtMs);
+                                });
 
                                 if tool::needsTask(&action) {
                                     // Subagent events handle all TUI rendering — no ToolStarted needed.
@@ -2272,6 +2379,10 @@ impl Session {
         } else {
             None
         };
+        let completedAtMs = unixNowMs();
+        let _ = self.transcript.updateToolCallMeta(callId, |meta| {
+            meta.completedAtMs = Some(completedAtMs);
+        });
         match self
             .transcript
             .recordToolResult(callId, content.textContent(), turnAttachments)

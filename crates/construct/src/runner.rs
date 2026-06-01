@@ -375,7 +375,7 @@ pub fn runSession<'a>(
                     LogEvent::ToolStarted { name, summary } => {
                         tracing::info!(tool = %name, summary = %summary, "tool started");
                     }
-                    LogEvent::ToolAutoApproved { name, summary } => {
+                    LogEvent::ToolAutoApproved { name, summary, .. } => {
                         tracing::info!(tool = %name, summary = %summary, "tool auto-approved");
                     }
                     LogEvent::ToolResult { name, .. } => {

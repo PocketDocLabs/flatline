@@ -61,6 +61,11 @@ flatline
 Running without a subcommand starts the interactive terminal UI. Use
 `flatline exec` for headless/non-interactive runs.
 
+Windows users should launch Flatline from Windows Terminal or VS Code's
+integrated terminal. The native Windows build needs Git Bash/MSYS2 bash or zsh
+for the embedded shared shell; set `FLATLINE_SHELL` if `bash.exe` is not on
+`PATH`. See [Getting Started](docs/getting-started.md#os-notes).
+
 ## Documentation
 
 - [Getting Started](docs/getting-started.md): install, run, first session
