@@ -228,15 +228,19 @@ async fn runSubagentTaskInBackground(
         .send(LogEvent::SubagentComplete {
             sessionId: childSessionId.clone(),
             agentType: agentType.clone(),
-            content: displayContent,
+            content: displayContent.clone(),
             turns,
         })
         .await;
 
     match outcome {
-        Outcome::Killed => handle.killed().await,
-        Outcome::Errored(e) => handle.errored(format!("subagent failed: {e}")).await,
-        Outcome::Completed => handle.complete(0).await,
+        Outcome::Killed => handle.killedWithOutput(displayContent).await,
+        Outcome::Errored(e) => {
+            handle
+                .erroredWithOutput(format!("subagent failed: {e}"), displayContent)
+                .await
+        }
+        Outcome::Completed => handle.completeWithOutput(0, displayContent).await,
     }
 }
 

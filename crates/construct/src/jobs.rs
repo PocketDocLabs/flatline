@@ -115,6 +115,9 @@ pub struct JobInfo {
 /// Snapshot of a task's output for `jobOutput`.
 pub struct JobOutputSnapshot {
     pub lines: Vec<String>,
+    /// Completed subagents have a message-shaped final answer in addition
+    /// to their live line stream. Bash-style jobs leave this empty.
+    pub finalOutput: Option<String>,
     /// First line index this snapshot includes (caller uses to compute
     /// next `sinceLine`).
     pub firstLine: u64,
@@ -185,6 +188,7 @@ struct BgJobInner {
     state: JobState,
     completedAt: Option<Instant>,
     stdoutTail: LineRing,
+    finalOutput: Option<String>,
     /// Wake context attached AFTER spawn. The drainer reads this on
     /// completion and pushes a `WakeFire` through the registry's batcher
     /// — coalesced with any concurrent wakes into a single `WakeBatch`.
@@ -243,6 +247,7 @@ impl BgJob {
             .saturating_sub(inner.stdoutTail.items.len() as u64);
         JobOutputSnapshot {
             lines,
+            finalOutput: inner.finalOutput.clone(),
             firstLine,
             totalLines: inner.stdoutTail.totalPushed,
             state: inner.state.clone(),
@@ -281,17 +286,25 @@ impl SubagentJobHandle {
             .try_send(LogEvent::JobOutput { id: self.id, line });
     }
 
-    /// Mark the subagent complete with the given exit code. 0 = success.
-    pub async fn complete(&self, exitCode: i32) {
-        let (wakeCtx, tailPreview) = {
+    /// Mark the subagent complete and attach its final answer for the
+    /// completion wake and post-completion `jobOutput` calls.
+    pub async fn completeWithOutput(&self, exitCode: i32, finalOutput: String) {
+        let (wakeCtx, outputPreview) = {
             let mut g = self.inner.lock().unwrap();
             g.state = JobState::Completed { exitCode };
             g.completedAt = Some(Instant::now());
-            let (lines, _) = g.stdoutTail.since(None, 20);
-            let joined = if lines.is_empty() {
-                "(no output)".to_string()
+            if !finalOutput.is_empty() {
+                g.finalOutput = Some(finalOutput.clone());
+            }
+            let joined = if !finalOutput.is_empty() {
+                finalOutput
             } else {
-                lines.join("\n")
+                let (lines, _) = g.stdoutTail.since(None, 20);
+                if lines.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    lines.join("\n")
+                }
             };
             (g.wakeCtx.clone(), joined)
         };
@@ -306,25 +319,32 @@ impl SubagentJobHandle {
             wakeCtx,
             format!(
                 "Subagent task #{id} exited with code {exitCode}.\n\
-             Tail of output:\n{tailPreview}",
+             Final output:\n{outputPreview}",
                 id = self.id,
             ),
         )
         .await;
     }
 
-    /// Mark the subagent errored with a reason string (will be surfaced
-    /// in the tasks panel and via `jobOutput`).
-    pub async fn errored(&self, reason: String) {
-        let (wakeCtx, tailPreview) = {
+    /// Mark the subagent errored and attach any partial/final text that
+    /// the child produced before failing.
+    pub async fn erroredWithOutput(&self, reason: String, finalOutput: String) {
+        let (wakeCtx, outputPreview) = {
             let mut g = self.inner.lock().unwrap();
             g.state = JobState::Errored(reason.clone());
             g.completedAt = Some(Instant::now());
-            let (lines, _) = g.stdoutTail.since(None, 20);
-            let joined = if lines.is_empty() {
-                "(no output)".to_string()
+            if !finalOutput.is_empty() {
+                g.finalOutput = Some(finalOutput.clone());
+            }
+            let joined = if !finalOutput.is_empty() {
+                finalOutput
             } else {
-                lines.join("\n")
+                let (lines, _) = g.stdoutTail.since(None, 20);
+                if lines.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    lines.join("\n")
+                }
             };
             (g.wakeCtx.clone(), joined)
         };
@@ -339,20 +359,24 @@ impl SubagentJobHandle {
             wakeCtx,
             format!(
                 "Subagent task #{id} errored: {reason}.\n\
-             Tail of output:\n{tailPreview}",
+             Final output:\n{outputPreview}",
                 id = self.id,
             ),
         )
         .await;
     }
 
-    /// Mark the subagent killed (cooperative cancellation completed).
+    /// Mark the subagent killed and retain any text it produced before
+    /// cancellation for later inspection.
     /// No wake fires for kills — the parent already knows it asked.
-    pub async fn killed(&self) {
+    pub async fn killedWithOutput(&self, finalOutput: String) {
         let wakeCtx = {
             let mut g = self.inner.lock().unwrap();
             g.state = JobState::Killed;
             g.completedAt = Some(Instant::now());
+            if !finalOutput.is_empty() {
+                g.finalOutput = Some(finalOutput);
+            }
             g.wakeCtx.clone()
         };
         let _ = self
@@ -503,6 +527,7 @@ impl JobPlane {
             state: JobState::Running,
             completedAt: None,
             stdoutTail: LineRing::new(MAX_BUFFERED_LINES),
+            finalOutput: None,
             wakeCtx,
         }));
 
@@ -590,6 +615,7 @@ impl JobPlane {
             state: JobState::Running,
             completedAt: None,
             stdoutTail: LineRing::new(MAX_BUFFERED_LINES),
+            finalOutput: None,
             wakeCtx,
         }));
 
@@ -1147,7 +1173,7 @@ mod tests {
         );
         assert_eq!(snap.state, JobState::Running);
 
-        handle.complete(0).await;
+        handle.completeWithOutput(0, String::new()).await;
         let snap = plane.output(id, None, 100).unwrap();
         assert_eq!(snap.state, JobState::Completed { exitCode: 0 });
 
@@ -1221,7 +1247,7 @@ mod tests {
         );
 
         handle.pushLine("scanning files");
-        handle.complete(0).await;
+        handle.completeWithOutput(0, String::new()).await;
 
         // The batcher coalesces fires within WAKE_BATCH_WINDOW; wait a
         // little longer than that for the batch to land.
@@ -1250,6 +1276,68 @@ mod tests {
         // The passive wake source must be unregistered so /jobs
         // schedules don't keep a phantom row after exit.
         assert_eq!(regArc.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subagentCompletionWakeUsesFinalOutputNotProgressTail() {
+        // Background subagents stream progress into the task buffer while
+        // running, but the completion wake should carry the completed
+        // answer, not whichever progress lines happen to be in the tail.
+        use crate::control::WakeKind as ControlWakeKind;
+        use crate::wakes::WakeRegistry;
+
+        let (tx, _rx) = mpsc::channel(64);
+        let (regArc, mut batchRx) = WakeRegistry::new();
+
+        let mut plane = JobPlane::new(None);
+        let taskId = plane.reserveJobId();
+        let (wakeId, fireTx) = {
+            let mut g = regArc.lock().await;
+            let wid = g.registerTaskComplete(taskId, &tx);
+            (wid, g.fireSender())
+        };
+        let wakeCtx = TaskWakeCtx {
+            wakeId,
+            registry: regArc.clone(),
+            fireTx,
+        };
+
+        let handle = plane.spawnSubagentWithId(
+            taskId,
+            "explore".into(),
+            "summarize auth".into(),
+            tx.clone(),
+            Some(wakeCtx),
+        );
+
+        handle.pushLine("progress: scanning files");
+        handle.pushLine("progress: reading handlers");
+        let finalOutput = "Final answer:\nAuth is routed through src/auth.rs.";
+        handle.completeWithOutput(0, finalOutput.into()).await;
+
+        let snap = plane.output(taskId, None, 100).unwrap();
+        assert_eq!(snap.finalOutput.as_deref(), Some(finalOutput));
+
+        let batch = tokio::time::timeout(
+            crate::wakes::WAKE_BATCH_WINDOW + std::time::Duration::from_millis(300),
+            batchRx.recv(),
+        )
+        .await
+        .expect("wake batch did not arrive")
+        .expect("batch channel closed");
+        assert_eq!(batch.fires.len(), 1);
+        let fire = &batch.fires[0];
+        assert!(matches!(fire.kind, ControlWakeKind::TaskComplete));
+        assert!(
+            fire.payload.contains(finalOutput),
+            "payload missing final output: {}",
+            fire.payload,
+        );
+        assert!(
+            !fire.payload.contains("progress: scanning files"),
+            "payload should not use progress tail: {}",
+            fire.payload,
+        );
     }
 
     #[tokio::test]
@@ -1284,7 +1372,7 @@ mod tests {
             Some(wakeCtx),
         );
 
-        handle.killed().await;
+        handle.killedWithOutput(String::new()).await;
 
         // No batch should arrive within the debounce window.
         let timed = tokio::time::timeout(

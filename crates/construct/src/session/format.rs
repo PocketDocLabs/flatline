@@ -322,6 +322,16 @@ pub(super) fn formatJobOutput(
     };
     let returned = snap.lines.len() as u64;
     let nextLine = snap.firstLine + returned;
+    if sinceLine.is_none()
+        && snap.state.isTerminal()
+        && let Some(finalOutput) = snap.finalOutput.as_deref()
+    {
+        let header = format!(
+            "Task #{} \u{2014} {}\nState: {} \u{00B7} final output \u{00B7} {} progress lines\n\n",
+            taskId, snap.command, stateLabel, snap.totalLines,
+        );
+        return format!("{header}{finalOutput}");
+    }
     let header = format!(
         "Task #{} \u{2014} {}\nState: {} \u{00B7} {} total lines \u{00B7} \
          showing lines {}..{}\n\n",
@@ -457,4 +467,28 @@ pub(super) fn formatWakeList(sources: &[crate::wakes::WakeSourceInfo]) -> String
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::{JobOutputSnapshot, JobState};
+
+    #[test]
+    fn formatJobOutputPrefersTerminalFinalOutput() {
+        let snap = JobOutputSnapshot {
+            lines: vec!["progress: scanning files".into()],
+            finalOutput: Some("Final answer:\nAuth is routed through src/auth.rs.".into()),
+            firstLine: 0,
+            totalLines: 1,
+            state: JobState::Completed { exitCode: 0 },
+            command: "task[explore]: summarize auth".into(),
+            earliestBuffered: 0,
+        };
+
+        let out = formatJobOutput(7, &snap, None);
+        assert!(out.contains("final output"));
+        assert!(out.contains("Final answer:\nAuth is routed through src/auth.rs."));
+        assert!(!out.contains("progress: scanning files"));
+    }
 }
