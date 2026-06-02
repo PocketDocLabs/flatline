@@ -4,7 +4,6 @@ use tokio::sync::mpsc;
 
 use super::request::buildRiders;
 use super::{Session, toolDefsForPermitMode};
-use crate::message::Message;
 use crate::{api, compaction_trigger, lsp, mcp, prompt, web};
 
 impl Session {
@@ -128,16 +127,7 @@ impl Session {
             systemPrompt.push_str(&mcpPrompt);
         }
 
-        self.systemPrompt = systemPrompt.clone();
-        match self.history.first_mut() {
-            Some(Message::System { content }) => *content = systemPrompt,
-            _ => self.history.insert(
-                0,
-                Message::System {
-                    content: systemPrompt,
-                },
-            ),
-        }
+        self.systemPrompt = systemPrompt;
     }
 
     async fn mcpPromptSection(&self) -> String {

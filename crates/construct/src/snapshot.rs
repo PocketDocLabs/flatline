@@ -166,6 +166,7 @@ impl SnapshotStore {
 /// Inputs for assembling a snapshot.
 pub struct BuildCtx<'a> {
     pub history: &'a [Message],
+    pub systemPrompt: Option<&'a str>,
     pub tools: &'a [ToolDef],
     pub reasoning: Option<&'a ReasoningConfig>,
     pub cfg: &'a ModelConfig,
@@ -179,9 +180,7 @@ pub struct BuildCtx<'a> {
 ///
 /// Returns the snapshot hash to store on the resulting assistant `Turn`.
 pub fn captureSnapshot(store: &mut SnapshotStore, ctx: BuildCtx<'_>) -> Result<BlobHash> {
-    let (systemContent, turnMsgs) = splitSystem(ctx.history);
-
-    let systemPromptHash = if let Some(sys) = systemContent {
+    let systemPromptHash = if let Some(sys) = ctx.systemPrompt {
         Some(store.putBlob(BlobNs::SystemPrompt, sys.as_bytes())?)
     } else {
         None
@@ -196,8 +195,8 @@ pub fn captureSnapshot(store: &mut SnapshotStore, ctx: BuildCtx<'_>) -> Result<B
         (Some(hash), ctx.tools.len().min(u16::MAX as usize) as u16)
     };
 
-    let mut messageHashes = Vec::with_capacity(turnMsgs.len());
-    for msg in turnMsgs {
+    let mut messageHashes = Vec::with_capacity(ctx.history.len());
+    for msg in ctx.history {
         messageHashes.push(store.putMessage(msg)?);
     }
 
@@ -220,15 +219,6 @@ pub fn captureSnapshot(store: &mut SnapshotStore, ctx: BuildCtx<'_>) -> Result<B
     };
 
     store.record(&snap)
-}
-
-/// Extract the leading system message content (if `history[0]` is System),
-/// returning it plus the remaining non-leading messages.
-fn splitSystem(history: &[Message]) -> (Option<&str>, &[Message]) {
-    match history.first() {
-        Some(Message::System { content }) => (Some(content.as_str()), &history[1..]),
-        _ => (None, history),
-    }
 }
 
 /// 40-char hex SHA-1 digest of bytes. Mirrors the convention in
@@ -381,9 +371,6 @@ mod tests {
     fn captureSnapshotRoundTripsMessages() {
         let (_dir, mut store) = tempStore();
         let history = vec![
-            Message::System {
-                content: "you are helpful".into(),
-            },
             Message::User {
                 content: Content::Text("hi".into()),
             },
@@ -419,6 +406,7 @@ mod tests {
             &mut store,
             BuildCtx {
                 history: &history,
+                systemPrompt: Some("you are helpful"),
                 tools: &tools,
                 reasoning: None,
                 cfg: &cfg,

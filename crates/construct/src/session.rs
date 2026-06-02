@@ -349,10 +349,7 @@ impl Session {
         });
 
         let systemPrompt = prompt::build(interface, domains, config.heavy.promptThinking);
-
-        let history = vec![Message::System {
-            content: systemPrompt.clone(),
-        }];
+        let history = Vec::new();
 
         let sessionId = transcript::newSessionId();
         let transcript = Transcript::create(&sessionId)?;
@@ -531,11 +528,7 @@ impl Session {
             None => Vec::new(),
         };
 
-        // Prepend system prompt (ephemeral, not from transcript).
-        let mut history = vec![Message::System {
-            content: systemPrompt.clone(),
-        }];
-        history.extend(reconstructed);
+        let history = reconstructed;
 
         let compactionTracker =
             compaction_trigger::Tracker::new(config.heavy.contextWindow, config.compactRatio);
@@ -1911,6 +1904,7 @@ impl Session {
             &mut self.snapshots,
             crate::snapshot::BuildCtx {
                 history: &self.history,
+                systemPrompt: Some(&self.systemPrompt),
                 tools: &self.tools,
                 reasoning,
                 cfg: &self.config.heavy,
@@ -1926,6 +1920,7 @@ impl Session {
         // baking apply here, not to `self.history`.
         let requestMessages = buildRequestMessages(
             &self.history,
+            &self.systemPrompt,
             &self.riders,
             self.config.heavy.promptThinking,
         );
@@ -2662,9 +2657,9 @@ mod tests {
         let history = vec![Message::User {
             content: Content::Text("hello".into()),
         }];
-        let out = buildRequestMessages(&history, &[], false);
-        assert_eq!(out.len(), 1);
-        if let Message::User { content } = &out[0] {
+        let out = buildRequestMessages(&history, "", &[], false);
+        assert_eq!(out.len(), 2);
+        if let Message::User { content } = &out[1] {
             assert_eq!(content.textContent(), "hello");
         } else {
             panic!("expected user");
@@ -2680,8 +2675,8 @@ mod tests {
             id: "THINKING",
             content: "Body text.".into(),
         }];
-        let out = buildRequestMessages(&history, &riders, false);
-        let text = if let Message::User { content } = &out[0] {
+        let out = buildRequestMessages(&history, "", &riders, false);
+        let text = if let Message::User { content } = &out[1] {
             content.textContent().to_string()
         } else {
             panic!("expected user");
@@ -2705,8 +2700,8 @@ mod tests {
                 content: "Review only.".into(),
             },
         ];
-        let out = buildRequestMessages(&history, &riders, false);
-        let text = if let Message::User { content } = &out[0] {
+        let out = buildRequestMessages(&history, "", &riders, false);
+        let text = if let Message::User { content } = &out[1] {
             content.textContent().to_string()
         } else {
             panic!();
@@ -2738,12 +2733,12 @@ mod tests {
             id: "X",
             content: "body".into(),
         }];
-        let out = buildRequestMessages(&history, &riders, false);
-        assert_eq!(out.len(), 3);
-        if let Message::User { content } = &out[0] {
+        let out = buildRequestMessages(&history, "", &riders, false);
+        assert_eq!(out.len(), 4);
+        if let Message::User { content } = &out[1] {
             assert_eq!(content.textContent(), "first", "first user untouched");
         }
-        if let Message::User { content } = &out[2] {
+        if let Message::User { content } = &out[3] {
             assert!(content.textContent().contains("<CRITICAL_INSTRUCTIONS>"));
             assert!(content.textContent().ends_with("second"));
         }
@@ -2764,10 +2759,10 @@ mod tests {
                 content: Content::Text("followup".into()),
             },
         ];
-        let out = buildRequestMessages(&history, &[], true);
+        let out = buildRequestMessages(&history, "", &[], true);
         if let Message::Assistant {
             content, reasoning, ..
-        } = &out[1]
+        } = &out[2]
         {
             assert_eq!(
                 content.as_deref(),
@@ -2789,10 +2784,10 @@ mod tests {
             tool_calls: None,
             reasoning: Some("thought".into()),
         }];
-        let out = buildRequestMessages(&history, &[], false);
+        let out = buildRequestMessages(&history, "", &[], false);
         if let Message::Assistant {
             content, reasoning, ..
-        } = &out[0]
+        } = &out[1]
         {
             assert_eq!(content.as_deref(), Some("answer"));
             assert_eq!(reasoning.as_deref(), Some("thought"));

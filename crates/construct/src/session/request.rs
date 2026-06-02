@@ -88,6 +88,7 @@ fn renderRiderPrefix(riders: &[Rider]) -> String {
 ///    this mode don't get a separate `reasoning` JSON key.
 pub(super) fn buildRequestMessages(
     history: &[Message],
+    systemPrompt: &str,
     riders: &[Rider],
     promptThinking: bool,
 ) -> Vec<Message> {
@@ -96,34 +97,35 @@ pub(super) fn buildRequestMessages(
         .iter()
         .rposition(|m| matches!(m, Message::User { .. }));
 
-    history
-        .iter()
-        .enumerate()
-        .map(|(i, msg)| match msg {
-            Message::User { content } if Some(i) == lastUserIdx && !prefix.is_empty() => {
-                Message::User {
-                    content: prependToContent(content, &prefix),
-                }
+    let mut out: Vec<Message> = Vec::with_capacity(history.len() + 1);
+    out.push(Message::System {
+        content: systemPrompt.to_string(),
+    });
+    out.extend(history.iter().enumerate().map(|(i, msg)| match msg {
+        Message::User { content } if Some(i) == lastUserIdx && !prefix.is_empty() => {
+            Message::User {
+                content: prependToContent(content, &prefix),
             }
+        }
+        Message::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+        } if promptThinking => {
+            let merged = match (reasoning.as_ref(), content.as_ref()) {
+                (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
+                (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
+                (None, c) => c.cloned(),
+            };
             Message::Assistant {
-                content,
-                tool_calls,
-                reasoning,
-            } if promptThinking => {
-                let merged = match (reasoning.as_ref(), content.as_ref()) {
-                    (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
-                    (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
-                    (None, c) => c.cloned(),
-                };
-                Message::Assistant {
-                    content: merged,
-                    tool_calls: tool_calls.clone(),
-                    reasoning: None,
-                }
+                content: merged,
+                tool_calls: tool_calls.clone(),
+                reasoning: None,
             }
-            other => other.clone(),
-        })
-        .collect()
+        }
+        other => other.clone(),
+    }));
+    out
 }
 
 /// Prepend `prefix` to a `Content`'s text portion. Preserves multimodal

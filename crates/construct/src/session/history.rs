@@ -6,7 +6,6 @@ use tokio::sync::mpsc;
 
 use super::Session;
 use crate::control::LogEvent;
-use crate::message::Message;
 use crate::transcript::{self, SessionMeta, Transcript};
 
 impl Session {
@@ -267,12 +266,7 @@ impl Session {
         }
 
         match crate::context::reconstruct(&self.transcript, &self.compactionLog, targetTurnId) {
-            Ok(h) => {
-                self.history = vec![Message::System {
-                    content: self.systemPrompt.clone(),
-                }];
-                self.history.extend(h);
-            }
+            Ok(h) => self.history = h,
             Err(e) => return format!("Failed to reconstruct history after rewind: {e}"),
         }
 
@@ -340,12 +334,7 @@ impl Session {
         }
 
         match crate::context::reconstruct(&self.transcript, &self.compactionLog, &fork.headTurn) {
-            Ok(h) => {
-                self.history = vec![Message::System {
-                    content: self.systemPrompt.clone(),
-                }];
-                self.history.extend(h);
-            }
+            Ok(h) => self.history = h,
             Err(e) => return format!("Failed to reconstruct after fork switch: {e}"),
         }
 
