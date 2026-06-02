@@ -605,6 +605,10 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
         // large commands (heredocs) don't deadlock with output echo.
         let mut pendingWrite: VecDeque<u8> = VecDeque::new();
         let mut listenerLineBuf: Vec<u8> = Vec::new();
+        // Set when shutdown is requested. After the kill chain exhausts
+        // (or immediately if no capture is active), we do process-group
+        // cleanup before breaking the loop.
+        let mut shutdownPending = false;
 
         // Feed bytes into the live VT that backs `readTerminal`.
         let feedVt = |bytes: &[u8]| {
@@ -708,6 +712,15 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                             feedVt(&remaining);
                             let _ = outputTx.try_send(remaining);
                         }
+                        if shutdownPending {
+                            if let Some(pgid) = master.process_group_leader()
+                                && pgid > 1 {
+                                    unsafe { libc::kill(-pgid, libc::SIGTERM); }
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                                }
+                            break;
+                        }
                     }
                 }
 
@@ -733,6 +746,15 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                             if !remaining.is_empty() {
                                 feedVt(&remaining);
                                 let _ = outputTx.try_send(remaining);
+                            }
+                            if shutdownPending {
+                                if let Some(pgid) = master.process_group_leader()
+                                    && pgid > 1 {
+                                        unsafe { libc::kill(-pgid, libc::SIGTERM); }
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                                    }
+                                break;
                             }
                             continue;
                         }
@@ -766,6 +788,18 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                     feedVt(&remaining);
                                     let _ = outputTx.try_send(remaining);
                                 }
+                                if shutdownPending {
+                                    // Kill chain exhausted during shutdown —
+                                    // SIGKILL the process group and exit.
+                                    if let Some(pgid) = master.process_group_leader()
+                                        && pgid > 1 {
+                                            tracing::info!(pgid, "shutdown: SIGKILL process group after kill chain");
+                                            unsafe { libc::kill(-pgid, libc::SIGTERM); }
+                                            tokio::time::sleep(Duration::from_millis(250)).await;
+                                            unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                                        }
+                                    break;
+                                }
                                 // Poke the shell with a newline to try to recover the prompt.
                                 let _ = writer.write_all(b"\n");
                                 let _ = writer.flush();
@@ -793,6 +827,17 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                 // Command execution request from session.
                 Some(req) = cmdRx.recv() => {
+                    if shutdownPending {
+                        let _ = req.respondTo.send(CommandExecution {
+                            command: req.command,
+                            output: "Terminal is being shut down.".into(),
+                            exitCode: None,
+                            lineCount: 1,
+                            replayBytes: Vec::new(),
+                            timedOut: false,
+                        });
+                        continue;
+                    }
                     if captureState.is_some() {
                         let _ = req.respondTo.send(
                             CommandExecution {
@@ -862,10 +907,19 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                 // User-triggered kill — start/advance the killchain immediately.
                 Some(()) = killRx.recv() => {
-                    // Abort any in-progress command write.
                     pendingWrite.clear();
                     if let Some(ref mut cap) = captureState {
                         cap.deadline = Some(tokio::time::Instant::now());
+                    } else if shutdownPending {
+                        // Shutdown requested while shell was idle.
+                        if let Some(pgid) = master.process_group_leader()
+                            && pgid > 1 {
+                                unsafe { libc::kill(-pgid, libc::SIGTERM); }
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                            }
+                        busyRef.store(false, Ordering::SeqCst);
+                        break;
                     } else {
                         // No active capture — just forward Ctrl+C.
                         let _ = writer.write_all(&[0x03]);
@@ -873,13 +927,31 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     }
                 }
 
-                // Tear-down — close the PTY and exit the loop. The PTY
-                // reader thread sees EOF on its next read and exits,
-                // which drops outputTx so the harness knows the shell
-                // is gone.
+                // Tear-down — run the kill chain for any active capture,
+                // then kill the foreground process group before closing
+                // the PTY. This ensures hung SSH sessions and stacked
+                // commands don't survive terminalKill.
                 Some(()) = shutdownRx.recv() => {
-                    busyRef.store(false, Ordering::SeqCst);
-                    break;
+                    pendingWrite.clear();
+                    shutdownPending = true;
+                    if let Some(ref mut cap) = captureState {
+                        // Trigger the kill chain immediately. The
+                        // process-group cleanup runs after the chain
+                        // exhausts (see force-extract and normal-
+                        // completion paths below).
+                        cap.deadline = Some(tokio::time::Instant::now());
+                    } else {
+                        // No active capture — kill the process group now.
+                        if let Some(pgid) = master.process_group_leader()
+                            && pgid > 1 {
+                                tracing::info!(pgid, "shutdown: sending SIGTERM to process group");
+                                unsafe { libc::kill(-pgid, libc::SIGTERM); }
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                            }
+                        busyRef.store(false, Ordering::SeqCst);
+                        break;
+                    }
                 }
 
                 // All channels closed — shut down.
