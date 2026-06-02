@@ -4011,19 +4011,6 @@ async fn handleInput(
                             agentPanel.denyPending();
                             sendPermit!(PermitResponse::Deny);
                         }
-                        // Shift+D: always deny (persist to project config).
-                        KeyCode::Char('D') => match agentPanel.selectedPattern() {
-                            Some(pattern) => {
-                                agentPanel.denyPending();
-                                sendPermit!(PermitResponse::AlwaysDeny { pattern });
-                            }
-                            None => {
-                                agentPanel.pushNotice(
-                                        "\u{26A0}\u{FE0E} cannot persist an empty pattern \u{2014} \
-                                         type one in the custom field first, or press n to deny once.",
-                                    );
-                            }
-                        },
                         // Shift+Up/Down: navigate pattern selector (patterns are for persistent decisions).
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             agentPanel.prevPattern();

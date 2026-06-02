@@ -1173,50 +1173,12 @@ impl Session {
                                                     let rulePattern = crate::permissions::normalizeRulePattern(
                                                         &action, &pattern,
                                                     );
-                                                    let persistPattern = rulePattern
-                                                        .clone()
-                                                        .unwrap_or_default();
                                                     self.permissions.addRule(crate::permissions::Rule {
                                                         tool: toolName.into(),
                                                         pattern: rulePattern,
                                                         allow: true,
                                                     });
-                                                    if let Some(ref root) = self.config.projectRoot
-                                                        && let Err(e) = crate::config::persistPermissionRule(
-                                                            root,
-                                                            &self.permissions,
-                                                            toolName,
-                                                            &persistPattern,
-                                                            true,
-                                                        ) {
-                                                            tracing::warn!("failed to persist permission rule: {e}");
-                                                        }
                                                     true
-                                                }
-                                                Ok(PermitResponse::AlwaysDeny { pattern }) => {
-                                                    let (toolName, _) = crate::permissions::actionKey(&action);
-                                                    let rulePattern = crate::permissions::normalizeRulePattern(
-                                                        &action, &pattern,
-                                                    );
-                                                    let persistPattern = rulePattern
-                                                        .clone()
-                                                        .unwrap_or_default();
-                                                    self.permissions.addRule(crate::permissions::Rule {
-                                                        tool: toolName.into(),
-                                                        pattern: rulePattern,
-                                                        allow: false,
-                                                    });
-                                                    if let Some(ref root) = self.config.projectRoot
-                                                        && let Err(e) = crate::config::persistPermissionRule(
-                                                            root,
-                                                            &self.permissions,
-                                                            toolName,
-                                                            &persistPattern,
-                                                            false,
-                                                        ) {
-                                                            tracing::warn!("failed to persist deny rule: {e}");
-                                                        }
-                                                    false
                                                 }
                                                 Ok(PermitResponse::Deny) | Err(_) => false,
                                             }
