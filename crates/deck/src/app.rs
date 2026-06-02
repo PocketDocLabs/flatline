@@ -50,10 +50,17 @@ use std::time::{Duration, Instant};
 
 /// Resolve main agent permissions from config, falling back to allowReadOnly.
 fn mainAgentPermissions(config: &construct::config::Config) -> Permissions {
-    config
+    let mut perms = config
         .permissions
         .clone()
-        .unwrap_or_else(Permissions::allowReadOnly)
+        .unwrap_or_else(Permissions::allowReadOnly);
+    // Guard against corrupt config entries: only Ask and Auto are valid.
+    // The custom Deserialize already maps unknown strings to Ask, but
+    // programmatic construction could still inject unsupported values.
+    perms.defaultMode = match perms.defaultMode {
+        PermitMode::Ask | PermitMode::Auto => perms.defaultMode,
+    };
+    perms
 }
 
 fn permissionsWithMode(config: &construct::config::Config, mode: &PermitMode) -> Permissions {
@@ -65,7 +72,7 @@ fn permissionsWithMode(config: &construct::config::Config, mode: &PermitMode) ->
 fn toggledRuntimePermitMode(mode: &PermitMode) -> PermitMode {
     match mode {
         PermitMode::Auto => PermitMode::Ask,
-        _ => PermitMode::Auto,
+        PermitMode::Ask => PermitMode::Auto,
     }
 }
 
@@ -73,8 +80,6 @@ fn permitModeLabel(mode: &PermitMode) -> &'static str {
     match mode {
         PermitMode::Ask => "ask",
         PermitMode::Auto => "auto",
-        PermitMode::Deny => "deny",
-        PermitMode::Abort => "abort",
     }
 }
 
@@ -82,8 +87,6 @@ fn permitModeStyle(mode: &PermitMode, bg: Color, fg: Color) -> Style {
     let color = match mode {
         PermitMode::Ask => fg,
         PermitMode::Auto => Color::Cyan,
-        PermitMode::Deny => Color::Yellow,
-        PermitMode::Abort => Color::Red,
     };
     Style::default()
         .bg(bg)

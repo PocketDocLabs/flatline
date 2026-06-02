@@ -235,8 +235,6 @@ impl PermissionsPanel {
         let modeStr = match self.defaultMode {
             PermitMode::Ask => "ask",
             PermitMode::Auto => "auto",
-            PermitMode::Deny => "deny",
-            PermitMode::Abort => "abort",
         };
         let modeLine = format!(" Default: {modeStr}");
         line(buf, x, *y, w, &modeLine, style(FG_DIM, BG));

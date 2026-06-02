@@ -354,7 +354,7 @@ fn urlPatterns(url: &str) -> Vec<String> {
 }
 
 /// What to do when a tool call isn't pre-approved.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermitMode {
     /// Ask the supervisor (TUI user, parent agent, etc.) and wait for response.
@@ -362,10 +362,20 @@ pub enum PermitMode {
     /// Ask an automatic reviewer first; escalate to the supervisor only when
     /// the reviewer explicitly grants a raise-to-user retry.
     Auto,
-    /// Immediately deny and continue the turn with a denial message.
-    Deny,
-    /// Immediately deny and abort the entire turn.
-    Abort,
+}
+
+impl<'de> Deserialize<'de> for PermitMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "ask" => Ok(PermitMode::Ask),
+            "auto" => Ok(PermitMode::Auto),
+            _ => Ok(PermitMode::Ask),
+        }
+    }
 }
 
 /// Result of a permission check.
@@ -436,19 +446,10 @@ impl Permissions {
         Self::default()
     }
 
-    /// Create permissions that deny everything and abort on any tool call.
-    pub fn denyAll() -> Self {
-        Self {
-            defaultMode: PermitMode::Abort,
-            rules: Vec::new(),
-            source: PermissionsSource::BuiltIn,
-        }
-    }
-
     /// Create permissions that auto-approve everything.
     pub fn allowAll() -> Self {
         Self {
-            defaultMode: PermitMode::Deny,
+            defaultMode: PermitMode::Auto,
             rules: vec![Rule {
                 tool: "*".into(),
                 pattern: None,
@@ -458,13 +459,11 @@ impl Permissions {
         }
     }
 
-    /// Create permissions that auto-approve read-only tools and deny
-    /// anything else without prompting. For explore subagents, the
-    /// ToolSet::ReadOnly gate already constrains available tools to
-    /// the read-only set, so a Deny fallback is safe.
+    /// Create permissions that auto-approve read-only tools and prompt
+    /// for anything else.
     pub fn allowReadOnly() -> Self {
         Self {
-            defaultMode: PermitMode::Deny,
+            defaultMode: PermitMode::Ask,
             rules: READ_ONLY_TOOLS
                 .iter()
                 .map(|&tool| Rule {

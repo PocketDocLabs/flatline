@@ -1103,8 +1103,6 @@ impl Session {
                             }
                         }
 
-                        let mut aborted = false;
-
                         for (callIdx, call) in calls.iter().enumerate() {
                             // Check for cancellation between tool calls.
                             if *cancelRx.borrow() {
@@ -1406,51 +1404,12 @@ impl Session {
                                             }
                                         }
                                     }
-                                    PermitMode::Deny => {
-                                        let _ =
-                                            self.transcript.updateToolCallMeta(&call.id, |meta| {
-                                                meta.outcome = Some(ToolCallOutcome::Denied);
-                                            });
-                                        let _ = logTx
-                                            .send(LogEvent::ToolDenied {
-                                                name: call.function.name.clone(),
-                                            })
-                                            .await;
-                                        false
-                                    }
-                                    PermitMode::Abort => {
-                                        let _ =
-                                            self.transcript.updateToolCallMeta(&call.id, |meta| {
-                                                meta.outcome = Some(ToolCallOutcome::Aborted);
-                                            });
-                                        let _ = logTx
-                                            .send(LogEvent::TurnAborted {
-                                                name: call.function.name.clone(),
-                                            })
-                                            .await;
-                                        aborted = true;
-                                        false
-                                    }
                                 },
                             };
 
-                            // Revert pre-emptive LSP notification if denied/aborted.
+                            // Revert pre-emptive LSP notification if denied.
                             if !approved && let Some((ref path, ref original)) = lspPreemptive {
                                 self.lspManager.touchFile(path, original).await;
-                            }
-
-                            if aborted {
-                                self.pushToolResult(
-                                    &call.id,
-                                    "Turn aborted: tool call not permitted.".into(),
-                                );
-                                for remaining in &calls[callIdx + 1..] {
-                                    self.pushToolResult(
-                                        &remaining.id,
-                                        "Turn aborted: tool call not permitted.".into(),
-                                    );
-                                }
-                                break;
                             }
 
                             // Guard: editFile/writeFile require a prior readFile of the same path.
@@ -1855,10 +1814,6 @@ impl Session {
                             self.pushToolResult(&call.id, output);
                         }
 
-                        if aborted {
-                            let _ = logTx.send(LogEvent::TurnComplete).await;
-                            break 'turns Ok(());
-                        }
                         // Inject queued user messages before the next API call.
                         self.drainSteer(steerRx, logTx).await;
                     }

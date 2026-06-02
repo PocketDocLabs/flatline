@@ -1216,8 +1216,7 @@ impl AgentPanel {
     pub fn denyPending(&mut self) {
         // Clear the permit-prompt UI state only. The ToolDenied entry is
         // pushed by the event-handler path (`toolDenied`) which is the
-        // single source of truth — covers both user-keypress denial and
-        // `PermitMode::Deny` auto-denial.
+        // single source of truth for denial feedback.
         self.pendingPermit = false;
         self.pendingPermitOrigin = None;
         self.pendingToolName.clear();
