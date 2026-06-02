@@ -1995,33 +1995,39 @@ impl Session {
                             // history/transcript so the user can resume
                             // from where we were cut off. Mirrors the
                             // cancel path but with Errored status.
-                            if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
+                            // Commit partial content to history/transcript.
+                            // When only reasoning was streamed, set content to "" so
+                            // the message satisfies API validation (assistant messages
+                            // must have `content` or `tool_calls`; `reasoning` alone
+                            // is rejected by DeepSeek and other native-reasoning providers).
+                            let hasContent = !contentBuf.is_empty();
+                            let hasReasoning = !reasoningBuf.is_empty();
+                            if hasContent || hasReasoning {
+                                let effectiveContent = if hasContent {
+                                    std::mem::take(&mut contentBuf)
+                                } else {
+                                    String::new()
+                                };
                                 let reasonRef = if reasoningBuf.is_empty() {
                                     None
                                 } else {
                                     Some(reasoningBuf.as_str())
                                 };
-                                if !contentBuf.is_empty() {
-                                    let meta = transcript::AssistantMeta {
-                                        reasoning: reasonRef,
-                                        cost: lastUsage.as_ref().and_then(|u| u.cost),
-                                        promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
-                                        completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
-                                        model: Some(self.config.heavy.model.as_str()),
-                                        finishReason: lastFinishReason.as_deref(),
-                                        snapshotHash: snapshotHash.as_deref(),
-                                        status: transcript::TurnStatus::Errored,
-                                    };
-                                    match self.transcript.recordAssistant(&contentBuf, meta) {
-                                        Ok(turnId) => self.headTurnId = Some(turnId),
-                                        Err(e) => tracing::warn!("transcript write failed: {e}"),
-                                    }
-                                }
-                                let content = if contentBuf.is_empty() {
-                                    None
-                                } else {
-                                    Some(std::mem::take(&mut contentBuf))
+                                let meta = transcript::AssistantMeta {
+                                    reasoning: reasonRef,
+                                    cost: lastUsage.as_ref().and_then(|u| u.cost),
+                                    promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                                    completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                                    model: Some(self.config.heavy.model.as_str()),
+                                    finishReason: lastFinishReason.as_deref(),
+                                    snapshotHash: snapshotHash.as_deref(),
+                                    status: transcript::TurnStatus::Errored,
                                 };
+                                match self.transcript.recordAssistant(&effectiveContent, meta) {
+                                    Ok(turnId) => self.headTurnId = Some(turnId),
+                                    Err(e) => tracing::warn!("transcript write failed: {e}"),
+                                }
+                                let content = Some(effectiveContent);
                                 let reasoning = if reasoningBuf.is_empty() {
                                     None
                                 } else {
@@ -2042,26 +2048,35 @@ impl Session {
                         tracing::info!("stream cancelled, committing partial content");
                         // Drop rx — kills the SSE background job.
                         drop(rx);
-                        // Commit partial content to history (skip if nothing was streamed).
-                        if !contentBuf.is_empty() || !reasoningBuf.is_empty() {
-                            if !contentBuf.is_empty() {
-                                let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
-                                let meta = transcript::AssistantMeta {
-                                    reasoning: reasonRef,
-                                    cost: lastUsage.as_ref().and_then(|u| u.cost),
-                                    promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
-                                    completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
-                                    model: Some(self.config.heavy.model.as_str()),
-                                    finishReason: lastFinishReason.as_deref(),
-                                    snapshotHash: snapshotHash.as_deref(),
-                                    status: transcript::TurnStatus::Cancelled,
-                                };
-                                match self.transcript.recordAssistant(&contentBuf, meta) {
-                                    Ok(turnId) => self.headTurnId = Some(turnId),
-                                    Err(e) => tracing::warn!("transcript write failed: {e}"),
-                                }
+                        // Commit partial content to history/transcript.
+                        // When only reasoning was streamed, set content to "" so
+                        // the message satisfies API validation (assistant messages
+                        // must have `content` or `tool_calls`; `reasoning` alone
+                        // is rejected by DeepSeek and other native-reasoning providers).
+                        let hasContent = !contentBuf.is_empty();
+                        let hasReasoning = !reasoningBuf.is_empty();
+                        if hasContent || hasReasoning {
+                            let effectiveContent = if hasContent {
+                                std::mem::take(&mut contentBuf)
+                            } else {
+                                String::new()
+                            };
+                            let reasonRef = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf.as_str()) };
+                            let meta = transcript::AssistantMeta {
+                                reasoning: reasonRef,
+                                cost: lastUsage.as_ref().and_then(|u| u.cost),
+                                promptTokens: lastUsage.as_ref().map(|u| u.promptTokens),
+                                completionTokens: lastUsage.as_ref().map(|u| u.completionTokens),
+                                model: Some(self.config.heavy.model.as_str()),
+                                finishReason: lastFinishReason.as_deref(),
+                                snapshotHash: snapshotHash.as_deref(),
+                                status: transcript::TurnStatus::Cancelled,
+                            };
+                            match self.transcript.recordAssistant(&effectiveContent, meta) {
+                                Ok(turnId) => self.headTurnId = Some(turnId),
+                                Err(e) => tracing::warn!("transcript write failed: {e}"),
                             }
-                            let content = if contentBuf.is_empty() { None } else { Some(contentBuf) };
+                            let content = Some(effectiveContent);
                             let reasoning = if reasoningBuf.is_empty() { None } else { Some(reasoningBuf) };
                             self.history.push(buildAssistantMessage(
                                 content, None, reasoning
