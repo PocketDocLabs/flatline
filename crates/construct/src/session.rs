@@ -2658,7 +2658,11 @@ mod tests {
             })
             .collect();
         filterConsumedTaskWakes(&mut fires, &consumed);
-        assert_eq!(fires.len(), sources.len(), "malformed sources must be preserved");
+        assert_eq!(
+            fires.len(),
+            sources.len(),
+            "malformed sources must be preserved"
+        );
     }
 
     #[test]
