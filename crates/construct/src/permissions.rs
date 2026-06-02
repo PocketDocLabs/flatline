@@ -44,6 +44,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "readTerminal",
     "terminalList",
     "terminalRunList",
+    "terminalRunStop",
     "jobOutput",
     "jobList",
     "monitorList",
@@ -455,10 +456,13 @@ impl Permissions {
         }
     }
 
-    /// Create permissions that auto-approve read-only tools.
+    /// Create permissions that auto-approve read-only tools and deny
+    /// anything else without prompting. For explore subagents, the
+    /// ToolSet::ReadOnly gate already constrains available tools to
+    /// the read-only set, so a Deny fallback is safe.
     pub fn allowReadOnly() -> Self {
         Self {
-            defaultMode: PermitMode::Ask,
+            defaultMode: PermitMode::Deny,
             rules: READ_ONLY_TOOLS
                 .iter()
                 .map(|&tool| Rule {
