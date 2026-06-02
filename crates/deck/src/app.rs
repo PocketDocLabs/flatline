@@ -2154,6 +2154,18 @@ async fn runLoop(
                 }
                 LogEvent::TurnCancelled => {
                     agentPanel.finalizeCancelled();
+                    // finalizeCancelled clears pendingPermit but not the oneshot
+                    // reply or the unseen title flag. Drop them.
+                    pendingPermitReply.take();
+                    if unseenPermitPending {
+                        unseenPermitPending = false;
+                        let glyph = if agentPanel.isActive() && currentTopic.is_some() {
+                            titleSpinner.current()
+                        } else {
+                            TITLE_IDLE_GLYPH
+                        };
+                        writeTerminalTitle(glyph, currentTopic.as_deref());
+                    }
                 }
                 LogEvent::SteerInjected { texts } => {
                     agentPanel.promoteQueue(&texts);
@@ -2311,6 +2323,10 @@ async fn runLoop(
                     agentPanel.clearDisplay();
                     tokenCount = 0;
                     currentTopic = None;
+                    // Drop any orphaned permit state — a cleared session
+                    // invalidates all pending requests.
+                    pendingPermitReply.take();
+                    unseenPermitPending = false;
                     // Fresh session => fresh JobPlane; the old plane's
                     // Drop kills any running tasks but the TaskStopped
                     // events may not reach us before the channel detaches,
@@ -2338,6 +2354,10 @@ async fn runLoop(
                     forkPicker = None;
                     agentPanel.clearDisplay();
                     tokenCount = 0;
+                    // Drop any orphaned permit state — rewinding
+                    // invalidates all pending requests.
+                    pendingPermitReply.take();
+                    unseenPermitPending = false;
                     if let Some(msg) = pendingRewindMessage.take() {
                         agentPanel.textArea.setText(&msg);
                     }
@@ -3924,6 +3944,19 @@ async fn handleInput(
                 if key.code == KeyCode::Esc && agentPanel.isActive() {
                     let _ = cancelTx.send(true);
                     agentPanel.finalizeCancelled();
+                    // finalizeCancelled clears pendingPermit but not the oneshot
+                    // reply or the unseen title flag. Drop them so we don't
+                    // orphan a stuck permit and a permanent spinner suppress.
+                    pendingPermitReply.take();
+                    if *unseenPermitPending {
+                        *unseenPermitPending = false;
+                        let glyph = if agentPanel.isActive() && currentTopic.is_some() {
+                            titleSpinner.current()
+                        } else {
+                            TITLE_IDLE_GLYPH
+                        };
+                        writeTerminalTitle(glyph, currentTopic.as_deref());
+                    }
                     break;
                 }
 
