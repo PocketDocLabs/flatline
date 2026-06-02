@@ -221,6 +221,10 @@ pub(crate) async fn execute(
         ToolAction::Task { .. } => {
             crate::message::Content::text("Error: task tools must be executed through the session.")
         }
+        // waitForSubagent is handled by session.rs (needs JobPlane).
+        ToolAction::WaitForSubagent { .. } => crate::message::Content::text(
+            "Error: waitForSubagent must be executed through the session.",
+        ),
         ToolAction::Unknown { name, .. } => {
             crate::message::Content::text(format!("Unknown tool: {name}"))
         }

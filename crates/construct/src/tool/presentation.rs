@@ -149,6 +149,7 @@ pub fn summarize(action: &ToolAction) -> String {
         },
         ToolAction::JobStop { jobId } => format!("jobStop #{jobId}"),
         ToolAction::JobList => "jobList".into(),
+        ToolAction::WaitForSubagent { jobId } => format!("waitForSubagent #{jobId}"),
         ToolAction::Monitor {
             description,
             terminal,

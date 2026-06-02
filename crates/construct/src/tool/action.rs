@@ -127,6 +127,11 @@ pub enum ToolAction {
     },
     /// Snapshot of all tasks.
     JobList,
+    /// Block until a background subagent reaches a terminal state, then
+    /// return its complete output. Replaces polling with jobOutput.
+    WaitForSubagent {
+        jobId: u64,
+    },
     /// Register a line-streamed monitor attached to an existing terminal. Lines
     /// matching the regex `filter` emit `MonitorEvent`s, bump the
     /// monitor's counter, and wake the agent with a synthetic wake event.
@@ -340,6 +345,7 @@ pub(crate) fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
     // phase 1 — child sessions stay single-shell.
     const SUBAGENT_DENIED: &[&str] = &[
         "task",
+        "waitForSubagent",
         "terminalSpawn",
         "terminalSwitch",
         "terminalKill",
@@ -422,7 +428,8 @@ pub(crate) fn needsJobPlane(action: &ToolAction) -> bool {
             ..
         } | ToolAction::JobOutput { .. }
             | ToolAction::JobStop { .. }
-            | ToolAction::JobList,
+            | ToolAction::JobList
+            | ToolAction::WaitForSubagent { .. },
     )
 }
 

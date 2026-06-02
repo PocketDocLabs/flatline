@@ -276,6 +276,9 @@ pub fn parse(name: &str, argsJson: &str) -> std::result::Result<ToolAction, Tool
             jobId: reqU64(&args, "jobId")?,
         },
         "jobList" => ToolAction::JobList,
+        "waitForSubagent" => ToolAction::WaitForSubagent {
+            jobId: reqU64(&args, "jobId")?,
+        },
         "monitor" => ToolAction::Monitor {
             description: reqString(&args, "description")?,
             terminal: optString(&args, "terminal")?,

@@ -622,9 +622,10 @@ impl Session {
 
         format!(
             "Spawned subagent #{taskId} ({agentType}). The agent is running in the \
-             background \u{2014} call jobOutput(jobId: {taskId}) for streaming \
-             progress or to read its final answer, jobList to see status, and \
-             jobStop(jobId: {taskId}) to cancel."
+             background \u{2014} use waitForSubagent(jobId: {taskId}) if you need \
+             its result before continuing, or let its completion notification wake \
+             you if you have independent work to do in parallel. \
+             jobList to see status, jobStop(jobId: {taskId}) to cancel."
         )
     }
 }

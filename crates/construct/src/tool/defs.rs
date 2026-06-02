@@ -1070,6 +1070,31 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
         ToolDef {
             defType: "function".into(),
             function: crate::message::FunctionDef {
+                name: "waitForSubagent".into(),
+                description: "Block until a background subagent reaches a terminal state, \
+                    then return its complete output. Use this instead of polling \
+                    jobOutput when you need the subagent's result before continuing. \
+                    The call blocks the current turn until the subagent finishes; \
+                    you'll receive the run's full final output. \
+                    If you have genuinely independent work to do in parallel with \
+                    the subagent, don't call this — let the wake notification \
+                    deliver the result instead."
+                    .into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "jobId": {
+                            "type": "integer",
+                            "description": "Subagent job id to wait for (returned by task(runInBackground: true))."
+                        }
+                    },
+                    "required": ["jobId"]
+                }),
+            },
+        },
+        ToolDef {
+            defType: "function".into(),
+            function: crate::message::FunctionDef {
                 name: "jobList".into(),
                 description: "List JobPlane-backed background tasks (running, \
                     completed, killed, errored) with age, total lines emitted, \

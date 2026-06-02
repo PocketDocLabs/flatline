@@ -371,8 +371,8 @@ pub(super) fn formatJobOutput(
         ));
     } else if matches!(snap.state, JobState::Running) {
         body.push_str(&format!(
-            "\n[task is still running \u{2014} next sinceLine: {}]",
-            nextLine,
+            "\n[task is still running \u{2014} use waitForSubagent(jobId: {taskId}) to \
+             block until completion, or call jobOutput(jobId: {taskId}) later to poll]",
         ));
     }
     format!("{header}{body}")

@@ -46,6 +46,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "terminalRunList",
     "terminalRunStop",
     "jobOutput",
+    "waitForSubagent",
     "jobList",
     "monitorList",
     "webSearch",
@@ -110,6 +111,7 @@ pub fn suggestPatterns(action: &ToolAction) -> Vec<String> {
         // Read-only / management tools — exact tool name only. No
         // user-typed pattern can broaden these incorrectly.
         ToolAction::JobList => vec!["jobList".into()],
+        ToolAction::WaitForSubagent { .. } => vec!["waitForSubagent".into()],
         ToolAction::JobOutput { .. } => vec!["jobOutput".into()],
         ToolAction::JobStop { .. } => vec!["jobStop".into()],
         ToolAction::TerminalRunList => vec!["terminalRunList".into()],
@@ -597,6 +599,7 @@ pub fn actionKey(action: &ToolAction) -> (&str, &str) {
         ToolAction::MonitorStop { .. } => ("monitorStop", ""),
         ToolAction::MonitorList => ("monitorList", ""),
         ToolAction::JobList => ("jobList", ""),
+        ToolAction::WaitForSubagent { .. } => ("waitForSubagent", ""),
         ToolAction::ScheduleWakeup { .. } => ("scheduleWakeup", ""),
         ToolAction::CronCreate { spec, .. } => ("cronCreate", spec),
         ToolAction::CronList => ("cronList", ""),

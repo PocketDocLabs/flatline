@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::Session;
 use super::format::{
@@ -18,6 +18,7 @@ impl Session {
         &mut self,
         action: &tool::ToolAction,
         logTx: &mpsc::Sender<LogEvent>,
+        cancelRx: &mut watch::Receiver<bool>,
     ) -> String {
         match action {
             tool::ToolAction::Shell {
@@ -69,6 +70,79 @@ impl Session {
                 }
             }
             tool::ToolAction::JobList => formatJobList(&self.jobs.lock().unwrap().list()),
+            tool::ToolAction::WaitForSubagent { jobId } => {
+                // Only subagent jobs can be waited on — bash background
+                // tasks stream output while running, there's no "completion"
+                // to wait for.
+                {
+                    let kind = self
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .list()
+                        .into_iter()
+                        .find(|t| t.id == *jobId)
+                        .map(|t| t.kind);
+                    match kind {
+                        Some(crate::jobs::JobKind::Bash) => {
+                            return format!(
+                                "Job #{jobId} is a background shell task, not a subagent. \
+                                 Use jobOutput(jobId: {jobId}) to stream its output."
+                            );
+                        }
+                        Some(crate::jobs::JobKind::Subagent { .. }) => {}
+                        None => {
+                            return format!(
+                                "No task #{jobId}. Use jobList to see available job ids."
+                            );
+                        }
+                    }
+                }
+                // Poll until the subagent reaches a terminal state, checking
+                // for cancellation between polls.
+                let start = std::time::Instant::now();
+                let pollInterval = std::time::Duration::from_millis(500);
+                let maxWait = std::time::Duration::from_secs(600);
+                loop {
+                    let state = self
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .list()
+                        .into_iter()
+                        .find(|t| t.id == *jobId)
+                        .map(|t| t.state);
+                    let Some(s) = state else {
+                        return format!("No task #{jobId}. Use jobList to see available job ids.");
+                    };
+                    if s.isTerminal() {
+                        let cap = crate::jobs::MAX_RESPONSE_LINES;
+                        // Prevent the TaskComplete wake from delivering the
+                        // same output again as a synthetic turn.
+                        self.consumedTaskWakes.insert(*jobId);
+                        return match self.jobs.lock().unwrap().output(*jobId, None, cap) {
+                            Ok(snap) => formatJobOutput(*jobId, &snap, None),
+                            Err(e) => format!("{e}. Use jobList to see available job ids."),
+                        };
+                    }
+                    if start.elapsed() > maxWait {
+                        return format!(
+                            "Subagent #{jobId} is still running after 10 minutes. \
+                             Continue work in parallel and it will notify you on completion, \
+                             or call jobStop({jobId}) to cancel."
+                        );
+                    }
+                    // Check for cancellation during the sleep.
+                    tokio::select! {
+                        _ = tokio::time::sleep(pollInterval) => {}
+                        _ = cancelRx.changed() => {
+                            if *cancelRx.borrow() {
+                                return format!("Wait for subagent #{jobId} cancelled.");
+                            }
+                        }
+                    }
+                }
+            }
             _ => unreachable!("non-job action passed to executeJobTool"),
         }
     }

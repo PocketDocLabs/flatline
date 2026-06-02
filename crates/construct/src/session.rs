@@ -15,7 +15,7 @@
 //! # Dependencies
 //! `tokio`, `serde_json`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -287,6 +287,10 @@ pub struct Session {
     /// later retry with `raiseToUser: true` may prompt the human only when
     /// the exact same action has an active ticket here.
     autoReviewTickets: HashMap<String, crate::auto_review::RaiseTicket>,
+    /// Job IDs whose TaskComplete wakes have been consumed via
+    /// `waitForSubagent`. Wakes for these jobs are filtered out of
+    /// incoming wake batches to prevent duplicate delivery.
+    consumedTaskWakes: HashSet<u64>,
     /// Receiver for coalesced `WakeBatch` values. The session task takes
     /// this once at startup and selects on it alongside user input; each
     /// batch becomes one synthetic user-shaped turn driving the model.
@@ -411,6 +415,7 @@ impl Session {
             pendingCheckpoint: None,
             turnsWithUsage: 0,
             autoReviewTickets: HashMap::new(),
+            consumedTaskWakes: HashSet::new(),
             wakeBatchRx: Some(wakeBatchRx),
         })
     }
@@ -647,6 +652,7 @@ impl Session {
             pendingCheckpoint: None,
             turnsWithUsage: 0,
             autoReviewTickets: HashMap::new(),
+            consumedTaskWakes: HashSet::new(),
             wakeBatchRx: Some(wakeBatchRx),
         })
     }
@@ -764,7 +770,7 @@ impl Session {
     /// receiver alongside `userInputRx`, so this only runs while idle.
     pub fn injectWakeBatch<'a>(
         &'a mut self,
-        batch: crate::wakes::WakeBatch,
+        mut batch: crate::wakes::WakeBatch,
         logTx: &'a mpsc::Sender<LogEvent>,
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
@@ -806,6 +812,10 @@ impl Session {
                     .await;
             }
             while userBgRx.try_recv().is_ok() {}
+
+            // Drop TaskComplete wakes for subagent jobs already consumed
+            // via waitForSubagent to prevent duplicate delivery.
+            filterConsumedTaskWakes(&mut batch.fires, &self.consumedTaskWakes);
 
             if batch.fires.is_empty() {
                 return Ok(());
@@ -1538,7 +1548,7 @@ impl Session {
                                         )
                                     } else if tool::needsJobPlane(&action) {
                                         crate::message::Content::text(
-                                            self.executeJobTool(&action, logTx).await,
+                                            self.executeJobTool(&action, logTx, cancelRx).await,
                                         )
                                     } else if tool::needsMonitor(&action) {
                                         crate::message::Content::text(
@@ -2500,10 +2510,156 @@ impl Session {
     }
 }
 
+/// Filter out `TaskComplete` wakes for subagent jobs already consumed
+/// via `waitForSubagent`, preventing duplicate delivery.
+pub(super) fn filterConsumedTaskWakes(
+    fires: &mut Vec<crate::wakes::WakeFire>,
+    consumed: &std::collections::HashSet<u64>,
+) {
+    fires.retain(|fire| {
+        if fire.kind == crate::control::WakeKind::TaskComplete
+            && fire.source.len() > 5
+            && &fire.source[..5] == "task#"
+            && let Ok(id) = fire.source[5..].parse::<u64>()
+        {
+            return !consumed.contains(&id);
+        }
+        true
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::message::Content;
+
+    // ── filterConsumedTaskWakes ──
+
+    #[test]
+    fn filterConsumedRemovesMatchingTaskComplete() {
+        let consumed: std::collections::HashSet<u64> = [7].into();
+        let mut fires = vec![crate::wakes::WakeFire {
+            wakeId: 1,
+            source: "task#7".into(),
+            kind: crate::control::WakeKind::TaskComplete,
+            payload: "Subagent task #7 exited with code 0.".into(),
+            firedAt: std::time::Instant::now(),
+        }];
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert!(fires.is_empty(), "consumed TaskComplete must be removed");
+    }
+
+    #[test]
+    fn filterConsumedPreservesNonMatchingTaskComplete() {
+        let consumed: std::collections::HashSet<u64> = [7].into();
+        let mut fires = vec![crate::wakes::WakeFire {
+            wakeId: 2,
+            source: "task#3".into(),
+            kind: crate::control::WakeKind::TaskComplete,
+            payload: "Subagent task #3 done.".into(),
+            firedAt: std::time::Instant::now(),
+        }];
+        let original = fires.clone();
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].source, original[0].source);
+    }
+
+    #[test]
+    fn filterConsumedPreservesNonTaskCompleteWakes() {
+        let consumed: std::collections::HashSet<u64> = [7].into();
+        let mut fires = vec![
+            crate::wakes::WakeFire {
+                wakeId: 3,
+                source: "task#7".into(),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload: "done".into(),
+                firedAt: std::time::Instant::now(),
+            },
+            crate::wakes::WakeFire {
+                wakeId: 4,
+                source: "monitor#1".into(),
+                kind: crate::control::WakeKind::MonitorMatch,
+                payload: "error in log".into(),
+                firedAt: std::time::Instant::now(),
+            },
+        ];
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert_eq!(fires.len(), 1, "only TaskComplete should be filtered");
+        assert_eq!(fires[0].source, "monitor#1");
+    }
+
+    #[test]
+    fn filterConsumedEmptyConsumedSetIsNoOp() {
+        let consumed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut fires = vec![crate::wakes::WakeFire {
+            wakeId: 5,
+            source: "task#7".into(),
+            kind: crate::control::WakeKind::TaskComplete,
+            payload: "done".into(),
+            firedAt: std::time::Instant::now(),
+        }];
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert_eq!(fires.len(), 1);
+    }
+
+    #[test]
+    fn filterConsumedHandlesMultipleConsumedIds() {
+        let consumed: std::collections::HashSet<u64> = [3, 7, 12].into();
+        let mut fires = vec![
+            crate::wakes::WakeFire {
+                wakeId: 10,
+                source: "task#3".into(),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload: "three done".into(),
+                firedAt: std::time::Instant::now(),
+            },
+            crate::wakes::WakeFire {
+                wakeId: 11,
+                source: "task#5".into(),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload: "five done".into(),
+                firedAt: std::time::Instant::now(),
+            },
+            crate::wakes::WakeFire {
+                wakeId: 12,
+                source: "task#12".into(),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload: "twelve done".into(),
+                firedAt: std::time::Instant::now(),
+            },
+        ];
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].source, "task#5");
+    }
+
+    #[test]
+    fn filterConsumedHandlesMalformedSource() {
+        // Sources that don't parse as "task#N" must be preserved.
+        let consumed: std::collections::HashSet<u64> = [7].into();
+        let sources = [
+            "task#",
+            "task#notanumber",
+            "task#99999999999999999999",
+            "notask",
+            "",
+            "monitor#7",
+        ];
+        let mut fires: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::wakes::WakeFire {
+                wakeId: i as u64,
+                source: s.to_string(),
+                kind: crate::control::WakeKind::TaskComplete,
+                payload: String::new(),
+                firedAt: std::time::Instant::now(),
+            })
+            .collect();
+        filterConsumedTaskWakes(&mut fires, &consumed);
+        assert_eq!(fires.len(), sources.len(), "malformed sources must be preserved");
+    }
 
     #[test]
     fn shellResolveErrorFormatsRecoveryHint() {
