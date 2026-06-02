@@ -52,6 +52,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "webSearch",
     "webFetch",
     "webSimilar",
+    "historySearch",
+    "historyFetch",
     "diagnostics",
 ];
 
@@ -64,8 +66,6 @@ pub enum PermitResponse {
     AlwaysAllow { pattern: String },
     /// Deny this invocation.
     Deny,
-    /// Deny and persist a deny rule for the given pattern.
-    AlwaysDeny { pattern: String },
 }
 
 /// Generate suggested "always allow" patterns for a tool action.
