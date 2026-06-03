@@ -35,18 +35,22 @@ fn headlessRegistry() -> anyhow::Result<std::sync::Arc<tokio::sync::Mutex<ShellR
 
     // Drain main shell.
     tokio::spawn(async move {
+        tracing::debug!("headless: PTY drainer started for main shell");
         let mut rx = mainIo.outputRx;
         while rx.recv().await.is_some() {}
+        tracing::debug!("headless: PTY drainer for main shell exited");
     });
 
     // Drain any later-spawned shells.
     tokio::spawn(async move {
-        while let Some((_name, io, _by)) = ioRx.recv().await {
+        while let Some((name, io, _by)) = ioRx.recv().await {
+            tracing::debug!(%name, "headless: PTY drainer started for spawned shell");
             tokio::spawn(async move {
                 let mut rx = io.outputRx;
                 while rx.recv().await.is_some() {}
             });
         }
+        tracing::debug!("headless: spawn channel closed, PTY drainer exiting");
     });
 
     Ok(std::sync::Arc::new(tokio::sync::Mutex::new(registry)))

@@ -1553,7 +1553,14 @@ impl Session {
                                                 .to_string(),
                                         };
                                         match resolvedShell {
-                                            Err(e) => crate::message::Content::text(e.to_string()),
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    target = %targetName,
+                                                    "session: shell resolution failed"
+                                                );
+                                                crate::message::Content::text(e.to_string())
+                                            }
                                             Ok(shell) => {
                                                 // Race tool execution against cancel + user-triggered
                                                 // bg (Ctrl+B) for shell commands. Auto-bg on a long
@@ -1574,6 +1581,12 @@ impl Session {
                                                     };
                                                     let effectiveTimeout = modelTimeout.unwrap_or(
                                                         crate::shell::SHELL_DEFAULT_TIMEOUT_SECS,
+                                                    );
+                                                    tracing::debug!(
+                                                        target = %targetName,
+                                                        timeout = effectiveTimeout,
+                                                        cmdLen = shellCommand.len(),
+                                                        "session: starting foreground shell execution"
                                                     );
                                                     let startedAt = unixNow();
                                                     let shellForExec = shell.clone();
@@ -1618,6 +1631,12 @@ impl Session {
                                                                 break result;
                                                             }
                                                             _ = &mut timeoutSleep => {
+                                                                let elapsed = unixNow().saturating_sub(startedAt);
+                                                                tracing::debug!(
+                                                                    target = %targetName,
+                                                                    elapsedSecs = elapsed,
+                                                                    "session: shell execution timed out, detaching"
+                                                                );
                                                                 let _ = logTx
                                                                     .send(LogEvent::AutoBgWarning {
                                                                         command: shellCommand.clone(),

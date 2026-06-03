@@ -115,6 +115,7 @@ impl ShellRegistry {
             defaultCols: cols,
             defaultRows: rows,
         };
+        tracing::debug!(cols, rows, "ShellRegistry: created with main shell");
         Ok((registry, io))
     }
 
@@ -160,6 +161,12 @@ impl ShellRegistry {
         );
         self.order.push(name.clone());
 
+        tracing::debug!(
+            name = %name,
+            spawnedBy = ?spawnedBy,
+            totalShells = self.shells.len(),
+            "ShellRegistry: shell spawned"
+        );
         Ok(name)
     }
 
@@ -184,6 +191,11 @@ impl ShellRegistry {
         };
         entry.shell.shutdown();
         self.order.retain(|n| n != name);
+        tracing::debug!(
+            name = %name,
+            remaining = self.shells.len(),
+            "ShellRegistry: shell killed"
+        );
         // If we just killed the active terminal, fall back to main
         // when present, otherwise to whatever remains.
         if self.activeForAgent == name {

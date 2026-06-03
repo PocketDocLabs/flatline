@@ -272,6 +272,7 @@ impl Shell {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            tracing::debug!("shell execute rejected: terminal busy");
             return CommandExecution {
                 command: command.into(),
                 output: "Terminal is busy running another command. Wait for it to finish or choose another terminal.".into(),
@@ -289,6 +290,7 @@ impl Shell {
         };
         if self.cmdTx.send(req).await.is_err() {
             self.busy.store(false, Ordering::SeqCst);
+            tracing::debug!("shell execute failed: driver channel closed");
             return CommandExecution {
                 command: command.into(),
                 output: "Shell closed.".into(),
@@ -299,9 +301,18 @@ impl Shell {
             };
         }
         match rx.await {
-            Ok(output) => output,
+            Ok(output) => {
+                tracing::debug!(
+                    exitCode = ?output.exitCode,
+                    timedOut = output.timedOut,
+                    lineCount = output.lineCount,
+                    "shell execute complete"
+                );
+                output
+            }
             Err(_) => {
                 self.busy.store(false, Ordering::SeqCst);
+                tracing::debug!("shell execute failed: driver task dropped");
                 CommandExecution {
                     command: command.into(),
                     output: "Shell disconnected.".into(),
@@ -600,6 +611,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
     // Background task — central hub for all PTY I/O.
     tokio::spawn(async move {
+        tracing::debug!("shell driver task started");
         let mut captureState: Option<CaptureState> = None;
         // Pending bytes to write to the PTY, drained in chunks so
         // large commands (heredocs) don't deadlock with output echo.
@@ -678,7 +690,14 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
             tokio::select! {
                 // PTY output — forward to harness, capture if active.
                 Some(bytes) = ptyOutputRx.recv() => {
+                    let _chunkLen = bytes.len();
                     if let Some(ref mut cap) = captureState {
+                        if cap.buffer.is_empty() && !bytes.is_empty() {
+                            tracing::debug!(
+                                uuid = %cap.uuid,
+                                "shell driver: first PTY output received"
+                            );
+                        }
                         // Raw bytes go to capture buffer (for extractOutput).
                         cap.buffer.extend_from_slice(&bytes);
 
@@ -707,6 +726,25 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
 
                     if done {
                         let cap = captureState.take().unwrap();
+                        let elapsed = cap.startedAt.elapsed();
+                        let exitCode = {
+                            let endPrefix = format!("__FLATLINE_END_{}_", cap.uuid);
+                            rfindBytes(&cap.buffer, endPrefix.as_bytes()).and_then(|pos| {
+                                let after = &cap.buffer[pos + endPrefix.len()..];
+                                String::from_utf8_lossy(after)
+                                    .split("__")
+                                    .next()?
+                                    .parse::<i32>()
+                                    .ok()
+                            })
+                        };
+                        tracing::debug!(
+                            uuid = %cap.uuid,
+                            exitCode = ?exitCode,
+                            elapsedMs = elapsed.as_millis(),
+                            bufferLen = cap.buffer.len(),
+                            "shell driver: END marker detected, finalizing capture"
+                        );
                         let (_, remaining) = finalizeCapture(cap, &historyRef, &busyRef, false);
                         if !remaining.is_empty() {
                             feedVt(&remaining);
@@ -821,6 +859,16 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     const CHUNK: usize = 128;
                     let n = CHUNK.min(pendingWrite.len());
                     let chunk: Vec<u8> = pendingWrite.drain(..n).collect();
+                    let remaining = pendingWrite.len();
+                    if remaining == 0 {
+                        // Last chunk — command fully written to PTY.
+                        if let Some(ref cap) = captureState {
+                            tracing::debug!(
+                                uuid = %cap.uuid,
+                                "shell driver: command fully written to PTY"
+                            );
+                        }
+                    }
                     let _ = writer.write_all(&chunk);
                     let _ = writer.flush();
                 }
@@ -852,6 +900,13 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         continue;
                     }
                     let uuid = generateUuid();
+                    let cmdLen = req.command.len();
+                    tracing::debug!(
+                        uuid = %uuid,
+                        len = cmdLen,
+                        hasTimeout = req.timeout.is_some(),
+                        "shell driver: command received"
+                    );
 
                     // Echo the command in the terminal so the user sees what ran.
                     // Sent directly on outputTx, bypassing the PTY/filter.
@@ -879,7 +934,13 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     );
                     // Queue for chunked write — large commands (heredocs)
                     // would deadlock if written in one blocking call.
-                    pendingWrite.extend(wrapped.as_bytes());
+                    let wrappedBytes = wrapped.as_bytes();
+                    tracing::debug!(
+                        uuid = %uuid,
+                        wrappedLen = wrappedBytes.len(),
+                        "shell driver: command queued for chunked write"
+                    );
+                    pendingWrite.extend(wrappedBytes);
 
                     let deadline = req.timeout.map(|d| tokio::time::Instant::now() + d);
                     captureState = Some(CaptureState {
@@ -891,6 +952,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         respondTo: req.respondTo,
                         deadline,
                         killPhase: KillPhase::Running,
+                        startedAt: tokio::time::Instant::now(),
                     });
                 }
 
@@ -912,6 +974,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         cap.deadline = Some(tokio::time::Instant::now());
                     } else if shutdownPending {
                         // Shutdown requested while shell was idle.
+                        tracing::debug!("shell driver: kill during shutdown, SIGKILL process group");
                         if let Some(pgid) = master.process_group_leader()
                             && pgid > 1 {
                                 unsafe { libc::kill(-pgid, libc::SIGTERM); }
@@ -1010,6 +1073,8 @@ struct CaptureState {
     deadline: Option<tokio::time::Instant>,
     /// Current kill escalation phase.
     killPhase: KillPhase,
+    /// When the command was received by the driver task.
+    startedAt: tokio::time::Instant,
 }
 
 /// Extracted result from the capture buffer.
@@ -1045,11 +1110,15 @@ impl DisplayFilter {
     }
 
     /// Process a chunk of bytes, returning only command output lines.
+    ///
+    /// Flushes on both `\n` and `\r` so that carriage-return-overwritten
+    /// output (e.g. rich progress bars) reaches the display in real-time
+    /// rather than being buffered until a newline arrives.
     fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         for &b in bytes {
             self.lineBuf.push(b);
-            if b == b'\n' {
+            if b == b'\n' || b == b'\r' {
                 let line = String::from_utf8_lossy(&self.lineBuf);
                 if !self.seenStart {
                     // Muted phase: suppress everything until start marker.
