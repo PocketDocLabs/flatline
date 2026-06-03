@@ -1096,6 +1096,79 @@ impl Session {
                             }
                         }
 
+                        // Pre-flight: fire all auto-review API calls in parallel.
+                        // Parses each call to identify which need review (verdict
+                        // NeedsApproval in Auto mode, without raiseToUser), then
+                        // launches concurrent API calls. Results feed into the
+                        // sequential loop below.
+                        let mut reviewIndices: Vec<usize> = Vec::new();
+                        let mut reviewFutures = Vec::new();
+                        for (idx, call) in calls.iter().enumerate() {
+                            let Ok(action) =
+                                tool::parse(&call.function.name, &call.function.arguments)
+                            else {
+                                continue;
+                            };
+                            let verdict = self.permissions.check(&action);
+                            let meta =
+                                crate::auto_review::permissionMeta(&call.function.arguments);
+                            let needsReview =
+                                matches!(verdict, Verdict::NeedsApproval)
+                                    && matches!(
+                                        self.permissions.defaultMode,
+                                        PermitMode::Auto
+                                    )
+                                    && !meta.raiseToUser;
+                            if needsReview {
+                                let client = self.client.clone();
+                                let rh = reviewHistory.clone();
+                                let input = crate::auto_review::ReviewInput {
+                                    toolCallId: call.id.clone(),
+                                    toolName: call.function.name.clone(),
+                                    summary: tool::summarize(&action),
+                                    args: call.function.arguments.clone(),
+                                    impact: crate::permissions::toolImpact(&action),
+                                    explanation: crate::permissions::toolExplanation(
+                                        &action,
+                                    )
+                                    .map(|s| s.to_string()),
+                                    diff: tool::diffPreview(&action),
+                                };
+                                let mut cancel = cancelRx.clone();
+                                reviewIndices.push(idx);
+                                reviewFutures.push(async move {
+                                    tokio::select! {
+                                        review = crate::auto_review::review(
+                                            &client, &rh, input,
+                                        ) => Some(review),
+                                        _ = cancel.changed() => None,
+                                    }
+                                });
+                            }
+                        }
+                        let mut preComputedReviews: HashMap<
+                            usize,
+                            anyhow::Result<crate::auto_review::Review>,
+                        > = if reviewFutures.is_empty() {
+                            HashMap::new()
+                        } else {
+                            let results = futures::future::join_all(reviewFutures).await;
+                            reviewIndices
+                                .into_iter()
+                                .zip(results)
+                                .map(|(idx, opt)| match opt {
+                                    Some(Ok(review)) => (idx, Ok(review)),
+                                    Some(Err(e)) => (idx, Err(e)),
+                                    None => (
+                                        idx,
+                                        Err(anyhow::anyhow!(
+                                            "auto-review cancelled"
+                                        )),
+                                    ),
+                                })
+                                .collect()
+                        };
+
                         for (callIdx, call) in calls.iter().enumerate() {
                             // Check for cancellation between tool calls.
                             if *cancelRx.borrow() {
@@ -1267,6 +1340,7 @@ impl Session {
                                                 &summary,
                                                 &reviewHistory,
                                                 cancelRx,
+                                                preComputedReviews.remove(&callIdx),
                                             )
                                             .await;
                                         match decision {

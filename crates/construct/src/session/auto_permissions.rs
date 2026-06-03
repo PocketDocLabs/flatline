@@ -31,6 +31,7 @@ impl Session {
         summary: &str,
         reviewHistory: &[Message],
         cancelRx: &mut watch::Receiver<bool>,
+        preComputedReview: Option<anyhow::Result<crate::auto_review::Review>>,
     ) -> AutoPermissionDecision {
         let diff = tool::diffPreview(action);
         let explanation =
@@ -77,25 +78,29 @@ impl Session {
             };
         }
 
-        let client = self.client.clone();
-        let reviewInput = crate::auto_review::ReviewInput {
-            toolCallId: call.id.clone(),
-            toolName: call.function.name.clone(),
-            summary: summary.to_string(),
-            args: call.function.arguments.clone(),
-            impact: impact.clone(),
-            explanation: explanation.clone(),
-            diff: diff.clone(),
-        };
-        let reviewResult = tokio::select! {
-            review = crate::auto_review::review(
-                &client,
-                reviewHistory,
-                reviewInput,
-            ) => review,
-            _ = cancelRx.changed() => {
-                tracing::info!("cancelled during auto-review");
-                return AutoPermissionDecision::Cancelled;
+        let reviewResult = if let Some(review) = preComputedReview {
+            review
+        } else {
+            let client = self.client.clone();
+            let reviewInput = crate::auto_review::ReviewInput {
+                toolCallId: call.id.clone(),
+                toolName: call.function.name.clone(),
+                summary: summary.to_string(),
+                args: call.function.arguments.clone(),
+                impact: impact.clone(),
+                explanation: explanation.clone(),
+                diff: diff.clone(),
+            };
+            tokio::select! {
+                review = crate::auto_review::review(
+                    &client,
+                    reviewHistory,
+                    reviewInput,
+                ) => review,
+                _ = cancelRx.changed() => {
+                    tracing::info!("cancelled during auto-review");
+                    return AutoPermissionDecision::Cancelled;
+                }
             }
         };
 
