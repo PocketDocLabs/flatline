@@ -123,6 +123,7 @@ pub struct ToolBlock {
     summary: String,
     status: ToolBlockStatus,
     sections: Vec<ToolBlockSection>,
+    hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +267,7 @@ impl ToolBlock {
             summary: headline,
             status,
             sections: Vec::new(),
+            hint: None,
         };
         if let Some(rawText) = invocation {
             block.upsertSection(ToolBlockSection {
@@ -1700,12 +1702,19 @@ impl AgentPanel {
         if let Some(block) = self.latestTransientToolBlockMut(name) {
             block.updateSummary(summary);
             block.status = ToolBlockStatus::Active { startedAt };
+            if name == "shell" {
+                block.hint = Some("\u{2303}B to \u{238B}".to_string());
+            }
         } else {
-            self.entries.push(PanelEntry::ToolBlock(ToolBlock::new(
-                name,
-                summary,
-                ToolBlockStatus::Active { startedAt },
-            )));
+            let hint = if name == "shell" {
+                Some("\u{2303}B to \u{238B}".to_string())
+            } else {
+                None
+            };
+            self.entries.push(PanelEntry::ToolBlock(ToolBlock {
+                hint,
+                ..ToolBlock::new(name, summary, ToolBlockStatus::Active { startedAt })
+            }));
         }
         // Tool started — DO NOT snap scroll
         self.newContentWhileScrolled = self.scrollOffset != 0;
@@ -1834,6 +1843,7 @@ impl AgentPanel {
                 .startedAt()
                 .map(|startedAt| startedAt.elapsed());
             block.status = ToolBlockStatus::Complete { duration };
+            block.hint = None;
             block.setOutput(output);
         } else {
             let mut block =
@@ -3677,6 +3687,7 @@ impl AgentPanel {
                         &label,
                         section.kind,
                         None,
+                        block.hint.as_deref().filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
                         false,
                         false,
                         borderStyle,
@@ -3769,6 +3780,7 @@ impl AgentPanel {
                 &label,
                 section.kind,
                 extra.as_deref(),
+                block.hint.as_deref().filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
                 section.copyable,
                 showCopied,
                 borderStyle,
@@ -4770,7 +4782,7 @@ impl AgentPanel {
                         .first()
                         .map(|s| s.content.to_string())
                         .unwrap_or_else(|| "\u{25cc}".into());
-                    let footerLabel = format!(" {throbberChar} running ({elapsed}s) ");
+                    let footerLabel = format!(" {throbberChar} running ({elapsed}s) \u{2014} \u{2303}B to \u{238B} ");
                     lines.push(makeBorderLine(
                         "\u{2570}",
                         "\u{256F}",
@@ -5102,6 +5114,7 @@ fn toolSectionHeaderCopyCol(
     label: &str,
     kind: ToolSectionKind,
     extra: Option<&str>,
+    hint: Option<&str>,
     copyable: bool,
     showCopied: bool,
     borderStyle: Style,
@@ -5140,16 +5153,33 @@ fn toolSectionHeaderCopyCol(
         copyText.clear();
     }
 
+    let mut hintText = hint.map(|s| format!(" {s} ")).unwrap_or_default();
+    let hintW = UnicodeWidthStr::width(hintText.as_str());
+    if hintW > innerW.saturating_sub(1) {
+        hintText.clear();
+    }
+
     let extraW = UnicodeWidthStr::width(extraText.as_str());
     let copyW = UnicodeWidthStr::width(copyText.as_str());
-    if extraW + copyW > innerW.saturating_sub(1) {
+    let hintW = UnicodeWidthStr::width(hintText.as_str());
+    if extraW + copyW + hintW > innerW.saturating_sub(1) {
+        // Drop hint first — it's optional decoration.
+        hintText.clear();
+    }
+    let hintW = UnicodeWidthStr::width(hintText.as_str());
+    if extraW + copyW + hintW > innerW.saturating_sub(1) {
         extraText.clear();
     }
 
     let nonLabelW =
-        UnicodeWidthStr::width(extraText.as_str()) + UnicodeWidthStr::width(copyText.as_str());
+        UnicodeWidthStr::width(extraText.as_str())
+        + UnicodeWidthStr::width(copyText.as_str())
+        + UnicodeWidthStr::width(hintText.as_str());
     let prospectiveSegments =
-        1 + usize::from(!extraText.is_empty()) + usize::from(!copyText.is_empty());
+        1
+        + usize::from(!hintText.is_empty())
+        + usize::from(!extraText.is_empty())
+        + usize::from(!copyText.is_empty());
     let desiredRules = if prospectiveSegments == 0 {
         0
     } else {
@@ -5165,6 +5195,9 @@ fn toolSectionHeaderCopyCol(
     let mut segments: Vec<(String, Style, bool)> = Vec::new();
     if !labelText.is_empty() {
         segments.push((labelText, labelStyle, false));
+    }
+    if !hintText.is_empty() {
+        segments.push((hintText, borderStyle, false));
     }
     if !extraText.is_empty() {
         segments.push((extraText, extraStyle, false));
@@ -6560,6 +6593,7 @@ mod wrapTests {
                 label,
                 ToolSectionKind::Invocation,
                 Some("\u{25BE}10"),
+                None,
                 true,
                 false,
                 Style::default().fg(Color::DarkGray),
@@ -6581,6 +6615,7 @@ mod wrapTests {
                 label,
                 ToolSectionKind::Invocation,
                 Some("\u{25BE}10"),
+                None,
                 true,
                 true,
                 Style::default().fg(Color::DarkGray),
