@@ -2278,8 +2278,14 @@ impl Session {
                 }
             }
 
-            self.history
-                .push(buildAssistantMessage(content, None, reasoning));
+            if content.is_some() || reasoning.is_some() {
+                self.history
+                    .push(buildAssistantMessage(content, None, reasoning));
+            } else {
+                tracing::debug!(
+                    "turn completed with no assistant content, reasoning, or tool calls"
+                );
+            }
 
             Ok(TurnResult::Done {
                 promptTokens: reportedTokens,
@@ -2768,6 +2774,50 @@ mod tests {
         {
             assert_eq!(content.as_deref(), Some("answer"));
             assert_eq!(reasoning.as_deref(), Some("thought"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn promptThinkingOffKeepsReasoningOnlyAssistantApiValid() {
+        let history = vec![Message::Assistant {
+            content: None,
+            tool_calls: None,
+            reasoning: Some("thought".into()),
+        }];
+        let out = buildRequestMessages(&history, "", &[], false);
+        if let Message::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+        } = &out[1]
+        {
+            assert_eq!(content.as_deref(), Some(""));
+            assert_eq!(reasoning.as_deref(), Some("thought"));
+            assert!(tool_calls.is_none());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn promptThinkingBakesReasoningOnlyAssistantAtApiBoundary() {
+        let history = vec![Message::Assistant {
+            content: None,
+            tool_calls: None,
+            reasoning: Some("thought".into()),
+        }];
+        let out = buildRequestMessages(&history, "", &[], true);
+        if let Message::Assistant {
+            content, reasoning, ..
+        } = &out[1]
+        {
+            assert_eq!(
+                content.as_deref(),
+                Some("<scratchpad>\nthought\n</scratchpad>"),
+            );
+            assert!(reasoning.is_none());
         } else {
             panic!();
         }

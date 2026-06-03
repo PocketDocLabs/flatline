@@ -111,16 +111,30 @@ pub(super) fn buildRequestMessages(
             content,
             tool_calls,
             reasoning,
-        } if promptThinking => {
-            let merged = match (reasoning.as_ref(), content.as_ref()) {
-                (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
-                (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
-                (None, c) => c.cloned(),
+        } => {
+            let tool_calls = tool_calls
+                .as_ref()
+                .filter(|calls| !calls.is_empty())
+                .cloned();
+            let (content, reasoning) = if promptThinking {
+                let merged = match (reasoning.as_ref(), content.as_ref()) {
+                    (Some(r), Some(c)) => Some(format!("<scratchpad>\n{r}\n</scratchpad>\n{c}")),
+                    (Some(r), None) => Some(format!("<scratchpad>\n{r}\n</scratchpad>")),
+                    (None, c) => c.cloned(),
+                };
+                (merged, None)
+            } else {
+                let mut content = content.clone();
+                let reasoning = reasoning.clone();
+                if content.is_none() && tool_calls.is_none() && reasoning.is_some() {
+                    content = Some(String::new());
+                }
+                (content, reasoning)
             };
             Message::Assistant {
-                content: merged,
-                tool_calls: tool_calls.clone(),
-                reasoning: None,
+                content,
+                tool_calls,
+                reasoning,
             }
         }
         other => other.clone(),
