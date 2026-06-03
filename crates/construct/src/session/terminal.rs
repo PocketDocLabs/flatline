@@ -283,7 +283,27 @@ impl Session {
         let purposeForTask = initialRecord.purpose.clone();
         tokio::spawn(async move {
             let dur = timeout.map(std::time::Duration::from_secs);
-            let exec = shell.executeDetailed(&commandForTask, dur).await;
+            tracing::debug!(
+                runId = %runIdForTask,
+                terminal = %terminalForTask,
+                hasTimeout = timeout.is_some(),
+                "spawnTerminalRun: execution started"
+            );
+            // Respect explicit model-provided timeout; otherwise no timeout.
+            // Background runs should not inherit the 30s foreground default.
+            let exec = if let Some(d) = dur {
+                shell.executeDetailed(&commandForTask, Some(d)).await
+            } else {
+                shell.executeDetailedNoTimeout(&commandForTask).await
+            };
+            tracing::debug!(
+                runId = %runIdForTask,
+                status = %terminalRunStatusForExecution(&exec),
+                exitCode = ?exec.exitCode,
+                timedOut = exec.timedOut,
+                lineCount = exec.lineCount,
+                "spawnTerminalRun: execution finished"
+            );
             let status = terminalRunStatusForExecution(&exec);
             let completed = crate::storage::TerminalRunRecord {
                 runId: runIdForTask.clone(),
@@ -431,15 +451,31 @@ impl Session {
         let purposeForTask = purpose.clone();
         tokio::spawn(async move {
             let exec = match execTask.await {
-                Ok(exec) => exec,
-                Err(e) => crate::shell::CommandExecution {
-                    command: commandForTask.clone(),
-                    output: format!("Terminal run task failed to join: {e}"),
-                    exitCode: None,
-                    lineCount: 1,
-                    replayBytes: Vec::new(),
-                    timedOut: false,
-                },
+                Ok(exec) => {
+                    tracing::debug!(
+                        runId = %runIdForTask,
+                        status = %terminalRunStatusForExecution(&exec),
+                        exitCode = ?exec.exitCode,
+                        timedOut = exec.timedOut,
+                        "detachTerminalRunJoin: execution finished"
+                    );
+                    exec
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        runId = %runIdForTask,
+                        error = %e,
+                        "detachTerminalRunJoin: task join failed"
+                    );
+                    crate::shell::CommandExecution {
+                        command: commandForTask.clone(),
+                        output: format!("Terminal run task failed to join: {e}"),
+                        exitCode: None,
+                        lineCount: 1,
+                        replayBytes: Vec::new(),
+                        timedOut: false,
+                    }
+                }
             };
             let status = terminalRunStatusForExecution(&exec);
             let completed = crate::storage::TerminalRunRecord {
