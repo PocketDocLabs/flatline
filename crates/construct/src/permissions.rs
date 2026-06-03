@@ -21,12 +21,11 @@
 use crate::tool::ToolAction;
 use serde::{Deserialize, Serialize};
 
-/// Tools that are considered read-only by [`Permissions::allowReadOnly`].
-/// Each gets an explicit `allow` rule so the model never hits an
-/// approval prompt for inspecting state. Shell is handled separately:
-/// a blanket shell rule would allow mutating commands too, so
-/// [`Permissions::check`] only auto-approves shell calls explicitly
-/// marked with `impact: read` when these read-only tool rules are enabled.
+/// Read-only tools. These read state without side effects and are
+/// unconditionally auto-approved by [`Permissions::check`] after the
+/// rules loop. [`Permissions::allowReadOnly`] also emits explicit rules
+/// for documentation/serialization, but the approval no longer depends
+/// on those rules being present.
 const READ_ONLY_TOOLS: &[&str] = &[
     "readFile",
     "glob",
@@ -55,6 +54,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "historySearch",
     "historyFetch",
     "diagnostics",
+    "cronList",
 ];
 
 /// Response from the supervisor (TUI or parent agent) to a permission prompt.
@@ -507,46 +507,30 @@ impl Permissions {
             };
         }
 
-        if isReadOnlyShell(action) && self.readOnlyToolsEnabled() {
+        // Read-only tools are unconditionally allowed. They read state
+        // without side effects, so there is no security reason to block
+        // or prompt for them — regardless of permit mode or config.
+        if isReadOnlyTool(action) {
             return Verdict::Allow;
         }
 
         Verdict::NeedsApproval
     }
-
-    /// Whether the permission set includes the read-only allow preset.
-    ///
-    /// This is derived from rules instead of a non-serialized flag so
-    /// persisted configs seeded from the built-in preset keep the same
-    /// behavior after restart.
-    fn readOnlyToolsEnabled(&self) -> bool {
-        READ_ONLY_TOOLS
-            .iter()
-            .all(|tool| self.unconditionalToolVerdict(tool) == Some(true))
-    }
-
-    fn unconditionalToolVerdict(&self, toolName: &str) -> Option<bool> {
-        for rule in &self.rules {
-            if !matchesTool(&rule.tool, toolName) {
-                continue;
-            }
-            if rule.pattern.is_some() {
-                continue;
-            }
-            return Some(rule.allow);
-        }
-        None
-    }
 }
 
-fn isReadOnlyShell(action: &ToolAction) -> bool {
-    matches!(
-        action,
-        ToolAction::Shell {
-            impact: crate::tool::ShellImpact::Read,
-            ..
-        }
-    )
+/// Read-only tools have no side effects — never prompt or deny them,
+/// regardless of configured permit mode or rules (explicit deny rules
+/// still take precedence, caught by the rules loop in `check`).
+fn isReadOnlyTool(action: &ToolAction) -> bool {
+    let (toolName, _) = actionKey(action);
+    READ_ONLY_TOOLS.contains(&toolName)
+        || matches!(
+            action,
+            ToolAction::Shell {
+                impact: crate::tool::ShellImpact::Read,
+                ..
+            }
+        )
 }
 
 /// Decide how a user-supplied pattern from the permit prompt should be
@@ -812,6 +796,51 @@ mod tests {
         // Inventory is harmless — terminalList should be auto-approved.
         let perms = Permissions::allowReadOnly();
         assert_eq!(perms.check(&ToolAction::TerminalList), Verdict::Allow,);
+    }
+
+    #[test]
+    fn readOnlyToolsAutoApproveWithEmptyRulesAndAskMode() {
+        // Regression: bare [permissions] with defaultMode="ask" and no
+        // rules must not force read-only tools to prompt the user.
+        let perms = Permissions::askForEverything();
+        for toolName in ["readFile", "grep", "glob", "listDir"] {
+            let action = match toolName {
+                "readFile" => ToolAction::ReadFile {
+                    path: "foo.txt".into(),
+                    offset: None,
+                    limit: None,
+                    anchor: None,
+                },
+                "grep" => ToolAction::Grep {
+                    pattern: "x".into(),
+                    path: None,
+                    include: None,
+                    fileType: None,
+                    outputMode: "files".into(),
+                    caseSensitive: None,
+                    contextLines: None,
+                    multiline: false,
+                },
+                "glob" => ToolAction::Glob {
+                    pattern: "*.rs".into(),
+                    path: None,
+                    metadata: false,
+                },
+                "listDir" => ToolAction::ListDir {
+                    path: ".".into(),
+                    depth: 1,
+                    offset: 0,
+                    limit: 50,
+                    metadata: false,
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                perms.check(&action),
+                Verdict::Allow,
+                "read-only tool {toolName} must auto-approve even with ask mode and no rules"
+            );
+        }
     }
 
     #[test]
