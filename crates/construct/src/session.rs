@@ -1110,15 +1110,10 @@ impl Session {
                                 continue;
                             };
                             let verdict = self.permissions.check(&action);
-                            let meta =
-                                crate::auto_review::permissionMeta(&call.function.arguments);
-                            let needsReview =
-                                matches!(verdict, Verdict::NeedsApproval)
-                                    && matches!(
-                                        self.permissions.defaultMode,
-                                        PermitMode::Auto
-                                    )
-                                    && !meta.raiseToUser;
+                            let meta = crate::auto_review::permissionMeta(&call.function.arguments);
+                            let needsReview = matches!(verdict, Verdict::NeedsApproval)
+                                && matches!(self.permissions.defaultMode, PermitMode::Auto)
+                                && !meta.raiseToUser;
                             if needsReview {
                                 let client = self.client.clone();
                                 let rh = reviewHistory.clone();
@@ -1128,10 +1123,8 @@ impl Session {
                                     summary: tool::summarize(&action),
                                     args: call.function.arguments.clone(),
                                     impact: crate::permissions::toolImpact(&action),
-                                    explanation: crate::permissions::toolExplanation(
-                                        &action,
-                                    )
-                                    .map(|s| s.to_string()),
+                                    explanation: crate::permissions::toolExplanation(&action)
+                                        .map(|s| s.to_string()),
                                     diff: tool::diffPreview(&action),
                                 };
                                 let mut cancel = cancelRx.clone();
@@ -1159,12 +1152,7 @@ impl Session {
                                 .map(|(idx, opt)| match opt {
                                     Some(Ok(review)) => (idx, Ok(review)),
                                     Some(Err(e)) => (idx, Err(e)),
-                                    None => (
-                                        idx,
-                                        Err(anyhow::anyhow!(
-                                            "auto-review cancelled"
-                                        )),
-                                    ),
+                                    None => (idx, Err(anyhow::anyhow!("auto-review cancelled"))),
                                 })
                                 .collect()
                         };

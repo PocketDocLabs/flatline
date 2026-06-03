@@ -1332,6 +1332,15 @@ pub async fn run() -> Result<()> {
                         Some(TuiRequest::ShowCost { reply }) => {
                             let _ = reply.send(session.formatCostBreakdown());
                         }
+                        Some(TuiRequest::DebugDump { reply }) => {
+                            let logsDir =
+                                construct::config::configDir().join("logs");
+                            let result = match session.writeDebugDump(&logsDir).await {
+                                Ok(path) => path.display().to_string(),
+                                Err(e) => format!("Error: {e}"),
+                            };
+                            let _ = reply.send(result);
+                        }
                         Some(TuiRequest::ListTerminalRuns { reply }) => {
                             let runs = session.listTerminalRuns().unwrap_or_default();
                             let _ = reply.send(runs);
@@ -5577,6 +5586,42 @@ fn dispatchSlashCommand(
                 let _ = requestTx.send(TuiRequest::ShowCost { reply: rTx }).await;
                 if let Ok(text) = rRx.await {
                     let _ = deckUpdateTx.send(DeckUpdate::ShowResult(text)).await;
+                }
+            });
+        }
+        crate::command::CommandAction::DebugDump => {
+            tokio::spawn(async move {
+                let (rTx, rRx) = oneshot::channel();
+                let _ = requestTx.send(TuiRequest::DebugDump { reply: rTx }).await;
+                if let Ok(result) = rRx.await {
+                    if result.starts_with("Error:") {
+                        let _ = deckUpdateTx.send(DeckUpdate::ShowResult(result)).await;
+                    } else {
+                        // Reveal the archive file in the system file manager.
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open")
+                            .arg("-R")
+                            .arg(&result)
+                            .spawn();
+                        #[cfg(target_os = "linux")]
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(
+                                std::path::Path::new(&result)
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new(".")),
+                            )
+                            .spawn();
+                        #[cfg(target_os = "windows")]
+                        let _ = std::process::Command::new("explorer")
+                            .arg("/select,")
+                            .arg(&result)
+                            .spawn();
+                        let _ = deckUpdateTx
+                            .send(DeckUpdate::ShowResult(format!(
+                                "Debug dump written to: {result}"
+                            )))
+                            .await;
+                    }
                 }
             });
         }

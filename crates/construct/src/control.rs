@@ -629,6 +629,9 @@ pub enum TuiRequest {
     /// Resume streaming from where the last turn was cut off.
     ContinueLastTurn { reply: oneshot::Sender<CommandAck> },
 
+    /// Generate a comprehensive debug dump of all session state.
+    DebugDump { reply: oneshot::Sender<String> },
+
     /// Gracefully shut down background services (LSP, MCP) and exit the session task.
     Shutdown,
 }

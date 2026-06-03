@@ -3687,7 +3687,10 @@ impl AgentPanel {
                         &label,
                         section.kind,
                         None,
-                        block.hint.as_deref().filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
+                        block
+                            .hint
+                            .as_deref()
+                            .filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
                         false,
                         false,
                         borderStyle,
@@ -3780,7 +3783,10 @@ impl AgentPanel {
                 &label,
                 section.kind,
                 extra.as_deref(),
-                block.hint.as_deref().filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
+                block
+                    .hint
+                    .as_deref()
+                    .filter(|_| matches!(block.status, ToolBlockStatus::Active { .. })),
                 section.copyable,
                 showCopied,
                 borderStyle,
@@ -4782,7 +4788,9 @@ impl AgentPanel {
                         .first()
                         .map(|s| s.content.to_string())
                         .unwrap_or_else(|| "\u{25cc}".into());
-                    let footerLabel = format!(" {throbberChar} running ({elapsed}s) \u{2014} \u{2303}B to \u{238B} ");
+                    let footerLabel = format!(
+                        " {throbberChar} running ({elapsed}s) \u{2014} \u{2303}B to \u{238B} "
+                    );
                     lines.push(makeBorderLine(
                         "\u{2570}",
                         "\u{256F}",
@@ -5171,12 +5179,10 @@ fn toolSectionHeaderCopyCol(
         extraText.clear();
     }
 
-    let nonLabelW =
-        UnicodeWidthStr::width(extraText.as_str())
+    let nonLabelW = UnicodeWidthStr::width(extraText.as_str())
         + UnicodeWidthStr::width(copyText.as_str())
         + UnicodeWidthStr::width(hintText.as_str());
-    let prospectiveSegments =
-        1
+    let prospectiveSegments = 1
         + usize::from(!hintText.is_empty())
         + usize::from(!extraText.is_empty())
         + usize::from(!copyText.is_empty());

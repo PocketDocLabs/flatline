@@ -109,6 +109,11 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Show developer log history",
     },
     CommandDef {
+        name: "dump",
+        aliases: &["debug"],
+        description: "Dump debug info (session state, transcript, logs) to a .tar.gz archive in the logs directory",
+    },
+    CommandDef {
         name: "layout",
         aliases: &[],
         description: "Open layout controls",
@@ -158,6 +163,8 @@ pub enum CommandAction {
     Tasks,
     /// Open the developer log history panel.
     Logs,
+    /// Dump all debug info to a timestamped .tar.gz archive.
+    DebugDump,
     /// Open the same layout controls as Ctrl+O.
     ShowLayout,
 }
@@ -232,6 +239,7 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "cost" => CommandOutput::Action(CommandAction::ShowCost),
         "tasks" => CommandOutput::Action(CommandAction::Tasks),
         "logs" => CommandOutput::Action(CommandAction::Logs),
+        "dump" | "debug" => CommandOutput::Action(CommandAction::DebugDump),
         "layout" => CommandOutput::Action(CommandAction::ShowLayout),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
     }

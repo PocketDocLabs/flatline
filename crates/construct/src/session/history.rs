@@ -430,6 +430,378 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Write a comprehensive debug dump as a `.tar.gz` archive.
+    ///
+    /// Builds `debug_output-{timestamp}.tar.gz` directly in memory — no temp
+    /// directory — containing JSON, JSONL, and text files covering all session
+    /// state. Archive construction and disk I/O run inside `spawn_blocking`.
+    ///
+    /// Files inside the archive: session.json, config.json, permissions.json, cost.json,
+    /// context.json, liveState.json, tools.json, transcript.jsonl,
+    /// compaction.jsonl, mcp.json, lsp.json, forks.json, systemPrompt.txt,
+    /// and a copy of the current tracing log.
+    pub async fn writeDebugDump(
+        &self,
+        baseDir: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+
+        let projectDir = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+
+        // ── Collect all file contents in memory ──
+        let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(16);
+
+        // session.json
+        let topics: Vec<serde_json::Value> = self
+            .topicTracker
+            .topics()
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "topicId": t.topicId,
+                    "label": t.label,
+                    "blockCount": t.blockCount,
+                })
+            })
+            .collect();
+        let sessionJson = serde_json::json!({
+            "sessionId": self.transcript.sessionId,
+            "projectDir": &projectDir,
+            "pid": std::process::id(),
+            "headTurnId": self.headTurnId,
+            "topicLabels": self.topicTracker.topicLabels(),
+            "topics": topics,
+            "turnsWithUsage": self.turnsWithUsage,
+            "maxBudgetUsd": self.maxBudgetUsd,
+        });
+        files.push((
+            "session.json".into(),
+            serde_json::to_vec_pretty(&sessionJson)?,
+        ));
+
+        // config.json
+        let configJson = serde_json::json!({
+            "heavyProfile": self.config.heavyProfile,
+            "lightProfile": self.config.lightProfile,
+            "utilityProfile": self.config.utilityProfile,
+            "heavy": {
+                "provider": self.config.heavy.provider,
+                "model": self.config.heavy.model,
+                "contextWindow": self.config.heavy.contextWindow,
+                "maxContextWindow": self.config.heavy.maxContextWindow,
+                "cachingActive": self.config.heavy.cachingActive(),
+                "promptThinking": self.config.heavy.promptThinking,
+            },
+            "compactRatio": self.config.compactRatio,
+            "budgetSessionLimit": self.config.budget.sessionLimit,
+            "profilesDefined": self.config.profiles.len(),
+        });
+        files.push((
+            "config.json".into(),
+            serde_json::to_vec_pretty(&configJson)?,
+        ));
+
+        // permissions.json
+        files.push((
+            "permissions.json".into(),
+            serde_json::to_vec_pretty(&self.permissions)?,
+        ));
+
+        // cost.json
+        let perModel: serde_json::Value = self
+            .costTracker
+            .perModel()
+            .iter()
+            .map(|(model, cost)| (model.clone(), serde_json::json!(*cost)))
+            .collect();
+        let costJson = serde_json::json!({
+            "sessionCost": self.costTracker.sessionCost(),
+            "lastTurnCost": self.costTracker.lastTurnCost(),
+            "perModel": perModel,
+            "rolling16h": crate::cost::rollingWindowCost(Some(&projectDir)),
+            "turnsWithUsage": self.turnsWithUsage,
+        });
+        files.push(("cost.json".into(), serde_json::to_vec_pretty(&costJson)?));
+
+        // context.json
+        let ctx = self.buildContextState();
+        let pct = if ctx.contextWindow > 0 {
+            (ctx.estimatedTokens as f64 / ctx.contextWindow as f64) * 100.0
+        } else {
+            0.0
+        };
+        let contextJson = serde_json::json!({
+            "contextWindow": ctx.contextWindow,
+            "estimatedTokens": ctx.estimatedTokens,
+            "reportedTokens": ctx.reportedTokens,
+            "usagePercent": pct,
+            "raw": {
+                "turns": ctx.raw.turns,
+                "estimatedTokens": ctx.raw.estimatedTokens,
+            },
+            "s2": ctx.s2.as_ref().map(|s| serde_json::json!({
+                "turnsCondensed": s.turnsCondensed,
+                "estimatedTokens": s.estimatedTokens,
+            })),
+            "s3": ctx.s3.as_ref().map(|s| serde_json::json!({
+                "topicLabels": s.topicLabels,
+                "turnsCondensed": s.turnsCondensed,
+                "estimatedTokens": s.estimatedTokens,
+            })),
+            "s4": ctx.s4.as_ref().map(|s| serde_json::json!({
+                "topicsMerged": s.topicsMerged,
+                "priorBriefings": s.priorBriefings,
+                "turnsCovered": s.turnsCovered,
+                "estimatedTokens": s.estimatedTokens,
+            })),
+        });
+        files.push((
+            "context.json".into(),
+            serde_json::to_vec_pretty(&contextJson)?,
+        ));
+
+        // liveState.json — collect from registries with proper Send scoping
+        let (jobList, monList) = {
+            let jobs = self.jobs.lock().unwrap();
+            let jl: Vec<serde_json::Value> = jobs
+                .list()
+                .iter()
+                .map(|j| {
+                    serde_json::json!({
+                        "id": j.id,
+                        "kind": format!("{:?}", j.kind),
+                        "state": format!("{:?}", j.state),
+                        "command": j.command,
+                        "totalLines": j.totalLines,
+                    })
+                })
+                .collect();
+            drop(jobs);
+
+            let monitors = self.monitors.lock().unwrap();
+            let ml: Vec<serde_json::Value> = monitors
+                .list()
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "terminal": m.terminal,
+                        "description": m.description,
+                        "filter": m.filter,
+                        "state": format!("{:?}", m.state),
+                        "eventCount": m.eventCount,
+                    })
+                })
+                .collect();
+            drop(monitors);
+
+            (jl, ml)
+        };
+
+        let termList = {
+            let shells = self.shells.lock().await;
+            shells
+                .list()
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "spawnedBy": format!("{:?}", t.spawnedBy),
+                        "activeForAgent": t.activeForAgent,
+                        "ageSecs": t.ageSecs,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let wakeList = {
+            let wakes = self.wakes.lock().await;
+            wakes
+                .list()
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "id": w.id,
+                        "kind": format!("{:?}", w.kind),
+                        "summary": w.summary,
+                        "firesSoFar": w.firesSoFar,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let filesReadList: Vec<&String> = self.filesRead.keys().collect();
+        let ridersList: Vec<String> = self.riders.iter().map(|r| format!("{r:?}")).collect();
+
+        let liveStateJson = serde_json::json!({
+            "terminals": termList,
+            "jobs": jobList,
+            "monitors": monList,
+            "wakes": wakeList,
+            "filesRead": filesReadList,
+            "riders": ridersList,
+        });
+        files.push((
+            "liveState.json".into(),
+            serde_json::to_vec_pretty(&liveStateJson)?,
+        ));
+
+        // tools.json
+        files.push(("tools.json".into(), serde_json::to_vec_pretty(&self.tools)?));
+
+        // transcript.jsonl
+        match self.transcript.exportJsonl() {
+            Ok(jsonl) => {
+                files.push(("transcript.jsonl".into(), jsonl.into_bytes()));
+            }
+            Err(e) => {
+                files.push((
+                    "transcript.jsonl".into(),
+                    format!("# Failed to export transcript: {e}\n").into_bytes(),
+                ));
+            }
+        }
+
+        // compaction.jsonl
+        match self.compactionLog.loadAll() {
+            Ok(ops) => {
+                let mut jsonl = String::new();
+                for op in &ops {
+                    jsonl.push_str(&serde_json::to_string(op)?);
+                    jsonl.push('\n');
+                }
+                files.push(("compaction.jsonl".into(), jsonl.into_bytes()));
+            }
+            Err(e) => {
+                files.push((
+                    "compaction.jsonl".into(),
+                    format!("# Failed to load compaction log: {e}\n").into_bytes(),
+                ));
+            }
+        }
+
+        // forks.json
+        let forks = self.listForks();
+        files.push(("forks.json".into(), serde_json::to_vec_pretty(&forks)?));
+
+        // mcp.json
+        let mcpConfigs: Vec<serde_json::Value> = self
+            .mcpConfigs
+            .iter()
+            .map(|(name, cfg)| {
+                let transport = if cfg.command.is_some() {
+                    "stdio"
+                } else if cfg.url.is_some() {
+                    "http"
+                } else {
+                    "unknown"
+                };
+                serde_json::json!({
+                    "name": name,
+                    "transport": transport,
+                    "command": cfg.command,
+                    "url": cfg.url,
+                })
+            })
+            .collect();
+        let mcpServers: Vec<serde_json::Value> = self
+            .mcpManager
+            .as_ref()
+            .map(|mgr| {
+                mgr.serverStatuses()
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "state": format!("{:?}", s.state),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mcpJson = serde_json::json!({
+            "configs": mcpConfigs,
+            "connectedServers": mcpServers,
+        });
+        files.push(("mcp.json".into(), serde_json::to_vec_pretty(&mcpJson)?));
+
+        // lsp.json
+        let lspList: Vec<serde_json::Value> = self
+            .lspManager
+            .allServerStatuses()
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "status": format!("{:?}", s.status),
+                    "extensions": s.extensions,
+                    "installHint": s.installHint,
+                    "runtime": s.runtime,
+                })
+            })
+            .collect();
+        files.push(("lsp.json".into(), serde_json::to_vec_pretty(&lspList)?));
+
+        // systemPrompt.txt
+        files.push((
+            "systemPrompt.txt".into(),
+            self.systemPrompt.clone().into_bytes(),
+        ));
+
+        // flatline.log — read + write both inside spawn_blocking
+        let logPath = crate::config::configDir()
+            .join("logs")
+            .join(format!("flatline-{}.log", std::process::id()));
+
+        // ── Build .tar.gz directly in memory on a blocking thread ──
+        let archiveName = format!("debug_output-{ts}.tar.gz");
+        let archivePath = baseDir.join(&archiveName);
+        let archivePath2 = archivePath.clone();
+        let logPath2 = logPath.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let gz = std::fs::File::create(&archivePath2)?;
+            let gzWriter = flate2::write::GzEncoder::new(gz, flate2::Compression::default());
+            let mut tarBuilder = tar::Builder::new(gzWriter);
+
+            // Write all in-memory files into the archive.
+            for (name, content) in &files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tarBuilder.append_data(&mut header, name.as_str(), content.as_slice())?;
+            }
+
+            // Read and write the log file.
+            match std::fs::read(&logPath2) {
+                Ok(content) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(content.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    tarBuilder.append_data(&mut header, "flatline.log", content.as_slice())?;
+                }
+                Err(e) => {
+                    let msg = format!("# Could not read log file {}: {e}\n", logPath2.display());
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(msg.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    tarBuilder.append_data(&mut header, "flatline.log", msg.as_bytes())?;
+                }
+            }
+
+            let gzWriter = tarBuilder.into_inner()?;
+            gzWriter.finish()?;
+            Ok(())
+        })
+        .await??;
+
+        Ok(archivePath)
+    }
+
     /// Format forks for inline display.
     pub fn formatForksListing(&self) -> String {
         let forks = self.listForks();
