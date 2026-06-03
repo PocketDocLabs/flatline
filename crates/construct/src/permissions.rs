@@ -501,8 +501,10 @@ impl Permissions {
                 }
             }
             return if rule.allow {
+                tracing::debug!(tool = %toolName, keyArg = %keyArg, "permission: allow via rule");
                 Verdict::Allow
             } else {
+                tracing::debug!(tool = %toolName, keyArg = %keyArg, "permission: deny via rule");
                 Verdict::Deny
             };
         }
@@ -511,9 +513,11 @@ impl Permissions {
         // without side effects, so there is no security reason to block
         // or prompt for them — regardless of permit mode or config.
         if isReadOnlyTool(action) {
+            tracing::debug!(tool = %toolName, keyArg = %keyArg, "permission: auto-allow read-only");
             return Verdict::Allow;
         }
 
+        tracing::debug!(tool = %toolName, keyArg = %keyArg, "permission: needs approval");
         Verdict::NeedsApproval
     }
 }

@@ -24,10 +24,12 @@ pub(super) async fn executeGlob(pattern: &str, path: Option<&str>, metadata: boo
     {
         Ok(stdout) => {
             if stdout.trim().is_empty() {
+                tracing::debug!(%pattern, ?path, "glob: no matches");
                 return "No files found.".into();
             }
             let lines: Vec<&str> = stdout.lines().collect();
             let total = lines.len();
+            tracing::debug!(%pattern, total, "glob matched");
             let mut output = String::new();
             for line in lines.iter().take(MAX_GLOB_RESULTS) {
                 output.push_str(line);
@@ -44,7 +46,10 @@ pub(super) async fn executeGlob(pattern: &str, path: Option<&str>, metadata: boo
             }
             output
         }
-        Err(e) => e.to_string(),
+        Err(e) => {
+            tracing::debug!(%pattern, error = %e, "glob subprocess failed");
+            e.to_string()
+        }
     }
 }
 
@@ -237,6 +242,7 @@ pub(super) async fn executeGrep(
         Ok(stdout) => {
             if stdout.trim().is_empty() {
                 let scope = path.unwrap_or(".");
+                tracing::debug!(%pattern, %scope, "grep: no matches");
                 let mut msg = format!("No matches for pattern {pattern:?} in {scope}.");
                 // Surface common foot-guns when a pattern looks suspect.
                 if pattern.ends_with('"') || pattern.ends_with("\\\"") {
@@ -259,6 +265,7 @@ pub(super) async fn executeGrep(
                 _ => MAX_GREP_FILES,
             };
             let total = lines.len();
+            tracing::debug!(%pattern, total, "grep matched");
             let mut truncated = String::new();
             for line in lines.iter().take(cap) {
                 truncated.push_str(line);
@@ -277,7 +284,10 @@ pub(super) async fn executeGrep(
             }
             output
         }
-        Err(e) => e.to_string(),
+        Err(e) => {
+            tracing::debug!(%pattern, error = %e, "grep subprocess failed");
+            e.to_string()
+        }
     }
 }
 

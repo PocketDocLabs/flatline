@@ -30,6 +30,7 @@ pub fn ensureSessionDb(sessionDir: &Path) -> Result<()> {
 }
 
 pub(crate) fn openSessionDb(sessionDir: &Path) -> Result<Connection> {
+    tracing::debug!(dir = %sessionDir.display(), "opening session db");
     sqliteBlocking(|| {
         fs::create_dir_all(sessionDir)
             .with_context(|| format!("create session dir: {}", sessionDir.display()))?;
@@ -262,6 +263,7 @@ fn importLegacySnapshots(tx: &rusqlite::Transaction<'_>, sessionDir: &Path) -> R
 }
 
 pub(crate) fn insertTurn(conn: &Connection, turn: &Turn) -> Result<()> {
+    tracing::trace!(turnId = %turn.id, role = ?turn.role, "insertTurn");
     sqliteBlocking(|| insertTurnTx(conn, turn))
 }
 

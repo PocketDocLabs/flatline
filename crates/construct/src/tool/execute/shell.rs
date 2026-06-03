@@ -108,6 +108,7 @@ pub(super) fn executeShellHistory(shell: &Shell, terminalName: &str) -> String {
         return format!("No commands in history for terminal '{terminalName}'.");
     }
 
+    tracing::debug!(%terminalName, count = entries.len(), "shellHistory");
     let mut output = format!("History for terminal '{terminalName}':\n");
     for (i, cmd, exitCode, lineCount) in &entries {
         let codeStr = match exitCode {

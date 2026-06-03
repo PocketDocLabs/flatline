@@ -20,6 +20,7 @@ impl Session {
         logTx: &mpsc::Sender<LogEvent>,
         cancelRx: &mut watch::Receiver<bool>,
     ) -> String {
+        tracing::debug!(action = ?action, "executeJobTool");
         match action {
             tool::ToolAction::Shell {
                 command,
@@ -153,6 +154,7 @@ impl Session {
         action: &tool::ToolAction,
         logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
+        tracing::debug!(action = ?action, "executeMonitorTool");
         match action {
             tool::ToolAction::Monitor {
                 description,
@@ -242,6 +244,7 @@ impl Session {
         action: &tool::ToolAction,
         logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
+        tracing::debug!(action = ?action, "executeWakeTool");
         match action {
             tool::ToolAction::ScheduleWakeup {
                 delaySeconds,
@@ -346,6 +349,7 @@ impl Session {
     }
 
     pub(super) fn executeTranscriptTool(&self, action: &tool::ToolAction) -> String {
+        tracing::debug!(action = ?action, "executeTranscriptTool");
         match action {
             tool::ToolAction::HistoryFetch { blockId } => match self.transcript.loadAll() {
                 Ok(turns) => {
@@ -463,6 +467,7 @@ impl Session {
 
     /// Execute a web tool (webSearch, webFetch, webSimilar).
     pub(super) async fn executeWebTool(&mut self, action: &tool::ToolAction) -> String {
+        tracing::debug!(action = ?action, "executeWebTool");
         let exa = match &self.exaClient {
             Some(c) => c,
             None => return web::notConfiguredError(),
@@ -521,6 +526,7 @@ impl Session {
 
     /// Execute an MCP tool action.
     pub(super) async fn executeMcpTool(&self, action: &tool::ToolAction) -> String {
+        tracing::debug!(action = ?action, "executeMcpTool");
         let mgr = match &self.mcpManager {
             Some(m) => m,
             None => return "MCP not configured.".into(),
@@ -543,6 +549,7 @@ impl Session {
 
     /// Execute an LSP diagnostics tool call.
     pub(super) async fn executeLspTool(&mut self, action: &tool::ToolAction) -> String {
+        tracing::debug!(action = ?action, "executeLspTool");
         let tool::ToolAction::Diagnostics { path, severity } = action else {
             return "Not an LSP tool.".into();
         };

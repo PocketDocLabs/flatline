@@ -271,6 +271,7 @@ pub async fn classifyPrepared(
     client: api::Client,
     utilityModel: String,
 ) -> TopicDecision {
+    tracing::debug!(msgCount = messages.len(), model = %utilityModel, "classifying topic");
     match client
         .complete(ModelTier::Utility, &messages, Some(&utilityModel))
         .await

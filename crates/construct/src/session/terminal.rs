@@ -54,6 +54,7 @@ impl Session {
         action: &tool::ToolAction,
         logTx: &mpsc::Sender<LogEvent>,
     ) -> String {
+        tracing::debug!(action = ?action, "executeTerminalTool");
         match action {
             tool::ToolAction::TerminalSpawn { name } => {
                 // NOTE: agent-spawned terminals do NOT emit TerminalSpawned

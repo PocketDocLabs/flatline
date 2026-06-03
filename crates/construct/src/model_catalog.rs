@@ -48,6 +48,7 @@ struct ModelCatalogCache {
 }
 
 pub async fn discoverModels(config: &Config, provider: &str) -> Result<Vec<ModelCatalogEntry>> {
+    tracing::debug!(%provider, "discovering models");
     let cache = readCache();
     if let Some(cached) = cache.providers.get(provider)
         && nowSecs().saturating_sub(cached.fetchedAt) <= cacheTtlSecs(provider)

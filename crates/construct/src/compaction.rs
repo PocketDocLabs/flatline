@@ -216,6 +216,7 @@ impl CompactionLog {
 
     /// S1: record that duplicate file reads were removed.
     pub fn recordFileDedup(&mut self, targetIds: Vec<String>, afterTurn: &str) -> Result<()> {
+        tracing::debug!(target = ?targetIds, %afterTurn, "compaction: S1 file dedup");
         self.writeOp(&CompactionOp::FileDedup {
             stage: "s1".into(),
             targetIds,
@@ -231,6 +232,7 @@ impl CompactionLog {
         afterTurn: &str,
         threshold: usize,
     ) -> Result<()> {
+        tracing::debug!(target = ?targetIds, %afterTurn, threshold, "compaction: S1 middle-out");
         self.writeOp(&CompactionOp::MiddleOut {
             stage: "s1".into(),
             targetIds,
@@ -248,6 +250,7 @@ impl CompactionLog {
         sourceIds: Vec<String>,
         afterTurn: &str,
     ) -> Result<()> {
+        tracing::info!(%blockId, after = %afterTurn, summaryLen = summary.len(), "compaction: S2 block compact");
         self.writeOp(&CompactionOp::BlockCompact {
             stage: "s2".into(),
             blockId: blockId.into(),
@@ -266,6 +269,7 @@ impl CompactionLog {
         blockIds: Vec<String>,
         afterTurn: &str,
     ) -> Result<()> {
+        tracing::info!(%topicLabel, blocks = blockIds.len(), after = %afterTurn, "compaction: S3 topic compact");
         self.writeOp(&CompactionOp::TopicCompact {
             stage: "s3".into(),
             topicLabel: topicLabel.into(),
@@ -283,6 +287,7 @@ impl CompactionLog {
         compactedIds: Vec<String>,
         afterTurn: &str,
     ) -> Result<()> {
+        tracing::info!(blocks = compactedIds.len(), after = %afterTurn, "compaction: S4 full briefing");
         self.writeOp(&CompactionOp::FullCompact {
             stage: "s4".into(),
             summary: summary.into(),

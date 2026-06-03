@@ -180,6 +180,7 @@ pub struct BuildCtx<'a> {
 ///
 /// Returns the snapshot hash to store on the resulting assistant `Turn`.
 pub fn captureSnapshot(store: &mut SnapshotStore, ctx: BuildCtx<'_>) -> Result<BlobHash> {
+    tracing::debug!(model = %ctx.cfg.model, "capturing snapshot");
     let systemPromptHash = if let Some(sys) = ctx.systemPrompt {
         Some(store.putBlob(BlobNs::SystemPrompt, sys.as_bytes())?)
     } else {

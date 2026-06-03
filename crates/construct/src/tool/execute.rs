@@ -47,6 +47,8 @@ pub(crate) async fn execute(
     shell: &Shell,
     terminalName: &str,
 ) -> crate::message::Content {
+    let (toolName, _keyArg) = crate::permissions::actionKey(action);
+    tracing::debug!(tool = %toolName, "executing tool");
     match action {
         ToolAction::Shell {
             command,

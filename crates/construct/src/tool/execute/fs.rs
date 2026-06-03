@@ -79,8 +79,14 @@ pub(super) fn executeWriteFile(path: &str, content: &str) -> String {
         return format!("Failed to create directories: {e}");
     }
     match std::fs::write(path, content) {
-        Ok(()) => format!("Wrote {} bytes to {path}", content.len()),
-        Err(e) => format!("Failed to write file: {e}"),
+        Ok(()) => {
+            tracing::debug!(%path, bytes = content.len(), "wrote file");
+            format!("Wrote {} bytes to {path}", content.len())
+        }
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "writeFile failed");
+            format!("Failed to write file: {e}")
+        }
     }
 }
 
@@ -124,12 +130,17 @@ pub(super) fn executeEditFile(
     match std::fs::write(path, &newContent) {
         Ok(()) => {
             if replaceAll && matchCount > 1 {
+                tracing::debug!(%path, count = matchCount, "editFile replaced all occurrences");
                 format!("Replaced {matchCount} occurrences in {path}.")
             } else {
+                tracing::debug!(%path, "editFile applied");
                 format!("Applied edit to {path}.")
             }
         }
-        Err(e) => format!("Failed to write file: {e}"),
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "editFile write failed");
+            format!("Failed to write file: {e}")
+        }
     }
 }
 
@@ -186,8 +197,14 @@ pub(super) fn executeMultiEdit(path: &str, edits: &[EditOp]) -> String {
 
     // All edits validated — write once.
     match std::fs::write(path, &content) {
-        Ok(()) => format!("Applied {} edits to {path}.", edits.len()),
-        Err(e) => format!("Failed to write file: {e}"),
+        Ok(()) => {
+            tracing::debug!(%path, edits = edits.len(), "multiEdit applied");
+            format!("Applied {} edits to {path}.", edits.len())
+        }
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "multiEdit write failed");
+            format!("Failed to write file: {e}")
+        }
     }
 }
 
@@ -208,13 +225,25 @@ pub(super) fn executeCopyFile(src: &str, dest: &str, overwrite: bool) -> String 
     }
     if srcPath.is_dir() {
         match copyDirRecursive(srcPath, destPath) {
-            Ok(()) => format!("Copied directory {src} \u{2192} {dest}."),
-            Err(e) => format!("Failed to copy directory: {e}"),
+            Ok(()) => {
+                tracing::debug!(%src, %dest, "copied directory");
+                format!("Copied directory {src} \u{2192} {dest}.")
+            }
+            Err(e) => {
+                tracing::warn!(%src, %dest, error = %e, "copyFile dir failed");
+                format!("Failed to copy directory: {e}")
+            }
         }
     } else {
         match std::fs::copy(srcPath, destPath) {
-            Ok(bytes) => format!("Copied {src} \u{2192} {dest} ({bytes} bytes)."),
-            Err(e) => format!("Failed to copy file: {e}"),
+            Ok(bytes) => {
+                tracing::debug!(%src, %dest, bytes, "copied file");
+                format!("Copied {src} \u{2192} {dest} ({bytes} bytes).")
+            }
+            Err(e) => {
+                tracing::warn!(%src, %dest, error = %e, "copyFile failed");
+                format!("Failed to copy file: {e}")
+            }
         }
     }
 }
@@ -266,14 +295,19 @@ pub(super) fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String 
     // Try a rename first (cheap, atomic when on the same filesystem). Fall back
     // to copy+delete on EXDEV (cross-device link) or other rename failures.
     match std::fs::rename(srcPath, destPath) {
-        Ok(()) => format!("Moved {src} \u{2192} {dest}."),
-        Err(_) => {
+        Ok(()) => {
+            tracing::debug!(%src, %dest, "moved file via rename");
+            format!("Moved {src} \u{2192} {dest}.")
+        }
+        Err(e) => {
+            tracing::debug!(%src, %dest, error = %e, "rename failed, falling back to copy+delete");
             let copyResult = if srcPath.is_dir() {
                 copyDirRecursive(srcPath, destPath)
             } else {
                 std::fs::copy(srcPath, destPath).map(|_| ())
             };
             if let Err(e) = copyResult {
+                tracing::warn!(%src, %dest, error = %e, "moveFile copy fallback failed");
                 return format!("Failed to move (copy phase): {e}");
             }
             let removeResult = if srcPath.is_dir() {
@@ -282,8 +316,14 @@ pub(super) fn executeMoveFile(src: &str, dest: &str, overwrite: bool) -> String 
                 std::fs::remove_file(srcPath)
             };
             match removeResult {
-                Ok(()) => format!("Moved {src} \u{2192} {dest} (cross-device, copy+delete)."),
-                Err(e) => format!("Copied {src} \u{2192} {dest} but failed to remove source: {e}"),
+                Ok(()) => {
+                    tracing::debug!(%src, %dest, "moved file via copy+delete fallback");
+                    format!("Moved {src} \u{2192} {dest} (cross-device, copy+delete).")
+                }
+                Err(e) => {
+                    tracing::warn!(%src, %dest, error = %e, "moveFile remove-source fallback failed");
+                    format!("Copied {src} \u{2192} {dest} but failed to remove source: {e}")
+                }
             }
         }
     }
@@ -297,29 +337,53 @@ pub(super) fn executeDeleteFile(path: &str, recursive: bool) -> String {
     if p.is_dir() {
         if recursive {
             match std::fs::remove_dir_all(p) {
-                Ok(()) => format!("Deleted directory tree {path}."),
-                Err(e) => format!("Failed to delete directory: {e}"),
+                Ok(()) => {
+                    tracing::info!(%path, "deleted directory tree");
+                    format!("Deleted directory tree {path}.")
+                }
+                Err(e) => {
+                    tracing::warn!(%path, error = %e, "deleteFile dir failed");
+                    format!("Failed to delete directory: {e}")
+                }
             }
         } else {
             match std::fs::remove_dir(p) {
-                Ok(()) => format!("Deleted empty directory {path}."),
-                Err(e) => format!(
-                    "Failed to delete directory: {e}. Set recursive=true to delete contents."
-                ),
+                Ok(()) => {
+                    tracing::info!(%path, "deleted empty directory");
+                    format!("Deleted empty directory {path}.")
+                }
+                Err(e) => {
+                    tracing::warn!(%path, error = %e, "deleteFile dir failed (not empty)");
+                    format!(
+                        "Failed to delete directory: {e}. Set recursive=true to delete contents."
+                    )
+                }
             }
         }
     } else {
         match std::fs::remove_file(p) {
-            Ok(()) => format!("Deleted {path}."),
-            Err(e) => format!("Failed to delete file: {e}"),
+            Ok(()) => {
+                tracing::info!(%path, "deleted file");
+                format!("Deleted {path}.")
+            }
+            Err(e) => {
+                tracing::warn!(%path, error = %e, "deleteFile failed");
+                format!("Failed to delete file: {e}")
+            }
         }
     }
 }
 
 pub(super) fn executeMakeDirs(path: &str) -> String {
     match std::fs::create_dir_all(path) {
-        Ok(()) => format!("Created directory {path}."),
-        Err(e) => format!("Failed to create directory: {e}"),
+        Ok(()) => {
+            tracing::debug!(%path, "created directory");
+            format!("Created directory {path}.")
+        }
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "makeDirs failed");
+            format!("Failed to create directory: {e}")
+        }
     }
 }
 

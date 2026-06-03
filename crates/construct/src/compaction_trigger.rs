@@ -94,6 +94,13 @@ impl Tracker {
             return None;
         }
 
+        tracing::debug!(
+            tokens,
+            limit,
+            ratio = self.usageRatio(),
+            "evaluating compaction trigger"
+        );
+
         // 80%+: S1 first (cheap mechanical), then S2 after S1 exhausted.
         if !self.exhausted.contains(&StagePick::S1) {
             return Some(StagePick::S1);

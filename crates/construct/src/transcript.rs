@@ -415,6 +415,7 @@ impl Transcript {
         toolName: &str,
         args: &serde_json::Value,
     ) -> Result<String> {
+        tracing::debug!(%callId, tool = %toolName, "recording tool call");
         let turn = Turn {
             id: randomHexId("t"),
             blockId: self.currentBlockId.clone(),
@@ -447,6 +448,7 @@ impl Transcript {
         content: &str,
         attachments: Option<Vec<TurnAttachment>>,
     ) -> Result<String> {
+        tracing::debug!(%callId, contentLen = content.len(), "recording tool result");
         let turn = Turn {
             id: randomHexId("t"),
             blockId: self.currentBlockId.clone(),
