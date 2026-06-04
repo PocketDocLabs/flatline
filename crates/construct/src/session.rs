@@ -1071,7 +1071,14 @@ impl Session {
                                 &call.function.name,
                                 &args,
                             ) {
-                                Ok(turnId) => self.headTurnId = Some(turnId),
+                                Ok(turnId) => {
+                                    self.headTurnId = Some(turnId);
+                                    tracing::debug!(
+                                        tool = %call.function.name,
+                                        callId = %call.id,
+                                        "ToolCall recorded to transcript"
+                                    );
+                                }
                                 Err(e) => tracing::warn!("transcript write failed: {e}"),
                             }
                         }
@@ -1175,6 +1182,11 @@ impl Session {
                                 match tool::parse(&call.function.name, &call.function.arguments) {
                                     Ok(a) => a,
                                     Err(err) => {
+                                        tracing::warn!(
+                                            tool = %call.function.name,
+                                            error = %err,
+                                            "tool parse failed — pushing to transcript/history, no live event"
+                                        );
                                         self.pushToolResult(&call.id, err.to_string().into());
                                         continue;
                                     }
@@ -1501,6 +1513,10 @@ impl Session {
                                             summary: tool::summarize(&action),
                                         })
                                         .await;
+                                    tracing::debug!(
+                                        tool = %call.function.name,
+                                        "ToolStarted event emitted"
+                                    );
 
                                     if tool::needsMcp(&action) {
                                         crate::message::Content::text(
@@ -1845,6 +1861,10 @@ impl Session {
                                         output: output.textContent().to_string(),
                                     })
                                     .await;
+                                tracing::debug!(
+                                    tool = %call.function.name,
+                                    "ToolResult event emitted"
+                                );
                             }
 
                             self.pushToolResult(&call.id, output);
@@ -2376,6 +2396,7 @@ impl Session {
 
     /// Push a tool result to history and record to transcript.
     fn pushToolResult(&mut self, callId: &str, content: crate::message::Content) {
+        tracing::debug!(callId = %callId, chars = content.textContent().chars().count(), "pushToolResult to transcript+history");
         // Extract image attachments for transcript persistence.
         let turnAttachments = if content.hasImages() {
             let atts: Vec<crate::transcript::TurnAttachment> = content
