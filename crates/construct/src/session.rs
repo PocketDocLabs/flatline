@@ -1178,19 +1178,21 @@ impl Session {
                                 break 'turns Ok(());
                             }
 
-                            let action =
-                                match tool::parse(&call.function.name, &call.function.arguments) {
-                                    Ok(a) => a,
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            tool = %call.function.name,
-                                            error = %err,
-                                            "tool parse failed — pushing to transcript/history, no live event"
-                                        );
-                                        self.pushToolResult(&call.id, err.to_string().into());
-                                        continue;
-                                    }
-                                };
+                            let action = match tool::parse(
+                                &call.function.name,
+                                &call.function.arguments,
+                            ) {
+                                Ok(a) => a,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        tool = %call.function.name,
+                                        error = %err,
+                                        "tool parse failed — pushing to transcript/history, no live event"
+                                    );
+                                    self.pushToolResult(&call.id, err.to_string().into());
+                                    continue;
+                                }
+                            };
                             let summary = tool::summarize(&action);
                             let diff = tool::diffPreview(&action);
                             let _ = self.transcript.updateToolCallMeta(&call.id, |meta| {
