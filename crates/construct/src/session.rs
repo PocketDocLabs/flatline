@@ -1312,6 +1312,13 @@ impl Session {
                                             impact,
                                             None
                                         );
+                                        if !allowed {
+                                            let _ = logTx
+                                                .send(LogEvent::ToolDenied {
+                                                    name: call.function.name.clone(),
+                                                })
+                                                .await;
+                                        }
                                         let _ =
                                             self.transcript.updateToolCallMeta(&call.id, |meta| {
                                                 meta.outcome = Some(if allowed {
@@ -1407,6 +1414,13 @@ impl Session {
                                                     impact,
                                                     reviewForPermit
                                                 );
+                                                if !allowed {
+                                                    let _ = logTx
+                                                        .send(LogEvent::ToolDenied {
+                                                            name: call.function.name.clone(),
+                                                        })
+                                                        .await;
+                                                }
                                                 let _ = self.transcript.updateToolCallMeta(
                                                     &call.id,
                                                     |meta| {
@@ -1745,11 +1759,6 @@ impl Session {
                                     }
                                 } // Close the else block for non-task tools.
                             } else {
-                                let _ = logTx
-                                    .send(LogEvent::ToolDenied {
-                                        name: call.function.name.clone(),
-                                    })
-                                    .await;
                                 crate::message::Content::text(
                                     deniedMessage
                                         .take()
