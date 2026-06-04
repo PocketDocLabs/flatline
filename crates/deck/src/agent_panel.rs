@@ -775,6 +775,9 @@ impl AgentPanel {
 
     /// Move queued messages into conversation entries (called on SteerInjected).
     pub fn promoteQueue(&mut self, texts: &[String]) {
+        // Force-commit any in-flight assistant content so the queued user
+        // bubble always renders after the assistant's last words.
+        self.forceFinalizeStreaming();
         for text in texts {
             self.entries.push(PanelEntry::User(text.clone()));
         }
@@ -784,6 +787,9 @@ impl AgentPanel {
         self.scrollOffset = 0;
         self.newContentWhileScrolled = false;
         self.idleWhileScrolled = false;
+        // Restore streaming state — the turn continues after promotion.
+        self.isStreaming = true;
+        self.thinkingStartTime = Some(Instant::now());
     }
 
     pub fn pushUser(&mut self, text: &str) {
@@ -980,6 +986,27 @@ impl AgentPanel {
             self.thinkingStartTime = Some(Instant::now());
         }
         self.streamingReasoning.push_str(text);
+    }
+
+    /// Commit all streaming content immediately, bypassing the reveal deferral.
+    /// Used when a queued user message or tool call must appear after the
+    /// assistant's output — the content is committed now rather than waiting
+    /// for the reveal ticker to drain pendingContent.
+    fn forceFinalizeStreaming(&mut self) {
+        if !self.streamingReasoning.is_empty() {
+            let clean = construct::text::sanitizeVariationSelectors(&self.streamingReasoning);
+            self.streamingReasoning.clear();
+            self.entries.push(PanelEntry::Reasoning {
+                text: clean,
+                expanded: false,
+            });
+        }
+        // Flush all pending content into streaming content immediately.
+        if !self.pendingContent.is_empty() {
+            self.streamingContent.push_str(&self.pendingContent);
+            self.pendingContent.clear();
+        }
+        self.doFinalize();
     }
 
     pub fn finalizeStreaming(&mut self) {
@@ -7244,6 +7271,45 @@ mod wrapTests {
                 );
             }
         }
+    }
+
+    /// Bug reproduction: when finalizeStreaming defers (pendingContent is
+    /// non-empty) and promoteQueue is called, the queued user bubble appears
+    /// in entries while the assistant text is stuck in streamingContent,
+    /// not yet committed.  The panel renders the User entry before the
+    /// Assistant content.
+    ///
+    /// The fix: promoteQueue force-finalizes streaming first.
+    #[test]
+    fn promoteQueueBeforeDeferredAssistantContentIsOutOfOrder() {
+        let mut panel = AgentPanel::new();
+        panel.pushUser("hello");
+
+        // Simulate streaming assistant content still mid-reveal.
+        panel.appendContent("Here is the answer.");
+        assert!(!panel.pendingContent.is_empty());
+
+        // finalizeStreaming defers because pendingContent is non-empty.
+        panel.finalizeStreaming();
+
+        // Queued message injected while content is still pending reveal.
+        panel.promoteQueue(&["next question".into()]);
+
+        // Assert the assistant content was committed before the queued user.
+        let asstIdx = panel
+            .entries
+            .iter()
+            .position(|e| matches!(e, PanelEntry::Assistant(_)))
+            .expect("assistant content should be committed");
+        let userIdx = panel
+            .entries
+            .iter()
+            .position(|e| matches!(e, PanelEntry::User(s) if s == "next question"))
+            .expect("queued user should be in entries");
+        assert!(
+            asstIdx < userIdx,
+            "assistant ({asstIdx}) must appear before queued user ({userIdx})"
+        );
     }
 
     fn snapshotBuffer(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
