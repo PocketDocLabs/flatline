@@ -46,6 +46,8 @@ use crate::terminal_pane::TerminalPane;
 use crate::toast::ToastCenter;
 
 use std::io::{self, Write as _};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Resolve main agent permissions from config, falling back to allowReadOnly.
@@ -709,7 +711,7 @@ pub async fn run() -> Result<()> {
 
         // Main agent auto-approves read-only tools but still prompts/reviews writes.
         let permissions = mainAgentPermissions(&config);
-        let mut runtimePermitMode = permissions.defaultMode.clone();
+        let initialPermitMode = permissions.defaultMode.clone();
 
         // Deck is the shared terminal harness — SWE domain by default.
         let mut session = match Session::new(
@@ -737,13 +739,49 @@ pub async fn run() -> Result<()> {
             _ => {}
         }
 
-        // Take the wake-batch receiver. The session's batcher coalesces
-        // wake fires into `WakeBatch` values; we select on this alongside
-        // userInputRx so a batch only injects when the session is idle
-        // — wakes that arrive mid-turn queue in the receiver and fire
-        // immediately after the current turn completes. Slot-replaced
-        // on /clear and /resume from the new session.
-        let mut wakeBatchRx = session.takeWakeBatchRx();
+        // Permit mode watch channel — lets sendInner pick up Shift+Tab
+        // toggles mid-turn. The deck writes to the sender; sendInner polls
+        // the receiver. The old `session.setPermitMode()` path still runs
+        // for the idle case (refresh tool defs / system prompt).
+        let (permitModeTx, permitModeRx) =
+            watch::channel::<construct::permissions::PermitMode>(initialPermitMode);
+        session.setPermitModeRx(permitModeRx);
+        // We reference only the sender after this point; the receiver is
+        // owned by the session (and replaced on /clear /resume).
+        // Clone for the demux task — it writes to the watch on every
+        // SetPermitMode so sendInner picks up changes mid-turn.
+        let demuxPermitModeTx = permitModeTx.clone();
+        // Dirty flag — set by the demux when the mode changes. Checked
+        // after each turn to refresh tool defs/system prompt if needed.
+        let permitModeDirty = Arc::new(AtomicBool::new(false));
+
+        // Take the wake-batch receiver and set up a forwarding task.
+        // The batcher uses mpsc (backpressure, no message loss). We fan
+        // out to two consumers:
+        //   deckWakeRx  — selected in the main loop for idle injection
+        //   sessionWakeRx — polled by sendInner for mid-turn injection
+        // The forwarder `send().await`s to sessionWakeTx (backpressure)
+        // and `try_send`s to deckWakeTx (non-blocking, drops if the
+        // deck is busy in a turn).
+        // We keep the Tx halves so session-replace paths can spawn new
+        // forwarders with fresh channels.
+        let (deckWakeTx, deckWakeRx) = mpsc::channel::<construct::wakes::WakeBatch>(32);
+        let (sessionWakeTx, sessionWakeRx) = mpsc::channel::<construct::wakes::WakeBatch>(32);
+        {
+            let rawRx = session.takeWakeBatchRx();
+            session.setWakeInjectRx(sessionWakeRx);
+            if let Some(mut batchRx) = rawRx {
+                let stx = sessionWakeTx.clone();
+                let dtx = deckWakeTx.clone();
+                tokio::spawn(async move {
+                    while let Some(batch) = batchRx.recv().await {
+                        let _ = stx.send(batch.clone()).await;
+                        let _ = dtx.try_send(batch);
+                    }
+                });
+            }
+        }
+        let mut wakeBatchRx = Some(deckWakeRx);
 
         // Split the inbound TuiRequest stream so jobs-panel queries can run
         // concurrently with `session.send`. Without this, a JobPlane
@@ -760,9 +798,10 @@ pub async fn run() -> Result<()> {
         let (taskPlaneReqTx, mut taskPlaneReqRx) = mpsc::channel::<TuiRequest>(16);
         let (terminalReqTx, mut terminalReqRx) = mpsc::channel::<TuiRequest>(16);
         let (otherReqTx, mut otherReqRx) = mpsc::channel::<TuiRequest>(16);
+        let demuxDirty = permitModeDirty.clone();
         tokio::spawn(async move {
             while let Some(req) = requestRx.recv().await {
-                match &req {
+                match req {
                     TuiRequest::ListJobs { .. }
                     | TuiRequest::ListWakes { .. }
                     | TuiRequest::KillTask { .. }
@@ -773,6 +812,22 @@ pub async fn run() -> Result<()> {
                     | TuiRequest::KillTerminal { .. }
                     | TuiRequest::ListTerminals { .. } => {
                         let _ = terminalReqTx.send(req).await;
+                    }
+                    TuiRequest::SetPermitMode { mode, reply } => {
+                        // Write to the watch channel immediately so
+                        // sendInner picks up the change mid-turn.
+                        let _ = demuxPermitModeTx.send(mode.clone());
+                        // Flag that tool defs/system prompt need refresh.
+                        demuxDirty.store(true, Ordering::Release);
+                        // Reply to the UI immediately — don't wait for
+                        // otherReqRx, which may be blocked by a turn.
+                        let _ = reply.send(construct::control::CommandAck::ok(format!(
+                            "Permission mode: {}",
+                            permitModeLabel(&mode),
+                        )));
+                        // Don't route to otherReqTx — the watch channel
+                        // handles mid-turn, and the dirty flag + after-turn
+                        // check handles idle tool/system prompt refresh.
                     }
                     _ => {
                         let _ = otherReqTx.send(req).await;
@@ -854,9 +909,8 @@ pub async fn run() -> Result<()> {
         loop {
             // Helper future: yields the next wake batch if the receiver
             // is present, otherwise blocks forever so the select arm
-            // becomes a no-op. Wakes that arrive while a turn is
-            // running stay in the receiver until this select wins
-            // again — no racing spawns, no out-of-order delivery.
+            // becomes a no-op. mpsc: `recv()` returns `Some(batch)` or
+            // `None` when the channel is closed.
             let nextWakeBatch = async {
                 match &mut wakeBatchRx {
                     Some(rx) => rx.recv().await,
@@ -874,6 +928,11 @@ pub async fn run() -> Result<()> {
                         // before streaming anything.
                         let _ = sessionCancelTx.send(false);
                         cancelRx.borrow_and_update();
+                        // Refresh tools/prompt for idle toggles before the turn.
+                        if permitModeDirty.swap(false, Ordering::Acquire) {
+                            let current = permitModeTx.borrow().clone();
+                            session.setPermitMode(current).await;
+                        }
                         if let Err(e) = session.injectWakeBatch(
                             batch,
                             &logTx,
@@ -886,6 +945,11 @@ pub async fn run() -> Result<()> {
                                 .send(LogEvent::Error(format!("Wake injection error: {e}")))
                                 .await;
                         }
+                        // Refresh tools/prompt for mid-turn toggles after the turn.
+                        if permitModeDirty.swap(false, Ordering::Acquire) {
+                            let current = permitModeTx.borrow().clone();
+                            session.setPermitMode(current).await;
+                        }
                     }
                 }
                 msg = userInputRx.recv() => {
@@ -893,10 +957,20 @@ pub async fn run() -> Result<()> {
                         Some(msg) => {
                             // Clear any stale cancel notification from a previous turn.
                             cancelRx.borrow_and_update();
+                            // Refresh tools/prompt for idle toggles before the turn.
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
+                            }
                             if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx).await {
                                 let _ = logTx
                                     .send(LogEvent::Error(format!("Agent error: {e}")))
                                     .await;
+                            }
+                            // Refresh tools/prompt for mid-turn toggles after the turn.
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
                             }
                         }
                         None => break,
@@ -915,9 +989,10 @@ pub async fn run() -> Result<()> {
                             }
                             // Consume old session, keep the shell.
                             let shells = session.intoShells();
+                            let currentMode = permitModeTx.borrow().clone();
                             match Session::resume(
                                 &config,
-                                permissionsWithMode(&config, &runtimePermitMode),
+                                permissionsWithMode(&config, &currentMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
@@ -925,13 +1000,33 @@ pub async fn run() -> Result<()> {
                             ).await {
                                 Ok(s) => {
                                     session = s;
+                                    // Give the new session the permit mode watch.
+                                    session.setPermitModeRx(permitModeTx.subscribe());
+                                    // Ensure watch matches the session's mode.
+                                    let _ = permitModeTx.send(session.currentPermitMode().clone());
                                     // Point request handlers at the new session runtime
                                     // so /tasks and terminal cleanup reflect resumed state.
                                     *runtimeSlot.write().unwrap() = session.runtimeHandles();
-                                    // Replace the wake-batch receiver — the old one
-                                    // belonged to the old session's batcher, which has
-                                    // been cancelled by disarmAll above.
-                                    wakeBatchRx = session.takeWakeBatchRx();
+                                    // Replace the wake-batch forwarding — the old
+                                    // forwarder's raw receiver belonged to the old
+                                    // session's batcher, now disarmed.
+                                    let (newDeckTx, newDeckRx) =
+                                        mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                    let (newSessionTx, newSessionRx) =
+                                        mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                    let stx = newSessionTx.clone();
+                                    let dtx = newDeckTx.clone();
+                                    let rawRx = session.takeWakeBatchRx();
+                                    session.setWakeInjectRx(newSessionRx);
+                                    if let Some(mut rawRx) = rawRx {
+                                        tokio::spawn(async move {
+                                            while let Some(batch) = rawRx.recv().await {
+                                                let _ = stx.send(batch.clone()).await;
+                                                let _ = dtx.try_send(batch);
+                                            }
+                                        });
+                                    }
+                                    wakeBatchRx = Some(newDeckRx);
                                     // Re-init MCP for the resumed session.
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
@@ -966,9 +1061,10 @@ pub async fn run() -> Result<()> {
                                         format!("Failed to resume {id}: {e}"),
                                     ));
                                     // Shell returned — recreate a fresh session.
+                                    let currentMode = permitModeTx.borrow().clone();
                                     match Session::new(
                                         &config,
-                                        permissionsWithMode(&config, &runtimePermitMode),
+                                        permissionsWithMode(&config, &currentMode),
                                         shell,
                                         InterfaceMode::SharedTerminal,
                                         &[DomainModule::Swe],
@@ -984,9 +1080,28 @@ pub async fn run() -> Result<()> {
                                             // (Old wakes already disarmed above before
                                             // the resume attempt — no race here.)
                                             session = s;
+                                            session.setPermitModeRx(permitModeTx.subscribe());
+                                            let _ = permitModeTx.send(session.currentPermitMode().clone());
                                             *runtimeSlot.write().unwrap() =
                                                 session.runtimeHandles();
-                                            wakeBatchRx = session.takeWakeBatchRx();
+                                            // Replace wake forwarding for new session.
+                                            let (newDeckTx, newDeckRx) =
+                                                mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                            let (newSessionTx, newSessionRx) =
+                                                mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                            let stx = newSessionTx.clone();
+                                            let dtx = newDeckTx.clone();
+                                            let rawRx = session.takeWakeBatchRx();
+                                            session.setWakeInjectRx(newSessionRx);
+                                            if let Some(mut rawRx) = rawRx {
+                                                tokio::spawn(async move {
+                                                    while let Some(batch) = rawRx.recv().await {
+                                                        let _ = stx.send(batch.clone()).await;
+                                                        let _ = dtx.try_send(batch);
+                                                    }
+                                                });
+                                            }
+                                            wakeBatchRx = Some(newDeckRx);
                                         }
                                         Err(e2) => {
                                             let _ = logTx
@@ -1009,20 +1124,40 @@ pub async fn run() -> Result<()> {
                                 oldRuntime.disarmAllWakes().await;
                             }
                             let shells = session.intoShells();
+                            let currentMode = permitModeTx.borrow().clone();
                             match Session::new(
                                 &config,
-                                permissionsWithMode(&config, &runtimePermitMode),
+                                permissionsWithMode(&config, &currentMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
                                 &[DomainModule::Swe],
                             ) {
                                 Ok(s) => {
                                     session = s;
+                                    session.setPermitModeRx(permitModeTx.subscribe());
+                                    let _ = permitModeTx.send(session.currentPermitMode().clone());
                                     // Hot-swap request handlers to the replacement
                                     // runtime. Dropping the old facade releases the
                                     // previous planes.
                                     *runtimeSlot.write().unwrap() = session.runtimeHandles();
-                                    wakeBatchRx = session.takeWakeBatchRx();
+                                    // Replace wake forwarding for new session.
+                                    let (newDeckTx, newDeckRx) =
+                                        mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                    let (newSessionTx, newSessionRx) =
+                                        mpsc::channel::<construct::wakes::WakeBatch>(32);
+                                    let stx = newSessionTx.clone();
+                                    let dtx = newDeckTx.clone();
+                                    let rawRx = session.takeWakeBatchRx();
+                                    session.setWakeInjectRx(newSessionRx);
+                                    if let Some(mut rawRx) = rawRx {
+                                        tokio::spawn(async move {
+                                            while let Some(batch) = rawRx.recv().await {
+                                                let _ = stx.send(batch.clone()).await;
+                                                let _ = dtx.try_send(batch);
+                                            }
+                                        });
+                                    }
+                                    wakeBatchRx = Some(newDeckRx);
                                     match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
                                         Ok(servers) if !servers.is_empty() => {
                                             session.initMcp(servers).await;
@@ -1057,6 +1192,13 @@ pub async fn run() -> Result<()> {
                             });
                         }
                         Some(TuiRequest::GetPermissions { reply }) => {
+                            // Sync permit mode in case Shift+Tab happened
+                            // while idle (demux updated watch, session stale).
+                            let current = permitModeTx.borrow().clone();
+                            if current != *session.currentPermitMode() {
+                                session.setPermitMode(current).await;
+                                permitModeDirty.store(false, Ordering::Release);
+                            }
                             let (defaultMode, rules, source, configPath) =
                                 session.permissionsStatusData();
                             let _ = reply.send(construct::control::PermissionsStatus {
@@ -1272,12 +1414,14 @@ pub async fn run() -> Result<()> {
                                     &rules,
                                 ) {
                                     Ok(()) => {
-                                        runtimePermitMode = defaultMode.clone();
+                                        let _ = permitModeTx.send(defaultMode.clone());
                                         session.setPermissions(construct::permissions::Permissions {
                                             defaultMode,
                                             rules,
                                             source: construct::permissions::PermissionsSource::Project,
                                         }).await;
+                                        // setPermissions already refreshed tools/prompt.
+                                        permitModeDirty.store(false, Ordering::Release);
                                         let _ = reply.send(construct::control::CommandAck::ok(
                                             "Permissions saved.",
                                         ));
@@ -1294,13 +1438,9 @@ pub async fn run() -> Result<()> {
                                 ));
                             }
                         }
-                        Some(TuiRequest::SetPermitMode { mode, reply }) => {
-                            runtimePermitMode = mode.clone();
-                            session.setPermitMode(mode.clone()).await;
-                            let _ = reply.send(construct::control::CommandAck::ok(format!(
-                                "Permission mode: {}",
-                                permitModeLabel(&mode),
-                            )));
+                        Some(TuiRequest::SetPermitMode { .. }) => {
+                            // Handled by the demux — never reaches otherReqRx.
+                            unreachable!("SetPermitMode handled by demux");
                         }
                         Some(TuiRequest::GetRewindOptions { reply }) => {
                             let turns = session.loadDisplayTurns().unwrap_or_default();
@@ -1352,6 +1492,10 @@ pub async fn run() -> Result<()> {
                         }
                         Some(TuiRequest::RetryLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
+                            }
                             match session.retryLastTurn(
                                 &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
                             ).await {
@@ -1367,9 +1511,17 @@ pub async fn run() -> Result<()> {
                                     ));
                                 }
                             }
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
+                            }
                         }
                         Some(TuiRequest::ContinueLastTurn { reply }) => {
                             cancelRx.borrow_and_update();
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
+                            }
                             match session.continueLastTurn(
                                 &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
                             ).await {
@@ -1384,6 +1536,10 @@ pub async fn run() -> Result<()> {
                                         format!("Continue failed: {e}"),
                                     ));
                                 }
+                            }
+                            if permitModeDirty.swap(false, Ordering::Acquire) {
+                                let current = permitModeTx.borrow().clone();
+                                session.setPermitMode(current).await;
                             }
                         }
                         // Terminal-management requests are routed to the

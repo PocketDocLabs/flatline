@@ -291,11 +291,21 @@ pub struct Session {
     /// `waitForSubagent`. Wakes for these jobs are filtered out of
     /// incoming wake batches to prevent duplicate delivery.
     consumedTaskWakes: HashSet<u64>,
-    /// Receiver for coalesced `WakeBatch` values. The session task takes
-    /// this once at startup and selects on it alongside user input; each
-    /// batch becomes one synthetic user-shaped turn driving the model.
+    /// Wake (source-id, fired-at) pairs that have been injected inline
+    /// during the current turn (mid-turn wake delivery). The deck's idle
+    /// wake path filters these out to prevent double injection from the
+    /// forwarding fan-out. Using `(wakeId, firedAt)` instead of just
+    /// `wakeId` because `wakeId` is per-source — a later fire from the
+    /// same source must not be filtered out.
+    injectedWakeIds: HashSet<(crate::wakes::WakeId, std::time::Instant)>,
+    /// Receiver for coalesced `WakeBatch` values. The session polls this
+    /// during `sendInner` for mid-turn wake delivery. The deck also receives
+    /// batches via a forwarding task for idle injection.
     /// `Option` so the host can pull it out via `takeWakeBatchRx()`.
     wakeBatchRx: Option<mpsc::Receiver<crate::wakes::WakeBatch>>,
+    /// Watch receiver for runtime permit mode changes. Polled during
+    /// `sendInner` so Shift+Tab toggles take effect mid-turn.
+    permitModeRx: Option<watch::Receiver<crate::permissions::PermitMode>>,
 }
 
 impl Session {
@@ -310,12 +320,29 @@ impl Session {
         }
     }
 
-    /// Take ownership of the wake-batch receiver. Called once by the
-    /// session host (e.g. the deck) so it can select on coalesced
-    /// `WakeBatch` values alongside user input. Subsequent calls return
-    /// `None`.
+    /// Take the wake-batch receiver for the deck's forwarding task.
+    /// The deck forwards batches to the session (via setWakeInjectRx)
+    /// for mid-turn injection and selects on its own copy for idle
+    /// injection. Subsequent calls return `None`.
     pub fn takeWakeBatchRx(&mut self) -> Option<mpsc::Receiver<crate::wakes::WakeBatch>> {
         self.wakeBatchRx.take()
+    }
+
+    /// Set a dedicated wake receiver for mid-turn polling during
+    /// `sendInner`. The deck's forwarding task sends batches here.
+    pub fn setWakeInjectRx(&mut self, rx: mpsc::Receiver<crate::wakes::WakeBatch>) {
+        self.wakeBatchRx = Some(rx);
+    }
+
+    /// Set the watch receiver for runtime permit mode changes.
+    /// Called once by the deck after session construction.
+    pub fn setPermitModeRx(&mut self, rx: watch::Receiver<PermitMode>) {
+        self.permitModeRx = Some(rx);
+    }
+
+    /// Return the current default permission mode for comparison after a turn.
+    pub fn currentPermitMode(&self) -> &PermitMode {
+        &self.permissions.defaultMode
     }
 
     /// Consume this session and return its shell registry handle. The
@@ -413,7 +440,9 @@ impl Session {
             turnsWithUsage: 0,
             autoReviewTickets: HashMap::new(),
             consumedTaskWakes: HashSet::new(),
+            injectedWakeIds: HashSet::new(),
             wakeBatchRx: Some(wakeBatchRx),
+            permitModeRx: None,
         })
     }
 
@@ -646,7 +675,9 @@ impl Session {
             turnsWithUsage: 0,
             autoReviewTickets: HashMap::new(),
             consumedTaskWakes: HashSet::new(),
+            injectedWakeIds: HashSet::new(),
             wakeBatchRx: Some(wakeBatchRx),
+            permitModeRx: None,
         })
     }
 
@@ -677,6 +708,81 @@ impl Session {
                 Err(e) => {
                     tracing::warn!("pending topic eval panicked: {e}");
                 }
+            }
+        }
+    }
+
+    /// Non-blocking version of `collectTopicEval`. If the pending
+    /// classification task has finished, collects the result immediately.
+    /// Called during `sendInner` between tool call batches.
+    async fn tryCollectTopicEvalAsync(&mut self, logTx: &mpsc::Sender<LogEvent>) {
+        if self
+            .pendingTopicEval
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
+            self.collectTopicEval(logTx).await;
+        }
+    }
+
+    /// Inject a wake batch inline during a running turn. Formats the batch
+    /// as user-shaped content, pushes to history, records a Wake transcript
+    /// entry, and emits a log event. Does NOT recurse into `sendInner` —
+    /// the current turn loop picks up the new history entry on the next
+    /// API call.
+    async fn injectWakeInline(
+        &mut self,
+        mut batch: crate::wakes::WakeBatch,
+        logTx: &mpsc::Sender<LogEvent>,
+    ) {
+        filterConsumedTaskWakes(&mut batch.fires, &self.consumedTaskWakes);
+        batch
+            .fires
+            .retain(|f| !self.injectedWakeIds.contains(&(f.wakeId, f.firedAt)));
+        if batch.fires.is_empty() {
+            return;
+        }
+
+        let envelope = formatWakeBatch(&batch);
+        tracing::info!(count = batch.fires.len(), "injecting wake inline mid-turn");
+
+        self.autoReviewTickets.clear();
+        let (content, _atts) = buildUserContent(&envelope, &[]);
+        self.history.push(Message::User { content });
+        match self
+            .transcript
+            .recordWake(&envelope, self.headTurnId.as_deref())
+        {
+            Ok(turnId) => self.headTurnId = Some(turnId),
+            Err(e) => tracing::warn!("wake transcript write failed: {e}"),
+        }
+
+        for f in &batch.fires {
+            self.injectedWakeIds.insert((f.wakeId, f.firedAt));
+        }
+
+        let _ = logTx
+            .send(LogEvent::WakeBatchInjected {
+                count: batch.fires.len(),
+                summary: wakeBatchSummary(&batch),
+            })
+            .await;
+    }
+
+    /// Poll the permit mode watch receiver and sync `self.permissions.defaultMode`.
+    /// If the mode changed, also refreshes tool defs and system prompt so
+    /// subsequent API calls in the same turn use the correct set.
+    async fn syncPermitMode(&mut self) {
+        if let Some(rx) = &self.permitModeRx {
+            let latest = rx.borrow().clone();
+            if latest != self.permissions.defaultMode {
+                tracing::info!(
+                    mode = ?latest,
+                    "permit mode changed mid-turn"
+                );
+                self.permissions.defaultMode = latest;
+                self.refreshToolDefs().await;
+                self.refreshSystemPrompt().await;
             }
         }
     }
@@ -736,6 +842,7 @@ impl Session {
             // applied later against the API-call copy; `self.history` and the
             // transcript get the clean user text.
             self.autoReviewTickets.clear();
+            self.injectedWakeIds.clear();
             let (content, turnAttachments) = buildUserContent(userMessage, &input.attachments);
             self.history.push(Message::User { content });
             match self.transcript.recordUser(
@@ -758,9 +865,10 @@ impl Session {
     /// `TurnRole::Wake` transcript entry so resume can render the turn
     /// as a notice rather than a real user bubble.
     ///
-    /// Wakes that arrive while a turn is running are queued in the
-    /// batcher's receiver — the deck's session task selects on that
-    /// receiver alongside `userInputRx`, so this only runs while idle.
+    /// The deck selects on the forwarded wake-batch receiver while the
+    /// agent is idle. Wakes that arrive during a turn are consumed by
+    /// `sendInner`'s mid-turn polling path and injected inline;
+    /// `injectedWakeIds` prevents this idle path from double-injecting.
     pub fn injectWakeBatch<'a>(
         &'a mut self,
         mut batch: crate::wakes::WakeBatch,
@@ -809,9 +917,22 @@ impl Session {
             // Drop TaskComplete wakes for subagent jobs already consumed
             // via waitForSubagent to prevent duplicate delivery.
             filterConsumedTaskWakes(&mut batch.fires, &self.consumedTaskWakes);
+            // Drop fires already injected inline by sendInner during the
+            // previous turn (mid-turn wake delivery via forwarding fan-out).
+            // Don't clear injectedWakeIds here — multiple stale batches
+            // may be queued in the deck receiver and all need the
+            // same filter. Clearing happens at the start of `send()`.
+            batch
+                .fires
+                .retain(|f| !self.injectedWakeIds.contains(&(f.wakeId, f.firedAt)));
 
             if batch.fires.is_empty() {
                 return Ok(());
+            }
+
+            // Track injected fires so the mid-turn path doesn't double-inject.
+            for f in &batch.fires {
+                self.injectedWakeIds.insert((f.wakeId, f.firedAt));
             }
 
             let envelope = formatWakeBatch(&batch);
@@ -980,6 +1101,25 @@ impl Session {
                     break 'turns Ok(());
                 }
 
+                // Sync permit mode and collect topic after every turn
+                // iteration — catches toggles during Done/retry/cancel.
+                self.syncPermitMode().await;
+                self.tryCollectTopicEvalAsync(logTx).await;
+                // Drain wake batches — catches wakes that arrived during
+                // API streaming (no tool calls in the previous iteration).
+                let pendingWakes: Vec<crate::wakes::WakeBatch> = {
+                    let mut batches = Vec::new();
+                    if let Some(rx) = &mut self.wakeBatchRx {
+                        while let Ok(batch) = rx.try_recv() {
+                            batches.push(batch);
+                        }
+                    }
+                    batches
+                };
+                for batch in pendingWakes {
+                    self.injectWakeInline(batch, logTx).await;
+                }
+
                 tracing::debug!(historyLen = self.history.len(), "starting turn");
                 // NOTE: Err from streamOneTurn means either a permanent API error
                 // or a transient one that already exhausted the API client's own
@@ -1038,6 +1178,9 @@ impl Session {
                         promptTokens,
                     } => {
                         retryCount = 0;
+                        // Sync permit mode now — a toggle during streaming
+                        // should affect this turn's tool permission checks.
+                        self.syncPermitMode().await;
                         // Update token count but don't trigger compaction mid-loop.
                         if let Some(tokens) = promptTokens {
                             self.compactionTracker.updateTokens(tokens);
@@ -1177,6 +1320,10 @@ impl Session {
                                 let _ = logTx.send(LogEvent::TurnCancelled).await;
                                 break 'turns Ok(());
                             }
+
+                            // Sync permit mode between tools — a toggle during
+                            // a long-running first tool should affect the next.
+                            self.syncPermitMode().await;
 
                             let action = match tool::parse(
                                 &call.function.name,
@@ -1883,6 +2030,28 @@ impl Session {
 
                         // Inject queued user messages before the next API call.
                         self.drainSteer(steerRx, logTx).await;
+
+                        // Poll mid-turn events: permit mode toggles, topic
+                        // classification, and background task wakes.
+                        self.syncPermitMode().await;
+                        self.tryCollectTopicEvalAsync(logTx).await;
+                        // Drain any wake batches that arrived during tool
+                        // execution — inject inline so the model notices
+                        // completed background tasks at the next opportunity.
+                        // Collect first (to release the receiver borrow),
+                        // then inject one by one.
+                        let pendingWakes: Vec<crate::wakes::WakeBatch> = {
+                            let mut batches = Vec::new();
+                            if let Some(rx) = &mut self.wakeBatchRx {
+                                while let Ok(batch) = rx.try_recv() {
+                                    batches.push(batch);
+                                }
+                            }
+                            batches
+                        };
+                        for batch in pendingWakes {
+                            self.injectWakeInline(batch, logTx).await;
+                        }
                     }
                 }
             }

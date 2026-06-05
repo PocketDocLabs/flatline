@@ -92,7 +92,7 @@ impl Session {
         Ok(())
     }
 
-    async fn refreshToolDefs(&mut self) {
+    pub(super) async fn refreshToolDefs(&mut self) {
         let includePermissionEscalation = matches!(
             self.permissions.defaultMode,
             crate::permissions::PermitMode::Auto
@@ -115,7 +115,7 @@ impl Session {
         self.tools = defs;
     }
 
-    async fn refreshSystemPrompt(&mut self) {
+    pub(super) async fn refreshSystemPrompt(&mut self) {
         let mut systemPrompt = prompt::build(
             self.interface,
             &self.domains,
