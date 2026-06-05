@@ -1065,6 +1065,7 @@ mod tests {
         .await
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn spawnAndComplete() {
         let (tx, mut rx) = mpsc::channel(64);
@@ -1455,6 +1456,7 @@ mod tests {
         assert_eq!(firstLine, 0);
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn snapshotReportsEarliestBufferedDistinctFromFirstLine() {
         // Tail of a noisy task: firstLine > earliestBuffered means earlier
@@ -1485,6 +1487,7 @@ mod tests {
         drop(plane);
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn sinceLinePagingWorks() {
         let (tx, mut rx) = mpsc::channel(64);

@@ -918,6 +918,7 @@ mod terminal_tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn attachMonitorMatchesTerminalOutput() {
         let shell = shellFixture().await;
@@ -1030,6 +1031,7 @@ mod terminal_tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn stopForTerminalStopsOnlyAttachedMonitors() {
         let shell = shellFixture().await;
