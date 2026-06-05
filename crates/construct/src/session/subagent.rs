@@ -248,39 +248,41 @@ fn buildChildPermissions(
     parent: &crate::permissions::Permissions,
     preset: &crate::runner::AgentPreset,
 ) -> crate::permissions::Permissions {
-    use crate::permissions::{Permissions, Rule};
+    use crate::permissions::{Permissions, PermitMode, Rule};
     use crate::tool::ToolSet;
 
-    let mut rules: Vec<Rule> = Vec::new();
-
+    // Read-only children get a closed-world permission set — explicit
+    // allows only for tools in the read-only toolset, derived from the
+    // canonical list shared with tool::filterDefs. A wildcard deny
+    // fallback rejects everything else. No parent rules are inherited
+    // so the explore agent's capability boundary is strictly its
+    // toolset. PermitMode::Auto ensures the auto reviewer handles
+    // anything unexpected without prompting the user.
     if matches!(preset.toolSet, ToolSet::ReadOnly) {
-        for tool in [
-            "shell",
-            "writeFile",
-            "editFile",
-            "multiEdit",
-            "copyFile",
-            "moveFile",
-            "deleteFile",
-            "makeDirs",
-            "terminalSpawn",
-            "terminalSwitch",
-            "terminalKill",
-            "monitor",
-            "monitorStop",
-            "scheduleWakeup",
-            "cronCreate",
-            "cronDelete",
-            "fileWatch",
-        ] {
-            rules.push(Rule {
+        let rules: Vec<Rule> = crate::tool::READ_ONLY_TOOLSET_TOOLS
+            .iter()
+            .map(|&tool| Rule {
                 tool: tool.into(),
                 pattern: None,
+                allow: true,
+            })
+            .chain(std::iter::once(Rule {
+                tool: "*".into(),
+                pattern: None,
                 allow: false,
-            });
-        }
+            }))
+            .collect();
+
+        return Permissions {
+            defaultMode: PermitMode::Auto,
+            rules,
+            source: parent.source,
+        };
     }
 
+    let mut rules: Vec<Rule> = Vec::new();
+    // General subagents inherit the preset's rules followed by parent
+    // rules, which take precedence and can widen or narrow as needed.
     rules.extend(preset.permissions.rules.iter().cloned());
     rules.extend(parent.rules.iter().cloned());
 

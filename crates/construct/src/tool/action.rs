@@ -340,6 +340,31 @@ pub enum ToolSet {
 }
 
 /// Filter tool definitions by a ToolSet.
+/// Tools available to explore subagents (ToolSet::ReadOnly).
+/// Deliberately omits `shell` — the model self-classifies impact and we
+/// don't trust that classification for explore agents. Read-only
+/// inspection of prior shell output is available via `shellHistory` +
+/// `readOutput` + `searchOutput`.
+pub(crate) const READ_ONLY_TOOLSET_TOOLS: &[&str] = &[
+    "readFile",
+    "glob",
+    "grep",
+    "listDir",
+    "structSearch",
+    "diff",
+    "fuzzyFind",
+    "fileOutline",
+    "viewSymbol",
+    "relatedFiles",
+    "shellHistory",
+    "readOutput",
+    "searchOutput",
+    "readTerminal",
+    "terminalList",
+    "terminalRunList",
+    "terminalRunStop",
+];
+
 pub(crate) fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
     // Terminal-management tools are excluded from subagent toolsets in
     // phase 1 — child sessions stay single-shell.
@@ -365,36 +390,11 @@ pub(crate) fn filterDefs(defs: &[ToolDef], set: &ToolSet) -> Vec<ToolDef> {
             .filter(|d| !SUBAGENT_DENIED.contains(&d.function.name.as_str()))
             .cloned()
             .collect(),
-        ToolSet::ReadOnly => {
-            // Read-only toolset for explore subagents. Deliberately omits
-            // `shell` — the model self-classifies impact and we don't trust
-            // that classification for explore agents. Read-only inspection
-            // of prior shell output is available via `shellHistory` +
-            // `readOutput` + `searchOutput`.
-            const ALLOWED: &[&str] = &[
-                "readFile",
-                "glob",
-                "grep",
-                "listDir",
-                "structSearch",
-                "diff",
-                "fuzzyFind",
-                "fileOutline",
-                "viewSymbol",
-                "relatedFiles",
-                "shellHistory",
-                "readOutput",
-                "searchOutput",
-                "readTerminal",
-                "terminalList",
-                "terminalRunList",
-                "terminalRunStop",
-            ];
-            defs.iter()
-                .filter(|d| ALLOWED.contains(&d.function.name.as_str()))
-                .cloned()
-                .collect()
-        }
+        ToolSet::ReadOnly => defs
+            .iter()
+            .filter(|d| READ_ONLY_TOOLSET_TOOLS.contains(&d.function.name.as_str()))
+            .cloned()
+            .collect(),
     }
 }
 

@@ -20,8 +20,8 @@ mod presentation;
 
 pub use action::{EditOp, ShellImpact, ToolAction, ToolParseError, ToolSet};
 pub(crate) use action::{
-    filterDefs, needsJobPlane, needsLsp, needsMcp, needsMonitor, needsRegistry, needsTask,
-    needsTranscript, needsWakes, needsWeb,
+    READ_ONLY_TOOLSET_TOOLS, filterDefs, needsJobPlane, needsLsp, needsMcp, needsMonitor,
+    needsRegistry, needsTask, needsTranscript, needsWakes, needsWeb,
 };
 pub(crate) use defs::{
     addPermissionEscalationFieldsToDefs, builtinDefs, builtinDefsWithPermissionEscalation,
