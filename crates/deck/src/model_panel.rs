@@ -1138,7 +1138,11 @@ impl ModelPanel {
                 profile.contextWindow = contextWindow;
                 profile.maxContextWindow = Some(contextWindow);
             }
-            if let Some(effort) = &model.defaultReasoningEffort {
+            // Clear stale reasoning when the new model does not support it.
+            if model.reasoningEfforts.is_empty() {
+                profile.reasoningEffort = None;
+                profile.reasoningSummary = None;
+            } else if let Some(effort) = &model.defaultReasoningEffort {
                 profile.reasoningEffort = Some(effort.clone());
             }
             profile.reasoningEfforts = model.reasoningEfforts.clone();

@@ -2,8 +2,12 @@
 
 //! Provider model catalog discovery for the `/model` panel.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -92,16 +96,10 @@ pub fn knownModelContextWindow(provider: &str, model: &str) -> Option<usize> {
 }
 
 pub fn knownModelReasoningEfforts(provider: &str, model: &str) -> Vec<String> {
-    if let Some(efforts) = readCache()
-        .providers
-        .get(provider)
-        .into_iter()
-        .flat_map(|catalog| catalog.models.iter())
-        .find(|entry| entry.id == model)
-        .map(|entry| entry.reasoningEfforts.clone())
-        .filter(|efforts| !efforts.is_empty())
+    if let Some(catalog) = readCache().providers.get(provider)
+        && let Some(entry) = catalog.models.iter().find(|e| e.id == model)
     {
-        return efforts;
+        return entry.reasoningEfforts.clone();
     }
 
     match provider {
@@ -251,6 +249,26 @@ fn parseOpenRouterModels(value: &Value) -> Vec<ModelCatalogEntry> {
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let supportsReasoning = item
+                .get("supported_parameters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|param| param == "reasoning");
+            let (reasoningEfforts, defaultReasoningEffort) = if supportsReasoning {
+                (
+                    vec![
+                        "low".to_string(),
+                        "medium".to_string(),
+                        "high".to_string(),
+                        "xhigh".to_string(),
+                    ],
+                    Some("medium".to_string()),
+                )
+            } else {
+                (Vec::new(), None)
+            };
             Some(ModelCatalogEntry {
                 id,
                 name,
@@ -258,8 +276,8 @@ fn parseOpenRouterModels(value: &Value) -> Vec<ModelCatalogEntry> {
                 contextWindow,
                 promptPrice,
                 completionPrice,
-                reasoningEfforts: Vec::new(),
-                defaultReasoningEffort: None,
+                reasoningEfforts,
+                defaultReasoningEffort,
                 description,
             })
         })
@@ -533,8 +551,38 @@ fn cacheTtlSecs(provider: &str) -> u64 {
     }
 }
 
-fn cachePath() -> std::path::PathBuf {
-    configDir().join(CACHE_FILE)
+thread_local! {
+    static CACHE_PATH_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Set a test-local cache path. Returns a guard that restores the default on drop.
+/// Pass to tests that call `readCache()`/`writeProviderCache()`.
+#[cfg(test)]
+pub fn setTestCachePath(path: &Path) -> TestCacheGuard {
+    CACHE_PATH_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(path.to_path_buf());
+    });
+    TestCacheGuard
+}
+
+#[cfg(test)]
+pub struct TestCacheGuard;
+
+#[cfg(test)]
+impl Drop for TestCacheGuard {
+    fn drop(&mut self) {
+        CACHE_PATH_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+fn cachePath() -> PathBuf {
+    CACHE_PATH_OVERRIDE.with(|cell| {
+        cell.borrow()
+            .clone()
+            .unwrap_or_else(|| configDir().join(CACHE_FILE))
+    })
 }
 
 fn readCache() -> ModelCatalogCache {
@@ -577,6 +625,7 @@ mod tests {
 
     #[test]
     fn parsesOpenRouterCatalog() {
+        // Model without reasoning support.
         let value = serde_json::json!({
             "data": [{
                 "id": "anthropic/claude-sonnet-4.6",
@@ -593,6 +642,36 @@ mod tests {
         assert_eq!(entries[0].contextWindow, Some(250000));
         assert_eq!(entries[0].promptPrice.as_deref(), Some("0.000003"));
         assert!(entries[0].reasoningEfforts.is_empty());
+    }
+
+    #[test]
+    fn parsesOpenRouterCatalogWithReasoning() {
+        let value = serde_json::json!({
+            "data": [{
+                "id": "anthropic/claude-opus-4.8",
+                "name": "Claude Opus 4.8",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000005", "completion": "0.000025" },
+                "description": "Frontier model with reasoning",
+                "supported_parameters": [
+                    "include_reasoning",
+                    "max_tokens",
+                    "reasoning",
+                    "response_format",
+                    "stop",
+                    "tools"
+                ]
+            }]
+        });
+
+        let entries = parseOpenRouterModels(&value);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "anthropic/claude-opus-4.8");
+        assert_eq!(
+            entries[0].reasoningEfforts,
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(entries[0].defaultReasoningEffort.as_deref(), Some("medium"));
     }
 
     #[test]
@@ -701,5 +780,55 @@ mod tests {
         );
         assert!(entries.iter().any(|entry| entry.id == "gpt-5.4"));
         assert!(entries.iter().any(|entry| entry.id == "gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn openrouterIncludeReasoningOnlyDoesNotGetEfforts() {
+        let value = serde_json::json!({
+            "data": [{
+                "id": "some/model",
+                "name": "Some Model",
+                "context_length": 128000,
+                "pricing": { "prompt": "0.000001", "completion": "0.000005" },
+                "description": "model with include_reasoning only",
+                "supported_parameters": [
+                    "include_reasoning",
+                    "max_tokens",
+                    "stop",
+                    "temperature"
+                ]
+            }]
+        });
+
+        let entries = parseOpenRouterModels(&value);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].reasoningEfforts.is_empty());
+        assert_eq!(entries[0].defaultReasoningEffort, None);
+    }
+
+    #[test]
+    fn knownModelReasoningEffortsRespectsCachedEmpty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cachePath = dir.path().join("test-cache.json");
+        let _guard = setTestCachePath(&cachePath);
+
+        let models = vec![ModelCatalogEntry {
+            id: "flatline-test-empty-efforts".to_string(),
+            name: "Test Model".to_string(),
+            provider: "deepseek".to_string(),
+            contextWindow: Some(128000),
+            promptPrice: None,
+            completionPrice: None,
+            reasoningEfforts: Vec::new(),
+            defaultReasoningEffort: None,
+            description: None,
+        }];
+        writeProviderCache("deepseek", &models);
+
+        let efforts = knownModelReasoningEfforts("deepseek", "flatline-test-empty-efforts");
+        assert!(
+            efforts.is_empty(),
+            "expected empty efforts from cache, got {efforts:?} — cache read may be broken"
+        );
     }
 }

@@ -1117,6 +1117,11 @@ pub fn saveDiscoveredModelInScope(
             summary,
         });
     }
+    // Clear stale reasoning when the new model does not support it.
+    // promptThinking is prompt-injected and works with any model, so leave it alone.
+    if entry.reasoningEfforts.is_empty() {
+        model.reasoning = None;
+    }
     saveModelProfileInScope(config, scope, profileName, &model)
 }
 
@@ -1695,6 +1700,45 @@ mod tests {
         assert!(contents.contains("model = \"gpt-5.5\""));
         assert!(contents.contains("contextWindow = 272000"));
         assert!(!contents.contains("maxTokens"));
+    }
+
+    #[test]
+    fn saveDiscoveredModelClearsStaleReasoningPreservesPromptThinking() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "sonnet"
+            [profile.sonnet]
+            provider = "openrouter"
+            model = "anthropic/claude-sonnet-4.6"
+            contextWindow = 250000
+            promptThinking = true
+            [profile.sonnet.reasoning]
+            effort = "high"
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let entry = ModelCatalogEntry {
+            id: "some/basic-model".to_string(),
+            name: "Basic Model".to_string(),
+            provider: "openrouter".to_string(),
+            contextWindow: Some(128000),
+            promptPrice: None,
+            completionPrice: None,
+            reasoningEfforts: Vec::new(),
+            defaultReasoningEffort: None,
+            description: None,
+        };
+        let path = saveDiscoveredModelInScope(&cfg, ConfigScope::ProjectLocal, "sonnet", &entry)
+            .expect("save discovered model");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("model = \"some/basic-model\""));
+        assert!(contents.contains("promptThinking = true"));
+        assert!(!contents.contains("[profile.sonnet.reasoning]"));
+        assert!(!contents.contains("effort"));
     }
 
     #[test]
