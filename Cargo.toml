@@ -92,7 +92,7 @@ dashmap = "6"
 # Wake scheduling
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 flate2 = "1"
 tar = "0.4"

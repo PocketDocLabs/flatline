@@ -26,6 +26,9 @@ jobs:
           - os: macos-latest
             artifact: flatline-macos-aarch64
             archive: flatline-macos-aarch64.tar.gz
+          - os: windows-latest
+            artifact: flatline-windows-x86_64
+            archive: flatline-windows-x86_64.zip
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,9 +46,14 @@ jobs:
         run: cargo build --locked --release -p deck
 
       - name: Package
+        shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/${{ matrix.archive }}" -C target/release flatline
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a "dist/${{ matrix.archive }}" ./target/release/flatline.exe
+          else
+            tar -czf "dist/${{ matrix.archive }}" -C target/release flatline
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

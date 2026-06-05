@@ -751,6 +751,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                             let _ = outputTx.try_send(remaining);
                         }
                         if shutdownPending {
+                            #[cfg(unix)]
                             if let Some(pgid) = master.process_group_leader()
                                 && pgid > 1 {
                                     unsafe { libc::kill(-pgid, libc::SIGTERM); }
@@ -786,6 +787,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                 let _ = outputTx.try_send(remaining);
                             }
                             if shutdownPending {
+                                #[cfg(unix)]
                                 if let Some(pgid) = master.process_group_leader()
                                     && pgid > 1 {
                                         unsafe { libc::kill(-pgid, libc::SIGTERM); }
@@ -827,8 +829,9 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                                     let _ = outputTx.try_send(remaining);
                                 }
                                 if shutdownPending {
-                                    // Kill chain exhausted during shutdown —
-                                    // SIGKILL the process group and exit.
+                                    // Kill chain exhausted during shutdown — clean up the
+                                    // process group (Unix) or drop the PTY (Windows).
+                                    #[cfg(unix)]
                                     if let Some(pgid) = master.process_group_leader()
                                         && pgid > 1 {
                                             tracing::info!(pgid, "shutdown: SIGKILL process group after kill chain");
@@ -975,6 +978,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     } else if shutdownPending {
                         // Shutdown requested while shell was idle.
                         tracing::debug!("shell driver: kill during shutdown, SIGKILL process group");
+                        #[cfg(unix)]
                         if let Some(pgid) = master.process_group_leader()
                             && pgid > 1 {
                                 unsafe { libc::kill(-pgid, libc::SIGTERM); }
@@ -1005,6 +1009,7 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                         cap.deadline = Some(tokio::time::Instant::now());
                     } else {
                         // No active capture — kill the process group now.
+                        #[cfg(unix)]
                         if let Some(pgid) = master.process_group_leader()
                             && pgid > 1 {
                                 tracing::info!(pgid, "shutdown: sending SIGTERM to process group");
