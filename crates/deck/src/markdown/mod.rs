@@ -26,6 +26,7 @@ use ratatui::text::{Line, Span};
 pub use highlight::renderCodeBlock;
 
 /// A rendered markdown block — either wrappable text or a scrollable code block.
+#[derive(Clone)]
 pub enum RenderedBlock {
     /// Regular text lines (paragraphs, headings, lists, tables, etc.).
     ///

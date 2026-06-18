@@ -97,6 +97,20 @@ impl Client {
 
         let mut adaptedMessages = adaptMessages(messages, &self.heavy.provider);
 
+        // DeepSeek silently drops `reasoning_content` from assistant messages
+        // that appear before the first `tool_calls` message in the history.
+        // After compaction replaces early tool-call blocks with summaries, the
+        // first surviving assistant turns often lack tool_calls, making their
+        // reasoning invisible. Inject a minimal no-op tool stub right after the
+        // system message so all subsequent reasoning_content is visible.
+        let thinkingEnabled = deepseekStubNeeded(
+            &self.heavy.provider,
+            reasoning.and_then(|r| r.effort.as_deref()),
+        );
+        if thinkingEnabled {
+            injectDeepseekToolStub(&mut adaptedMessages);
+        }
+
         if self.heavy.cachingActive() {
             injectCacheControl(&mut adaptedMessages);
             warnIfProviderNotPinned(&self.heavy);
@@ -245,9 +259,22 @@ impl Client {
         let url = format!("{}/chat/completions", cfg.baseUrl);
         let modelId = model.unwrap_or(&cfg.model);
 
+        let mut adaptedMessages = adaptMessages(messages, &cfg.provider);
+
+        let thinkingEnabled = deepseekStubNeeded(
+            &cfg.provider,
+            cfg.reasoning
+                .as_ref()
+                .and_then(|r| r.effort.as_deref()),
+        );
+
+        if thinkingEnabled {
+            injectDeepseekToolStub(&mut adaptedMessages);
+        }
+
         let mut body = serde_json::json!({
             "model": modelId,
-            "messages": messages,
+            "messages": adaptedMessages,
             "stream": false,
         });
 
@@ -822,6 +849,51 @@ fn warnIfProviderNotPinned(cfg: &ModelConfig) {
     }
 }
 
+/// Inject a minimal no-op tool call at the start of a DeepSeek message array.
+///
+/// DeepSeek only surfaces `reasoning_content` from input assistant messages
+/// when at least one prior message carries `tool_calls`. After compaction
+/// replaces early blocks with summary User messages, the first raw assistant
+/// turns may precede any surviving tool_call — causing their reasoning to be
+/// silently dropped (zero prompt tokens). This two-message stub (~18 tokens)
+/// placed right after the system message flips the switch for the entire
+/// conversation.
+fn injectDeepseekToolStub(messages: &mut serde_json::Value) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    // Insert after the system message (index 0), or at the start if empty.
+    let pos = if arr
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("system")
+    {
+        1
+    } else {
+        0
+    };
+    let stub = [
+        serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "_rc_stub",
+                "type": "function",
+                "function": { "name": "_noop", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "_rc_stub",
+            "content": ""
+        }),
+    ];
+    let [assistantStub, toolStub] = stub;
+    arr.insert(pos, toolStub);
+    arr.insert(pos, assistantStub);
+}
+
 /// Serialize messages with provider-specific field names.
 ///
 /// DeepSeek uses `reasoning_content` where OpenRouter uses `reasoning` on
@@ -842,6 +914,18 @@ fn adaptMessages(messages: &[Message], provider: &str) -> serde_json::Value {
         }
     }
     value
+}
+
+/// Whether the DeepSeek tool stub should be injected. DeepSeek defaults
+/// to thinking server-side, so `None` effort means enabled — only an
+/// explicit "disabled"/"off" opts out.
+fn deepseekStubNeeded(provider: &str, effort: Option<&str>) -> bool {
+    if provider != "deepseek" {
+        return false;
+    }
+    effort.is_none_or(|e| {
+        !e.eq_ignore_ascii_case("disabled") && !e.eq_ignore_ascii_case("off")
+    })
 }
 
 /// Build the DeepSeek `thinking` request object. Effort strings `"disabled"`
@@ -1651,6 +1735,51 @@ mod tests {
         let assistant = arr[0].as_object().unwrap();
         assert!(!assistant.contains_key("reasoning"));
         assert_eq!(assistant.get("reasoning_content").unwrap(), "ponder");
+    }
+
+    #[test]
+    fn deepseekToolStubInjectedAfterSystem() {
+        let msgs = vec![
+            Message::System {
+                content: "sys".into(),
+            },
+            Message::User {
+                content: Content::Text("hi".into()),
+            },
+            Message::Assistant {
+                content: Some("yo".into()),
+                tool_calls: None,
+                reasoning: Some("thought".into()),
+            },
+        ];
+        let mut value = adaptMessages(&msgs, "deepseek");
+        injectDeepseekToolStub(&mut value);
+        let arr = value.as_array().unwrap();
+        // System at 0, stub assistant at 1, stub tool at 2, then originals.
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[1]["role"], "assistant");
+        assert!(arr[1]["tool_calls"].is_array());
+        assert_eq!(arr[2]["role"], "tool");
+        assert_eq!(arr[3]["role"], "user");
+        assert_eq!(arr[4]["role"], "assistant");
+        // Original reasoning was renamed to reasoning_content.
+        assert_eq!(arr[4]["reasoning_content"], "thought");
+    }
+
+    #[test]
+    fn deepseekToolStubWithoutSystem() {
+        let msgs = vec![Message::User {
+            content: Content::Text("hi".into()),
+        }];
+        let mut value = adaptMessages(&msgs, "deepseek");
+        injectDeepseekToolStub(&mut value);
+        let arr = value.as_array().unwrap();
+        // Stub at 0+1, original user at 2.
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "assistant");
+        assert_eq!(arr[1]["role"], "tool");
+        assert_eq!(arr[2]["role"], "user");
     }
 
     #[test]

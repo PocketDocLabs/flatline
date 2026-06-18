@@ -307,6 +307,10 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             supportsAnthropicCache: Some(false),
         },
         // Default to OpenRouter for anything unrecognized.
+        // NOTE: providerOrder is empty here — Anthropic pinning belongs in
+        // explicit Claude profiles (tierDefaults / defaultConfigToml), not in
+        // the generic openrouter fallback where it would break non-Anthropic
+        // models.
         _ => ModelConfig {
             provider: "openrouter".into(),
             key: String::new(),
@@ -314,7 +318,7 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             baseUrl: "https://openrouter.ai/api/v1".into(),
             reasoning: None,
             promptThinking: false,
-            providerOrder: vec!["Anthropic".into()],
+            providerOrder: Vec::new(),
             maxTokens: Some(100_000),
             contextWindow: 250_000,
             maxContextWindow: None,
@@ -1097,12 +1101,18 @@ pub fn saveDiscoveredModelInScope(
     };
     model.provider = entry.provider.clone();
     model.model = entry.id.clone();
+    // Provider routing is model-specific — a providerOrder that made sense
+    // for the old model (e.g. ["Anthropic"] for Claude) is almost certainly
+    // wrong for the new one. Clear it so the new model uses default routing.
+    model.providerOrder = Vec::new();
     if let Some(contextWindow) = entry.contextWindow {
         model.contextWindow = contextWindow;
         model.maxContextWindow = Some(contextWindow);
     }
     if entry.provider == "openai-codex" {
         model.maxTokens = None;
+    } else if let Some(max) = entry.maxCompletionTokens {
+        model.maxTokens = Some(max);
     }
     let shouldSeedReasoning = existing.provider != entry.provider
         || model
@@ -1175,6 +1185,21 @@ pub fn saveModelProfileThinkingInScope(
     } else {
         None
     };
+    saveModelProfileInScope(config, scope, profileName, &model)
+}
+
+pub fn saveModelProfileProviderOrderInScope(
+    config: &Config,
+    scope: ConfigScope,
+    profileName: &str,
+    providerOrder: Vec<String>,
+) -> Result<PathBuf> {
+    let existing = config
+        .profiles
+        .get(profileName)
+        .with_context(|| format!("unknown model profile: {profileName}"))?;
+    let mut model = existing.clone();
+    model.providerOrder = providerOrder;
     saveModelProfileInScope(config, scope, profileName, &model)
 }
 
@@ -1656,6 +1681,7 @@ mod tests {
             reasoningEfforts: Vec::new(),
             defaultReasoningEffort: None,
             description: None,
+            maxCompletionTokens: None,
         };
         let path = saveDiscoveredModelInScope(&cfg, ConfigScope::LaunchLocal, "sonnet", &entry)
             .expect("save discovered model");
@@ -1692,6 +1718,7 @@ mod tests {
             reasoningEfforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
             defaultReasoningEffort: Some("medium".into()),
             description: None,
+            maxCompletionTokens: None,
         };
         let path = saveDiscoveredModelInScope(&cfg, ConfigScope::ProjectLocal, "codex", &entry)
             .expect("save discovered codex model");
@@ -1730,6 +1757,7 @@ mod tests {
             reasoningEfforts: Vec::new(),
             defaultReasoningEffort: None,
             description: None,
+            maxCompletionTokens: None,
         };
         let path = saveDiscoveredModelInScope(&cfg, ConfigScope::ProjectLocal, "sonnet", &entry)
             .expect("save discovered model");
@@ -1739,6 +1767,46 @@ mod tests {
         assert!(contents.contains("promptThinking = true"));
         assert!(!contents.contains("[profile.sonnet.reasoning]"));
         assert!(!contents.contains("effort"));
+    }
+
+    #[test]
+    fn saveDiscoveredModelClearsStaleProviderOrder() {
+        let mut cfg = resolveOk(parseToml(
+            r#"
+            heavyProfile = "opus"
+            [profile.opus]
+            provider = "openrouter"
+            model = "anthropic/claude-opus-4.6"
+            contextWindow = 250000
+            providerOrder = ["Anthropic"]
+            "#,
+        ));
+        let project = tempfile::tempdir().expect("project tempdir");
+        cfg.projectRoot = Some(project.path().to_path_buf());
+        cfg.launchDir = project.path().to_path_buf();
+
+        let entry = ModelCatalogEntry {
+            id: "z-ai/glm-5.2".to_string(),
+            name: "GLM 5.2".to_string(),
+            provider: "openrouter".to_string(),
+            contextWindow: Some(1_048_576),
+            promptPrice: None,
+            completionPrice: None,
+            reasoningEfforts: vec!["low".into(), "medium".into(), "high".into()],
+            defaultReasoningEffort: Some("medium".into()),
+            description: None,
+            maxCompletionTokens: None,
+        };
+        let path = saveDiscoveredModelInScope(&cfg, ConfigScope::ProjectLocal, "opus", &entry)
+            .expect("save discovered model");
+
+        let contents = fs::read_to_string(&path).expect("read saved config");
+        assert!(contents.contains("model = \"z-ai/glm-5.2\""));
+        // providerOrder must be cleared — Anthropic doesn't serve GLM 5.2.
+        assert!(
+            !contents.contains("Anthropic"),
+            "stale Anthropic providerOrder should be cleared: {contents}"
+        );
     }
 
     #[test]
@@ -2286,6 +2354,14 @@ mod tests {
                     "anthropic/claude-opus-4.6".to_string(),
                     vec!["Anthropic".to_string()],
                 ),
+                // modelDefaults("openrouter") uses sonnet with empty
+                // providerOrder — the safe fallback for unknown models.
+                (
+                    "anthropic/claude-sonnet-4.6".to_string(),
+                    Vec::new(),
+                ),
+                // Explicit sonnet profile in defaultConfigToml pins to
+                // Anthropic — correct because the model is known.
                 (
                     "anthropic/claude-sonnet-4.6".to_string(),
                     vec!["Anthropic".to_string()],

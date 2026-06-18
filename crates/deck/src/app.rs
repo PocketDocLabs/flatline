@@ -136,6 +136,7 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
                     &model.model,
                 ),
                 reasoningSummary: model.reasoning.as_ref().and_then(|r| r.summary.clone()),
+                providerOrder: model.providerOrder.clone(),
                 configured,
             }
         })
@@ -263,6 +264,7 @@ enum DeckUpdate {
         snap: Option<construct::jobs::JobOutputSnapshot>,
     },
     PermitModeChanged(PermitMode),
+    ProviderResult(std::result::Result<Vec<String>, String>),
 }
 
 fn openRunsPanel(requestTx: &mpsc::Sender<TuiRequest>, deckUpdateTx: &mpsc::Sender<DeckUpdate>) {
@@ -689,13 +691,12 @@ pub async fn run() -> Result<()> {
     let (userInputTx, mut userInputRx) = mpsc::channel::<construct::session::UserInput>(16);
     let (requestTx, mut requestRx) = mpsc::channel::<TuiRequest>(16);
     let (cancelTx, cancelRx) = watch::channel(false);
-    let (steerTx, steerRx) = mpsc::channel::<construct::session::UserInput>(16);
+    let steerQueue = agentPanel.steerQueue();
     let (userBgTx, userBgRx) = mpsc::channel::<()>(4);
     let (deckUpdateTx, mut deckUpdateRx) = mpsc::channel::<DeckUpdate>(32);
 
     // Spawn the agent session task.
     let mut cancelRx = cancelRx;
-    let mut steerRx = steerRx;
     let mut userBgRx = userBgRx;
     let sessionCancelTx = cancelTx.clone();
     tokio::spawn(async move {
@@ -938,7 +939,7 @@ pub async fn run() -> Result<()> {
                             &logTx,
                             &sessionRequestTx,
                             &mut cancelRx,
-                            &mut steerRx,
+                            &steerQueue,
                             &mut userBgRx,
                         ).await {
                             let _ = logTx
@@ -962,7 +963,7 @@ pub async fn run() -> Result<()> {
                                 let current = permitModeTx.borrow().clone();
                                 session.setPermitMode(current).await;
                             }
-                            if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx).await {
+                            if let Err(e) = session.send(&msg, &logTx, &sessionRequestTx, &mut cancelRx, &steerQueue, &mut userBgRx).await {
                                 let _ = logTx
                                     .send(LogEvent::Error(format!("Agent error: {e}")))
                                     .await;
@@ -1406,6 +1407,43 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                         }
+                        Some(TuiRequest::SaveModelProfileProviderOrder {
+                            scope,
+                            profile,
+                            providerOrder,
+                            reply,
+                        }) => {
+                            match construct::config::saveModelProfileProviderOrderInScope(
+                                &config,
+                                scope,
+                                &profile,
+                                providerOrder,
+                            ) {
+                                Ok(_) => match reloadAndApplyConfig(&mut config, &mut session, &logTx).await {
+                                    Ok(()) => {
+                                        let _ = reply.send(construct::control::CommandAck::ok(""));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(construct::control::CommandAck::err(e));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = reply.send(construct::control::CommandAck::err(
+                                        format!("Failed to save provider order: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(TuiRequest::DiscoverModelProviders {
+                            provider,
+                            model,
+                            reply,
+                        }) => {
+                            let result = construct::model_catalog::discoverModelProviders(
+                                &config, &provider, &model,
+                            ).await;
+                            let _ = reply.send(result);
+                        }
                         Some(TuiRequest::SavePermissions { defaultMode, rules, reply }) => {
                             if let Some(ref root) = config.projectRoot {
                                 match construct::config::savePermissions(
@@ -1497,7 +1535,7 @@ pub async fn run() -> Result<()> {
                                 session.setPermitMode(current).await;
                             }
                             match session.retryLastTurn(
-                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
+                                &logTx, &sessionRequestTx, &mut cancelRx, &steerQueue, &mut userBgRx,
                             ).await {
                                 Ok(()) => {
                                     let _ = reply.send(construct::control::CommandAck::ok(""));
@@ -1523,7 +1561,7 @@ pub async fn run() -> Result<()> {
                                 session.setPermitMode(current).await;
                             }
                             match session.continueLastTurn(
-                                &logTx, &sessionRequestTx, &mut cancelRx, &mut steerRx, &mut userBgRx,
+                                &logTx, &sessionRequestTx, &mut cancelRx, &steerQueue, &mut userBgRx,
                             ).await {
                                 Ok(()) => {
                                     let _ = reply.send(construct::control::CommandAck::ok(""));
@@ -1590,7 +1628,6 @@ pub async fn run() -> Result<()> {
         &requestTx,
         &deckUpdateTx,
         &cancelTx,
-        &steerTx,
         &userBgTx,
         contextWindow,
         rollingBaseline,
@@ -1641,7 +1678,6 @@ async fn runLoop(
     requestTx: &mpsc::Sender<TuiRequest>,
     deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
-    steerTx: &mpsc::Sender<construct::session::UserInput>,
     userBgTx: &mpsc::Sender<()>,
     mut contextWindow: usize,
     rollingBaseline: f64,
@@ -3206,6 +3242,11 @@ async fn runLoop(
                         }
                     }
                 }
+                DeckUpdate::ProviderResult(result) => {
+                    if let Some(panel) = modelPanel.as_mut() {
+                        panel.setProviderResult(result);
+                    }
+                }
                 DeckUpdate::ResumeResult(ack) => {
                     if ack.ok {
                         sessionPicker = None;
@@ -3273,7 +3314,6 @@ async fn runLoop(
             requestTx,
             deckUpdateTx,
             cancelTx,
-            steerTx,
             userBgTx,
             &mut sessionPicker,
             &mut rewindPicker,
@@ -3366,7 +3406,6 @@ async fn handleInput(
     requestTx: &mpsc::Sender<TuiRequest>,
     deckUpdateTx: &mpsc::Sender<DeckUpdate>,
     cancelTx: &watch::Sender<bool>,
-    steerTx: &mpsc::Sender<construct::session::UserInput>,
     userBgTx: &mpsc::Sender<()>,
     sessionPicker: &mut Option<SessionPicker>,
     rewindPicker: &mut Option<RewindPicker>,
@@ -4025,6 +4064,44 @@ async fn handleInput(
                                 },
                             );
                         }
+                        ModelPanelAction::SaveProviderOrder {
+                            scope,
+                            profile,
+                            providerOrder,
+                        } => {
+                            spawnSilentSettingsRequest(
+                                requestTx.clone(),
+                                deckUpdateTx.clone(),
+                                move |reply| TuiRequest::SaveModelProfileProviderOrder {
+                                    scope,
+                                    profile,
+                                    providerOrder,
+                                    reply,
+                                },
+                            );
+                        }
+                        ModelPanelAction::DiscoverProviders {
+                            provider,
+                            model,
+                        } => {
+                            let requestTx = requestTx.clone();
+                            let deckUpdateTx = deckUpdateTx.clone();
+                            tokio::spawn(async move {
+                                let (reply, rx) = tokio::sync::oneshot::channel();
+                                let _ = requestTx
+                                    .send(TuiRequest::DiscoverModelProviders {
+                                        provider,
+                                        model,
+                                        reply,
+                                    })
+                                    .await;
+                                if let Ok(result) = rx.await {
+                                    let _ = deckUpdateTx
+                                        .send(DeckUpdate::ProviderResult(result))
+                                        .await;
+                                }
+                            });
+                        }
                         ModelPanelAction::None => {}
                     }
                     break;
@@ -4384,8 +4461,7 @@ async fn handleInput(
                                                 text: msg,
                                                 attachments: agentPanel.takeAttachments(),
                                             };
-                                            agentPanel.queueMessage(input.clone());
-                                            let _ = steerTx.try_send(input);
+                                            agentPanel.queueMessage(input);
                                         } else {
                                             let _ = cancelTx.send(false);
                                             agentPanel.history.push(&msg);

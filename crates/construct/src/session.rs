@@ -59,6 +59,9 @@ mod tools;
 pub use request::{Attachment, UserInput};
 use request::{Rider, buildRequestMessages, buildRiders};
 
+/// Shared queue for mid-turn user messages. Deck pushes/pops; session drains.
+pub type SteerQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<UserInput>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShellResolveError {
     MissingNamed {
@@ -815,12 +818,12 @@ impl Session {
         logTx: &'a mpsc::Sender<LogEvent>,
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
-        steerRx: &'a mut mpsc::Receiver<UserInput>,
+        steerQueue: &'a SteerQueue,
         userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             // Drain stale steer messages from a previous cancelled turn.
-            while steerRx.try_recv().is_ok() {}
+            steerQueue.lock().unwrap().clear();
             // Drain stale user-bg requests from a previous turn.
             while userBgRx.try_recv().is_ok() {}
 
@@ -854,7 +857,7 @@ impl Session {
                 Err(e) => tracing::warn!("transcript write failed: {e}"),
             }
 
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerQueue, userBgRx)
                 .await
         })
     }
@@ -875,17 +878,18 @@ impl Session {
         logTx: &'a mpsc::Sender<LogEvent>,
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
-        steerRx: &'a mut mpsc::Receiver<UserInput>,
+        steerQueue: &'a SteerQueue,
         userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             // User input that landed since the last in-turn drain beats
-            // the wake. If anything is queued in steerRx, requeue the
-            // batch's fires (they re-batch on the next idle tick) and
+            // the wake. If anything is queued in the steer queue, requeue
+            // the batch's fires (they re-batch on the next idle tick) and
             // process the queued input as a real user turn instead.
             let mut queued: Vec<UserInput> = Vec::new();
-            while let Ok(input) = steerRx.try_recv() {
-                queued.push(input);
+            {
+                let mut q = steerQueue.lock().unwrap();
+                queued.extend(q.drain(..));
             }
             if !queued.is_empty() {
                 let fireTx = self.wakes.lock().await.fireSender();
@@ -893,12 +897,13 @@ impl Session {
                     let _ = fireTx.send(fire);
                 }
                 while userBgRx.try_recv().is_ok() {}
+                let texts: Vec<String> = queued.iter().map(|i| i.text.clone()).collect();
+                let combinedText = texts.join("\n\n");
+                let _ = logTx
+                    .send(LogEvent::SteerInjected { texts })
+                    .await;
                 let combined = UserInput {
-                    text: queued
-                        .iter()
-                        .map(|i| i.text.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
+                    text: combinedText,
                     attachments: queued.into_iter().flat_map(|i| i.attachments).collect(),
                 };
                 return self
@@ -907,7 +912,7 @@ impl Session {
                         logTx,
                         sessionRequestTx,
                         cancelRx,
-                        steerRx,
+                        steerQueue,
                         userBgRx,
                     )
                     .await;
@@ -968,7 +973,7 @@ impl Session {
                 })
                 .await;
 
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerQueue, userBgRx)
                 .await
         })
     }
@@ -987,11 +992,11 @@ impl Session {
         logTx: &'a mpsc::Sender<LogEvent>,
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
-        steerRx: &'a mut mpsc::Receiver<UserInput>,
+        steerQueue: &'a SteerQueue,
         userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            while steerRx.try_recv().is_ok() {}
+            steerQueue.lock().unwrap().clear();
             while userBgRx.try_recv().is_ok() {}
 
             // Pop the trailing partial assistant, if any.
@@ -1020,7 +1025,7 @@ impl Session {
             }
 
             tracing::info!("retrying last turn");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerQueue, userBgRx)
                 .await
         })
     }
@@ -1036,11 +1041,11 @@ impl Session {
         logTx: &'a mpsc::Sender<LogEvent>,
         sessionRequestTx: &'a mpsc::Sender<SessionRequest>,
         cancelRx: &'a mut watch::Receiver<bool>,
-        steerRx: &'a mut mpsc::Receiver<UserInput>,
+        steerQueue: &'a SteerQueue,
         userBgRx: &'a mut mpsc::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            while steerRx.try_recv().is_ok() {}
+            steerQueue.lock().unwrap().clear();
             while userBgRx.try_recv().is_ok() {}
 
             // For continue we need a trailing assistant (the prefill).
@@ -1050,7 +1055,7 @@ impl Session {
             }
 
             tracing::info!("continuing from partial assistant response");
-            self.sendInner(logTx, sessionRequestTx, cancelRx, steerRx, userBgRx)
+            self.sendInner(logTx, sessionRequestTx, cancelRx, steerQueue, userBgRx)
                 .await
         })
     }
@@ -1061,7 +1066,7 @@ impl Session {
         logTx: &mpsc::Sender<LogEvent>,
         sessionRequestTx: &mpsc::Sender<SessionRequest>,
         cancelRx: &mut watch::Receiver<bool>,
-        steerRx: &mut mpsc::Receiver<UserInput>,
+        steerQueue: &SteerQueue,
         userBgRx: &mut mpsc::Receiver<()>,
     ) -> Result<()> {
         let blockId = self.transcript.currentBlock().to_string();
@@ -1158,7 +1163,7 @@ impl Session {
                             self.checkCompactionTrigger(logTx).await;
                         }
                         // Extend turn if user queued messages during streaming.
-                        if self.drainSteer(steerRx, logTx).await {
+                        if self.drainSteer(steerQueue, logTx).await {
                             tracing::info!("extending turn with queued user messages");
                             continue;
                         }
@@ -2029,7 +2034,7 @@ impl Session {
                         }
 
                         // Inject queued user messages before the next API call.
-                        self.drainSteer(steerRx, logTx).await;
+                        self.drainSteer(steerQueue, logTx).await;
 
                         // Poll mid-turn events: permit mode toggles, topic
                         // classification, and background task wakes.
@@ -2084,15 +2089,18 @@ impl Session {
     /// Returns true if anything was injected (caller should continue the turn).
     async fn drainSteer(
         &mut self,
-        steerRx: &mut mpsc::Receiver<UserInput>,
+        steerQueue: &SteerQueue,
         logTx: &mpsc::Sender<LogEvent>,
     ) -> bool {
         let mut allTexts: Vec<String> = Vec::new();
         let mut allAttachments: Vec<Attachment> = Vec::new();
 
-        while let Ok(input) = steerRx.try_recv() {
-            allTexts.push(input.text);
-            allAttachments.extend(input.attachments);
+        {
+            let mut q = steerQueue.lock().unwrap();
+            for input in q.drain(..) {
+                allTexts.push(input.text);
+                allAttachments.extend(input.attachments);
+            }
         }
 
         if allTexts.is_empty() {

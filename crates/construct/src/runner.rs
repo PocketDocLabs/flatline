@@ -303,7 +303,7 @@ pub async fn runStreaming(
         let _cancel = cancelTx;
 
         // Subagents don't support mid-turn steering.
-        let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+        let steerQueue: crate::session::SteerQueue = Default::default();
         // Headless: no user keybind.
         let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
@@ -313,7 +313,7 @@ pub async fn runStreaming(
                 &logTx,
                 &sessionRequestTx,
                 &mut cancelRx,
-                &mut steerRx,
+                &steerQueue,
                 &mut userBgRx,
             )
             .await;
@@ -395,7 +395,7 @@ pub fn runSession<'a>(
         // Run the agentic turn loop.
         let input = crate::session::UserInput::from(prompt.to_string());
         // Headless runners don't support mid-turn steering.
-        let (_steerTx, mut steerRx) = mpsc::channel::<crate::session::UserInput>(1);
+        let steerQueue: crate::session::SteerQueue = Default::default();
         let (_userBgTx, mut userBgRx) = mpsc::channel::<()>(1);
 
         let sendResult = session
@@ -404,7 +404,7 @@ pub fn runSession<'a>(
                 &logTx,
                 &sessionRequestTx,
                 &mut cancelRx,
-                &mut steerRx,
+                &steerQueue,
                 &mut userBgRx,
             )
             .await;

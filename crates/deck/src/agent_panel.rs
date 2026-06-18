@@ -188,6 +188,7 @@ pub(crate) struct ToolSectionId {
     sectionIndex: usize,
 }
 
+#[derive(Clone)]
 struct ToolSectionRange {
     startLine: usize,
     endLine: usize,
@@ -440,6 +441,7 @@ impl ToolBlockStatus {
 }
 
 /// Metadata for a rendered code block in the visual line buffer.
+#[derive(Clone)]
 struct CodeBlockRange {
     /// First visual line index (inclusive, includes top border).
     startLine: usize,
@@ -472,9 +474,25 @@ type BuiltLines = (
     HashSet<usize>,
 );
 
+#[derive(Clone)]
+struct CachedEntryLines {
+    version: u64,
+    width: u16,
+    lines: Vec<Line<'static>>,
+    cont: Vec<bool>,
+    codeBlockRanges: Vec<CodeBlockRange>,
+    toolSectionRanges: Vec<ToolSectionRange>,
+    nonCopyableIndices: Vec<usize>,
+    isReasoning: bool,
+    subagentHeaderOffset: Option<usize>,
+    subagentToggleOffset: Option<(usize, usize)>,
+}
+
 struct RenderTracking<'a> {
     codeBlockRanges: &'a mut Vec<CodeBlockRange>,
     toolSectionRanges: &'a mut Vec<ToolSectionRange>,
+    subagentHeader: &'a mut Option<usize>,
+    subagentToggle: &'a mut Option<(usize, usize)>,
 }
 
 /// Agent panel state.
@@ -613,8 +631,16 @@ pub struct AgentPanel {
     retryStatus: Option<String>,
     /// Image attachments queued for the next message submission.
     attachments: Vec<construct::session::Attachment>,
-    /// Messages queued while the agent is mid-turn (full payload for multimodal).
-    queuedMessages: VecDeque<construct::session::UserInput>,
+    /// Shared queue for mid-turn user messages. Deck pushes/pops; session drains.
+    steerQueue: std::sync::Arc<std::sync::Mutex<VecDeque<construct::session::UserInput>>>,
+    /// Per-entry rendered line cache. Finalized entries reuse their rendered
+    /// output across frames instead of re-rendering on every tick.
+    entryLineCache: Vec<Option<CachedEntryLines>>,
+    /// Per-entry version counter. Any mutation that changes an entry's
+    /// appearance bumps its version, forcing a cache miss on the next render.
+    entryVersions: Vec<u64>,
+    /// Per-text markdown cache so rebuilds skip pulldown-cmark+syntect.
+    blockRenderCache: std::cell::RefCell<HashMap<String, (u16, Vec<RenderedBlock>)>>,
 }
 
 impl AgentPanel {
@@ -684,13 +710,25 @@ impl AgentPanel {
             lastSubagentToggleLine: std::cell::Cell::new(None),
             retryStatus: None,
             attachments: Vec::new(),
-            queuedMessages: VecDeque::new(),
+            steerQueue: std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            entryLineCache: Vec::new(),
+            entryVersions: Vec::new(),
+            blockRenderCache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn steerQueue(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<VecDeque<construct::session::UserInput>>> {
+        self.steerQueue.clone()
     }
 
     /// Reset the panel to a clean state (new session).
     pub fn clearDisplay(&mut self) {
         self.entries.clear();
+        self.entryLineCache.clear();
+        self.entryVersions.clear();
+        self.blockRenderCache.borrow_mut().clear();
         self.streamingContent.clear();
         self.pendingContent.clear();
         self.fadeProgress = 1.0;
@@ -730,7 +768,7 @@ impl AgentPanel {
         self.toolSectionCopiedFlash = None;
         self.codeExpanded.clear();
         self.attachments.clear();
-        self.queuedMessages.clear();
+        self.steerQueue.lock().unwrap().clear();
     }
 
     /// Add an image attachment for the next submission.
@@ -760,17 +798,17 @@ impl AgentPanel {
 
     /// Queue a message for mid-turn injection.
     pub fn queueMessage(&mut self, input: construct::session::UserInput) {
-        self.queuedMessages.push_back(input);
+        self.steerQueue.lock().unwrap().push_back(input);
     }
 
     /// Pop the last queued message for editing. Returns the full UserInput.
     pub fn popQueuedMessage(&mut self) -> Option<construct::session::UserInput> {
-        self.queuedMessages.pop_back()
+        self.steerQueue.lock().unwrap().pop_back()
     }
 
     /// Number of queued messages.
     pub fn queuedCount(&self) -> usize {
-        self.queuedMessages.len()
+        self.steerQueue.lock().unwrap().len()
     }
 
     /// Move queued messages into conversation entries (called on SteerInjected).
@@ -781,8 +819,7 @@ impl AgentPanel {
         for text in texts {
             self.entries.push(PanelEntry::User(text.clone()));
         }
-        // Discard the deck-side queue — construct has consumed them.
-        self.queuedMessages.clear();
+
         // User explicitly promoted queue — snap to bottom
         self.scrollOffset = 0;
         self.newContentWhileScrolled = false;
@@ -1110,7 +1147,7 @@ impl AgentPanel {
         self.pendingToolSummary.clear();
         self.pendingToolCommand = None;
         self.pendingReviewerReport = None;
-        self.queuedMessages.clear();
+        self.steerQueue.lock().unwrap().clear();
         self.clearToolActiveEntries();
         self.textArea.placeholder = "Type a message...";
         self.entries.push(PanelEntry::Cancelled);
@@ -1599,6 +1636,7 @@ impl AgentPanel {
         }) = self.entries.get_mut(entryIndex)
         {
             *contentExpanded = !*contentExpanded;
+            self.bumpEntryVersion(entryIndex);
         }
     }
 
@@ -1908,6 +1946,8 @@ impl AgentPanel {
             .rposition(|e| matches!(e, PanelEntry::ToolActive { .. }))
         {
             self.entries.remove(pos);
+            self.entryLineCache.clear();
+            self.entryVersions.clear();
         }
     }
 
@@ -1918,6 +1958,8 @@ impl AgentPanel {
             .rposition(|e| matches!(e, PanelEntry::ToolReviewing { .. }))
         {
             self.entries.remove(pos);
+            self.entryLineCache.clear();
+            self.entryVersions.clear();
         }
     }
 
@@ -1938,6 +1980,7 @@ impl AgentPanel {
             )
         }) {
             self.entries.remove(pos);
+            self.entryLineCache.clear();
         }
     }
 
@@ -1951,6 +1994,8 @@ impl AgentPanel {
                 PanelEntry::ToolBlock(block) if block.status.isTransient()
             )
         });
+        self.entryLineCache.clear();
+        self.entryVersions.clear();
     }
 
     fn markTimelineActivity(&mut self) {
@@ -2070,6 +2115,8 @@ impl AgentPanel {
             }
         }
 
+        self.entryLineCache.clear();
+        self.entryVersions.clear();
         self.entries.insert(
             insertAt,
             PanelEntry::CompactionMarker {
@@ -2201,6 +2248,7 @@ impl AgentPanel {
         } else {
             self.codeScrollX.insert(blockId, new);
         }
+        self.bumpEntryVersion(blockId.0);
     }
 
     pub(crate) fn scrollToolSectionH(&mut self, sectionId: ToolSectionId, delta: i16) {
@@ -2231,6 +2279,7 @@ impl AgentPanel {
         } else {
             self.toolSectionScrollX.insert(sectionId, new);
         }
+        self.bumpEntryVersion(sectionId.entryIndex);
     }
 
     /// Find the code block at a given grid line (for mouse hit-testing).
@@ -2275,6 +2324,7 @@ impl AgentPanel {
             if contentCol >= range.copyLabelCol {
                 selection::copyToClipboard(&range.rawCode);
                 self.copiedFlash = Some((range.blockId, Instant::now()));
+                self.bumpEntryVersion(range.blockId.0);
                 return true;
             }
         }
@@ -2289,6 +2339,7 @@ impl AgentPanel {
             if contentCol >= copyLabelCol {
                 selection::copyToClipboard(&range.rawText);
                 self.toolSectionCopiedFlash = Some((range.id, Instant::now()));
+                self.bumpEntryVersion(range.id.entryIndex);
                 return true;
             }
         }
@@ -2316,12 +2367,14 @@ impl AgentPanel {
                 self.codeExpanded.insert(range.blockId);
                 self.scrollOffset = self.scrollOffset.saturating_add(hiddenLines);
                 self.lastMaxScroll = self.lastMaxScroll.saturating_add(hiddenLines);
+                self.bumpEntryVersion(range.blockId.0);
                 return true;
             }
             if isExpanded && (visualLine == range.startLine || visualLine == range.endLine) {
                 self.codeExpanded.remove(&range.blockId);
                 self.scrollOffset = self.scrollOffset.saturating_sub(hiddenLines);
                 self.lastMaxScroll = self.lastMaxScroll.saturating_sub(hiddenLines);
+                self.bumpEntryVersion(range.blockId.0);
                 return true;
             }
         }
@@ -2339,6 +2392,7 @@ impl AgentPanel {
             && let Some(section) = block.sections.get_mut(id.sectionIndex)
         {
             section.expanded = !section.expanded;
+            self.bumpEntryVersion(id.entryIndex);
             if self.scrollOffset > 0 {
                 if wasExpanded {
                     self.scrollOffset = self.scrollOffset.saturating_sub(delta);
@@ -2491,6 +2545,14 @@ impl AgentPanel {
                 }
             }
         }
+        // Invalidate the last reasoning entry's cache.
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, PanelEntry::Reasoning { .. }))
+        {
+            self.bumpEntryVersion(idx);
+        }
     }
 
     /// Toggle a reasoning block if the given grid line is its header.
@@ -2523,6 +2585,7 @@ impl AgentPanel {
                                 }
                             }
                         }
+                        self.bumpEntryVersion(idx);
                     }
                     None => {
                         let delta = countReasoningLines(&self.streamingReasoning, w);
@@ -2712,10 +2775,13 @@ impl AgentPanel {
         };
 
         // Queue zone height: 1 row per queued message, max 4 visible.
-        let queueHeight = if self.queuedMessages.is_empty() {
-            0u16
-        } else {
-            (self.queuedMessages.len() as u16).min(4)
+        let queueHeight = {
+            let q = self.steerQueue.lock().unwrap();
+            if q.is_empty() {
+                0u16
+            } else {
+                (q.len() as u16).min(4)
+            }
         };
 
         // Split: chat area + separator + [queue zone] + input.
@@ -2804,14 +2870,18 @@ impl AgentPanel {
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
         {
-            self.copiedFlash = None;
+            if let Some((blockId, _)) = self.copiedFlash.take() {
+                self.bumpEntryVersion(blockId.0);
+            }
         }
         if self
             .toolSectionCopiedFlash
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
         {
-            self.toolSectionCopiedFlash = None;
+            if let Some((id, _)) = self.toolSectionCopiedFlash.take() {
+                self.bumpEntryVersion(id.entryIndex);
+            }
         }
         // Cache plain text of each visual line for scrollback copy.
         self.lastLineTexts = lines
@@ -3149,10 +3219,11 @@ impl AgentPanel {
         let textStyle = Style::default().fg(Color::White);
         let imgStyle = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
         let maxVisible = area.height as usize;
-        let total = self.queuedMessages.len();
+        let q = self.steerQueue.lock().unwrap();
+        let total = q.len();
         let skip = total.saturating_sub(maxVisible);
 
-        for (i, input) in self.queuedMessages.iter().skip(skip).enumerate() {
+        for (i, input) in q.iter().skip(skip).enumerate() {
             let row = area.y + i as u16;
             if row >= area.y + area.height {
                 break;
@@ -3531,9 +3602,13 @@ impl AgentPanel {
         for (idx, entry) in self.entries.iter().enumerate() {
             let mut entryLines: Vec<Line<'static>> = Vec::new();
             let mut entryCont: Vec<bool> = Vec::new();
+            let mut dummyHeader = None;
+            let mut dummyToggle = None;
             let mut tracking = RenderTracking {
                 codeBlockRanges: &mut dummyRanges,
                 toolSectionRanges: &mut dummyToolRanges,
+                subagentHeader: &mut dummyHeader,
+                subagentToggle: &mut dummyToggle,
             };
             self.renderEntry(
                 entry,
@@ -3542,6 +3617,7 @@ impl AgentPanel {
                 w as u16,
                 idx,
                 &mut tracking,
+                &self.blockRenderCache,
             );
 
             let entryStart = cursor;
@@ -3934,7 +4010,52 @@ impl AgentPanel {
         }
     }
 
-    fn buildLines(&self, width: u16) -> BuiltLines {
+    fn bumpEntryVersion(&mut self, idx: usize) {
+        if let Some(v) = self.entryVersions.get_mut(idx) {
+            *v = v.wrapping_add(1);
+        }
+    }
+
+    /// Replace all entries and invalidate the cache. Used by the subagent
+    /// overlay which clones a fresh transcript every frame.
+    pub fn setEntries(&mut self, entries: Vec<PanelEntry>) {
+        self.entries = entries;
+        self.entryLineCache.clear();
+        self.entryVersions.clear();
+    }
+
+    fn isStaticEntry(entry: &PanelEntry) -> bool {
+        match entry {
+            PanelEntry::ToolActive { .. }
+            | PanelEntry::ToolReviewing { .. }
+            | PanelEntry::WakeSchedule { .. }
+            | PanelEntry::SubagentBlock { done: false, .. } => false,
+            PanelEntry::ToolBlock(block) if block.status.isTransient() => false,
+            _ => true,
+        }
+    }
+
+    fn cachedMarkdownRender(
+        text: &str,
+        renderWidth: u16,
+        cache: &std::cell::RefCell<HashMap<String, (u16, Vec<RenderedBlock>)>>,
+    ) -> Vec<RenderedBlock> {
+        {
+            let c = cache.borrow();
+            if let Some((cw, cached)) = c.get(text) {
+                if *cw == renderWidth {
+                    return cached.clone();
+                }
+            }
+        }
+        let blocks = markdown::render(text, renderWidth);
+        cache
+            .borrow_mut()
+            .insert(text.to_string(), (renderWidth, blocks.clone()));
+        blocks
+    }
+
+    fn buildLines(&mut self, width: u16) -> BuiltLines {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cont: Vec<bool> = Vec::new();
         let mut reasoningHeaders: Vec<(Option<usize>, usize)> = Vec::new();
@@ -3942,28 +4063,132 @@ impl AgentPanel {
         let mut toolSectionRanges: Vec<ToolSectionRange> = Vec::new();
 
         let mut nonCopyable = HashSet::new();
+
+        // Resize cache vec to match entries.
+        self.entryLineCache.resize_with(self.entries.len(), || None);
+        self.entryVersions.resize(self.entries.len(), 0);
+
+        let mut lastSubagentHeader: Option<usize> = None;
+        let mut lastSubagentToggle: Option<(usize, usize)> = None;
+
         for (i, entry) in self.entries.iter().enumerate() {
-            if matches!(entry, PanelEntry::Reasoning { .. }) {
-                reasoningHeaders.push((Some(i), lines.len()));
+            let offset = lines.len();
+            let shouldCache = Self::isStaticEntry(entry);
+
+            // Try cache hit for static entries.
+            if shouldCache {
+                if let Some(ref cached) = self.entryLineCache[i] {
+                    if cached.width == width && cached.version == self.entryVersions[i] {
+                        if cached.isReasoning {
+                            reasoningHeaders.push((Some(i), offset));
+                        }
+                        lines.extend_from_slice(&cached.lines);
+                        cont.extend_from_slice(&cached.cont);
+                        for cbr in &cached.codeBlockRanges {
+                            let mut c = cbr.clone();
+                            c.startLine += offset;
+                            c.endLine += offset;
+                            codeBlockRanges.push(c);
+                        }
+                        for tsr in &cached.toolSectionRanges {
+                            let mut t = tsr.clone();
+                            t.startLine += offset;
+                            t.endLine += offset;
+                            toolSectionRanges.push(t);
+                        }
+                        for &idx in &cached.nonCopyableIndices {
+                            nonCopyable.insert(offset + idx);
+                        }
+                        if let Some(h) = cached.subagentHeaderOffset {
+                            lastSubagentHeader = Some(offset + h);
+                        }
+                        if let Some((t, e)) = cached.subagentToggleOffset {
+                            lastSubagentToggle = Some((offset + t, e));
+                        }
+                        lines.push(Line::from(""));
+                        cont.push(false);
+                        continue;
+                    }
+                }
+            }
+
+            // Cache miss or non-cacheable — render fresh.
+            let isReasoning = matches!(entry, PanelEntry::Reasoning { .. });
+            if isReasoning {
+                reasoningHeaders.push((Some(i), offset));
             }
             let isNotice = matches!(
                 entry,
                 PanelEntry::SessionNotice(_) | PanelEntry::CompactionMarker { .. }
             );
             let linesBefore = lines.len();
+            let cbrBefore = codeBlockRanges.len();
+            let tsrBefore = toolSectionRanges.len();
+            let mut subagentHeader = None;
+            let mut subagentToggle = None;
             let mut tracking = RenderTracking {
                 codeBlockRanges: &mut codeBlockRanges,
                 toolSectionRanges: &mut toolSectionRanges,
+                subagentHeader: &mut subagentHeader,
+                subagentToggle: &mut subagentToggle,
             };
-            self.renderEntry(entry, &mut lines, &mut cont, width, i, &mut tracking);
+            self.renderEntry(
+                entry,
+                &mut lines,
+                &mut cont,
+                width,
+                i,
+                &mut tracking,
+                &self.blockRenderCache,
+            );
+            let mut ncIndices = Vec::new();
             if isNotice {
                 for idx in linesBefore..lines.len() {
                     nonCopyable.insert(idx);
+                    ncIndices.push(idx - linesBefore);
                 }
             }
+            if let Some(h) = subagentHeader {
+                lastSubagentHeader = Some(h);
+            }
+            if let Some(t) = subagentToggle {
+                lastSubagentToggle = Some(t);
+            }
+
+            // Cache the freshly rendered entry.
+            if shouldCache {
+                let entryLines = lines[linesBefore..].to_vec();
+                let entryCont = cont[linesBefore..].to_vec();
+                let mut entryCBR = codeBlockRanges[cbrBefore..].to_vec();
+                for cbr in &mut entryCBR {
+                    cbr.startLine -= linesBefore;
+                    cbr.endLine -= linesBefore;
+                }
+                let mut entryTSR = toolSectionRanges[tsrBefore..].to_vec();
+                for tsr in &mut entryTSR {
+                    tsr.startLine -= linesBefore;
+                    tsr.endLine -= linesBefore;
+                }
+                self.entryLineCache[i] = Some(CachedEntryLines {
+                    version: self.entryVersions[i],
+                    width,
+                    lines: entryLines,
+                    cont: entryCont,
+                    codeBlockRanges: entryCBR,
+                    toolSectionRanges: entryTSR,
+                    nonCopyableIndices: ncIndices,
+                    isReasoning,
+                    subagentHeaderOffset: subagentHeader.map(|h| h - linesBefore),
+                    subagentToggleOffset: subagentToggle.map(|(t, e)| (t - linesBefore, e)),
+                });
+            }
+
             lines.push(Line::from(""));
             cont.push(false);
         }
+
+        self.lastSubagentHeaderLine.set(lastSubagentHeader);
+        self.lastSubagentToggleLine.set(lastSubagentToggle);
 
         // Streaming content.
         if self.isStreaming {
@@ -4173,6 +4398,7 @@ impl AgentPanel {
         width: u16,
         entryIndex: usize,
         tracking: &mut RenderTracking<'_>,
+        blockCache: &std::cell::RefCell<HashMap<String, (u16, Vec<RenderedBlock>)>>,
     ) {
         match entry {
             PanelEntry::User(text) => {
@@ -4204,7 +4430,8 @@ impl AgentPanel {
             }
             PanelEntry::Assistant(text) => {
                 // NOTE: Subtract prefix width ("◆ " = 2 cols) so blocks size correctly.
-                let mdBlocks = markdown::render(text, width.saturating_sub(2));
+                let mdBlocks =
+                    Self::cachedMarkdownRender(text, width.saturating_sub(2), blockCache);
                 prefixRenderedBlocks(
                     lines,
                     cont,
@@ -4461,7 +4688,7 @@ impl AgentPanel {
                 let toolStyle = Style::default().fg(Color::Cyan);
 
                 // Track header line for click-to-view.
-                self.lastSubagentHeaderLine.set(Some(lines.len()));
+                *tracking.subagentHeader = Some(lines.len());
 
                 // Top border: ╭ explore ─── prompt... ─── view ╮
                 use unicode_width::UnicodeWidthStr as UWS;
@@ -4598,7 +4825,11 @@ impl AgentPanel {
                         // Render markdown blocks, then wrap each in │ ... │ borders.
                         // Code blocks get full renderCodeBlock() treatment (copy, scroll, expand).
                         let contentInnerW = innerW.saturating_sub(2); // 1 space pad each side.
-                        let mdBlocks = crate::markdown::render(contentText, contentInnerW as u16);
+                        let mdBlocks = Self::cachedMarkdownRender(
+                            contentText,
+                            contentInnerW as u16,
+                            blockCache,
+                        );
 
                         let mut contentLines: Vec<Line<'static>> = Vec::new();
                         let mut contentCont: Vec<bool> = Vec::new();
@@ -4791,8 +5022,7 @@ impl AgentPanel {
                         }
                         cont.push(false);
                         // Set toggle line AFTER the border is pushed.
-                        self.lastSubagentToggleLine
-                            .set(Some((lines.len() - 1, toggleEntryIdx)));
+                        *tracking.subagentToggle = Some((lines.len() - 1, toggleEntryIdx));
                     } else {
                         // No content — simple bottom border.
                         lines.push(makeBorderLine(
@@ -4858,7 +5088,8 @@ impl AgentPanel {
             }
             PanelEntry::CommandResult(text) => {
                 // NOTE: Subtract prefix width ("ℹ︎ " = 2 cols) so blocks size correctly.
-                let mdBlocks = markdown::render(text, width.saturating_sub(2));
+                let mdBlocks =
+                    Self::cachedMarkdownRender(text, width.saturating_sub(2), blockCache);
                 prefixRenderedBlocks(
                     lines,
                     cont,

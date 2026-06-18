@@ -885,7 +885,7 @@ impl SubagentPanel {
             return;
         }
 
-        self.transcriptPanel.entries = entries;
+        self.transcriptPanel.setEntries(entries);
         self.transcriptPanel.renderChatOnly(area, buf);
 
         // Apply selection highlight using the after-prefix rect so columns

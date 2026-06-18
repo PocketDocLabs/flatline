@@ -173,7 +173,7 @@ async fn runSubagentTaskInBackground(
     });
 
     let childInput = UserInput::from(prompt.clone());
-    let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
+    let childSteerQueue: crate::session::SteerQueue = Default::default();
     let (_childUserBgTx, mut childUserBgRx) = mpsc::channel::<()>(1);
 
     let sendResult = child
@@ -182,7 +182,7 @@ async fn runSubagentTaskInBackground(
             &childLogTx,
             &childRequestTx,
             &mut childCancelRx,
-            &mut childSteerRx,
+            &childSteerQueue,
             &mut childUserBgRx,
         )
         .await;
@@ -476,7 +476,7 @@ impl Session {
         });
 
         let childInput = UserInput::from(prompt.to_string());
-        let (_childSteerTx, mut childSteerRx) = mpsc::channel::<UserInput>(1);
+        let childSteerQueue: crate::session::SteerQueue = Default::default();
         let (_childUserBgTx, mut childUserBgRx) = mpsc::channel::<()>(1);
         let sendResult = child
             .send(
@@ -484,7 +484,7 @@ impl Session {
                 &childLogTx,
                 &childRequestTx,
                 &mut childCancelRx,
-                &mut childSteerRx,
+                &childSteerQueue,
                 &mut childUserBgRx,
             )
             .await;

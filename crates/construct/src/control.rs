@@ -410,6 +410,7 @@ pub struct ModelProfileStatus {
     pub reasoningEffort: Option<String>,
     pub reasoningEfforts: Vec<String>,
     pub reasoningSummary: Option<String>,
+    pub providerOrder: Vec<String>,
     pub configured: bool,
 }
 
@@ -558,6 +559,21 @@ pub enum TuiRequest {
         reasoningEffort: Option<String>,
         reasoningSummary: Option<String>,
         reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Persist a profile's OpenRouter provider routing order.
+    SaveModelProfileProviderOrder {
+        scope: crate::config::ConfigScope,
+        profile: String,
+        providerOrder: Vec<String>,
+        reply: oneshot::Sender<CommandAck>,
+    },
+
+    /// Discover available providers for a model (OpenRouter endpoints).
+    DiscoverModelProviders {
+        provider: String,
+        model: String,
+        reply: oneshot::Sender<std::result::Result<Vec<String>, String>>,
     },
 
     /// Persist a new permissions config and apply it in-session.

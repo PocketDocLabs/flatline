@@ -36,6 +36,8 @@ pub struct ModelCatalogEntry {
     #[serde(default)]
     pub defaultReasoningEffort: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub maxCompletionTokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,46 @@ pub async fn discoverModels(config: &Config, provider: &str) -> Result<Vec<Model
             Err(err)
         }
     }
+}
+
+/// Fetch the list of provider names serving a specific model on OpenRouter.
+pub async fn discoverModelProviders(
+    _config: &Config,
+    provider: &str,
+    model: &str,
+) -> std::result::Result<Vec<String>, String> {
+    if provider != "openrouter" {
+        return Err("provider discovery is only supported for OpenRouter".into());
+    }
+    let http = reqwest::Client::new();
+    let url = format!("https://openrouter.ai/api/v1/models/{model}/endpoints");
+    let body: Value = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch endpoints: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("endpoint discovery failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse endpoints: {e}"))?;
+
+    let providers = body
+        .pointer("/data/endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|ep| ep.get("provider_name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    // Deduplicate while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    let unique = providers
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+    Ok(unique)
 }
 
 pub fn knownModelContextWindow(provider: &str, model: &str) -> Option<usize> {
@@ -269,6 +311,9 @@ fn parseOpenRouterModels(value: &Value) -> Vec<ModelCatalogEntry> {
             } else {
                 (Vec::new(), None)
             };
+            let maxCompletionTokens = item
+                .pointer("/top_provider/max_completion_tokens")
+                .and_then(valueAsUsize);
             Some(ModelCatalogEntry {
                 id,
                 name,
@@ -279,6 +324,7 @@ fn parseOpenRouterModels(value: &Value) -> Vec<ModelCatalogEntry> {
                 reasoningEfforts,
                 defaultReasoningEffort,
                 description,
+                maxCompletionTokens,
             })
         })
         .collect()
@@ -326,6 +372,7 @@ fn parseOpenAiCompatibleModels(value: &Value, provider: &str) -> Vec<ModelCatalo
                             .and_then(Value::as_str)
                             .map(|owner| format!("owned by {owner}"))
                     }),
+                maxCompletionTokens: None,
             })
         })
         .collect()
@@ -389,6 +436,7 @@ fn parseCodexModels(value: &Value) -> Vec<ModelCatalogEntry> {
                     reasoningEfforts,
                     defaultReasoningEffort,
                     description,
+                    maxCompletionTokens: None,
                 },
             ))
         })
@@ -448,6 +496,7 @@ fn codexPresets() -> Vec<ModelCatalogEntry> {
             "{} Built-in fallback from Codex model catalog metadata.",
             preset.description
         )),
+        maxCompletionTokens: None,
     })
     .collect()
 }
@@ -822,6 +871,7 @@ mod tests {
             reasoningEfforts: Vec::new(),
             defaultReasoningEffort: None,
             description: None,
+            maxCompletionTokens: None,
         }];
         writeProviderCache("deepseek", &models);
 

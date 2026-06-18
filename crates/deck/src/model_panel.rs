@@ -36,6 +36,7 @@ enum PanelMode {
 enum ConfigField {
     Model,
     Context,
+    ProviderOrder,
     ThinkingMode,
     ReasoningEffort,
     ReasoningSummary,
@@ -67,6 +68,11 @@ enum ProfileEdit {
         profile: String,
         text: String,
         maxContextWindow: Option<usize>,
+    },
+    ProviderOrder {
+        profile: String,
+        providers: Vec<(String, bool)>,
+        cursor: usize,
     },
 }
 
@@ -111,6 +117,15 @@ pub enum PanelAction {
         promptThinking: bool,
         reasoningEffort: Option<String>,
         reasoningSummary: Option<String>,
+    },
+    SaveProviderOrder {
+        scope: ConfigScope,
+        profile: String,
+        providerOrder: Vec<String>,
+    },
+    DiscoverProviders {
+        provider: String,
+        model: String,
     },
 }
 
@@ -479,6 +494,56 @@ impl ModelPanel {
                     PanelAction::None
                 }
             },
+            Some(ProfileEdit::ProviderOrder {
+                profile,
+                mut providers,
+                mut cursor,
+            }) => match key.code {
+                KeyCode::Esc => {
+                    self.notice = Some("Provider order edit canceled".to_string());
+                    PanelAction::None
+                }
+                KeyCode::Enter => self.finishProviderOrderEdit(profile, providers),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = cursor.saturating_sub(1);
+                    self.profileEdit = Some(ProfileEdit::ProviderOrder {
+                        profile,
+                        providers,
+                        cursor,
+                    });
+                    PanelAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if cursor + 1 < providers.len() {
+                        cursor += 1;
+                    }
+                    self.profileEdit = Some(ProfileEdit::ProviderOrder {
+                        profile,
+                        providers,
+                        cursor,
+                    });
+                    PanelAction::None
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = providers.get_mut(cursor) {
+                        entry.1 = !entry.1;
+                    }
+                    self.profileEdit = Some(ProfileEdit::ProviderOrder {
+                        profile,
+                        providers,
+                        cursor,
+                    });
+                    PanelAction::None
+                }
+                _ => {
+                    self.profileEdit = Some(ProfileEdit::ProviderOrder {
+                        profile,
+                        providers,
+                        cursor,
+                    });
+                    PanelAction::None
+                }
+            },
             None => PanelAction::None,
         }
     }
@@ -510,6 +575,44 @@ impl ModelPanel {
             Err(error) => {
                 self.catalogEntries.clear();
                 self.catalogError = Some(error);
+            }
+        }
+    }
+
+    pub fn setProviderResult(
+        &mut self,
+        result: std::result::Result<Vec<String>, String>,
+    ) {
+        match result {
+            Ok(providerNames) => {
+                // Check if we're still waiting for provider results.
+                let Some(ProfileEdit::ProviderOrder {
+                    ref profile,
+                    ref mut providers,
+                    ..
+                }) = self.profileEdit
+                else {
+                    return;
+                };
+                let currentOrder: Vec<String> = self
+                    .status
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == *profile)
+                    .map(|p| p.providerOrder.clone())
+                    .unwrap_or_default();
+                *providers = providerNames
+                    .into_iter()
+                    .map(|name| {
+                        let enabled = currentOrder.iter().any(|o| o.eq_ignore_ascii_case(&name));
+                        (name, enabled)
+                    })
+                    .collect();
+                self.notice = None;
+            }
+            Err(error) => {
+                self.profileEdit = None;
+                self.notice = Some(format!("Failed to fetch providers: {error}"));
             }
         }
     }
@@ -572,7 +675,17 @@ impl ModelPanel {
         let rowCount = match self.mode {
             PanelMode::Profiles => self.status.profiles.len(),
             PanelMode::Discover => self.catalogEntries.len().max(3),
-            PanelMode::Config => configFields().len().max(4),
+            PanelMode::Config => {
+                let base = configFields().len();
+                let extra = match &self.profileEdit {
+                    Some(ProfileEdit::ProviderOrder { providers, .. }) => {
+                        // +1 for the blank separator line.
+                        1 + providers.len().max(1)
+                    }
+                    _ => 0,
+                };
+                (base + extra).max(4)
+            }
         };
         let desiredInner = HEADER_LINES
             .saturating_add(PROFILE_HEADER_LINES)
@@ -696,6 +809,64 @@ impl ModelPanel {
             maxContextWindow: profile.maxContextWindow,
         });
         self.notice = None;
+    }
+
+    fn startProviderOrderEdit(&mut self) -> PanelAction {
+        let Some(profile) = self.status.profiles.get(self.selectedProfile) else {
+            self.notice = Some("No profile selected".to_string());
+            return PanelAction::None;
+        };
+        if profile.provider != "openrouter" {
+            self.notice = Some("Provider order is only for OpenRouter".to_string());
+            return PanelAction::None;
+        }
+        // Start with an empty list — providers will be populated async
+        // via setProviderResult once the fetch completes.
+        self.profileEdit = Some(ProfileEdit::ProviderOrder {
+            profile: profile.name.clone(),
+            providers: Vec::new(),
+            cursor: 0,
+        });
+        self.notice = Some("Loading providers\u{2026}".to_string());
+        PanelAction::DiscoverProviders {
+            provider: profile.provider.clone(),
+            model: profile.model.clone(),
+        }
+    }
+
+    fn finishProviderOrderEdit(
+        &mut self,
+        profileName: String,
+        providers: Vec<(String, bool)>,
+    ) -> PanelAction {
+        let providerOrder: Vec<String> = providers
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(name, _)| name)
+            .collect();
+        if let Some(profile) = self
+            .status
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == profileName)
+        {
+            profile.providerOrder = providerOrder.clone();
+        }
+        let scope = self.selectedScope();
+        let label = if providerOrder.is_empty() {
+            "none".to_string()
+        } else {
+            providerOrder.join(", ")
+        };
+        self.notice = Some(format!(
+            "Provider order for {profileName}: {label} ({})",
+            scope.shortLabel()
+        ));
+        PanelAction::SaveProviderOrder {
+            scope,
+            profile: profileName,
+            providerOrder,
+        }
     }
 
     fn finishCreateProfile(&mut self, profileName: String, sourceProfile: String) -> PanelAction {
@@ -866,6 +1037,7 @@ impl ModelPanel {
                 self.startContextEdit();
                 PanelAction::None
             }
+            ConfigField::ProviderOrder => self.startProviderOrderEdit(),
             ConfigField::ThinkingMode => self.cycleThinkingMode(),
             ConfigField::ReasoningEffort => {
                 let Some(profile) = self.status.profiles.get(self.selectedProfile) else {
@@ -911,6 +1083,7 @@ impl ModelPanel {
                 self.startContextEdit();
                 PanelAction::None
             }
+            ConfigField::ProviderOrder => self.startProviderOrderEdit(),
             ConfigField::ThinkingMode => self.cycleThinkingMode(),
             ConfigField::ReasoningEffort => {
                 let Some(profile) = self.status.profiles.get(self.selectedProfile) else {
@@ -1146,6 +1319,8 @@ impl ModelPanel {
                 profile.reasoningEffort = Some(effort.clone());
             }
             profile.reasoningEfforts = model.reasoningEfforts.clone();
+            // Provider routing is model-specific — clear stale pinning.
+            profile.providerOrder = Vec::new();
         }
     }
 
@@ -1200,6 +1375,20 @@ impl ModelPanel {
                         .map(formatContextInput)
                         .unwrap_or_else(|| "unknown".to_string());
                     format!(" Context for {profile} (max {max}): {text}")
+                }
+                ProfileEdit::ProviderOrder {
+                    profile, providers, ..
+                } => {
+                    let enabled: Vec<&str> = providers
+                        .iter()
+                        .filter(|(_, on)| *on)
+                        .map(|(name, _)| name.as_str())
+                        .collect();
+                    if enabled.is_empty() {
+                        format!(" Provider order for {profile}: none (auto-route)")
+                    } else {
+                        format!(" Provider order for {profile}: {}", enabled.join(", "))
+                    }
                 }
             };
             if let Some(notice) = &self.notice {
@@ -1270,6 +1459,12 @@ impl ModelPanel {
                 ProfileEdit::Context { .. } => vec![
                     "type tokens or 128k".to_string(),
                     "ctrl-u clear".to_string(),
+                    "enter save".to_string(),
+                    "esc cancel".to_string(),
+                ],
+                ProfileEdit::ProviderOrder { .. } => vec![
+                    "up/down navigate".to_string(),
+                    "space toggle".to_string(),
                     "enter save".to_string(),
                     "esc cancel".to_string(),
                 ],
@@ -1637,6 +1832,44 @@ impl ModelPanel {
             *y += 1;
         }
 
+        // Render provider toggle list when editing provider order.
+        if let Some(ProfileEdit::ProviderOrder {
+            providers, cursor, ..
+        }) = &self.profileEdit
+        {
+            *y += 1;
+            if providers.is_empty() {
+                line(
+                    buf,
+                    inner.x,
+                    *y,
+                    w,
+                    &truncateStr("   Loading providers\u{2026}", w),
+                    style(FG_DIM, BG),
+                );
+                *y += 1;
+            } else {
+                for (idx, (name, enabled)) in providers.iter().enumerate() {
+                    let selected = idx == *cursor;
+                    let bg = if selected { BG_SELECTED } else { BG };
+                    let check = if *enabled { "\u{25c9}" } else { "\u{25cb}" };
+                    let row = format!("   {check} {name}");
+                    line(
+                        buf,
+                        inner.x,
+                        *y,
+                        w,
+                        &truncateStr(&row, w),
+                        style(FG_PRIMARY, bg),
+                    );
+                    *y += 1;
+                    if *y >= inner.y + inner.height - FOOTER_RESERVE {
+                        break;
+                    }
+                }
+            }
+        }
+
         while *y < inner.y + inner.height - FOOTER_RESERVE {
             line(buf, inner.x, *y, w, "", style(FG_PRIMARY, BG));
             *y += 1;
@@ -1679,6 +1912,15 @@ impl ModelPanel {
             ConfigField::Model => format!("{} / {}", profile.provider, profile.model),
             ConfigField::Context => {
                 profileContextLabel(profile.contextWindow, profile.maxContextWindow)
+            }
+            ConfigField::ProviderOrder => {
+                if profile.provider != "openrouter" {
+                    "n/a".to_string()
+                } else if profile.providerOrder.is_empty() {
+                    "none (auto-route)".to_string()
+                } else {
+                    profile.providerOrder.join(", ")
+                }
             }
             ConfigField::ThinkingMode => thinkingModeLabel(thinkingMode(profile)).to_string(),
             ConfigField::ReasoningEffort => {
@@ -1780,6 +2022,7 @@ fn configFields() -> &'static [ConfigField] {
     &[
         ConfigField::Model,
         ConfigField::Context,
+        ConfigField::ProviderOrder,
         ConfigField::ThinkingMode,
         ConfigField::ReasoningEffort,
         ConfigField::ReasoningSummary,
@@ -1793,6 +2036,7 @@ fn configFieldLabel(field: ConfigField) -> &'static str {
     match field {
         ConfigField::Model => "model",
         ConfigField::Context => "context",
+        ConfigField::ProviderOrder => "provider order",
         ConfigField::ThinkingMode => "thinking mode",
         ConfigField::ReasoningEffort => "provider effort",
         ConfigField::ReasoningSummary => "reasoning summary",
@@ -1830,10 +2074,13 @@ fn configFieldDisabled(
     profile: &construct::control::ModelProfileStatus,
     field: ConfigField,
 ) -> bool {
-    matches!(
-        field,
-        ConfigField::ReasoningEffort | ConfigField::ReasoningSummary
-    ) && thinkingMode(profile) != ThinkingMode::Provider
+    match field {
+        ConfigField::ReasoningEffort | ConfigField::ReasoningSummary => {
+            thinkingMode(profile) != ThinkingMode::Provider
+        }
+        ConfigField::ProviderOrder => profile.provider != "openrouter",
+        _ => false,
+    }
 }
 
 fn thinkingMode(profile: &construct::control::ModelProfileStatus) -> ThinkingMode {
