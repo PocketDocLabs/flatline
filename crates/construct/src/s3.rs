@@ -65,7 +65,7 @@ pub async fn run(
     client: &api::Client,
     utilityModel: &str,
     _contextWindow: usize,
-    _compactRatio: f64,
+    zoneFraction: f64,
 ) -> Result<S3Result> {
     let turns = transcript.loadAll()?;
     if turns.is_empty() || topics.is_empty() {
@@ -78,7 +78,7 @@ pub async fn run(
 
     let ops = compactionLog.loadAll()?;
     let blockContent = groupTurnsByBlock(&turns);
-    let eligible = resolveEligible(&turns, &ops, headTurnId, topics);
+    let eligible = resolveEligible(&turns, &ops, headTurnId, topics, zoneFraction);
 
     if eligible.is_empty() {
         tracing::debug!(
@@ -119,7 +119,17 @@ pub async fn run(
                     .iter()
                     .filter_map(|bid| blockContent.get(bid))
                     .map(|b| {
-                        b.agentTurns.iter().map(|t| t.content.len()).sum::<usize>()
+                        b.agentTurns
+                            .iter()
+                            .map(|t| {
+                                t.content.len()
+                                    + t.toolArgs
+                                        .as_ref()
+                                        .map(|a| a.to_string().len())
+                                        .unwrap_or(0)
+                                    + t.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
+                            })
+                            .sum::<usize>()
                             + b.userMessage.len()
                     })
                     .sum();
@@ -181,14 +191,41 @@ fn resolveEligible(
     ops: &[CompactionOp],
     headTurnId: &str,
     topics: &[TopicInfo],
+    zoneFraction: f64,
 ) -> Vec<EligibleTopic> {
     // Every block id covered by a prior S3 op — not just the first
     // one of each topic. Partial topic compactions must continue from
     // where they left off, not skip the remainder of the topic.
+    // Exclude blocks whose TopicCompact is fully superseded by S4
+    // (all source blocks appear in the latest FullCompact) — those
+    // topics are consumed and the blocks are eligible for re-grouping.
+    let s4Blocks: HashSet<&str> = ops
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            CompactionOp::FullCompact { sourceIds, .. } => Some(
+                sourceIds
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<HashSet<&str>>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+
     let alreadyCompacted: HashSet<String> = ops
         .iter()
         .flat_map(|op| match op {
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds.clone(),
+            CompactionOp::TopicCompact { sourceBlockIds, .. } => {
+                let allInS4 = sourceBlockIds
+                    .iter()
+                    .all(|id| s4Blocks.contains(id.as_str()));
+                if allInS4 {
+                    Vec::new()
+                } else {
+                    sourceBlockIds.clone()
+                }
+            }
             _ => Vec::new(),
         })
         .collect();
@@ -203,7 +240,8 @@ fn resolveEligible(
     let topicBlockMap = buildTopicBlockMap(&activeTurns, topics);
 
     let superseded = crate::compaction::supersededBlocks(ops);
-    let zone = crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, &superseded, 0.30);
+    let zone =
+        crate::compaction::zoneBlocks(&activeTurns, &compactedSizes, &superseded, zoneFraction);
 
     findEligibleTopics(
         topics,
@@ -461,14 +499,7 @@ async fn compactTopic(
                     let argStr = turn
                         .toolArgs
                         .as_ref()
-                        .map(|v| {
-                            let s = v.to_string();
-                            if s.len() > 500 {
-                                format!("{}...", &s[..s.floor_char_boundary(500)])
-                            } else {
-                                s
-                            }
-                        })
+                        .map(|v| v.to_string())
                         .unwrap_or_else(|| "{}".to_string());
                     exchangeParts.push(format!(
                         "<agent_turn>[tool_call: {name}({argStr})]</agent_turn>"
@@ -1387,7 +1418,7 @@ mod tests {
             },
         ];
 
-        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);
+        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics, 0.30);
 
         assert!(
             !eligible.is_empty(),
@@ -1544,7 +1575,7 @@ mod tests {
             },
         ];
 
-        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics);
+        let eligible = resolveEligible(&turns, &ops, &headTurnId, &topics, 0.30);
 
         assert!(
             eligible.len() >= 2,

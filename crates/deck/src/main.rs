@@ -301,11 +301,35 @@ async fn runAuthCommand(command: AuthCommands) -> Result<()> {
                 );
                 println!("  expiresAt: {expiresAt}");
             }
+
+            let anthropic = construct::auth::anthropicOauthStatus();
+            println!("anthropic:");
+            println!("  configured: {}", anthropic.configured);
+            println!("  path: {}", anthropic.storagePath.display());
+            if let Some(sub) = anthropic.subscriptionType.as_deref() {
+                println!("  subscription: {sub}");
+            }
+            if let Some(expiresAt) = anthropic.expiresAt {
+                println!(
+                    "  token: {}",
+                    if anthropic.expired {
+                        "expired"
+                    } else {
+                        "valid"
+                    }
+                );
+                println!("  expiresAt: {expiresAt}");
+            }
             Ok(())
         }
         AuthCommands::Logout { provider } if provider == "openai-codex" => {
             construct::auth::clearOpenAiCodexAuth()?;
             println!("Removed openai-codex credentials.");
+            Ok(())
+        }
+        AuthCommands::Logout { provider } if provider == "anthropic-oauth" => {
+            construct::auth::clearAnthropicOauthAuth()?;
+            println!("Removed anthropic-oauth credentials.");
             Ok(())
         }
         AuthCommands::Logout { provider } => {
@@ -607,6 +631,9 @@ fn formatEventJson(event: &construct::control::LogEvent) -> String {
         } => serde_json::json!({
             "type": "compactionComplete", "stage": stage,
             "reduction": reduction, "markerBlock": markerBlock,
+        }),
+        LogEvent::CompactionFailed { stage, reason } => serde_json::json!({
+            "type": "compactionFailed", "stage": stage, "reason": reason,
         }),
         LogEvent::Cleared => serde_json::json!({ "type": "cleared" }),
         LogEvent::SessionRestored { turns, markers } => serde_json::json!({

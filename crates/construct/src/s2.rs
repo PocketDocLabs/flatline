@@ -60,7 +60,7 @@ pub async fn run(
     client: &api::Client,
     utilityModel: &str,
     _contextWindow: usize,
-    _compactRatio: f64,
+    zoneFraction: f64,
 ) -> Result<S2Result> {
     let allTurns = transcript.loadAll()?;
     if allTurns.is_empty() {
@@ -86,7 +86,7 @@ pub async fn run(
     let ops = compactionLog.loadAll()?;
     let compactedSizes = crate::compaction::compactedBlockSizes(&ops);
     let superseded = crate::compaction::supersededBlocks(&ops);
-    let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &superseded, 0.60);
+    let zone = crate::compaction::zoneBlocks(&turns, &compactedSizes, &superseded, zoneFraction);
 
     // Group turns by blockId, preserving order.
     let blocks = groupByBlock(&turns);
@@ -148,8 +148,18 @@ pub async fn run(
                 // content it replaces is not a compaction. Drop it so
                 // the stage trips its exhaustion check instead of
                 // growing context and re-firing.
-                let originalAgentChars: usize =
-                    block.agentTurns.iter().map(|t| t.content.len()).sum();
+                let originalAgentChars: usize = block
+                    .agentTurns
+                    .iter()
+                    .map(|t| {
+                        t.content.len()
+                            + t.toolArgs
+                                .as_ref()
+                                .map(|a| a.to_string().len())
+                                .unwrap_or(0)
+                            + t.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
+                    })
+                    .sum();
                 if summary.len() >= originalAgentChars {
                     tracing::warn!(
                         blockId = %block.blockId,
@@ -254,7 +264,9 @@ fn groupByBlock(turns: &[Turn]) -> Vec<Block> {
 
         let block = blocks.last_mut().unwrap();
         block.allTurnIds.push(turn.id.clone());
-        block.charCount += turn.content.len();
+        block.charCount += turn.content.len()
+            + turn.args.as_ref().map(|a| a.to_string().len()).unwrap_or(0)
+            + turn.reasoning.as_ref().map(|r| r.len()).unwrap_or(0);
 
         match turn.role {
             TurnRole::User | TurnRole::Wake => {

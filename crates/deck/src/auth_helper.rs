@@ -18,25 +18,25 @@ const PANEL_WIDTH: u16 = 74;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
     OpenAiCodex,
-    Future,
+    Anthropic,
 }
 
 impl Provider {
     fn all() -> &'static [Provider] {
-        &[Provider::OpenAiCodex, Provider::Future]
+        &[Provider::OpenAiCodex, Provider::Anthropic]
     }
 
     fn label(self) -> &'static str {
         match self {
             Provider::OpenAiCodex => "OpenAI Codex",
-            Provider::Future => "More OAuth providers",
+            Provider::Anthropic => "Anthropic (Claude)",
         }
     }
 
     fn status(self) -> String {
         match self {
             Provider::OpenAiCodex => openAiCodexStatusLine(),
-            Provider::Future => "not configured yet".to_string(),
+            Provider::Anthropic => anthropicStatusLine(),
         }
     }
 }
@@ -45,6 +45,7 @@ impl Provider {
 enum Screen {
     Providers,
     OpenAiCodex,
+    Anthropic,
     WaitingForBrowser,
 }
 
@@ -103,10 +104,32 @@ struct AuthMini {
     pendingLogin: Option<PendingLogin>,
 }
 
-struct PendingLogin {
-    verificationUrl: String,
-    userCode: String,
-    task: JoinHandle<Result<construct::auth::OpenAiCodexAuth>>,
+enum PendingLogin {
+    OpenAiCodex {
+        verificationUrl: String,
+        userCode: String,
+        task: JoinHandle<Result<construct::auth::OpenAiCodexAuth>>,
+    },
+    Anthropic {
+        authorizeUrl: String,
+        task: JoinHandle<Result<construct::auth::AnthropicOauthAuth>>,
+    },
+}
+
+impl PendingLogin {
+    fn isFinished(&self) -> bool {
+        match self {
+            PendingLogin::OpenAiCodex { task, .. } => task.is_finished(),
+            PendingLogin::Anthropic { task, .. } => task.is_finished(),
+        }
+    }
+
+    fn abort(&self) {
+        match self {
+            PendingLogin::OpenAiCodex { task, .. } => task.abort(),
+            PendingLogin::Anthropic { task, .. } => task.abort(),
+        }
+    }
 }
 
 impl AuthMini {
@@ -134,7 +157,7 @@ impl AuthMini {
         }
 
         if let Some(pending) = self.pendingLogin.take() {
-            pending.task.abort();
+            pending.abort();
         }
         terminal.clear()?;
         Ok(())
@@ -148,7 +171,7 @@ impl AuthMini {
                 }
                 if self.screen == Screen::WaitingForBrowser {
                     if let Some(pending) = self.pendingLogin.take() {
-                        pending.task.abort();
+                        pending.abort();
                     }
                     self.notice = Some("Sign-in cancelled.".to_string());
                 }
@@ -174,15 +197,25 @@ impl AuthMini {
                 self.selected = 0;
                 self.notice = None;
             }
-            Action::Provider(Provider::Future) => {
-                self.notice =
-                    Some("Future OAuth providers will appear here when supported.".to_string());
+            Action::Provider(Provider::Anthropic) => {
+                self.screen = Screen::Anthropic;
+                self.selected = 0;
+                self.notice = None;
             }
-            Action::SignIn => self.startOpenAiCodexLogin().await?,
-            Action::Logout => {
-                construct::auth::clearOpenAiCodexAuth()?;
-                self.notice = Some("Removed OpenAI Codex credentials.".to_string());
-            }
+            Action::SignIn => match self.screen {
+                Screen::Anthropic => self.startAnthropicLogin()?,
+                _ => self.startOpenAiCodexLogin().await?,
+            },
+            Action::Logout => match self.screen {
+                Screen::Anthropic => {
+                    construct::auth::clearAnthropicOauthAuth()?;
+                    self.notice = Some("Removed Claude credentials.".to_string());
+                }
+                _ => {
+                    construct::auth::clearOpenAiCodexAuth()?;
+                    self.notice = Some("Removed OpenAI Codex credentials.".to_string());
+                }
+            },
             Action::Back => {
                 self.screen = Screen::Providers;
                 self.selected = 0;
@@ -204,6 +237,14 @@ impl AuthMini {
             Screen::OpenAiCodex => {
                 let mut actions = vec![Action::SignIn];
                 if construct::auth::openAiCodexStatus().configured {
+                    actions.insert(1, Action::Logout);
+                }
+                actions.push(Action::Back);
+                actions
+            }
+            Screen::Anthropic => {
+                let mut actions = vec![Action::SignIn];
+                if construct::auth::anthropicOauthStatus().configured {
                     actions.insert(1, Action::Logout);
                 }
                 actions.push(Action::Back);
@@ -236,7 +277,7 @@ impl AuthMini {
         let verificationUrl = device.verificationUrl.clone();
         let userCode = device.userCode.clone();
         let task = tokio::spawn(construct::auth::completeOpenAiCodexDeviceLogin(device));
-        self.pendingLogin = Some(PendingLogin {
+        self.pendingLogin = Some(PendingLogin::OpenAiCodex {
             verificationUrl,
             userCode,
             task,
@@ -245,43 +286,72 @@ impl AuthMini {
         Ok(())
     }
 
-    async fn checkLoginTask(&mut self) {
-        let Some(done) = self
-            .pendingLogin
-            .as_ref()
-            .map(|pending| pending.task.is_finished())
-        else {
-            return;
+    fn startAnthropicLogin(&mut self) -> Result<()> {
+        self.screen = Screen::WaitingForBrowser;
+        self.notice = Some("Opening your browser to approve Claude access...".to_string());
+        let login = match construct::auth::requestAnthropicLogin() {
+            Ok(login) => login,
+            Err(e) => {
+                self.screen = Screen::Anthropic;
+                self.notice = Some(format!("Sign-in failed: {e}"));
+                return Ok(());
+            }
         };
-        if !done {
+        let authorizeUrl = login.authorizeUrl.clone();
+        let task = tokio::spawn(construct::auth::completeAnthropicLogin(login));
+        self.pendingLogin = Some(PendingLogin::Anthropic { authorizeUrl, task });
+        self.notice = None;
+        Ok(())
+    }
+
+    async fn checkLoginTask(&mut self) {
+        let finished = match self.pendingLogin.as_ref() {
+            Some(pending) => pending.isFinished(),
+            None => return,
+        };
+        if !finished {
             return;
         }
-
         let Some(pending) = self.pendingLogin.take() else {
             return;
         };
-        match pending.task.await {
-            Ok(Ok(auth)) => {
-                let who = auth
-                    .email
-                    .as_deref()
-                    .or(auth.accountId.as_deref())
-                    .unwrap_or("OpenAI account");
-                let suffix = auth
-                    .planType
-                    .as_deref()
-                    .map(|plan| format!(" ({plan})"))
-                    .unwrap_or_default();
-                self.notice = Some(format!("Signed in as {who}{suffix}."));
+
+        match pending {
+            PendingLogin::OpenAiCodex { task, .. } => {
+                match task.await {
+                    Ok(Ok(auth)) => {
+                        let who = auth
+                            .email
+                            .as_deref()
+                            .or(auth.accountId.as_deref())
+                            .unwrap_or("OpenAI account");
+                        let suffix = auth
+                            .planType
+                            .as_deref()
+                            .map(|plan| format!(" ({plan})"))
+                            .unwrap_or_default();
+                        self.notice = Some(format!("Signed in as {who}{suffix}."));
+                    }
+                    Ok(Err(e)) => self.notice = Some(format!("Sign-in failed: {e}")),
+                    Err(e) => self.notice = Some(format!("Sign-in task ended: {e}")),
+                }
+                self.screen = Screen::OpenAiCodex;
             }
-            Ok(Err(e)) => {
-                self.notice = Some(format!("Sign-in failed: {e}"));
-            }
-            Err(e) => {
-                self.notice = Some(format!("Sign-in task ended: {e}"));
+            PendingLogin::Anthropic { task, .. } => {
+                match task.await {
+                    Ok(Ok(auth)) => {
+                        let who = auth
+                            .subscriptionType
+                            .as_deref()
+                            .unwrap_or("Claude subscription");
+                        self.notice = Some(format!("Signed in to {who}."));
+                    }
+                    Ok(Err(e)) => self.notice = Some(format!("Sign-in failed: {e}")),
+                    Err(e) => self.notice = Some(format!("Sign-in task ended: {e}")),
+                }
+                self.screen = Screen::Anthropic;
             }
         }
-        self.screen = Screen::OpenAiCodex;
         self.selected = 0;
     }
 
@@ -297,6 +367,7 @@ impl AuthMini {
         match self.screen {
             Screen::Providers => self.renderProviders(frame, inner),
             Screen::OpenAiCodex => self.renderOpenAiCodex(frame, inner),
+            Screen::Anthropic => self.renderAnthropic(frame, inner),
             Screen::WaitingForBrowser => self.renderWaiting(frame, inner),
         }
     }
@@ -367,10 +438,45 @@ impl AuthMini {
         renderHelp(frame, chunks[2], self.notice.as_deref());
     }
 
+    fn renderAnthropic(&self, frame: &mut Frame<'_>, area: Rect) {
+        let chunks = vertical(
+            area,
+            &[
+                Constraint::Length(3),
+                Constraint::Min(4),
+                Constraint::Length(2),
+            ],
+        );
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Anthropic - Claude subscription",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("Status: {}", anthropicStatusLine())),
+            Line::from(format!("Store: {}", construct::auth::authPath().display())),
+        ])
+        .render(chunks[0], frame.buffer_mut());
+
+        let items: Vec<ListItem<'_>> = self
+            .actions()
+            .iter()
+            .copied()
+            .map(|action| ListItem::new(actionLabel(action)))
+            .collect();
+        renderList(frame, chunks[1], items, self.selected);
+        renderHelp(frame, chunks[2], self.notice.as_deref());
+    }
+
     fn renderWaiting(&self, frame: &mut Frame<'_>, area: Rect) {
         let chunks = vertical(area, &[Constraint::Length(8), Constraint::Length(2)]);
-        let lines = if let Some(pending) = &self.pendingLogin {
-            vec![
+        let lines = match &self.pendingLogin {
+            Some(PendingLogin::OpenAiCodex {
+                verificationUrl,
+                userCode,
+                ..
+            }) => vec![
                 Line::from(Span::styled(
                     "OpenAI Codex sign-in",
                     Style::default()
@@ -379,12 +485,12 @@ impl AuthMini {
                 )),
                 Line::from("1. Open this URL:"),
                 Line::from(Span::styled(
-                    format!("   {}", pending.verificationUrl),
+                    format!("   {verificationUrl}"),
                     Style::default().fg(Color::Cyan),
                 )),
                 Line::from("2. Enter this code:"),
                 Line::from(Span::styled(
-                    format!("   {}", pending.userCode),
+                    format!("   {userCode}"),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -392,21 +498,33 @@ impl AuthMini {
                 Line::from("3. Finish in the browser. Flatline is waiting here."),
                 Line::from(""),
                 Line::from("Esc cancels waiting."),
-            ]
-        } else {
-            vec![
+            ],
+            Some(PendingLogin::Anthropic { authorizeUrl, .. }) => vec![
                 Line::from(Span::styled(
-                    "OpenAI Codex sign-in",
+                    "Claude subscription sign-in",
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Line::from(
-                    self.notice
-                        .as_deref()
-                        .unwrap_or("Requesting OpenAI device code..."),
-                ),
-            ]
+                Line::from("Your browser should open to approve access."),
+                Line::from("If it didn't, open this URL:"),
+                Line::from(Span::styled(
+                    format!("   {authorizeUrl}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(""),
+                Line::from("Approve in the browser. Flatline is waiting here."),
+                Line::from("Esc cancels waiting."),
+            ],
+            None => vec![
+                Line::from(Span::styled(
+                    "Signing in",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(self.notice.as_deref().unwrap_or("Working...")),
+            ],
         };
         Paragraph::new(lines).render(chunks[0], frame.buffer_mut());
         renderHelp(frame, chunks[1], self.notice.as_deref());
@@ -473,6 +591,17 @@ fn openAiCodexStatusLine() -> String {
     }
 }
 
+fn anthropicStatusLine() -> String {
+    let status = construct::auth::anthropicOauthStatus();
+    if !status.configured {
+        return "not signed in".to_string();
+    }
+    let who = status.subscriptionType.as_deref().unwrap_or("signed in");
+    let token = if status.expired { "expired" } else { "valid" };
+    format!("{who} ({token})")
+}
+
 fn printPlainStatus() {
     println!("openai-codex: {}", openAiCodexStatusLine());
+    println!("anthropic:    {}", anthropicStatusLine());
 }

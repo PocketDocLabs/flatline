@@ -158,7 +158,9 @@ pub fn zoneBlocks(
             currentBlockId = turn.blockId.clone();
             currentRawSize = 0;
         }
-        currentRawSize += turn.content.len();
+        currentRawSize += turn.content.len()
+            + turn.args.as_ref().map(|a| a.to_string().len()).unwrap_or(0)
+            + turn.reasoning.as_ref().map(|r| r.len()).unwrap_or(0);
     }
     // Flush last block.
     if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
@@ -300,5 +302,15 @@ impl CompactionLog {
     /// Load all operations from the compaction log.
     pub fn loadAll(&self) -> Result<Vec<CompactionOp>> {
         crate::storage::loadCompaction(&self.conn.lock().unwrap())
+    }
+
+    /// Remove the most recent S4 FullCompact entry from the log.
+    /// Returns true if a row was deleted.
+    pub fn removeLastFullCompact(&mut self) -> Result<bool> {
+        let deleted = crate::storage::removeLastFullCompact(&self.conn.lock().unwrap())?;
+        if deleted > 0 {
+            tracing::info!("compaction: removed last S4 full compact");
+        }
+        Ok(deleted > 0)
     }
 }

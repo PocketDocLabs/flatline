@@ -553,8 +553,8 @@ impl Session {
 
         // Reconstruct conversation from the active branch.
         let reconstructed = match &headTurnId {
-            Some(head) => match context::reconstruct(&transcript, &compactionLog, head) {
-                Ok(h) => h,
+            Some(head) => match context::reconstruct(&transcript, &compactionLog, head, 0, 0) {
+                Ok(r) => r.messages,
                 Err(e) => return Err((e, shells)),
             },
             None => Vec::new(),
@@ -899,9 +899,7 @@ impl Session {
                 while userBgRx.try_recv().is_ok() {}
                 let texts: Vec<String> = queued.iter().map(|i| i.text.clone()).collect();
                 let combinedText = texts.join("\n\n");
-                let _ = logTx
-                    .send(LogEvent::SteerInjected { texts })
-                    .await;
+                let _ = logTx.send(LogEvent::SteerInjected { texts }).await;
                 let combined = UserInput {
                     text: combinedText,
                     attachments: queued.into_iter().flat_map(|i| i.attachments).collect(),

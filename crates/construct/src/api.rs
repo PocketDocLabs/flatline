@@ -92,6 +92,9 @@ impl Client {
         if usesResponsesApi(&self.heavy.provider) {
             return self.streamResponses(messages, tools, reasoning).await;
         }
+        if usesMessagesApi(&self.heavy.provider) {
+            return self.streamMessages(messages, tools, reasoning).await;
+        }
 
         let url = format!("{}/chat/completions", self.heavy.baseUrl);
 
@@ -263,9 +266,7 @@ impl Client {
 
         let thinkingEnabled = deepseekStubNeeded(
             &cfg.provider,
-            cfg.reasoning
-                .as_ref()
-                .and_then(|r| r.effort.as_deref()),
+            cfg.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
         );
 
         if thinkingEnabled {
@@ -430,6 +431,57 @@ impl Client {
         Ok(rx)
     }
 
+    /// Stream from the Anthropic Messages API using subscription OAuth.
+    async fn streamMessages(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        reasoning: Option<&ReasoningConfig>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let url = format!("{}/v1/messages", self.heavy.baseUrl);
+        let body = buildMessagesBody(&self.heavy, messages, tools, reasoning, true)?;
+
+        tracing::debug!(
+            provider = %self.heavy.provider,
+            model = %self.heavy.model,
+            messageCount = messages.len(),
+            toolCount = tools.len(),
+            "sending Anthropic Messages request"
+        );
+        tracing::trace!(body = %body, "messages request body");
+
+        let http = self.heavyHttp.clone();
+        let cfg = self.heavy.clone();
+        let response = (|| {
+            let http = http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            let cfg = cfg.clone();
+            async move { sendJsonRequest(http, &cfg, &url, &body).await }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(120))
+                .with_max_times(8)
+                .with_jitter(),
+        )
+        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
+        .notify(|err, dur| {
+            tracing::warn!(error = %err, delay = ?dur, "retrying Anthropic Messages request");
+        })
+        .await?;
+
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            if let Err(e) = readMessagesStream(response, &tx).await {
+                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
     async fn completeResponsesWith(
         http: reqwest::Client,
         cfg: ModelConfig,
@@ -501,7 +553,7 @@ impl Client {
 }
 
 fn providerRequiresApiKey(provider: &str) -> bool {
-    provider != "openai-codex"
+    !matches!(provider, "openai-codex" | "anthropic-oauth")
 }
 
 fn ensureProviderConfigured(tier: &str, model: &ModelConfig) -> Result<()> {
@@ -536,6 +588,13 @@ async fn sendJsonRequest(
             req = req.header("ChatGPT-Account-Id", accountId);
         }
     }
+    if cfg.provider == "anthropic-oauth" {
+        let access = crate::auth::anthropicAccessToken().await?;
+        req = req
+            .bearer_auth(access.accessToken)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA);
+    }
 
     let response = req.send().await.context("Failed to send API request")?;
     if response.status().is_success() {
@@ -552,6 +611,360 @@ async fn sendJsonRequest(
 
     tracing::error!(%status, body = %errorBody, "API error (not retryable)");
     Err(PermanentApiError(format!("API error {status}: {errorBody}")).into())
+}
+
+// ── Anthropic Messages API transport ──────────────────────────────────
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+fn usesMessagesApi(provider: &str) -> bool {
+    provider == "anthropic-oauth"
+}
+
+/// Build an Anthropic `/v1/messages` body from the OpenAI-shaped history.
+fn buildMessagesBody(
+    cfg: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDef],
+    reasoning: Option<&ReasoningConfig>,
+    stream: bool,
+) -> Result<serde_json::Value> {
+    // NOTE: Native Anthropic thinking is a follow-up; default profiles run
+    // without it, so reasoning is accepted but unused here.
+    let _ = reasoning;
+    let (system, mut msgs) = anthropicMessages(messages);
+
+    if cfg.cachingActive() {
+        markLastAnthropicBlock(&mut msgs);
+    }
+
+    let mut body = serde_json::json!({
+        "model": cfg.model,
+        "max_tokens": cfg.maxTokens.unwrap_or(8192),
+        "stream": stream,
+        "messages": msgs,
+    });
+
+    if let Some(system) = system {
+        let mut block = serde_json::json!({ "type": "text", "text": system });
+        if cfg.cachingActive() {
+            block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
+        body["system"] = serde_json::json!([block]);
+    }
+
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools.iter().map(anthropicTool).collect());
+    }
+
+    Ok(body)
+}
+
+/// Collapse the OpenAI-shaped history into Anthropic's top-level `system`
+/// string plus a role-alternating `messages` array (tool results become
+/// `tool_result` blocks inside a user turn; adjacent same-role turns merge).
+fn anthropicMessages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut system: Vec<String> = Vec::new();
+    let mut turns: Vec<(&'static str, Vec<serde_json::Value>)> = Vec::new();
+
+    for msg in messages {
+        match msg {
+            Message::System { content } => system.push(content.clone()),
+            Message::User { content } => {
+                pushAnthropicTurn(&mut turns, "user", anthropicContentBlocks(content));
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                reasoning: _,
+            } => {
+                let mut blocks = Vec::new();
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                if let Some(calls) = tool_calls {
+                    for call in calls {
+                        let input: serde_json::Value =
+                            serde_json::from_str(&call.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.function.name,
+                            "input": input,
+                        }));
+                    }
+                }
+                pushAnthropicTurn(&mut turns, "assistant", blocks);
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content.textContent(),
+                });
+                pushAnthropicTurn(&mut turns, "user", vec![block]);
+            }
+        }
+    }
+
+    let msgs = turns
+        .into_iter()
+        .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+        .collect();
+    let system = (!system.is_empty()).then(|| system.join("\n\n"));
+    (system, msgs)
+}
+
+fn pushAnthropicTurn(
+    turns: &mut Vec<(&'static str, Vec<serde_json::Value>)>,
+    role: &'static str,
+    blocks: Vec<serde_json::Value>,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = turns.last_mut()
+        && last.0 == role
+    {
+        last.1.extend(blocks);
+        return;
+    }
+    turns.push((role, blocks));
+}
+
+fn anthropicContentBlocks(content: &Content) -> Vec<serde_json::Value> {
+    match content {
+        Content::Text(text) => vec![serde_json::json!({ "type": "text", "text": text })],
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => serde_json::json!({ "type": "text", "text": text }),
+                ContentBlock::ImageUrl { image_url } => anthropicImageBlock(&image_url.url),
+            })
+            .collect(),
+    }
+}
+
+fn anthropicImageBlock(url: &str) -> serde_json::Value {
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((meta, data)) = rest.split_once(',')
+    {
+        let mediaType = meta.split(';').next().unwrap_or("image/png");
+        return serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": mediaType, "data": data },
+        });
+    }
+    serde_json::json!({
+        "type": "image",
+        "source": { "type": "url", "url": url },
+    })
+}
+
+fn anthropicTool(tool: &ToolDef) -> serde_json::Value {
+    serde_json::json!({
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "input_schema": tool.function.parameters,
+    })
+}
+
+/// Place a rolling cache breakpoint on the last block of the last message.
+fn markLastAnthropicBlock(messages: &mut [serde_json::Value]) {
+    if let Some(last) = messages.last_mut()
+        && let Some(blocks) = last.get_mut("content").and_then(|c| c.as_array_mut())
+        && let Some(block) = blocks.last_mut()
+        && let Some(obj) = block.as_object_mut()
+    {
+        obj.insert(
+            "cache_control".to_string(),
+            serde_json::json!({ "type": "ephemeral" }),
+        );
+    }
+}
+
+async fn readMessagesStream(
+    response: reqwest::Response,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let mut state = MessagesStreamState::default();
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    loop {
+        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk.context("Messages stream read error")?,
+            Ok(None) => break,
+            Err(_) => bail!("Messages stream stalled — no data received for {IDLE_TIMEOUT:?}"),
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(lineEnd) = buffer.find('\n') {
+            let line = buffer[..lineEnd].trim().to_string();
+            buffer = buffer[lineEnd + 1..].to_string();
+
+            if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                match serde_json::from_str::<serde_json::Value>(data) {
+                    Ok(value) => {
+                        for event in parseAnthropicEvent(&mut state, value) {
+                            if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(data = %data, "failed to parse Messages SSE chunk: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct MessagesStreamState {
+    inputTokens: usize,
+    outputTokens: usize,
+    cacheReadTokens: usize,
+    cacheCreationTokens: usize,
+    stopReason: Option<String>,
+}
+
+impl MessagesStreamState {
+    fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            promptTokens: self.inputTokens,
+            completionTokens: self.outputTokens,
+            totalTokens: self.inputTokens + self.outputTokens,
+            cost: None,
+            cacheReadTokens: self.cacheReadTokens,
+            cacheCreationTokens: self.cacheCreationTokens,
+        }
+    }
+}
+
+fn parseAnthropicEvent(
+    state: &mut MessagesStreamState,
+    value: serde_json::Value,
+) -> Vec<StreamEvent> {
+    match value.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "message_start" => {
+            if let Some(usage) = value.pointer("/message/usage") {
+                state.inputTokens = usageField(usage, "input_tokens");
+                state.cacheReadTokens = usageField(usage, "cache_read_input_tokens");
+                state.cacheCreationTokens = usageField(usage, "cache_creation_input_tokens");
+            }
+            Vec::new()
+        }
+        "content_block_start" => {
+            let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let block = value.get("content_block");
+            if block.and_then(|b| b.get("type")).and_then(|v| v.as_str()) == Some("tool_use") {
+                vec![StreamEvent::ToolCallDelta {
+                    index,
+                    id: block
+                        .and_then(|b| b.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    name: block
+                        .and_then(|b| b.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    arguments: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+        "content_block_delta" => {
+            let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let delta = value.get("delta");
+            match delta.and_then(|d| d.get("type")).and_then(|v| v.as_str()) {
+                Some("text_delta") => textFrom(delta, "text")
+                    .map(|t| vec![StreamEvent::ContentDelta(t)])
+                    .unwrap_or_default(),
+                Some("thinking_delta") => textFrom(delta, "thinking")
+                    .map(|t| vec![StreamEvent::ReasoningDelta(t)])
+                    .unwrap_or_default(),
+                Some("input_json_delta") => textFrom(delta, "partial_json")
+                    .map(|args| {
+                        vec![StreamEvent::ToolCallDelta {
+                            index,
+                            id: None,
+                            name: None,
+                            arguments: Some(args),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+        "message_delta" => {
+            if let Some(output) = value
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                state.outputTokens = output as usize;
+            }
+            if let Some(reason) = value.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                state.stopReason = Some(reason.to_string());
+            }
+            Vec::new()
+        }
+        "message_stop" => vec![StreamEvent::Done {
+            finishReason: state.stopReason.as_deref().map(mapAnthropicStopReason),
+            usage: Some(state.usage()),
+        }],
+        "error" => {
+            let msg = value
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Anthropic Messages stream error");
+            vec![StreamEvent::Error(msg.to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn usageField(usage: &serde_json::Value, key: &str) -> usize {
+    usage
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(0)
+}
+
+fn textFrom(delta: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    delta
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn mapAnthropicStopReason(reason: &str) -> String {
+    match reason {
+        "tool_use" => "tool_calls".to_string(),
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn buildResponsesBody(
@@ -923,9 +1336,7 @@ fn deepseekStubNeeded(provider: &str, effort: Option<&str>) -> bool {
     if provider != "deepseek" {
         return false;
     }
-    effort.is_none_or(|e| {
-        !e.eq_ignore_ascii_case("disabled") && !e.eq_ignore_ascii_case("off")
-    })
+    effort.is_none_or(|e| !e.eq_ignore_ascii_case("disabled") && !e.eq_ignore_ascii_case("off"))
 }
 
 /// Build the DeepSeek `thinking` request object. Effort strings `"disabled"`

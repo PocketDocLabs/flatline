@@ -74,6 +74,9 @@ pub async fn discoverModels(config: &Config, provider: &str) -> Result<Vec<Model
             if provider == "openai-codex" {
                 return Ok(codexPresets());
             }
+            if provider == "anthropic-oauth" {
+                return Ok(anthropicPresets());
+            }
             Err(err)
         }
     }
@@ -133,6 +136,10 @@ pub fn knownModelContextWindow(provider: &str, model: &str) -> Option<usize> {
                 .into_iter()
                 .find(|entry| entry.id == model)
                 .and_then(|entry| entry.contextWindow),
+            "anthropic-oauth" => anthropicPresets()
+                .into_iter()
+                .find(|entry| entry.id == model)
+                .and_then(|entry| entry.contextWindow),
             _ => None,
         })
 }
@@ -158,6 +165,11 @@ pub fn knownModelReasoningEfforts(provider: &str, model: &str) -> Vec<String> {
             "high".to_string(),
             "max".to_string(),
         ],
+        "anthropic-oauth" => anthropicPresets()
+            .into_iter()
+            .find(|entry| entry.id == model)
+            .map(|entry| entry.reasoningEfforts)
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -169,6 +181,7 @@ async fn fetchProviderModels(config: &Config, provider: &str) -> Result<Vec<Mode
         "openai" => fetchOpenAi(config, &http).await,
         "deepseek" => fetchDeepSeek(config, &http).await,
         "openai-codex" => fetchOpenAiCodex(config, &http).await,
+        "anthropic-oauth" => fetchAnthropic(config, &http).await,
         other => bail!("model discovery is not implemented for provider {other:?}"),
     }
 }
@@ -221,6 +234,112 @@ async fn fetchDeepSeek(config: &Config, http: &reqwest::Client) -> Result<Vec<Mo
         .await
         .context("failed to parse DeepSeek model catalog")?;
     Ok(parseOpenAiCompatibleModels(&body, "deepseek"))
+}
+
+async fn fetchAnthropic(config: &Config, http: &reqwest::Client) -> Result<Vec<ModelCatalogEntry>> {
+    let access = crate::auth::anthropicAccessToken()
+        .await
+        .context("Claude model discovery needs Anthropic sign-in (run `flatline auth`)")?;
+    let base = providerBaseUrl(config, "anthropic-oauth", "https://api.anthropic.com");
+    let body = http
+        .get(format!("{base}/v1/models?limit=100"))
+        .header(AUTHORIZATION, format!("Bearer {}", access.accessToken))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .context("failed to fetch Anthropic models")?
+        .error_for_status()
+        .context("Anthropic model discovery failed")?
+        .json::<Value>()
+        .await
+        .context("failed to parse Anthropic model catalog")?;
+    let models = parseAnthropicModels(&body);
+    if models.is_empty() {
+        bail!("Anthropic model discovery returned no models");
+    }
+    Ok(models)
+}
+
+fn parseAnthropicModels(value: &Value) -> Vec<ModelCatalogEntry> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?.to_string();
+            let name = item
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(id.as_str())
+                .to_string();
+            let contextWindow = item.get("max_input_tokens").and_then(valueAsUsize);
+            let effort = item.pointer("/capabilities/effort");
+            let supportsEffort = effort
+                .and_then(|e| e.get("supported"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let reasoningEfforts: Vec<String> = if supportsEffort {
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .filter(|level| {
+                        effort
+                            .and_then(|e| e.get(*level))
+                            .and_then(|l| l.get("supported"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let defaultReasoningEffort = reasoningEfforts
+                .iter()
+                .any(|e| e == "high")
+                .then(|| "high".to_string());
+            Some(ModelCatalogEntry {
+                id,
+                name,
+                provider: "anthropic-oauth".to_string(),
+                contextWindow,
+                promptPrice: None,
+                completionPrice: None,
+                reasoningEfforts,
+                defaultReasoningEffort,
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                maxCompletionTokens: item.get("max_tokens").and_then(valueAsUsize),
+            })
+        })
+        .collect()
+}
+
+fn anthropicPresets() -> Vec<ModelCatalogEntry> {
+    [
+        ("claude-opus-4-8", "Claude Opus 4.8", 1_000_000usize),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6", 1_000_000),
+        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5", 200_000),
+        ("claude-opus-4-7", "Claude Opus 4.7", 1_000_000),
+        ("claude-fable-5", "Claude Fable 5", 1_000_000),
+    ]
+    .into_iter()
+    .map(|(id, name, contextWindow)| ModelCatalogEntry {
+        id: id.to_string(),
+        name: name.to_string(),
+        provider: "anthropic-oauth".to_string(),
+        contextWindow: Some(contextWindow),
+        promptPrice: None,
+        completionPrice: None,
+        reasoningEfforts: Vec::new(),
+        defaultReasoningEffort: None,
+        description: Some("Built-in fallback from the Anthropic model catalog.".to_string()),
+        maxCompletionTokens: None,
+    })
+    .collect()
 }
 
 async fn fetchOpenAiCodex(

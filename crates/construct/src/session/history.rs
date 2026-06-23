@@ -193,12 +193,21 @@ impl Session {
 
     /// Build context state for the /context display.
     pub fn buildContextState(&self) -> crate::context::ContextState {
+        let toolDefsChars = serde_json::to_string(&self.tools)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let historyChars = serde_json::to_string(&self.history)
+            .map(|s| s.len())
+            .unwrap_or(0);
         let input = crate::context::BuildStateInput {
             contextWindow: self.config.heavy.contextWindow,
             compactionLog: &self.compactionLog,
             reportedTokens: self.compactionTracker.lastTokens(),
             transcript: &self.transcript,
             headTurnId: self.headTurnId.as_deref().unwrap_or(""),
+            systemPromptChars: self.systemPrompt.len(),
+            toolDefsChars,
+            historyChars,
         };
         crate::context::buildState(&input)
     }
@@ -265,8 +274,9 @@ impl Session {
             self.transcript.setHead(targetTurnId, &turn.blockId);
         }
 
-        match crate::context::reconstruct(&self.transcript, &self.compactionLog, targetTurnId) {
-            Ok(h) => self.history = h,
+        match crate::context::reconstruct(&self.transcript, &self.compactionLog, targetTurnId, 0, 0)
+        {
+            Ok(r) => self.history = r.messages,
             Err(e) => return format!("Failed to reconstruct history after rewind: {e}"),
         }
 
@@ -333,8 +343,14 @@ impl Session {
             self.transcript.setHead(&fork.headTurn, &turn.blockId);
         }
 
-        match crate::context::reconstruct(&self.transcript, &self.compactionLog, &fork.headTurn) {
-            Ok(h) => self.history = h,
+        match crate::context::reconstruct(
+            &self.transcript,
+            &self.compactionLog,
+            &fork.headTurn,
+            0,
+            0,
+        ) {
+            Ok(r) => self.history = r.messages,
             Err(e) => return format!("Failed to reconstruct after fork switch: {e}"),
         }
 

@@ -427,6 +427,23 @@ pub(crate) fn loadCompaction(conn: &Connection) -> Result<Vec<CompactionOp>> {
     })
 }
 
+/// Remove the most recent `full_compact` (S4) entry from the compaction
+/// log. Returns the number of rows deleted (0 or 1).
+pub(crate) fn removeLastFullCompact(conn: &Connection) -> Result<usize> {
+    sqliteBlocking(|| {
+        let deleted = conn.execute(
+            "DELETE FROM compaction_ops WHERE seq = (
+                SELECT seq FROM compaction_ops
+                WHERE action = 'full_compact'
+                ORDER BY seq DESC
+                LIMIT 1
+            )",
+            [],
+        )?;
+        Ok(deleted)
+    })
+}
+
 pub(crate) fn insertSnapshot(conn: &Connection, hash: &str, snap: &RequestSnapshot) -> Result<()> {
     sqliteBlocking(|| insertSnapshotTx(conn, hash, snap))
 }

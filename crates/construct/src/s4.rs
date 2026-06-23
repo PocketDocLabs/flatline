@@ -3,33 +3,23 @@
 //! S4 — deep recompaction (single LLM call).
 //!
 //! Last-resort recompression of the OLDER compacted layers when S1–S3
-//! are exhausted. Despite the historical "full compaction" name, S4
-//! does NOT touch the most recent context: a protected band of the
-//! newest [`DEFAULT_PROTECTED_RATIO`] characters of effective content
-//! is held verbatim, so the model always has a high-fidelity working
-//! set even after repeated S4 firings.
+//! are exhausted.
 //!
 //! Sources fed into S4:
 //! - The latest active S4 briefing, if one exists. Older S4 ops are
 //!   historical log entries already consumed by that frontier.
-//! - S3 topic summaries whose sourceBlocks are entirely outside the
-//!   protected band and not already covered by a later S4.
-//! - Orphan S2 block summaries whose blocks were never lifted into an
-//!   S3 or S4 op AND fall outside the protected band — these are
-//!   typically single-block topics or fragments S3 wouldn't touch.
+//! - S3 topic summaries not already covered by a later S4.
 //!
-//! Reads the post-compaction summaries from the log directly; the
-//! transcript is consulted only to compute the protected band.
+//! Reads the post-compaction summaries from the log directly.
 //!
 //! # Public API
 //! - [`run`] — execute S4 compaction
 //! - [`S4Result`] — what was produced
-//! - [`DEFAULT_PROTECTED_RATIO`] — fraction of effective context held verbatim
 //!
 //! # Dependencies
 //! `crate::api`, `crate::compaction`, `crate::message`, `crate::transcript`
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
@@ -38,11 +28,6 @@ use crate::compaction::{CompactionLog, CompactionOp};
 use crate::config::ModelTier;
 use crate::message::Message;
 use crate::transcript::Transcript;
-
-/// Fraction of effective context (newest end) that S4 must NEVER
-/// touch. Holds the model's working set in full fidelity even after
-/// repeated S4 firings.
-pub const DEFAULT_PROTECTED_RATIO: f64 = 0.30;
 
 pub struct S4Result {
     pub didWork: bool,
@@ -65,6 +50,7 @@ pub async fn run(
     headTurnId: &str,
     client: &api::Client,
     utilityModel: &str,
+    maxInputChars: usize,
 ) -> Result<S4Result> {
     let ops = compactionLog.loadAll()?;
 
@@ -78,9 +64,7 @@ pub async fn run(
         .filter(|op| opAppliesToActiveBranch(op, &activeBlockIds, &activeTurnIds, &knownTurnIds))
         .collect();
 
-    let protectedBand = computeProtectedBand(&activeTurns, &activeOps, DEFAULT_PROTECTED_RATIO);
-
-    let plan = buildRecompactPlan(&activeOps, &protectedBand);
+    let plan = buildRecompactPlan(&activeOps, &activeTurns, maxInputChars);
 
     if plan.sections.is_empty() {
         return Ok(S4Result {
@@ -109,7 +93,6 @@ pub async fn run(
         sectionCount,
         sourceBlocks = sourceCount,
         inputChars,
-        protectedBlocks = protectedBand.len(),
         "S4: recompressing older layers"
     );
 
@@ -173,45 +156,83 @@ struct RecompactPlan {
 /// log, but only the newest active one is the current S4 frontier. Feeding
 /// older S4 briefings alongside the frontier duplicates already-consumed
 /// history and invites summary drift.
-fn buildRecompactPlan(ops: &[CompactionOp], protectedBand: &HashSet<String>) -> RecompactPlan {
+///
+/// `maxInputChars` caps the total char count of accumulated sections so
+/// S4 only compacts the oldest ~30% of effective context. The budget is
+/// enforced after the latest S4 briefing (always included as anchor);
+/// additional S3 topics and S2 orphans stop being added once the budget
+/// is exceeded.
+fn buildRecompactPlan(
+    ops: &[CompactionOp],
+    activeTurns: &[crate::transcript::Turn],
+    maxInputChars: usize,
+) -> RecompactPlan {
+    // Group transcript turns by blockId for raw content rendering.
+    let mut turnsByBlock: HashMap<String, Vec<&crate::transcript::Turn>> = HashMap::new();
+    for turn in activeTurns {
+        turnsByBlock
+            .entry(turn.blockId.clone())
+            .or_default()
+            .push(turn);
+    }
+
+    // Find the latest S4 briefing (continuity anchor).
     let latestS4 = ops.iter().rev().find_map(|op| match op {
         CompactionOp::FullCompact {
             summary, sourceIds, ..
-        } => {
-            if sourceIds.iter().any(|bid| protectedBand.contains(bid)) {
-                None
-            } else {
-                Some((summary.as_str(), sourceIds.as_slice()))
-            }
-        }
+        } => Some((summary.as_str(), sourceIds.as_slice())),
         _ => None,
     });
 
-    // Blocks absorbed by the active S4 frontier. Earlier S4 entries and
-    // the S2/S3 summaries that fed them are dead inputs.
     let s4Covered: HashSet<String> = latestS4
-        .map(|(_, sourceIds)| sourceIds.iter().cloned().collect())
+        .map(|(_, ids)| ids.iter().cloned().collect())
         .unwrap_or_default();
 
-    // Blocks already absorbed by S3.
-    let s3Covered: HashSet<String> = ops
-        .iter()
-        .flat_map(|op| match op {
-            CompactionOp::TopicCompact { sourceBlockIds, .. } => sourceBlockIds.clone(),
-            _ => Vec::new(),
-        })
-        .collect();
+    // Collect S3 topics not already in S4, in op order (oldest first).
+    struct TopicEntry<'a> {
+        label: &'a str,
+        summary: &'a str,
+        sourceBlockIds: &'a [String],
+    }
+    let mut eligibleTopics: Vec<TopicEntry> = Vec::new();
+    for op in ops {
+        if let CompactionOp::TopicCompact {
+            topicLabel,
+            summary,
+            sourceBlockIds,
+            ..
+        } = op
+            && !sourceBlockIds.iter().all(|bid| s4Covered.contains(bid))
+        {
+            eligibleTopics.push(TopicEntry {
+                label: topicLabel.as_str(),
+                summary: summary.as_str(),
+                sourceBlockIds: sourceBlockIds.as_slice(),
+            });
+        }
+    }
+
+    if eligibleTopics.is_empty() {
+        return RecompactPlan {
+            sections: Vec::new(),
+            sourceBlockIds: Vec::new(),
+        };
+    }
+
+    // Take the oldest 25% of S3 topics.
+    let takeCount = (eligibleTopics.len() as f64 * 0.25).ceil() as usize;
+    let batch = &eligibleTopics[..takeCount.min(eligibleTopics.len())];
 
     let mut sections: Vec<String> = Vec::new();
     let mut allSourceBlockIds: Vec<String> = Vec::new();
     let mut seenBlocks: HashSet<String> = HashSet::new();
+    let mut accumulatedChars: usize = 0;
 
+    // Include prior briefing as anchor.
     if let Some((summary, sourceIds)) = latestS4 {
-        sections.push(format!(
-            "<prior_briefing>\n\
-             {summary}\n\
-             </prior_briefing>"
-        ));
+        let section = format!("<prior_briefing>\n{summary}\n</prior_briefing>");
+        accumulatedChars += section.len();
+        sections.push(section);
         for bid in sourceIds {
             if seenBlocks.insert(bid.clone()) {
                 allSourceBlockIds.push(bid.clone());
@@ -219,60 +240,30 @@ fn buildRecompactPlan(ops: &[CompactionOp], protectedBand: &HashSet<String>) -> 
         }
     }
 
-    for op in ops {
-        match op {
-            CompactionOp::TopicCompact {
-                topicLabel,
-                summary,
-                sourceBlockIds,
-                ..
-            } => {
-                if sourceBlockIds.iter().any(|bid| protectedBand.contains(bid)) {
-                    continue;
-                }
-                if sourceBlockIds.iter().all(|bid| s4Covered.contains(bid)) {
-                    // Already folded into a prior S4 briefing; that
-                    // briefing carries the content forward.
-                    continue;
-                }
-                let blockRange = formatBlockRange(sourceBlockIds);
-                sections.push(format!(
-                    "<topic_summary label=\"{topicLabel}\" blocks=\"{blockRange}\">\n\
-                     {summary}\n\
-                     </topic_summary>"
-                ));
-                for bid in sourceBlockIds {
-                    if seenBlocks.insert(bid.clone()) {
-                        allSourceBlockIds.push(bid.clone());
-                    }
-                }
+    // Render each topic. Use raw transcript if it fits, fall back to S3 summary.
+    for topic in batch {
+        let rawSection = renderTopicRaw(topic.label, topic.sourceBlockIds, &turnsByBlock);
+        // Use raw if it has real content and fits; otherwise fall back to S3 summary.
+        let rawHasContent = rawSection.lines().count() > 2; // More than just open/close tags.
+        let section = if rawHasContent && accumulatedChars + rawSection.len() <= maxInputChars {
+            rawSection
+        } else {
+            // Fall back to S3 summary.
+            let blockRange = formatBlockRange(topic.sourceBlockIds);
+            format!(
+                "<topic_summary label=\"{}\" blocks=\"{blockRange}\">\n\
+                 {}\n\
+                 </topic_summary>",
+                topic.label, topic.summary,
+            )
+        };
+
+        accumulatedChars += section.len();
+        sections.push(section);
+        for bid in topic.sourceBlockIds {
+            if seenBlocks.insert(bid.clone()) {
+                allSourceBlockIds.push(bid.clone());
             }
-            CompactionOp::BlockCompact {
-                blockId, summary, ..
-            } => {
-                if protectedBand.contains(blockId) {
-                    continue;
-                }
-                if s3Covered.contains(blockId) || s4Covered.contains(blockId) {
-                    // Already absorbed by S3 or S4 — including it
-                    // again would duplicate content.
-                    continue;
-                }
-                sections.push(format!(
-                    "<block_summary block=\"{blockId}\">\n\
-                     {summary}\n\
-                     </block_summary>"
-                ));
-                if seenBlocks.insert(blockId.clone()) {
-                    allSourceBlockIds.push(blockId.clone());
-                }
-            }
-            CompactionOp::FullCompact { .. } => {
-                // Only the latest active S4 frontier is carried above.
-                // Earlier S4 entries are historical and already consumed
-                // by that frontier.
-            }
-            _ => {}
         }
     }
 
@@ -280,6 +271,57 @@ fn buildRecompactPlan(ops: &[CompactionOp], protectedBand: &HashSet<String>) -> 
         sections,
         sourceBlockIds: allSourceBlockIds,
     }
+}
+
+/// Render a topic's blocks as raw transcript content for S4 input.
+fn renderTopicRaw(
+    label: &str,
+    blockIds: &[String],
+    turnsByBlock: &HashMap<String, Vec<&crate::transcript::Turn>>,
+) -> String {
+    use crate::transcript::TurnRole;
+
+    let mut parts = vec![format!("<topic label=\"{label}\">")];
+    for bid in blockIds {
+        let turns = match turnsByBlock.get(bid) {
+            Some(t) => t,
+            None => continue,
+        };
+        parts.push(format!("<exchange id=\"{bid}\">"));
+        for turn in turns {
+            match turn.role {
+                TurnRole::User | TurnRole::Wake => {
+                    parts.push(format!("<user_turn>{}</user_turn>", turn.content));
+                }
+                TurnRole::Assistant => {
+                    let body = if let Some(r) = &turn.reasoning {
+                        format!("<reasoning>{r}</reasoning>\n{}", turn.content)
+                    } else {
+                        turn.content.clone()
+                    };
+                    parts.push(format!("<agent_turn>{body}</agent_turn>"));
+                }
+                TurnRole::ToolResult => {
+                    parts.push(format!("<tool_output>{}</tool_output>", turn.content));
+                }
+                TurnRole::ToolCall => {
+                    let name = turn.tool.as_deref().unwrap_or("unknown");
+                    let argStr = turn
+                        .args
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    parts.push(format!(
+                        "<agent_turn>[tool_call: {name}({argStr})]</agent_turn>"
+                    ));
+                }
+                TurnRole::System => {}
+            }
+        }
+        parts.push("</exchange>".to_string());
+    }
+    parts.push("</topic>".to_string());
+    parts.join("\n")
 }
 
 /// Does a compaction op belong to the current active branch?
@@ -311,160 +353,9 @@ fn opAppliesToActiveBranch(
     }
 }
 
-/// Compute the set of block IDs in the protected recent band.
-///
-/// Walks the active branch from newest to oldest, accumulating each
-/// block's *effective* size (its S2 summary length when one exists,
-/// otherwise the raw char count). The newest blocks summing to
-/// `protectRatio` of total effective chars form the protected band.
-/// S2 blocks that have been superseded by S3 or S4 are excluded — they
-/// no longer contribute to live context.
-fn computeProtectedBand(
-    activeTurns: &[crate::transcript::Turn],
-    ops: &[CompactionOp],
-    protectRatio: f64,
-) -> HashSet<String> {
-    let compactedSizes = crate::compaction::compactedBlockSizes(ops);
-    let superseded = crate::compaction::supersededBlocks(ops);
-
-    let mut blocks: Vec<(String, usize)> = Vec::new();
-    let mut currentBlockId = String::new();
-    let mut currentRawSize: usize = 0;
-    for turn in activeTurns {
-        if turn.blockId != currentBlockId {
-            if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
-                let effective = compactedSizes
-                    .get(&currentBlockId)
-                    .copied()
-                    .unwrap_or(currentRawSize);
-                blocks.push((currentBlockId.clone(), effective));
-            }
-            currentBlockId = turn.blockId.clone();
-            currentRawSize = 0;
-        }
-        currentRawSize += turn.content.len();
-    }
-    if !currentBlockId.is_empty() && !superseded.contains(&currentBlockId) {
-        let effective = compactedSizes
-            .get(&currentBlockId)
-            .copied()
-            .unwrap_or(currentRawSize);
-        blocks.push((currentBlockId, effective));
-    }
-
-    let total: usize = blocks.iter().map(|(_, s)| s).sum();
-    if total == 0 {
-        return HashSet::new();
-    }
-    let target = (total as f64 * protectRatio) as usize;
-
-    let mut band = HashSet::new();
-    let mut cumulative: usize = 0;
-    for (blockId, size) in blocks.iter().rev() {
-        if cumulative >= target {
-            break;
-        }
-        band.insert(blockId.clone());
-        cumulative += size;
-    }
-    band
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::{Turn, TurnRole, TurnStatus};
-
-    fn makeTurn(
-        id: &str,
-        blockId: &str,
-        role: TurnRole,
-        content: &str,
-        parentId: Option<&str>,
-    ) -> Turn {
-        Turn {
-            id: id.to_string(),
-            blockId: blockId.to_string(),
-            topicId: String::new(),
-            role,
-            content: content.to_string(),
-            ts: 0,
-            parentId: parentId.map(|s| s.to_string()),
-            tool: None,
-            args: None,
-            toolCallId: None,
-            reasoning: None,
-            attachments: None,
-            toolMeta: None,
-            cost: None,
-            promptTokens: None,
-            completionTokens: None,
-            model: None,
-            finishReason: None,
-            snapshotHash: None,
-            status: TurnStatus::Completed,
-        }
-    }
-
-    /// The newest 30% of effective chars must end up in the protected
-    /// band. Blocks already absorbed by S3/S4 (`superseded`) are
-    /// invisible to the calculation — they aren't in live context.
-    #[test]
-    fn protected_band_holds_newest_thirty_percent() {
-        let turns = vec![
-            makeTurn("t1", "b_aaa", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_bbb", TurnRole::User, &"x".repeat(100), Some("t1")),
-            makeTurn("t3", "b_ccc", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_ddd", TurnRole::User, &"x".repeat(100), Some("t3")),
-            makeTurn("t5", "b_eee", TurnRole::User, &"x".repeat(100), Some("t4")),
-            makeTurn("t6", "b_fff", TurnRole::User, &"x".repeat(100), Some("t5")),
-            makeTurn("t7", "b_ggg", TurnRole::User, &"x".repeat(100), Some("t6")),
-            makeTurn("t8", "b_hhh", TurnRole::User, &"x".repeat(100), Some("t7")),
-            makeTurn("t9", "b_iii", TurnRole::User, &"x".repeat(100), Some("t8")),
-            makeTurn("t10", "b_jjj", TurnRole::User, &"x".repeat(100), Some("t9")),
-        ];
-        // 10 blocks × 100 chars = 1000 effective. 30% = 300, so the
-        // newest 3 blocks form the band.
-        let band = computeProtectedBand(&turns, &[], 0.30);
-        assert!(band.contains("b_jjj"), "newest block must be protected");
-        assert!(band.contains("b_iii"));
-        assert!(band.contains("b_hhh"));
-        assert!(
-            !band.contains("b_ggg"),
-            "older blocks must NOT be protected"
-        );
-        assert!(!band.contains("b_aaa"));
-    }
-
-    /// Blocks superseded by an S3 op are removed from live context, so
-    /// they shouldn't consume protected-band budget. The band should
-    /// expand backward to cover more of the still-live tail.
-    #[test]
-    fn protected_band_skips_superseded_blocks() {
-        let turns = vec![
-            makeTurn("t1", "b_old1", TurnRole::User, &"x".repeat(100), None),
-            makeTurn("t2", "b_old2", TurnRole::User, &"x".repeat(100), Some("t1")),
-            makeTurn("t3", "b_old3", TurnRole::User, &"x".repeat(100), Some("t2")),
-            makeTurn("t4", "b_new1", TurnRole::User, &"x".repeat(100), Some("t3")),
-            makeTurn("t5", "b_new2", TurnRole::User, &"x".repeat(100), Some("t4")),
-        ];
-        // Old three blocks are merged into one topic summary.
-        let ops = vec![CompactionOp::TopicCompact {
-            stage: "s3".into(),
-            topicLabel: "Merged".into(),
-            summary: "x".repeat(30),
-            sourceBlockIds: vec!["b_old1".into(), "b_old2".into(), "b_old3".into()],
-            afterTurn: "t5".into(),
-            ts: 0,
-        }];
-        // Live: just b_new1 (100) + b_new2 (100) = 200 effective.
-        // 30% = 60 → newest block (b_new2) only.
-        let band = computeProtectedBand(&turns, &ops, 0.30);
-        assert!(band.contains("b_new2"));
-        assert!(!band.contains("b_old1"), "superseded blocks not in band");
-        assert!(!band.contains("b_old2"));
-        assert!(!band.contains("b_old3"));
-    }
 
     #[test]
     fn recompact_plan_uses_only_latest_s4_frontier() {
@@ -517,7 +408,7 @@ mod tests {
             },
         ];
 
-        let plan = buildRecompactPlan(&ops, &HashSet::new());
+        let plan = buildRecompactPlan(&ops, &[], usize::MAX);
         let input = plan.sections.join("\n\n");
 
         assert!(
@@ -529,12 +420,22 @@ mod tests {
             1,
             "the active S4 frontier should be fed exactly once"
         );
-        assert!(input.contains("fresh topic summary"));
-        assert!(input.contains("orphan block summary"));
+        // Fresh Topic is the only S3 topic not covered by S4. With 1
+        // eligible topic, 25% rounds up to 1 → it should be included.
+        assert!(
+            input.contains("fresh topic summary"),
+            "uncovered S3 topics should be included"
+        );
+        // S2 orphans are no longer included — S4 only merges S3 topics.
+        assert!(
+            !input.contains("orphan block summary"),
+            "S4 no longer consumes standalone S2 blocks"
+        );
         assert!(
             !input.contains("topic one summary") && !input.contains("topic two summary"),
             "summaries already covered by the latest S4 must not be fed again"
         );
+        // Source blocks: S4 frontier (a,b,c) + Fresh Topic (d,e).
         assert_eq!(
             plan.sourceBlockIds,
             vec![
@@ -543,7 +444,6 @@ mod tests {
                 "b_c".to_string(),
                 "b_d".to_string(),
                 "b_e".to_string(),
-                "b_f".to_string(),
             ]
         );
     }

@@ -168,7 +168,8 @@ pub struct WebConfig {
 /// Per-model API settings — used for both main and utility models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// API provider: "openrouter", "deepseek", "openai", or "openai-codex".
+    /// API provider: "openrouter", "deepseek", "openai", "openai-codex", or
+    /// "anthropic-oauth".
     pub provider: String,
 
     /// API key.
@@ -305,6 +306,19 @@ fn modelDefaults(provider: &str) -> ModelConfig {
             contextWindow: 272_000,
             maxContextWindow: None,
             supportsAnthropicCache: Some(false),
+        },
+        "anthropic-oauth" => ModelConfig {
+            provider: "anthropic-oauth".into(),
+            key: String::new(),
+            model: "claude-sonnet-4-6".into(),
+            baseUrl: "https://api.anthropic.com".into(),
+            reasoning: None,
+            promptThinking: false,
+            providerOrder: Vec::new(),
+            maxTokens: Some(64_000),
+            contextWindow: 1_000_000,
+            maxContextWindow: None,
+            supportsAnthropicCache: Some(true),
         },
         // Default to OpenRouter for anything unrecognized.
         // NOTE: providerOrder is empty here — Anthropic pinning belongs in
@@ -618,6 +632,7 @@ fn applyEnvKey(config: &mut ModelConfig) {
         "deepseek" => "DEEPSEEK_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "openai-codex" => return,
+        "anthropic-oauth" => return,
         _ => "OPENROUTER_API_KEY",
     };
 
@@ -2356,10 +2371,7 @@ mod tests {
                 ),
                 // modelDefaults("openrouter") uses sonnet with empty
                 // providerOrder — the safe fallback for unknown models.
-                (
-                    "anthropic/claude-sonnet-4.6".to_string(),
-                    Vec::new(),
-                ),
+                ("anthropic/claude-sonnet-4.6".to_string(), Vec::new(),),
                 // Explicit sonnet profile in defaultConfigToml pins to
                 // Anthropic — correct because the model is known.
                 (

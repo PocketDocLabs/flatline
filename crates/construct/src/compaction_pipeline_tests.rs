@@ -189,9 +189,16 @@ async fn s4NoInputsIsNoopWithoutModelCall() {
     let compactionLog = CompactionLog::open(dir.path()).unwrap();
     let client = dummyClient();
 
-    let result = crate::s4::run(&transcript, &compactionLog, &head, &client, "test-model")
-        .await
-        .expect("S4 no-op should not error");
+    let result = crate::s4::run(
+        &transcript,
+        &compactionLog,
+        &head,
+        &client,
+        "test-model",
+        usize::MAX,
+    )
+    .await
+    .expect("S4 no-op should not error");
 
     assert!(!result.didWork);
     assert!(result.sourceBlockIds.is_empty());

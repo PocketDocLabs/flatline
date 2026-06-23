@@ -118,6 +118,11 @@ pub const COMMANDS: &[CommandDef] = &[
         aliases: &[],
         description: "Open layout controls",
     },
+    CommandDef {
+        name: "compact",
+        aliases: &[],
+        description: "Compaction tools: undo, run",
+    },
 ];
 
 /// Return commands whose name or aliases start with the given prefix.
@@ -165,6 +170,10 @@ pub enum CommandAction {
     Logs,
     /// Dump all debug info to a timestamped .tar.gz archive.
     DebugDump,
+    /// Remove the last S4 compaction and reconstruct context.
+    CompactUndo,
+    /// Recalibrate context against current budget.
+    CompactRun,
     /// Open the same layout controls as Ctrl+O.
     ShowLayout,
 }
@@ -241,7 +250,19 @@ fn dispatch(name: &str, args: &str) -> CommandOutput {
         "logs" => CommandOutput::Action(CommandAction::Logs),
         "dump" | "debug" => CommandOutput::Action(CommandAction::DebugDump),
         "layout" => CommandOutput::Action(CommandAction::ShowLayout),
+        "compact" => dispatchCompact(args),
         _ => CommandOutput::Inline(format!("/{name} is not yet implemented.")),
+    }
+}
+
+fn dispatchCompact(args: &str) -> CommandOutput {
+    match args {
+        "undo" => CommandOutput::Action(CommandAction::CompactUndo),
+        "run" => CommandOutput::Action(CommandAction::CompactRun),
+        _ => CommandOutput::Inline(
+            "Usage:\n  `/compact undo` — remove last S4 briefing\n  `/compact run` — recalibrate context against current budget"
+                .to_string(),
+        ),
     }
 }
 

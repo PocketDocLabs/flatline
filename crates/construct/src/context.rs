@@ -23,33 +23,414 @@ use crate::transcript::{Transcript, Turn, TurnRole};
 
 use anyhow::Result;
 
-/// Reconstruct conversation history by walking the parent-child chain
-/// from `headTurnId` back to the root.
+/// Char cost of a single turn (content + args + reasoning).
+fn turnChars(turn: &Turn) -> usize {
+    turn.content.len()
+        + turn.args.as_ref().map(|a| a.to_string().len()).unwrap_or(0)
+        + turn.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
+}
+
+/// Result of budget-aware context reconstruction.
+pub(crate) struct ReconstructResult {
+    pub messages: Vec<Message>,
+}
+
+/// Reconstruct conversation history with budget-aware compaction.
 ///
-/// Applies compaction operations whose targets are in the active chain,
-/// then reassembles into the grouped Message format the API expects.
-/// Does NOT include the system prompt — the caller prepends that.
+/// Loads the compaction log as a CACHE of available compressions, then
+/// selectively applies them bottom-up (oldest first) until the context
+/// fits within `tokenBudget`. Stages are applied in order:
+///
+/// 1. S1 (lossless dedup/truncation) — always applied
+/// 2. S2 (per-block summaries) — oldest blocks first
+/// 3. S3 (per-topic summaries) — oldest topics first
+/// 4. S4 (monolithic briefing) — last resort
+///
+/// Each stage stops as soon as the estimated total drops below budget.
+/// If `tokenBudget` is 0, all cached compressions are applied (legacy
+/// behavior for callers that don't have a budget yet).
+///
+/// `overheadTokens` is the estimated token cost of system prompt + tool
+/// definitions — subtracted from the budget to get the message allowance.
 pub(crate) fn reconstruct(
     transcript: &Transcript,
     compactionLog: &CompactionLog,
     headTurnId: &str,
-) -> Result<Vec<Message>> {
+    tokenBudget: usize,
+    overheadTokens: usize,
+) -> Result<ReconstructResult> {
     let allTurns = transcript.loadAll()?;
     let chain = walkChain(&allTurns, headTurnId);
 
-    // Build sets for compaction op filtering.
+    if chain.is_empty() {
+        return Ok(ReconstructResult {
+            messages: Vec::new(),
+        });
+    }
+
     let activeBlockIds: HashSet<&str> = chain.iter().map(|t| t.blockId.as_str()).collect();
     let activeTurnIds: HashSet<&str> = chain.iter().map(|t| t.id.as_str()).collect();
-    // Known turn IDs across the entire transcript — used to distinguish
-    // "afterTurn references a real turn that's off this branch" from
-    // "afterTurn is a legacy block id from before the schema migration."
     let knownTurnIds: HashSet<&str> = allTurns.iter().map(|t| t.id.as_str()).collect();
 
     let allOps = compactionLog.loadAll()?;
     let ops = filterOpsForChain(allOps, &activeBlockIds, &activeTurnIds, &knownTurnIds);
 
-    let transformed = applyOps(&chain, &ops);
-    Ok(assembleMessages(&transformed))
+    // Unlimited budget → apply everything (legacy behavior).
+    if tokenBudget == 0 {
+        let transformed = applyOps(&chain, &ops);
+        return Ok(ReconstructResult {
+            messages: assembleMessages(&transformed),
+        });
+    }
+
+    let messageBudgetTokens = tokenBudget.saturating_sub(overheadTokens);
+
+    // Separate S1 ops (always applied) from S2/S3/S4 (budget-gated cache).
+    let mut s1Ops: Vec<&CompactionOp> = Vec::new();
+    let mut s2Cache: HashMap<String, String> = HashMap::new();
+    // S3 keyed by first source block ID (same as applyOps). Later ops
+    // for the same blocks overwrite earlier ones.
+    let mut s3Cache: Vec<(Vec<String>, String)> = Vec::new();
+    let mut s4Cache: Option<(String, Vec<String>)> = None;
+
+    for op in &ops {
+        match op {
+            CompactionOp::FileDedup { .. } | CompactionOp::MiddleOut { .. } => {
+                s1Ops.push(op);
+            }
+            CompactionOp::BlockCompact {
+                blockId, summary, ..
+            } => {
+                s2Cache.insert(blockId.clone(), summary.clone());
+            }
+            CompactionOp::TopicCompact {
+                sourceBlockIds,
+                summary,
+                ..
+            } => {
+                s3Cache.push((sourceBlockIds.clone(), summary.clone()));
+            }
+            CompactionOp::FullCompact {
+                sourceIds, summary, ..
+            } => {
+                s4Cache = Some((summary.clone(), sourceIds.clone()));
+            }
+        }
+    }
+
+    // Apply S1 unconditionally — build the base turn stream with
+    // dedup/middle-out applied.
+    let s1OnlyOps: Vec<CompactionOp> = s1Ops.iter().map(|o| (*o).clone()).collect();
+    let baseTurns = applyOps(&chain, &s1OnlyOps);
+
+    // Group turns into blocks for budget accounting.
+    let mut blocks: Vec<ContextBlock> = Vec::new();
+    let mut currentBlockId = String::new();
+    for (i, tt) in baseTurns.iter().enumerate() {
+        let bid = transformedTurnBlockId(tt);
+        if bid != currentBlockId {
+            blocks.push(ContextBlock {
+                blockId: bid.to_string(),
+                startIdx: i,
+                endIdx: i + 1,
+                rawChars: transformedTurnChars(tt),
+                state: BlockState::Raw,
+            });
+            currentBlockId = bid.to_string();
+        } else if let Some(last) = blocks.last_mut() {
+            last.endIdx = i + 1;
+            last.rawChars += transformedTurnChars(tt);
+        }
+    }
+
+    let totalRawChars: usize = blocks.iter().map(|b| b.rawChars).sum();
+
+    // Zone-based application — same logic as organic compaction.
+    // S2 protects newest 40% of budget, S3 protects newest 70%.
+    // Zones are computed from block positions, oldest first.
+    let blockIdToIdx: HashMap<String, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.blockId.clone(), i))
+        .collect();
+
+    let budgetChars = if messageBudgetTokens > 0 {
+        // Convert token budget to approximate chars.
+        (messageBudgetTokens as f64 * 2.5) as usize
+    } else {
+        usize::MAX
+    };
+
+    // S2 zone: protect newest 40% of budget → compress oldest portion.
+    let s2ProtectedChars = (budgetChars as f64 * 0.40) as usize;
+    let s2Zone: HashSet<String> = {
+        let mut zone = HashSet::new();
+        let mut cumulative = 0usize;
+        let zoneLimit = totalRawChars.saturating_sub(s2ProtectedChars);
+        for block in blocks.iter() {
+            if cumulative >= zoneLimit {
+                break;
+            }
+            cumulative += block.rawChars;
+            zone.insert(block.blockId.clone());
+        }
+        zone
+    };
+
+    // S3 zone: protect newest 70% of budget → compress oldest portion.
+    let s3ProtectedChars = (budgetChars as f64 * 0.70) as usize;
+    let s3Zone: HashSet<String> = {
+        let mut zone = HashSet::new();
+        let mut cumulative = 0usize;
+        let zoneLimit = totalRawChars.saturating_sub(s3ProtectedChars);
+        for block in blocks.iter() {
+            if cumulative >= zoneLimit {
+                break;
+            }
+            cumulative += block.rawChars;
+            zone.insert(block.blockId.clone());
+        }
+        zone
+    };
+
+    // S2 pass: apply cached summaries to raw blocks in the S2 zone.
+    for block in blocks.iter_mut() {
+        if !matches!(block.state, BlockState::Raw) {
+            continue;
+        }
+        if !s2Zone.contains(&block.blockId) {
+            continue;
+        }
+        if let Some(summary) = s2Cache.get(&block.blockId) {
+            let userChars: usize = baseTurns[block.startIdx..block.endIdx]
+                .iter()
+                .filter(|tt| {
+                    matches!(
+                        tt,
+                        TransformedTurn::Original(t) | TransformedTurn::Replaced { turn: t, .. }
+                            if matches!(t.role, TurnRole::User | TurnRole::Wake)
+                    )
+                })
+                .map(|tt| transformedTurnChars(tt))
+                .sum();
+            let compressedChars = userChars + summary.len() + 200;
+            if compressedChars < block.rawChars {
+                block.state = BlockState::S2(summary.clone());
+            }
+        }
+    }
+
+    // S3 pass: apply cached topic summaries where ALL blocks are in S3 zone.
+    for (sourceBlockIds, summary) in &s3Cache {
+        if !sourceBlockIds.iter().all(|bid| s3Zone.contains(bid)) {
+            continue;
+        }
+        let indices: Vec<usize> = sourceBlockIds
+            .iter()
+            .filter_map(|bid| blockIdToIdx.get(bid).copied())
+            .collect();
+        if indices.len() != sourceBlockIds.len() {
+            continue;
+        }
+        if indices.iter().any(|&i| {
+            matches!(
+                blocks[i].state,
+                BlockState::S3 { .. }
+                    | BlockState::S3Covered
+                    | BlockState::S4
+                    | BlockState::S4Briefing(..)
+            )
+        }) {
+            continue;
+        }
+        let coveredChars: usize = indices
+            .iter()
+            .map(|&i| blockCurrentChars(&blocks[i], &baseTurns))
+            .sum();
+        let summaryChars = summary.len() + 200;
+        if summaryChars < coveredChars {
+            let firstIdx = indices[0];
+            blocks[firstIdx].state = BlockState::S3 {
+                summary: summary.clone(),
+                sourceBlockIds: sourceBlockIds.clone(),
+            };
+            for &i in &indices[1..] {
+                blocks[i].state = BlockState::S3Covered;
+            }
+        }
+    }
+
+    // S4 pass: always apply cached briefing when available.
+    // S4 replaces large S3/S2 content with a tiny briefing — always beneficial.
+    if let Some((summary, sourceIds)) = &s4Cache {
+        let indices: Vec<usize> = sourceIds
+            .iter()
+            .filter_map(|bid| blockIdToIdx.get(bid).copied())
+            .collect();
+        if !indices.is_empty()
+            && !indices
+                .iter()
+                .any(|&i| matches!(blocks[i].state, BlockState::S4 | BlockState::S4Briefing(..)))
+        {
+            let coveredChars: usize = indices
+                .iter()
+                .map(|&i| blockCurrentChars(&blocks[i], &baseTurns))
+                .sum();
+            let briefingChars = summary.len() + 200;
+            if briefingChars < coveredChars {
+                let firstIdx = indices[0];
+                blocks[firstIdx].state = BlockState::S4Briefing(summary.clone(), sourceIds.clone());
+                for &i in &indices[1..] {
+                    blocks[i].state = BlockState::S4;
+                }
+            }
+        }
+    }
+
+    // Build the final TransformedTurn list from block states.
+    let mut result: Vec<TransformedTurn> = Vec::new();
+    for block in &blocks {
+        match &block.state {
+            BlockState::Raw => {
+                for tt in &baseTurns[block.startIdx..block.endIdx] {
+                    result.push(cloneTransformedTurn(tt));
+                }
+            }
+            BlockState::S2(summary) => {
+                // Keep user turns, replace rest with summary.
+                let mut emittedSummary = false;
+                for tt in &baseTurns[block.startIdx..block.endIdx] {
+                    let isUser = matches!(
+                        tt,
+                        TransformedTurn::Original(t) | TransformedTurn::Replaced { turn: t, .. }
+                            if matches!(t.role, TurnRole::User | TurnRole::Wake)
+                    );
+                    if isUser {
+                        result.push(cloneTransformedTurn(tt));
+                    } else if !emittedSummary {
+                        result.push(TransformedTurn::Summary {
+                            blockId: block.blockId.clone(),
+                            content: summary.clone(),
+                            kind: SummaryKind::Block,
+                            sourceBlockIds: vec![block.blockId.clone()],
+                        });
+                        emittedSummary = true;
+                    }
+                }
+            }
+            BlockState::S3 {
+                summary,
+                sourceBlockIds,
+            } => {
+                result.push(TransformedTurn::Summary {
+                    blockId: block.blockId.clone(),
+                    content: summary.clone(),
+                    kind: SummaryKind::Topic,
+                    sourceBlockIds: sourceBlockIds.clone(),
+                });
+            }
+            BlockState::S3Covered => {} // Handled by the S3 block
+            BlockState::S4Briefing(summary, sourceIds) => {
+                result.push(TransformedTurn::Summary {
+                    blockId: block.blockId.clone(),
+                    content: summary.clone(),
+                    kind: SummaryKind::Full,
+                    sourceBlockIds: sourceIds.clone(),
+                });
+            }
+            BlockState::S4 => {} // Handled by the S4Briefing block
+        }
+    }
+
+    Ok(ReconstructResult {
+        messages: assembleMessages(&result),
+    })
+}
+
+/// Block state during budget-aware reconstruction.
+#[derive(Clone)]
+enum BlockState {
+    Raw,
+    S2(String),
+    S3 {
+        summary: String,
+        sourceBlockIds: Vec<String>,
+    },
+    S3Covered,
+    S4Briefing(String, Vec<String>),
+    S4,
+}
+
+/// A contiguous group of turns sharing a blockId.
+struct ContextBlock {
+    blockId: String,
+    startIdx: usize,
+    endIdx: usize,
+    rawChars: usize,
+    state: BlockState,
+}
+
+/// Current char cost of a block given its compression state.
+fn blockCurrentChars(block: &ContextBlock, baseTurns: &[TransformedTurn]) -> usize {
+    match &block.state {
+        BlockState::Raw => block.rawChars,
+        BlockState::S2(s) => {
+            let userChars: usize = baseTurns[block.startIdx..block.endIdx]
+                .iter()
+                .filter(|tt| {
+                    matches!(
+                        tt,
+                        TransformedTurn::Original(t) | TransformedTurn::Replaced { turn: t, .. }
+                            if matches!(t.role, TurnRole::User | TurnRole::Wake)
+                    )
+                })
+                .map(|tt| transformedTurnChars(tt))
+                .sum();
+            userChars + s.len() + 200
+        }
+        BlockState::S3 { summary, .. } => summary.len() + 200,
+        BlockState::S3Covered | BlockState::S4 | BlockState::S4Briefing(..) => 0,
+    }
+}
+
+fn transformedTurnChars(tt: &TransformedTurn) -> usize {
+    match tt {
+        TransformedTurn::Original(turn) => turnChars(turn),
+        TransformedTurn::Replaced { turn, newContent } => {
+            newContent.len()
+                + turn.args.as_ref().map(|a| a.to_string().len()).unwrap_or(0)
+                + turn.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
+        }
+        TransformedTurn::Summary { content, .. } => content.len() + 200,
+    }
+}
+
+fn transformedTurnBlockId<'a>(tt: &'a TransformedTurn) -> &'a str {
+    match tt {
+        TransformedTurn::Original(t) | TransformedTurn::Replaced { turn: t, .. } => &t.blockId,
+        TransformedTurn::Summary { blockId, .. } => blockId,
+    }
+}
+
+fn cloneTransformedTurn<'a>(tt: &TransformedTurn<'a>) -> TransformedTurn<'a> {
+    match tt {
+        TransformedTurn::Original(t) => TransformedTurn::Original(t),
+        TransformedTurn::Replaced { turn, newContent } => TransformedTurn::Replaced {
+            turn,
+            newContent: newContent.clone(),
+        },
+        TransformedTurn::Summary {
+            blockId,
+            content,
+            kind,
+            sourceBlockIds,
+        } => TransformedTurn::Summary {
+            blockId: blockId.clone(),
+            content: content.clone(),
+            kind: *kind,
+            sourceBlockIds: sourceBlockIds.clone(),
+        },
+    }
 }
 
 /// Walk the parent-child chain from `headTurnId` to root.
@@ -111,9 +492,16 @@ fn filterOpsForChain(
             // that's off the active branch. Tolerate legacy afterTurn
             // values (block ids from before the migration) by treating
             // unknown-turn references as "always apply".
-            let afterTurn = op.afterTurn();
-            if knownTurnIds.contains(afterTurn) && !activeTurnIds.contains(afterTurn) {
-                return false;
+            //
+            // BlockCompact is exempt: it's a deterministic compression
+            // of a single block whose content is identical across
+            // branches. Only the blockId check matters.
+            let skipTemporal = matches!(op, CompactionOp::BlockCompact { .. });
+            if !skipTemporal {
+                let afterTurn = op.afterTurn();
+                if knownTurnIds.contains(afterTurn) && !activeTurnIds.contains(afterTurn) {
+                    return false;
+                }
             }
 
             // Branch coverage gate.
@@ -502,6 +890,13 @@ pub(crate) struct BuildStateInput<'a> {
     pub reportedTokens: usize,
     pub transcript: &'a Transcript,
     pub headTurnId: &'a str,
+    /// Char length of the system prompt.
+    pub systemPromptChars: usize,
+    /// Char length of the serialized tool definitions.
+    pub toolDefsChars: usize,
+    /// Char length of the serialized history (Vec<Message> JSON).
+    /// Includes all message structure, tool call framing, etc.
+    pub historyChars: usize,
 }
 
 /// S4 briefing layer — the deepest compression.
@@ -560,6 +955,11 @@ pub struct ContextState {
 /// then estimates token counts from the transformed turn stream.
 pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
     let ops = input.compactionLog.loadAll().unwrap_or_default();
+    let totalOps = ops.len();
+    let totalBcOps = ops
+        .iter()
+        .filter(|op| matches!(op, CompactionOp::BlockCompact { .. }))
+        .count();
 
     if input.headTurnId.is_empty() {
         return ContextState {
@@ -599,133 +999,237 @@ pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
     let activeTurnIds: HashSet<&str> = chain.iter().map(|t| t.id.as_str()).collect();
     let knownTurnIds: HashSet<&str> = allTurns.iter().map(|t| t.id.as_str()).collect();
     let filteredOps = filterOpsForChain(ops, &activeBlockIds, &activeTurnIds, &knownTurnIds);
-    let transformed = applyOps(&chain, &filteredOps);
 
-    // Count unique blocks in the chain (each block = one user-visible turn).
-    let allBlockIds: Vec<&str> = {
+    // Build block list with raw char sizes.
+    let mut allBlockIds: Vec<&str> = Vec::new();
+    let mut blockRawChars: HashMap<&str, usize> = HashMap::new();
+    {
         let mut seen = HashSet::new();
-        chain
-            .iter()
-            .filter(|t| seen.insert(t.blockId.as_str()))
-            .map(|t| t.blockId.as_str())
-            .collect()
-    };
-
-    // Track which blocks are covered by each compaction stage.
-    let mut s4Blocks: HashSet<&str> = HashSet::new();
-    let mut s3Blocks: HashSet<&str> = HashSet::new();
-    let mut s2Blocks: HashSet<&str> = HashSet::new();
-
-    // NOTE: FullCompact supersedes earlier TopicCompact ops for the same blocks.
-    // We count topics that were folded into S4 by tracking TopicCompact labels
-    // whose source blocks are now covered by a FullCompact.
-    let mut s4CoveredTopicLabels: HashSet<String> = HashSet::new();
-
-    // S3: active topic labels (not superseded by S4).
-    let mut s3TopicLabels: Vec<String> = Vec::new();
-
-    // First pass: identify S4 coverage.
-    let mut fullCompactCount = 0usize;
-    for op in &filteredOps {
-        if let CompactionOp::FullCompact { sourceIds, .. } = op {
-            fullCompactCount += 1;
-            for id in sourceIds {
-                s4Blocks.insert(id.as_str());
+        for t in &chain {
+            let bid = t.blockId.as_str();
+            *blockRawChars.entry(bid).or_default() += turnChars(t);
+            if seen.insert(bid) {
+                allBlockIds.push(bid);
             }
         }
     }
-    // Prior briefings = total S4 ops minus the current active one.
-    let s4PriorBriefings = fullCompactCount.saturating_sub(1);
+    let totalRawChars: usize = blockRawChars.values().sum();
 
-    // Second pass: classify S3 and S2, count S4 topics.
+    // Ops metadata: topic labels, S4 topic counts, briefing counts.
+    let mut s4CoveredTopicLabels: HashSet<String> = HashSet::new();
+    let mut s3TopicLabels: Vec<String> = Vec::new();
+    let mut fullCompactCount = 0usize;
+
+    // Use only the LATEST FullCompact (matching reconstruction).
+    let latestS4SourceIds: HashSet<&str> = filteredOps
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            CompactionOp::FullCompact { sourceIds, .. } => Some(
+                sourceIds
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<HashSet<&str>>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    // Zone-based classification — same math as reconstruction.
+    let compactRatio = 0.80;
+    let overheadToks = (input.systemPromptChars + input.toolDefsChars) / 4;
+    let budgetToks = (input.contextWindow as f64 * compactRatio) as usize;
+    let msgBudgetToks = budgetToks.saturating_sub(overheadToks);
+    let budgetChars = if msgBudgetToks > 0 {
+        (msgBudgetToks as f64 * 2.5) as usize
+    } else {
+        usize::MAX
+    };
+
+    let s2ProtectedChars = (budgetChars as f64 * 0.40) as usize;
+    let s2Zone: HashSet<&str> = {
+        let mut zone = HashSet::new();
+        let mut cum = 0usize;
+        let limit = totalRawChars.saturating_sub(s2ProtectedChars);
+        for &bid in &allBlockIds {
+            if cum >= limit {
+                break;
+            }
+            cum += blockRawChars.get(bid).copied().unwrap_or(0);
+            zone.insert(bid);
+        }
+        zone
+    };
+
+    tracing::debug!(
+        totalOps,
+        totalBcOps,
+        totalRawChars,
+        budgetChars,
+        s2ProtectedChars,
+        s2ZoneLimit = totalRawChars.saturating_sub(s2ProtectedChars),
+        s2ZoneSize = s2Zone.len(),
+        latestS4Size = latestS4SourceIds.len(),
+        "buildState zone debug"
+    );
+
+    let s3ProtectedChars = (budgetChars as f64 * 0.70) as usize;
+    let s3Zone: HashSet<&str> = {
+        let mut zone = HashSet::new();
+        let mut cum = 0usize;
+        let limit = totalRawChars.saturating_sub(s3ProtectedChars);
+        for &bid in &allBlockIds {
+            if cum >= limit {
+                break;
+            }
+            cum += blockRawChars.get(bid).copied().unwrap_or(0);
+            zone.insert(bid);
+        }
+        zone
+    };
+
+    // S2/S3/S4 cache for zone-aware classification and token estimation.
+    let bcOpsCount = filteredOps
+        .iter()
+        .filter(|op| matches!(op, CompactionOp::BlockCompact { .. }))
+        .count();
+    let mut s2CacheSizes: HashMap<&str, usize> = HashMap::new();
+    for op in &filteredOps {
+        if let CompactionOp::BlockCompact {
+            blockId, summary, ..
+        } = op
+        {
+            s2CacheSizes.insert(blockId.as_str(), summary.len());
+        }
+    }
+    let s2Cache: HashSet<&str> = s2CacheSizes.keys().copied().collect();
+
+    let mut s3TopicSummaryChars: usize = 0;
+    let mut s4BriefingChars: usize = 0;
+
+    // S3 topics: not in latest S4 and all blocks in S3 zone.
+    let mut s3CacheBlocks: HashSet<&str> = HashSet::new();
     for op in &filteredOps {
         match op {
+            CompactionOp::FullCompact { summary, .. } => {
+                fullCompactCount += 1;
+                s4BriefingChars = summary.len();
+            }
             CompactionOp::TopicCompact {
                 sourceBlockIds,
                 topicLabel,
+                summary,
                 ..
             } => {
-                let coveredByS4 = sourceBlockIds
+                let inS4 = sourceBlockIds
                     .iter()
-                    .all(|id| s4Blocks.contains(id.as_str()));
-                if coveredByS4 {
+                    .all(|id| latestS4SourceIds.contains(id.as_str()));
+                if inS4 {
                     s4CoveredTopicLabels.insert(topicLabel.clone());
-                } else {
+                } else if sourceBlockIds.iter().all(|id| s3Zone.contains(id.as_str())) {
                     s3TopicLabels.push(topicLabel.clone());
+                    s3TopicSummaryChars += summary.len();
                     for id in sourceBlockIds {
-                        s3Blocks.insert(id.as_str());
+                        s3CacheBlocks.insert(id.as_str());
                     }
                 }
-            }
-            // Only count if not already covered by S3 or S4.
-            CompactionOp::BlockCompact { blockId, .. }
-                if !s4Blocks.contains(blockId.as_str()) && !s3Blocks.contains(blockId.as_str()) =>
-            {
-                s2Blocks.insert(blockId.as_str());
             }
             _ => {}
         }
     }
 
+    let s4PriorBriefings = fullCompactCount.saturating_sub(1);
     let s4TopicsMerged = s4CoveredTopicLabels.len();
 
-    // Count turns (blocks) per layer.
-    let s4TurnCount = allBlockIds
-        .iter()
-        .filter(|bid| s4Blocks.contains(**bid))
-        .count();
-    let s3TurnCount = allBlockIds
-        .iter()
-        .filter(|bid| s3Blocks.contains(**bid))
-        .count();
-    let s2TurnCount = allBlockIds
-        .iter()
-        .filter(|bid| s2Blocks.contains(**bid))
-        .count();
-    let rawTurnCount = allBlockIds
-        .iter()
-        .filter(|bid| {
-            !s4Blocks.contains(**bid) && !s3Blocks.contains(**bid) && !s2Blocks.contains(**bid)
-        })
-        .count();
+    // Classify blocks by what reconstruction would do.
+    let mut s4TurnCount = 0usize;
+    let mut s3TurnCount = 0usize;
+    let mut s2TurnCount = 0usize;
+    let mut rawTurnCount = 0usize;
+    let mut blockLayer: HashMap<&str, &str> = HashMap::new();
+    let mut rawInZoneWithCache = 0usize;
+    let mut rawInZoneNoCache = 0usize;
+    let mut rawNotInZone = 0usize;
 
-    // Estimate tokens per layer from the transformed stream.
-    let mut s4Tokens = 0usize;
-    let mut s3Tokens = 0usize;
-    let mut s2Tokens = 0usize;
-    let mut rawTokens = 0usize;
-
-    for tt in &transformed {
-        let chars = match tt {
-            TransformedTurn::Original(turn) => turn.content.len(),
-            TransformedTurn::Replaced { newContent, .. } => newContent.len(),
-            TransformedTurn::Summary { content, .. } => content.len(),
-        };
-        let tokens = chars / 4;
-
-        match tt {
-            TransformedTurn::Summary { kind, .. } => match kind {
-                SummaryKind::Full => s4Tokens += tokens,
-                SummaryKind::Topic => s3Tokens += tokens,
-                SummaryKind::Block => s2Tokens += tokens,
-            },
-            TransformedTurn::Original(turn) | TransformedTurn::Replaced { turn, .. } => {
-                let bid = turn.blockId.as_str();
-                if s4Blocks.contains(bid) {
-                    s4Tokens += tokens;
-                } else if s3Blocks.contains(bid) {
-                    s3Tokens += tokens;
-                } else if s2Blocks.contains(bid) {
-                    s2Tokens += tokens;
+    for &bid in &allBlockIds {
+        if latestS4SourceIds.contains(bid) {
+            s4TurnCount += 1;
+            blockLayer.insert(bid, "s4");
+        } else if s3CacheBlocks.contains(bid) {
+            s3TurnCount += 1;
+            blockLayer.insert(bid, "s3");
+        } else if s2Zone.contains(bid) && s2Cache.contains(bid) {
+            s2TurnCount += 1;
+            blockLayer.insert(bid, "s2");
+        } else {
+            rawTurnCount += 1;
+            blockLayer.insert(bid, "raw");
+            if s2Zone.contains(bid) {
+                if s2Cache.contains(bid) {
+                    rawInZoneWithCache += 1;
                 } else {
-                    rawTokens += tokens;
+                    rawInZoneNoCache += 1;
                 }
+            } else {
+                rawNotInZone += 1;
             }
         }
     }
 
+    tracing::debug!(
+        s2CacheLen = s2Cache.len(),
+        bcOpsCount,
+        s3CacheBlocksLen = s3CacheBlocks.len(),
+        rawInZoneWithCache,
+        rawInZoneNoCache,
+        rawNotInZone,
+        "buildState raw breakdown"
+    );
+
+    tracing::debug!(
+        s4TurnCount,
+        s3TurnCount,
+        s2TurnCount,
+        rawTurnCount,
+        s3TopicCount = s3TopicLabels.len(),
+        s4TopicsMerged,
+        totalBlocks = allBlockIds.len(),
+        "buildState layer classification"
+    );
+
+    // Estimate tokens per layer directly from block classification
+    // and cached summary sizes. No applyOps — measure what the
+    // reconstruction would actually send to the model.
+    let mut s2Tokens = 0usize;
+    let mut rawTokens = 0usize;
+
+    for &bid in &allBlockIds {
+        let layer = blockLayer.get(bid).copied().unwrap_or("raw");
+        match layer {
+            "s4" => {} // Counted separately from briefing.
+            "s3" => {} // Counted separately from topic summaries.
+            "s2" => {
+                // S2 keeps user turns raw + summary for agent turns.
+                let summaryChars = s2CacheSizes.get(bid).copied().unwrap_or(0);
+                // Approximate user turn chars as raw chars minus agent chars.
+                // Since we don't track agent vs user separately, use summary
+                // size + 200 overhead as the block's effective size.
+                s2Tokens += (summaryChars + 200) / 4;
+            }
+            _ => {
+                // Raw: full block content.
+                rawTokens += blockRawChars.get(bid).copied().unwrap_or(0) / 4;
+            }
+        }
+    }
+
+    // S3 token estimate from topic summary sizes.
+    let s3Tokens = s3TopicSummaryChars / 4;
+    // S4 token estimate from latest briefing.
+    let s4Tokens = s4BriefingChars / 4;
+
     // Build layers — only present if that stage has produced output.
-    let s4 = if fullCompactCount > 0 {
+    let mut s4 = if fullCompactCount > 0 {
         Some(S4Layer {
             topicsMerged: s4TopicsMerged,
             priorBriefings: s4PriorBriefings,
@@ -736,7 +1240,7 @@ pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
         None
     };
 
-    let s3 = if !s3TopicLabels.is_empty() {
+    let mut s3 = if !s3TopicLabels.is_empty() {
         Some(S3Layer {
             topicLabels: s3TopicLabels,
             turnsCondensed: s3TurnCount,
@@ -746,7 +1250,7 @@ pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
         None
     };
 
-    let s2 = if !s2Blocks.is_empty() {
+    let mut s2 = if s2TurnCount > 0 {
         Some(S2Layer {
             turnsCondensed: s2TurnCount,
             estimatedTokens: s2Tokens,
@@ -755,20 +1259,44 @@ pub(crate) fn buildState(input: &BuildStateInput) -> ContextState {
         None
     };
 
-    let raw = RawLayer {
+    let mut raw = RawLayer {
         turns: rawTurnCount,
         estimatedTokens: rawTokens,
     };
 
-    // Use sum of layer estimates as the total — more accurate than
-    // history char count because it reflects the actual compacted content.
-    let layerTotal = s4.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
+    // Total estimate from the serialized message list — captures all
+    // JSON structure overhead (role tags, tool_call wrappers, etc.).
+    // Divisor of 2.5 empirically matches Anthropic's reported token
+    // counts on serialized request content (cl100k gives 3.4 c/t but
+    // Anthropic's tokenizer + API framing push effective ratio to ~2.5).
+    let totalRequestChars = input.historyChars + input.systemPromptChars + input.toolDefsChars;
+    let estimatedTokens = totalRequestChars * 2 / 5;
+
+    // Scale layer estimates so they sum to the accurate total.
+    // The per-layer chars/4 estimates are good for relative proportions
+    // but undercount in absolute terms; rescaling keeps the breakdown
+    // consistent with the top-level number.
+    let layerSum = s4.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
         + s3.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
         + s2.as_ref().map(|l| l.estimatedTokens).unwrap_or(0)
         + raw.estimatedTokens;
 
+    if layerSum > 0 && estimatedTokens > 0 {
+        let scale = estimatedTokens as f64 / layerSum as f64;
+        if let Some(ref mut l) = s4 {
+            l.estimatedTokens = (l.estimatedTokens as f64 * scale) as usize;
+        }
+        if let Some(ref mut l) = s3 {
+            l.estimatedTokens = (l.estimatedTokens as f64 * scale) as usize;
+        }
+        if let Some(ref mut l) = s2 {
+            l.estimatedTokens = (l.estimatedTokens as f64 * scale) as usize;
+        }
+        raw.estimatedTokens = (raw.estimatedTokens as f64 * scale) as usize;
+    }
+
     ContextState {
-        estimatedTokens: layerTotal,
+        estimatedTokens,
         reportedTokens: input.reportedTokens,
         contextWindow: input.contextWindow,
         s4,
@@ -977,7 +1505,9 @@ mod tests {
         fn reconstruct(&self) -> Vec<Message> {
             let head = self.headTurnId.as_ref().expect("no turns recorded");
             let log = self.compactionLog();
-            reconstruct(&self.transcript, &log, head).unwrap()
+            reconstruct(&self.transcript, &log, head, 0, 0)
+                .unwrap()
+                .messages
         }
     }
 
@@ -1742,7 +2272,9 @@ mod tests {
         // Reconstructing from the later head should see the truncation
         // (op is on the active chain at that point).
         let log = s.compactionLog();
-        let lateMsgs = reconstruct(&s.transcript, &log, &laterHead).unwrap();
+        let lateMsgs = reconstruct(&s.transcript, &log, &laterHead, 0, 0)
+            .unwrap()
+            .messages;
         let lateToolBody = lateMsgs
             .iter()
             .find_map(|m| {
@@ -1760,7 +2292,9 @@ mod tests {
 
         // Reconstructing from the EARLIER head must NOT see the truncation
         // — the op was recorded after a turn that isn't on this branch.
-        let earlyMsgs = reconstruct(&s.transcript, &log, &rewindTarget).unwrap();
+        let earlyMsgs = reconstruct(&s.transcript, &log, &rewindTarget, 0, 0)
+            .unwrap()
+            .messages;
         let earlyToolBody = earlyMsgs
             .iter()
             .find_map(|m| {
@@ -1809,7 +2343,9 @@ mod tests {
 
         // From the rewound head, no S2 summary should appear.
         let log = s.compactionLog();
-        let msgs = reconstruct(&s.transcript, &log, &rewindTarget).unwrap();
+        let msgs = reconstruct(&s.transcript, &log, &rewindTarget, 0, 0)
+            .unwrap()
+            .messages;
         let hasCompressed = msgs.iter().any(|m| {
             if let Message::User { content } = m {
                 content.textContent().contains("<compressed_content>")
@@ -1817,9 +2353,13 @@ mod tests {
                 false
             }
         });
+        // BlockCompact is exempt from afterTurn filtering — the summary
+        // is a deterministic compression of block content that's identical
+        // across branches. So even from the rewound head, the S2 cache
+        // entry applies.
         assert!(
-            !hasCompressed,
-            "rewind to before S2 compaction must not see the summary"
+            hasCompressed,
+            "S2 BlockCompact should apply regardless of afterTurn branch"
         );
     }
 
@@ -1884,7 +2424,9 @@ mod tests {
         // Rewind to turn 1 — images should be in the reconstructed history.
         let msgs = {
             let log = s.compactionLog();
-            reconstruct(&s.transcript, &log, &turn1Head).unwrap()
+            reconstruct(&s.transcript, &log, &turn1Head, 0, 0)
+                .unwrap()
+                .messages
         };
         dump("image_rewind", &msgs);
 

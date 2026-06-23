@@ -99,6 +99,8 @@ fn permitModeStyle(mode: &PermitMode, bg: Color, fg: Color) -> Style {
 fn buildModelStatus(config: &construct::config::Config) -> construct::control::ModelStatus {
     let codexStatus = construct::auth::openAiCodexStatus();
     let codexConfigured = codexStatus.configured;
+    let anthropicStatus = construct::auth::anthropicOauthStatus();
+    let anthropicConfigured = anthropicStatus.configured;
     let saveScope = construct::config::defaultModelSaveScope(config);
     let scopes = construct::config::modelConfigScopes(config)
         .into_iter()
@@ -121,6 +123,7 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
         .map(|(name, model)| {
             let configured = match model.provider.as_str() {
                 "openai-codex" => codexConfigured,
+                "anthropic-oauth" => anthropicConfigured,
                 _ => !model.key.is_empty(),
             };
             construct::control::ModelProfileStatus {
@@ -159,6 +162,7 @@ fn buildModelStatus(config: &construct::config::Config) -> construct::control::M
         scopes,
         configPath,
         openAiCodex: codexStatus,
+        anthropic: anthropicStatus,
     }
 }
 
@@ -1504,6 +1508,14 @@ pub async fn run() -> Result<()> {
                             let ack = session.undoCheckpoint().await;
                             let _ = reply.send(ack);
                         }
+                        Some(TuiRequest::CompactUndo { reply }) => {
+                            let ack = session.undoFullCompact();
+                            let _ = reply.send(ack);
+                        }
+                        Some(TuiRequest::CompactRun { reply }) => {
+                            let ack = session.recalibrateContext(&logTx).await;
+                            let _ = reply.send(ack);
+                        }
                         Some(TuiRequest::ListSessions { reply }) => {
                             let _ = reply.send(session.listSessionsText());
                         }
@@ -2509,6 +2521,19 @@ async fn runLoop(
                     if let Some(blockIdx) = markerBlock {
                         agentPanel.pushCompactionMarker(&stage, blockIdx);
                     }
+                }
+                LogEvent::CompactionFailed { stage, reason } => {
+                    tracing::warn!(stage = %stage, reason = %reason, "compaction failed");
+                    pushOperationalLog(
+                        &mut developerLog,
+                        &mut toastCenter,
+                        &mut logPanel,
+                        LogLevel::Warning,
+                        "context",
+                        format!("compaction failed: {stage} (will retry)"),
+                        Some(reason),
+                        true,
+                    );
                 }
                 LogEvent::Cleared => {
                     pushOperationalLog(
@@ -4080,10 +4105,7 @@ async fn handleInput(
                                 },
                             );
                         }
-                        ModelPanelAction::DiscoverProviders {
-                            provider,
-                            model,
-                        } => {
+                        ModelPanelAction::DiscoverProviders { provider, model } => {
                             let requestTx = requestTx.clone();
                             let deckUpdateTx = deckUpdateTx.clone();
                             tokio::spawn(async move {
@@ -4096,9 +4118,8 @@ async fn handleInput(
                                     })
                                     .await;
                                 if let Ok(result) = rx.await {
-                                    let _ = deckUpdateTx
-                                        .send(DeckUpdate::ProviderResult(result))
-                                        .await;
+                                    let _ =
+                                        deckUpdateTx.send(DeckUpdate::ProviderResult(result)).await;
                                 }
                             });
                         }
@@ -5709,6 +5730,16 @@ fn dispatchSlashCommand(
         }
         crate::command::CommandAction::Undo => {
             spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::Undo { reply });
+        }
+        crate::command::CommandAction::CompactUndo => {
+            spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::CompactUndo {
+                reply,
+            });
+        }
+        crate::command::CommandAction::CompactRun => {
+            spawnAckRequest(requestTx, deckUpdateTx, |reply| TuiRequest::CompactRun {
+                reply,
+            });
         }
         crate::command::CommandAction::Rewind { target } => {
             if target.is_empty() {

@@ -579,10 +579,7 @@ impl ModelPanel {
         }
     }
 
-    pub fn setProviderResult(
-        &mut self,
-        result: std::result::Result<Vec<String>, String>,
-    ) {
+    pub fn setProviderResult(&mut self, result: std::result::Result<Vec<String>, String>) {
         match result {
             Ok(providerNames) => {
                 // Check if we're still waiting for provider results.
@@ -748,13 +745,13 @@ impl ModelPanel {
     }
 
     fn providerChoices(&self) -> Vec<String> {
-        let providers = vec![
+        vec![
             "openrouter".to_string(),
             "deepseek".to_string(),
             "openai".to_string(),
             "openai-codex".to_string(),
-        ];
-        providers
+            "anthropic-oauth".to_string(),
+        ]
     }
 
     fn startCreateProfile(&mut self) {
@@ -1332,22 +1329,26 @@ impl ModelPanel {
     }
 
     fn authLine(&self) -> String {
-        let auth = &self.status.openAiCodex;
-        if auth.configured {
-            let who = auth
+        let codex = &self.status.openAiCodex;
+        let codexPart = if codex.configured {
+            let who = codex
                 .email
                 .as_deref()
-                .or(auth.accountId.as_deref())
+                .or(codex.accountId.as_deref())
                 .unwrap_or("signed in");
-            let plan = auth.planType.as_deref().unwrap_or("plan unknown");
-            if auth.expired {
-                format!(" OpenAI Codex: {who} ({plan}), token expired")
-            } else {
-                format!(" OpenAI Codex: {who} ({plan})")
-            }
+            let plan = codex.planType.as_deref().unwrap_or("plan unknown");
+            format!("Codex: {who} ({plan})")
         } else {
-            " OpenAI Codex: not signed in".to_string()
-        }
+            "Codex: not signed in".to_string()
+        };
+        let anthropic = &self.status.anthropic;
+        let anthropicPart = if anthropic.configured {
+            let who = anthropic.subscriptionType.as_deref().unwrap_or("signed in");
+            format!("Claude: {who}")
+        } else {
+            "Claude: not signed in".to_string()
+        };
+        format!(" {codexPart}  |  {anthropicPart}")
     }
 
     fn selectionLine(&self) -> String {
@@ -1598,15 +1599,20 @@ impl ModelPanel {
         );
         *y += 1;
 
-        let auth = &self.status.openAiCodex;
         let authLabel = self.authLine();
+        let selectedReady = self
+            .status
+            .profiles
+            .get(self.selectedProfile)
+            .map(|p| p.configured)
+            .unwrap_or(false);
         line(
             buf,
             x,
             *y,
             w,
             &truncateStr(&authLabel, w),
-            style(if auth.configured { FG_GOOD } else { FG_WARN }, BG),
+            style(if selectedReady { FG_GOOD } else { FG_WARN }, BG),
         );
         *y += 1;
 

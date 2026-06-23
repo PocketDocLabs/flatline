@@ -182,6 +182,11 @@ pub enum LogEvent {
         markerBlock: Option<usize>,
     },
 
+    /// A compaction stage hit a transient failure (e.g. utility model
+    /// API error). The stage was not marked exhausted and will be
+    /// retried on the next turn; the user is notified why.
+    CompactionFailed { stage: String, reason: String },
+
     /// Session was cleared — deck should wipe the display.
     Cleared,
 
@@ -433,6 +438,7 @@ pub struct ModelStatus {
     pub scopes: Vec<ModelConfigScopeStatus>,
     pub configPath: String,
     pub openAiCodex: crate::auth::OpenAiCodexStatus,
+    pub anthropic: crate::auth::AnthropicStatus,
 }
 
 /// Requests from the TUI (or any consumer) to the session. Each variant
@@ -591,6 +597,12 @@ pub enum TuiRequest {
 
     /// Re-run the last user turn from scratch. Drives the turn loop.
     RetryLastTurn { reply: oneshot::Sender<CommandAck> },
+
+    /// Remove the last S4 compaction and reconstruct context.
+    CompactUndo { reply: oneshot::Sender<CommandAck> },
+
+    /// Recalibrate context against current budget.
+    CompactRun { reply: oneshot::Sender<CommandAck> },
 
     /// User spawned a new terminal (Ctrl+T / Ctrl+T).
     /// Reply carries the resolved name (registry may auto-generate).
