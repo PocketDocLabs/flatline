@@ -2569,9 +2569,18 @@ impl Session {
                 self.history
                     .push(buildAssistantMessage(content, None, reasoning));
             } else {
-                tracing::debug!(
-                    "turn completed with no assistant content, reasoning, or tool calls"
+                // Empty response — no content, reasoning, or tool calls.
+                // This is never healthy; usually caused by content_filter,
+                // provider glitches, or truncated streams. Retry via the
+                // existing transient-error loop rather than silently going idle.
+                let reason = lastFinishReason.as_deref().unwrap_or("unknown");
+                tracing::warn!(
+                    finishReason = %reason,
+                    "empty response from API, treating as transient error"
                 );
+                return Ok(TurnResult::TransientError(format!(
+                    "Empty response (finish_reason: {reason})"
+                )));
             }
 
             Ok(TurnResult::Done {

@@ -587,17 +587,17 @@ pub struct AgentPanel {
     /// Last wall-clock redraw request for wake countdown labels.
     lastWakeScheduleTick: Instant,
     /// Scroll offset from the bottom (in visual lines).
-    pub scrollOffset: u16,
+    pub scrollOffset: u32,
     /// New content arrived while scrolled up (for border indicator).
     newContentWhileScrolled: bool,
     /// Agent became idle while user scrolled up (for border indicator).
     idleWhileScrolled: bool,
     /// ScrollY value from the last render (for visual-line lookups).
-    lastScrollY: u16,
+    lastScrollY: u32,
     /// Chat area width from the last render (for wrap estimation).
     lastChatWidth: u16,
     /// Previous maxScroll value (for stable scroll during streaming).
-    lastMaxScroll: u16,
+    lastMaxScroll: u32,
     /// Which visual lines are wrap continuations (not real line breaks).
     lastContinuationMap: Vec<bool>,
     /// Visual line index of each reasoning header (entry index, line index).
@@ -2211,15 +2211,15 @@ impl AgentPanel {
     }
 
     pub fn scrollUp(&mut self, amount: u16) {
-        self.scrollOffset = self.scrollOffset.saturating_add(amount);
+        self.scrollOffset = self.scrollOffset.saturating_add(amount as u32);
     }
 
     pub fn scrollDown(&mut self, amount: u16) {
-        self.scrollOffset = self.scrollOffset.saturating_sub(amount);
+        self.scrollOffset = self.scrollOffset.saturating_sub(amount as u32);
     }
 
     /// Scroll offset from the bottom (analogous to terminal displayOffset).
-    pub fn displayOffset(&self) -> u16 {
+    pub fn displayOffset(&self) -> u32 {
         self.scrollOffset
     }
 
@@ -2361,7 +2361,7 @@ impl AgentPanel {
                 continue;
             }
             let isExpanded = self.codeExpanded.contains(&range.blockId);
-            let hiddenLines = range.totalLines.saturating_sub(MAX_CODE_BLOCK_LINES) as u16;
+            let hiddenLines = range.totalLines.saturating_sub(MAX_CODE_BLOCK_LINES) as u32;
 
             if !isExpanded && visualLine == range.startLine {
                 self.codeExpanded.insert(range.blockId);
@@ -2387,10 +2387,11 @@ impl AgentPanel {
                         || (range.expanded && visualLine == range.endLine))
             })
             .map(|range| (range.id, range.expanded, range.hiddenLines));
-        if let Some((id, wasExpanded, delta)) = toolSection
+        if let Some((id, wasExpanded, delta_u16)) = toolSection
             && let Some(PanelEntry::ToolBlock(block)) = self.entries.get_mut(id.entryIndex)
             && let Some(section) = block.sections.get_mut(id.sectionIndex)
         {
+            let delta = delta_u16 as u32;
             section.expanded = !section.expanded;
             self.bumpEntryVersion(id.entryIndex);
             if self.scrollOffset > 0 {
@@ -2568,7 +2569,7 @@ impl AgentPanel {
                 match entryIdx {
                     Some(idx) => {
                         if let PanelEntry::Reasoning { text, expanded } = &mut self.entries[idx] {
-                            let delta = countReasoningLines(text, w);
+                            let delta = countReasoningLines(text, w) as u32;
                             *expanded = !*expanded;
                             // NOTE: Only pre-adjust when scrolled up. At the bottom the
                             // natural reflow keeps the view at the newest content, and
@@ -2588,7 +2589,7 @@ impl AgentPanel {
                         self.bumpEntryVersion(idx);
                     }
                     None => {
-                        let delta = countReasoningLines(&self.streamingReasoning, w);
+                        let delta = countReasoningLines(&self.streamingReasoning, w) as u32;
                         self.thinkingExpanded = !self.thinkingExpanded;
                         if self.scrollOffset > 0 {
                             if self.thinkingExpanded {
@@ -2619,7 +2620,7 @@ impl AgentPanel {
         sel: &Selection,
         area: Rect,
         buf: &Buffer,
-        displayOffset: u16,
+        displayOffset: u32,
     ) -> String {
         if sel.isEmpty() {
             return String::new();
@@ -2891,8 +2892,8 @@ impl AgentPanel {
         self.nonCopyableLines = nonCopyable;
 
         // buildLines already wraps text to fit paddedChat.width.
-        let totalLines = lines.len() as u16;
-        let visible = paddedChat.height;
+        let totalLines = lines.len() as u32;
+        let visible = paddedChat.height as u32;
         let maxScroll = totalLines.saturating_sub(visible);
         // Keep view stable when scrolled up and content grows below.
         // scrollOffset is "lines from bottom", so when content grows (maxScroll increases),
@@ -2982,8 +2983,8 @@ impl AgentPanel {
             .collect();
         self.nonCopyableLines = nonCopyable;
 
-        let totalLines = chatLines.len() as u16;
-        let visible = padded.height;
+        let totalLines = chatLines.len() as u32;
+        let visible = padded.height as u32;
         let maxScroll = totalLines.saturating_sub(visible);
         self.scrollOffset = self.scrollOffset.min(maxScroll);
         let scrollY = maxScroll.saturating_sub(self.scrollOffset);
@@ -7372,7 +7373,7 @@ mod wrapTests {
         let delta = resultRange.hiddenLines;
 
         assert!(panel.tryToggleCodeBlock(header));
-        assert_eq!(panel.scrollOffset, 10 + delta);
+        assert_eq!(panel.scrollOffset, 10 + delta as u32);
         assert!(matches!(
             panel.entries[0],
             PanelEntry::ToolBlock(ref block)

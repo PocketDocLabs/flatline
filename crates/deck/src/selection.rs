@@ -262,12 +262,12 @@ impl SelectionState {
 // --- Rendering and extraction ---
 
 /// Convert a panel-local screen row to a grid line.
-pub fn toGridLine(screenRow: u16, displayOffset: u16) -> i32 {
+pub fn toGridLine(screenRow: u16, displayOffset: u32) -> i32 {
     screenRow as i32 - displayOffset as i32
 }
 
 /// Convert a grid line back to a screen row. Returns None if off-screen.
-pub fn toScreenRow(gridLine: i32, displayOffset: u16, height: u16) -> Option<u16> {
+pub fn toScreenRow(gridLine: i32, displayOffset: u32, height: u16) -> Option<u16> {
     let sr = gridLine + displayOffset as i32;
     if sr >= 0 && sr < height as i32 {
         Some(sr as u16)
@@ -279,7 +279,7 @@ pub fn toScreenRow(gridLine: i32, displayOffset: u16, height: u16) -> Option<u16
 /// Apply selection highlighting to cells in the Buffer.
 ///
 /// `displayOffset` is the panel's current scroll position.
-pub fn applyHighlight(selection: &Selection, area: Rect, buf: &mut Buffer, displayOffset: u16) {
+pub fn applyHighlight(selection: &Selection, area: Rect, buf: &mut Buffer, displayOffset: u32) {
     if selection.isEmpty() {
         return;
     }
@@ -395,7 +395,7 @@ pub fn expandSelection(
     clickCount: usize,
     buf: &Buffer,
     area: Rect,
-    displayOffset: u16,
+    displayOffset: u32,
 ) {
     let (col, gridLine) = selection.start;
     let screenRow = match toScreenRow(gridLine, displayOffset, area.height) {

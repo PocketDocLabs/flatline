@@ -1927,7 +1927,7 @@ async fn runLoop(
                 selState.inputContentRect = agentPanel.lastInputRect;
 
                 // Expand selection for double/triple/quad click (needs Buffer).
-                let termOffset = termPane.activeStateRef().displayOffset() as u16;
+                let termOffset = termPane.activeStateRef().displayOffset() as u32;
                 let agentOffset = agentPanel.displayOffset();
                 if let Some((panel, clickCount)) = selState.pendingExpand.take() {
                     if panel == PanelId::Input {
@@ -4728,9 +4728,9 @@ fn handleMouse(
     deckUpdateTx: &mpsc::Sender<DeckUpdate>,
 ) -> bool {
     // Resolve display offset for the given panel.
-    fn panelOffset(panel: PanelId, termPane: &TerminalPane, agentPanel: &AgentPanel) -> u16 {
+    fn panelOffset(panel: PanelId, termPane: &TerminalPane, agentPanel: &AgentPanel) -> u32 {
         match panel {
-            PanelId::Terminal => termPane.activeStateRef().displayOffset() as u16,
+            PanelId::Terminal => termPane.activeStateRef().displayOffset() as u32,
             PanelId::Agent => agentPanel.displayOffset(),
             PanelId::Input => 0,
         }
@@ -4976,7 +4976,7 @@ fn handleMouse(
                     if selState.selectingIn == Some(PanelId::Terminal) {
                         let (_, screenRow) =
                             selState.toLocal(PanelId::Terminal, mouse.column, mouse.row);
-                        let offset = termPane.activeStateRef().displayOffset() as u16;
+                        let offset = termPane.activeStateRef().displayOffset() as u32;
                         if let Some(sel) = &mut selState.termSelection {
                             sel.extendRow(selection::toGridLine(screenRow, offset));
                         }
@@ -5012,7 +5012,7 @@ fn handleMouse(
                     if selState.selectingIn == Some(PanelId::Terminal) {
                         let (_, screenRow) =
                             selState.toLocal(PanelId::Terminal, mouse.column, mouse.row);
-                        let offset = termPane.activeStateRef().displayOffset() as u16;
+                        let offset = termPane.activeStateRef().displayOffset() as u32;
                         if let Some(sel) = &mut selState.termSelection {
                             sel.extendRow(selection::toGridLine(screenRow, offset));
                         }
@@ -5223,7 +5223,7 @@ fn extractTerminalUnwrapped(
     sel: &selection::Selection,
     area: ratatui::layout::Rect,
     buf: &ratatui::buffer::Buffer,
-    displayOffset: u16,
+    displayOffset: u32,
     termState: &TerminalState,
 ) -> String {
     if sel.isEmpty() {
