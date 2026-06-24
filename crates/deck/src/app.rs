@@ -3176,7 +3176,10 @@ async fn runLoop(
                     forkPicker = Some(ForkPicker::new(&forks));
                 }
                 DeckUpdate::ShowResult(text) => {
-                    agentPanel.pushCommandResult(&text);
+                    // Async results (e.g. /dump, /cost) may arrive
+                    // after a new turn has started. pushNotice is
+                    // mid-turn-safe and won't clobber turnActive.
+                    agentPanel.pushNotice(&text);
                 }
                 DeckUpdate::CommandAck(ack) => {
                     if forkPicker.is_some() && !ack.ok {
@@ -3184,7 +3187,7 @@ async fn runLoop(
                             picker.switchFailed(ack.message);
                         }
                     } else if !ack.message.is_empty() {
-                        agentPanel.pushCommandResult(&ack.message);
+                        agentPanel.pushNotice(&ack.message);
                     }
                 }
                 DeckUpdate::PermitModeChanged(mode) => {

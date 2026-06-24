@@ -919,22 +919,27 @@ pub fn spawnShell(cols: u16, rows: u16) -> Result<(Shell, ShellIo)> {
                     feedVt(&echoBytes);
                     let _ = outputTx.try_send(echoBytes);
 
-                    // SINGLE-LINE WRAPPER: set the per-command uuid
-                    // variable, emit START, then run the user's command.
-                    // The END marker is emitted by the shell's natural
-                    // `precmd` hook (injected via shell integration)
-                    // immediately after the command finishes — no
-                    // separate follow-up line that would race with the
-                    // shell's prompt redraw and hang until timeout.
+                    // Set the per-command uuid variable, emit START,
+                    // then run the user's command. The END marker is
+                    // emitted by the shell's `precmd` hook (injected via
+                    // shell integration) after the command finishes.
                     //
-                    // Heredoc-safe: setting `_flatline_uuid` is on the
-                    // same logical line as the user command via `;`,
-                    // not on a separate line that would attach to a
-                    // heredoc delimiter.
+                    // Multi-line commands must be wrapped in { ... } so
+                    // zsh treats them as a single compound command.
+                    // Without this, zsh fires precmd after the FIRST
+                    // line, emitting the END marker before subsequent
+                    // lines execute — the capture finalizes with zero
+                    // output and the rest of the command runs unwatched.
                     let cmd = req.command.trim_end();
-                    let wrapped = format!(
-                        "_flatline_uuid='{uuid}'; printf '__FLATLINE_START_%s__\\n' '{uuid}'; {cmd}\n",
-                    );
+                    let wrapped = if cmd.contains('\n') {
+                        format!(
+                            "_flatline_uuid='{uuid}'; printf '__FLATLINE_START_%s__\\n' '{uuid}'; {{\n{cmd}\n}}\n",
+                        )
+                    } else {
+                        format!(
+                            "_flatline_uuid='{uuid}'; printf '__FLATLINE_START_%s__\\n' '{uuid}'; {cmd}\n",
+                        )
+                    };
                     // Queue for chunked write — large commands (heredocs)
                     // would deadlock if written in one blocking call.
                     let wrappedBytes = wrapped.as_bytes();
