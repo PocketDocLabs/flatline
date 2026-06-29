@@ -23,6 +23,7 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
+async-trait = "0.1"
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -77,6 +78,7 @@ rmcp = { version = "1", default-features = false, features = [
     "server",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
+    "reqwest",
     "transport-io",
     "macros",
     "elicitation",
@@ -98,3 +100,4 @@ notify = { version = "8" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 flate2 = "1"
 tar = "0.4"
+tantivy = "0.22"

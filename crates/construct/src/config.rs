@@ -96,6 +96,9 @@ pub struct Config {
     /// Budget and cost warning settings.
     pub budget: BudgetConfig,
 
+    /// Module loading settings.
+    pub modules: ModulesConfig,
+
     /// Discovered project root (not serialized — derived at load time).
     pub projectRoot: Option<PathBuf>,
 
@@ -155,6 +158,52 @@ pub struct BudgetConfig {
     /// Session cost warning threshold (USD). Emits a warning when exceeded.
     #[serde(default)]
     pub sessionLimit: Option<f64>,
+}
+
+/// Module loading settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModulesConfig {
+    /// Include the built-in swe domain module. Defaults to true.
+    #[serde(default = "defaultTrue")]
+    pub swe: bool,
+
+    /// Extra module files to load. Each path is resolved relative to the
+    /// config file's directory, or absolute.
+    #[serde(default)]
+    pub extra: Vec<String>,
+
+    /// Skip loading ~/.config/flatline/AGENTS.md. Defaults to false.
+    #[serde(default)]
+    pub skipUserContext: bool,
+}
+
+fn defaultTrue() -> bool {
+    true
+}
+
+/// Build the domain module list from config. Resolves `[modules]` settings:
+/// includes Swe when `swe = true` (default), loads extra module files.
+pub fn resolveModules(config: &ModulesConfig) -> Vec<crate::prompt::DomainModule> {
+    let mut domains = Vec::new();
+    if config.swe {
+        domains.push(crate::prompt::DomainModule::Swe);
+    }
+    for path in &config.extra {
+        let p = std::path::Path::new(path);
+        match crate::prompt::loadModule(p) {
+            Some(m) => domains.push(m),
+            None => tracing::warn!(path = %path, "module file not found or empty"),
+        }
+    }
+    domains
+}
+
+/// Build [`ContextOptions`] from config.
+pub fn resolveContextOptions(config: &ModulesConfig) -> crate::prompt::ContextOptions {
+    crate::prompt::ContextOptions {
+        skipUserContext: config.skipUserContext,
+    }
 }
 
 /// Web tool settings (Exa API).
@@ -718,6 +767,8 @@ struct PartialConfig {
     permissions: Option<Permissions>,
     #[serde(default)]
     budget: Option<BudgetConfig>,
+    #[serde(default)]
+    modules: Option<ModulesConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -808,6 +859,7 @@ impl PartialConfig {
             lsp: mergeLsp(self.lsp, overlay.lsp),
             permissions: overlay.permissions.or(self.permissions),
             budget: overlay.budget.or(self.budget),
+            modules: overlay.modules.or(self.modules),
         }
     }
 }
@@ -901,6 +953,7 @@ fn resolveMerged(partial: PartialConfig, overrides: ProfileOverrides<'_>) -> Res
         lsp: partial.lsp.unwrap_or_default(),
         permissions: partial.permissions,
         budget: partial.budget.unwrap_or_default(),
+        modules: partial.modules.unwrap_or_default(),
         projectRoot: None,
         launchDir: launchDir(),
     })

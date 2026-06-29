@@ -47,6 +47,7 @@ pub mod tool;
 pub(crate) mod tool_preview;
 pub mod topic;
 pub mod transcript;
+pub(crate) mod transcript_search;
 pub mod wakes;
 pub(crate) mod web;
 

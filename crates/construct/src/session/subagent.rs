@@ -336,7 +336,7 @@ impl Session {
             childPermissions,
             childRegistryArc,
             preset.interface,
-            &[crate::prompt::DomainModule::Swe],
+            &crate::config::resolveModules(&childConfig.modules),
         ) {
             Ok(s) => s,
             Err(e) => return format!("Failed to create subagent session: {e}"),
@@ -572,7 +572,7 @@ impl Session {
             childPermissions,
             childRegistryArc,
             preset.interface,
-            &[crate::prompt::DomainModule::Swe],
+            &crate::config::resolveModules(&childConfig.modules),
         ) {
             Ok(s) => s,
             Err(e) => return format!("Failed to create subagent session: {e}"),

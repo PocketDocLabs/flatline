@@ -180,6 +180,8 @@ pub(super) async fn executeGrep(
         );
     }
 
+    let fileType = fileType.map(str::trim).filter(|value| !value.is_empty());
+
     let mut argStrings: Vec<String> = Vec::new();
 
     // Output mode flags.

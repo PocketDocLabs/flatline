@@ -4,9 +4,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use super::Session;
-use super::format::{
-    extractSnippet, formatJobList, formatJobOutput, formatMonitorList, formatWakeList,
-};
+use super::format::{formatJobList, formatJobOutput, formatMonitorList, formatWakeList};
 use crate::control::LogEvent;
 use crate::{tool, web};
 
@@ -399,61 +397,41 @@ impl Session {
             tool::ToolAction::HistorySearch { query, mediaType } => {
                 match self.transcript.loadAll() {
                     Ok(turns) => {
-                        let queryLower = query.to_lowercase();
-                        let mut matches: Vec<(String, String, String)> = Vec::new();
+                        let rawHits = crate::transcript_search::search(&turns, query, 40);
 
-                        for turn in &turns {
-                            if let Some(mt) = mediaType {
-                                let hasMatchingMedia =
+                        // Post-filter by mediaType if requested, then cap at 20.
+                        let hits: Vec<_> = rawHits
+                            .into_iter()
+                            .filter(|hit| {
+                                if let Some(mt) = mediaType {
+                                    let turn = &turns[hit.turnIndex];
                                     turn.attachments.as_ref().is_some_and(|atts| {
                                         atts.iter().any(|a| a.mimeType.starts_with(mt.as_str()))
-                                    });
-                                if !hasMatchingMedia {
-                                    continue;
+                                    })
+                                } else {
+                                    true
                                 }
-                            }
+                            })
+                            .take(20)
+                            .collect();
 
-                            if turn.content.to_lowercase().contains(&queryLower) {
-                                let snippet = extractSnippet(&turn.content, &queryLower);
-                                let roleLabel = match turn.role {
-                                    crate::transcript::TurnRole::User => "user",
-                                    crate::transcript::TurnRole::Assistant => "assistant",
-                                    crate::transcript::TurnRole::ToolCall => "tool_call",
-                                    crate::transcript::TurnRole::ToolResult => "tool_result",
-                                    crate::transcript::TurnRole::System => "system",
-                                    crate::transcript::TurnRole::Wake => "wake",
-                                };
-                                let imageNote = turn
-                                    .attachments
-                                    .as_ref()
-                                    .filter(|a| !a.is_empty())
-                                    .map(|a| format!(" [+{} image(s)]", a.len()))
-                                    .unwrap_or_default();
-                                matches.push((
-                                    turn.blockId.clone(),
-                                    format!("{} ({}){imageNote}", turn.id, roleLabel),
-                                    snippet,
-                                ));
-                            }
-                        }
-
-                        if matches.is_empty() {
+                        if hits.is_empty() {
                             return format!("No matches found for \"{query}\".");
                         }
 
-                        let totalMatches = matches.len();
-                        let shown = matches.len().min(20);
                         let mut output =
-                            format!("Found {totalMatches} matches for \"{query}\":\n\n");
-                        for (blockId, turnInfo, snippet) in &matches[..shown] {
+                            format!("Found {} results for \"{query}\":\n\n", hits.len());
+                        for hit in &hits {
+                            let turn = &turns[hit.turnIndex];
+                            let imageNote = turn
+                                .attachments
+                                .as_ref()
+                                .filter(|a| !a.is_empty())
+                                .map(|a| format!(" [+{} image(s)]", a.len()))
+                                .unwrap_or_default();
                             output.push_str(&format!(
-                                "- **{blockId}** {turnInfo}: ...{snippet}...\n"
-                            ));
-                        }
-                        if totalMatches > shown {
-                            output.push_str(&format!(
-                                "\n({} more matches not shown)\n",
-                                totalMatches - shown
+                                "- **{}** {} ({}){imageNote}: ...{}...\n",
+                                hit.blockId, hit.turnId, hit.role, hit.snippet,
                             ));
                         }
                         output

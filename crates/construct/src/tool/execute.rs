@@ -302,8 +302,16 @@ fn expandFromAnchor(content: &str, anchorLine: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let totalLines = lines.len();
 
+    if totalLines == 0 {
+        return format!(
+            "Anchor line {anchorLine} out of range (file is empty). readFile anchor is 1-indexed; there is no valid anchor."
+        );
+    }
+
     if anchorLine == 0 || anchorLine > totalLines {
-        return format!("Anchor line {anchorLine} out of range (file has {totalLines} lines).");
+        return format!(
+            "Anchor line {anchorLine} out of range (file has {totalLines} lines). readFile anchor is 1-indexed; valid range is 1 to {totalLines}."
+        );
     }
 
     let anchorIdx = anchorLine - 1;
@@ -383,4 +391,29 @@ fn indentLevel(line: &str) -> usize {
         }
     }
     level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchorZeroExplainsOneIndexedRange() {
+        let output = expandFromAnchor("alpha\nbeta\n", 0);
+
+        assert_eq!(
+            output,
+            "Anchor line 0 out of range (file has 2 lines). readFile anchor is 1-indexed; valid range is 1 to 2."
+        );
+    }
+
+    #[test]
+    fn anchorPastEndExplainsOneIndexedRange() {
+        let output = expandFromAnchor("alpha\nbeta\n", 3);
+
+        assert_eq!(
+            output,
+            "Anchor line 3 out of range (file has 2 lines). readFile anchor is 1-indexed; valid range is 1 to 2."
+        );
+    }
 }

@@ -28,7 +28,23 @@ fn reqStringAllowEmpty(args: &serde_json::Value, field: &'static str) -> ToolPar
 
 fn optString(args: &serde_json::Value, field: &'static str) -> ToolParseResult<Option<String>> {
     match &args[field] {
+        serde_json::Value::String(s) if s.is_empty() => Ok(None),
         serde_json::Value::String(s) => Ok(Some(s.clone())),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ToolParseError::WrongType {
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn optStringOmitEmpty(
+    args: &serde_json::Value,
+    field: &'static str,
+) -> ToolParseResult<Option<String>> {
+    match &args[field] {
+        serde_json::Value::String(s) if s.trim().is_empty() => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.trim().to_string())),
         serde_json::Value::Null => Ok(None),
         _ => Err(ToolParseError::WrongType {
             field,
@@ -314,7 +330,7 @@ pub fn parse(name: &str, argsJson: &str) -> std::result::Result<ToolAction, Tool
             pattern: reqString(&args, "pattern")?,
             path: optString(&args, "path")?,
             include: optString(&args, "include")?,
-            fileType: optString(&args, "type")?,
+            fileType: optStringOmitEmpty(&args, "type")?,
             outputMode: validateStringEnum(
                 optStringDefault(&args, "output_mode", "files")?,
                 "output_mode",
@@ -406,4 +422,49 @@ pub fn parse(name: &str, argsJson: &str) -> std::result::Result<ToolAction, Tool
     };
 
     Ok(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optionalEmptyStringsAreOmitted() {
+        let action = parse("historySearch", r#"{"query":"HF_TOKEN","mediaType":""}"#).unwrap();
+
+        match action {
+            ToolAction::HistorySearch { mediaType, .. } => assert_eq!(mediaType, None),
+            other => panic!("expected historySearch action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grepEmptyTypeIsOmitted() {
+        let action = parse("grep", r#"{"pattern":"needle","type":""}"#).unwrap();
+
+        match action {
+            ToolAction::Grep { fileType, .. } => assert_eq!(fileType, None),
+            other => panic!("expected grep action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grepWhitespaceTypeIsOmitted() {
+        let action = parse("grep", r#"{"pattern":"needle","type":"   "}"#).unwrap();
+
+        match action {
+            ToolAction::Grep { fileType, .. } => assert_eq!(fileType, None),
+            other => panic!("expected grep action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grepNonEmptyTypeIsPreserved() {
+        let action = parse("grep", r#"{"pattern":"needle","type":"rust"}"#).unwrap();
+
+        match action {
+            ToolAction::Grep { fileType, .. } => assert_eq!(fileType.as_deref(), Some("rust")),
+            other => panic!("expected grep action, got {other:?}"),
+        }
+    }
 }

@@ -116,10 +116,12 @@ impl Session {
     }
 
     pub(super) async fn refreshSystemPrompt(&mut self) {
+        let contextOptions = crate::config::resolveContextOptions(&self.config.modules);
         let mut systemPrompt = prompt::build(
             self.interface,
             &self.domains,
             self.config.heavy.promptThinking,
+            &contextOptions,
         );
         let mcpPrompt = self.mcpPromptSection().await;
         if !mcpPrompt.is_empty() {

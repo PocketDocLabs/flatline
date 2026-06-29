@@ -55,6 +55,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "historyFetch",
     "diagnostics",
     "cronList",
+    "cronCreate",
+    "cronDelete",
+    "scheduleWakeup",
+    "fileWatch",
 ];
 
 /// Response from the supervisor (TUI or parent agent) to a permission prompt.
@@ -198,14 +202,9 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
     use crate::tool::ShellImpact;
     match action {
         ToolAction::Shell { impact, .. } => impact.clone(),
-        // Wake registry tools schedule autonomous future LLM calls —
-        // conservatively MinorMod so the confirm UI surfaces them
-        // above read-tier (file reads/grep/etc.).
-        ToolAction::ScheduleWakeup { .. }
-        | ToolAction::CronCreate { .. }
-        | ToolAction::CronDelete { .. }
-        | ToolAction::FileWatch { .. } => ShellImpact::MinorMod,
-        // cronList is read-only; let it fall through to the bottom.
+        // Wake registry tools (scheduleWakeup, cronCreate, cronDelete,
+        // fileWatch) and cronList are auto-approved read-only tools; let
+        // them fall through to the bottom Read tier.
         // Monitors subscribe to terminal output and schedule future wake
         // turns — still a session-visible behavior change.
         ToolAction::Monitor { .. } => ShellImpact::MinorMod,
@@ -218,6 +217,8 @@ pub fn toolImpact(action: &ToolAction) -> crate::tool::ShellImpact {
         | ToolAction::MakeDirs { .. } => ShellImpact::MinorMod,
         ToolAction::DeleteFile { .. } => ShellImpact::Delete,
         ToolAction::Mcp { .. } => ShellImpact::MinorMod,
+        // Explore subagents are read-only — no user prompt needed.
+        ToolAction::Task { agent: Some(a), .. } if a == "explore" => ShellImpact::Read,
         ToolAction::Task { .. } => ShellImpact::MinorMod,
         // jobStop kills a process group — surface as MinorMod so the
         // confirm UI doesn't downgrade the prompt.
@@ -534,6 +535,10 @@ fn isReadOnlyTool(action: &ToolAction) -> bool {
                 impact: crate::tool::ShellImpact::Read,
                 ..
             }
+        )
+        || matches!(
+            action,
+            ToolAction::Task { agent: Some(a), .. } if a == "explore"
         )
 }
 
@@ -1008,5 +1013,56 @@ mod tests {
             bad.check(&ToolAction::JobStop { jobId: 1 }),
             Verdict::NeedsApproval,
         );
+    }
+
+    #[test]
+    fn exploreTaskAutoApproved() {
+        let perms = Permissions::askForEverything();
+        let explore = ToolAction::Task {
+            prompt: "find all config files".into(),
+            agent: Some("explore".into()),
+            runInBackground: false,
+        };
+        assert_eq!(
+            perms.check(&explore),
+            Verdict::Allow,
+            "explore subagent spawning is read-only and must auto-approve"
+        );
+    }
+
+    #[test]
+    fn generalTaskStillNeedsApproval() {
+        let perms = Permissions::askForEverything();
+        let general = ToolAction::Task {
+            prompt: "refactor the module".into(),
+            agent: Some("general".into()),
+            runInBackground: false,
+        };
+        assert_eq!(perms.check(&general), Verdict::NeedsApproval);
+
+        let defaultAgent = ToolAction::Task {
+            prompt: "do stuff".into(),
+            agent: None,
+            runInBackground: false,
+        };
+        assert_eq!(perms.check(&defaultAgent), Verdict::NeedsApproval);
+    }
+
+    #[test]
+    fn exploreTaskImpactIsRead() {
+        use crate::tool::ShellImpact;
+        let explore = ToolAction::Task {
+            prompt: "search the codebase".into(),
+            agent: Some("explore".into()),
+            runInBackground: true,
+        };
+        assert!(matches!(toolImpact(&explore), ShellImpact::Read));
+
+        let general = ToolAction::Task {
+            prompt: "edit files".into(),
+            agent: Some("general".into()),
+            runInBackground: false,
+        };
+        assert!(matches!(toolImpact(&general), ShellImpact::MinorMod));
     }
 }

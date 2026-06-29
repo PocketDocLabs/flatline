@@ -25,9 +25,10 @@ use ratatui::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+use construct::config::resolveModules;
 use construct::control::{LogEvent, SessionRequest, TuiRequest};
 use construct::permissions::{Permissions, PermitMode};
-use construct::prompt::{DomainModule, InterfaceMode};
+use construct::prompt::InterfaceMode;
 use construct::session::Session;
 use construct::shell::ShellIo;
 use construct::shells::{ShellRegistry, SpawnedBy};
@@ -718,13 +719,14 @@ pub async fn run() -> Result<()> {
         let permissions = mainAgentPermissions(&config);
         let initialPermitMode = permissions.defaultMode.clone();
 
-        // Deck is the shared terminal harness — SWE domain by default.
+        let domains = resolveModules(&config.modules);
+
         let mut session = match Session::new(
             &config,
             permissions,
             shells,
             InterfaceMode::SharedTerminal,
-            &[DomainModule::Swe],
+            &domains,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -995,12 +997,13 @@ pub async fn run() -> Result<()> {
                             // Consume old session, keep the shell.
                             let shells = session.intoShells();
                             let currentMode = permitModeTx.borrow().clone();
+                            let domains = resolveModules(&config.modules);
                             match Session::resume(
                                 &config,
                                 permissionsWithMode(&config, &currentMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
-                                &[DomainModule::Swe],
+                                &domains,
                                 &id,
                             ).await {
                                 Ok(s) => {
@@ -1067,12 +1070,13 @@ pub async fn run() -> Result<()> {
                                     ));
                                     // Shell returned — recreate a fresh session.
                                     let currentMode = permitModeTx.borrow().clone();
+                                    let domains = resolveModules(&config.modules);
                                     match Session::new(
                                         &config,
                                         permissionsWithMode(&config, &currentMode),
                                         shell,
                                         InterfaceMode::SharedTerminal,
-                                        &[DomainModule::Swe],
+                                        &domains,
                                     ) {
                                         Ok(mut s) => {
                                             match construct::mcp::config::loadMcpServers(config.projectRoot.as_deref()) {
@@ -1130,12 +1134,13 @@ pub async fn run() -> Result<()> {
                             }
                             let shells = session.intoShells();
                             let currentMode = permitModeTx.borrow().clone();
+                            let domains = resolveModules(&config.modules);
                             match Session::new(
                                 &config,
                                 permissionsWithMode(&config, &currentMode),
                                 shells,
                                 InterfaceMode::SharedTerminal,
-                                &[DomainModule::Swe],
+                                &domains,
                             ) {
                                 Ok(s) => {
                                     session = s;

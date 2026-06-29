@@ -18,9 +18,10 @@ use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
+use crate::config::resolveModules;
 use crate::control::{LogEvent, SessionRequest};
 use crate::permissions::Permissions;
-use crate::prompt::{DomainModule, InterfaceMode};
+use crate::prompt::InterfaceMode;
 use crate::session::Session;
 use crate::shell;
 use crate::shells::ShellRegistry;
@@ -204,12 +205,13 @@ pub async fn run(config: &Config, prompt: &str, runConfig: &RunConfig) -> Result
     };
 
     let permitMode = permissions.defaultMode.clone();
+    let domains = resolveModules(&config.modules);
     let mut session = Session::new(
         &config,
         permissions,
         agentShells,
         InterfaceMode::Headless,
-        &[DomainModule::Swe],
+        &domains,
     )?;
 
     // Apply hard budget limit.
@@ -265,12 +267,13 @@ pub async fn runStreaming(
     let agentShells = headlessRegistry()?;
 
     let permissions = Permissions::allowAll();
+    let domains = resolveModules(&config.modules);
     let mut session = Session::new(
         config,
         permissions,
         agentShells,
         InterfaceMode::Headless,
-        &[DomainModule::Swe],
+        &domains,
     )?;
 
     // Apply hard budget limit.

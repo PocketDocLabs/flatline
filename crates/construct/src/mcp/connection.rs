@@ -200,7 +200,7 @@ impl ServerConnection {
         handler: FlatlineHandler,
         url: &str,
         auth: Option<&str>,
-        _headers: &std::collections::HashMap<String, String>,
+        headers: &std::collections::HashMap<String, String>,
         timeout: Duration,
     ) -> Result<(), String> {
         let mut config =
@@ -208,8 +208,15 @@ impl ServerConnection {
                 url,
             );
 
-        if let Some(authVal) = auth {
-            config.auth_header = Some(authVal.to_string());
+        // Resolve auth token. The `auth` field takes precedence, then
+        // the `Authorization` header. Strip "Bearer " prefix if present
+        // since rmcp prepends it via bearer_auth().
+        let token = auth
+            .or_else(|| headers.get("Authorization").map(|s| s.as_str()))
+            .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
+
+        if let Some(t) = token {
+            config = config.auth_header(t.to_string());
         }
 
         // NOTE: Use from_config() so rmcp constructs its own reqwest::Client

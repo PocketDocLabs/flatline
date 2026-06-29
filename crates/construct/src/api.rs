@@ -12,6 +12,7 @@
 //! `reqwest`, `tokio`, `serde_json`, `backon`
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -42,41 +43,32 @@ impl std::fmt::Display for PermanentApiError {
 
 impl std::error::Error for PermanentApiError {}
 
-/// LLM API client. Supports OpenRouter, DeepSeek, OpenAI, and OpenAI Codex.
+/// LLM API client. Supports OpenRouter, DeepSeek, OpenAI, OpenAI Codex, and
+/// Anthropic (subscription OAuth).
 ///
-/// Holds HTTP clients for the configured model tiers. Streaming uses the
-/// heavy tier; non-streaming calls choose the tier explicitly.
+/// Holds one resolved backend per model tier. Streaming uses the heavy tier;
+/// non-streaming calls choose the tier explicitly.
 #[derive(Clone)]
 pub struct Client {
-    heavyHttp: reqwest::Client,
-    lightHttp: reqwest::Client,
-    utilityHttp: reqwest::Client,
-    heavy: ModelConfig,
-    light: ModelConfig,
-    utility: ModelConfig,
+    heavy: Arc<dyn ChatBackend>,
+    light: Arc<dyn ChatBackend>,
+    utility: Arc<dyn ChatBackend>,
 }
 
 impl Client {
     /// Create a new API client from config.
     pub fn new(config: &Config) -> Result<Self> {
-        let heavyHttp =
-            buildHttpClient(&config.heavy).context("Failed to build heavy HTTP client")?;
-        let lightHttp =
-            buildHttpClient(&config.light).context("Failed to build light HTTP client")?;
-        let utilityHttp =
-            buildHttpClient(&config.utility).context("Failed to build utility HTTP client")?;
-
         Ok(Self {
-            heavyHttp,
-            lightHttp,
-            utilityHttp,
-            heavy: config.heavy.clone(),
-            light: config.light.clone(),
-            utility: config.utility.clone(),
+            heavy: buildBackend("heavy", &config.heavy)?,
+            light: buildBackend("light", &config.light)?,
+            utility: buildBackend("utility", &config.utility)?,
         })
     }
 
     /// Send a chat completion request and stream events back.
+    ///
+    /// Streaming always uses the heavy tier — the interactive agent loop's
+    /// model.
     ///
     /// Args:
     ///     messages: Conversation history.
@@ -88,17 +80,110 @@ impl Client {
         tools: &[ToolDef],
         reasoning: Option<&ReasoningConfig>,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        ensureProviderConfigured("heavy", &self.heavy)?;
-        if usesResponsesApi(&self.heavy.provider) {
-            return self.streamResponses(messages, tools, reasoning).await;
-        }
-        if usesMessagesApi(&self.heavy.provider) {
-            return self.streamMessages(messages, tools, reasoning).await;
-        }
+        self.heavy.stream(messages, tools, reasoning).await
+    }
 
-        let url = format!("{}/chat/completions", self.heavy.baseUrl);
+    /// Non-streaming completion for a selected model tier.
+    ///
+    /// Args:
+    ///     tier: Model tier to use for this call.
+    ///     messages: Conversation messages (typically system + user).
+    ///     model: Model override. Uses the tier's configured model if None.
+    pub async fn complete(
+        &self,
+        tier: ModelTier,
+        messages: &[Message],
+        model: Option<&str>,
+    ) -> Result<(String, Option<TokenUsage>)> {
+        self.backend(tier).complete(messages, model).await
+    }
 
-        let mut adaptedMessages = adaptMessages(messages, &self.heavy.provider);
+    fn backend(&self, tier: ModelTier) -> &dyn ChatBackend {
+        match tier {
+            ModelTier::Heavy => self.heavy.as_ref(),
+            ModelTier::Light => self.light.as_ref(),
+            ModelTier::Utility => self.utility.as_ref(),
+        }
+    }
+}
+
+/// A provider transport: knows how to both stream and complete over one wire
+/// protocol. Implementing this trait forces a backend to support *both*
+/// modes, so a protocol can never be wired into streaming while silently
+/// missing from the non-streaming path (or vice versa).
+#[async_trait::async_trait]
+trait ChatBackend: Send + Sync {
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        reasoning: Option<&ReasoningConfig>,
+    ) -> Result<mpsc::Receiver<StreamEvent>>;
+
+    async fn complete(
+        &self,
+        messages: &[Message],
+        model: Option<&str>,
+    ) -> Result<(String, Option<TokenUsage>)>;
+}
+
+/// The wire protocol a provider speaks.
+enum WireProtocol {
+    ChatCompletions,
+    Responses,
+    Messages,
+}
+
+/// Map a provider to its transport. This is the single source of truth for
+/// protocol selection — every request, streaming or not, routes through the
+/// backend that `backendFor` builds from this decision.
+fn protocolFor(provider: &str) -> WireProtocol {
+    if usesResponsesApi(provider) {
+        WireProtocol::Responses
+    } else if usesMessagesApi(provider) {
+        WireProtocol::Messages
+    } else {
+        // OpenAI-compatible chat/completions is the default for the
+        // openrouter / deepseek / custom-endpoint family.
+        WireProtocol::ChatCompletions
+    }
+}
+
+/// Resolve the concrete backend for a tier. The only place a `WireProtocol`
+/// becomes a transport.
+fn backendFor(tier: &'static str, cfg: ModelConfig, http: reqwest::Client) -> Arc<dyn ChatBackend> {
+    match protocolFor(&cfg.provider) {
+        WireProtocol::ChatCompletions => Arc::new(ChatCompletionsBackend { tier, cfg, http }),
+        WireProtocol::Responses => Arc::new(ResponsesBackend { tier, cfg, http }),
+        WireProtocol::Messages => Arc::new(MessagesBackend { tier, cfg, http }),
+    }
+}
+
+fn buildBackend(tier: &'static str, cfg: &ModelConfig) -> Result<Arc<dyn ChatBackend>> {
+    let http =
+        buildHttpClient(cfg).with_context(|| format!("Failed to build {tier} HTTP client"))?;
+    Ok(backendFor(tier, cfg.clone(), http))
+}
+
+// ── OpenAI-compatible chat/completions ────────────────────────────────
+struct ChatCompletionsBackend {
+    tier: &'static str,
+    cfg: ModelConfig,
+    http: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for ChatCompletionsBackend {
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        reasoning: Option<&ReasoningConfig>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/chat/completions", self.cfg.baseUrl);
+
+        let mut adaptedMessages = adaptMessages(messages, &self.cfg.provider);
 
         // DeepSeek silently drops `reasoning_content` from assistant messages
         // that appear before the first `tool_calls` message in the history.
@@ -107,26 +192,26 @@ impl Client {
         // reasoning invisible. Inject a minimal no-op tool stub right after the
         // system message so all subsequent reasoning_content is visible.
         let thinkingEnabled = deepseekStubNeeded(
-            &self.heavy.provider,
+            &self.cfg.provider,
             reasoning.and_then(|r| r.effort.as_deref()),
         );
         if thinkingEnabled {
             injectDeepseekToolStub(&mut adaptedMessages);
         }
 
-        if self.heavy.cachingActive() {
+        if self.cfg.cachingActive() {
             injectCacheControl(&mut adaptedMessages);
-            warnIfProviderNotPinned(&self.heavy);
+            warnIfProviderNotPinned(&self.cfg);
         }
 
         let mut body = serde_json::json!({
-            "model": self.heavy.model,
+            "model": self.cfg.model,
             "messages": adaptedMessages,
             "stream": true,
             "stream_options": { "include_usage": true },
         });
 
-        if let Some(max) = self.heavy.maxTokens {
+        if let Some(max) = self.cfg.maxTokens {
             body["max_tokens"] = serde_json::json!(max);
         }
 
@@ -136,7 +221,7 @@ impl Client {
         }
 
         if let Some(r) = reasoning {
-            match self.heavy.provider.as_str() {
+            match self.cfg.provider.as_str() {
                 "deepseek" => {
                     // DeepSeek wraps reasoning in a `thinking` object with
                     // `type` ("enabled" | "disabled") and `reasoning_effort`
@@ -155,15 +240,15 @@ impl Client {
         }
 
         // OpenRouter-specific provider routing.
-        if self.heavy.provider == "openrouter" && !self.heavy.providerOrder.is_empty() {
+        if self.cfg.provider == "openrouter" && !self.cfg.providerOrder.is_empty() {
             body["provider"] = serde_json::json!({
-                "order": self.heavy.providerOrder,
+                "order": self.cfg.providerOrder,
                 "allow_fallbacks": false,
             });
         }
 
         tracing::debug!(
-            model = %self.heavy.model,
+            model = %self.cfg.model,
             messageCount = messages.len(),
             toolCount = tools.len(),
             hasReasoning = reasoning.is_some(),
@@ -171,7 +256,7 @@ impl Client {
         );
         tracing::trace!(body = %body, "request body");
 
-        let http = self.heavyHttp.clone();
+        let http = self.http.clone();
         let response = (|| async {
             let response = http
                 .post(&url)
@@ -224,49 +309,23 @@ impl Client {
         Ok(rx)
     }
 
-    /// Non-streaming completion for a selected model tier.
-    ///
-    /// Args:
-    ///     tier: Model tier to use for this call.
-    ///     messages: Conversation messages (typically system + user).
-    ///     model: Model override. Uses the client's configured model if None.
-    pub async fn complete(
+    async fn complete(
         &self,
-        tier: ModelTier,
         messages: &[Message],
         model: Option<&str>,
     ) -> Result<(String, Option<TokenUsage>)> {
-        let (http, cfg, tierName) = match tier {
-            ModelTier::Heavy => (&self.heavyHttp, &self.heavy, "heavy"),
-            ModelTier::Light => (&self.lightHttp, &self.light, "light"),
-            ModelTier::Utility => (&self.utilityHttp, &self.utility, "utility"),
-        };
-        self.completeWith(http, cfg, messages, model, tierName)
-            .await
-    }
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/chat/completions", self.cfg.baseUrl);
+        let modelId = model.unwrap_or(&self.cfg.model);
 
-    async fn completeWith(
-        &self,
-        http: &reqwest::Client,
-        cfg: &ModelConfig,
-        messages: &[Message],
-        model: Option<&str>,
-        tier: &str,
-    ) -> Result<(String, Option<TokenUsage>)> {
-        ensureProviderConfigured(tier, cfg)?;
-        if usesResponsesApi(&cfg.provider) {
-            return Self::completeResponsesWith(http.clone(), cfg.clone(), messages, model, tier)
-                .await;
-        }
-
-        let url = format!("{}/chat/completions", cfg.baseUrl);
-        let modelId = model.unwrap_or(&cfg.model);
-
-        let mut adaptedMessages = adaptMessages(messages, &cfg.provider);
+        let mut adaptedMessages = adaptMessages(messages, &self.cfg.provider);
 
         let thinkingEnabled = deepseekStubNeeded(
-            &cfg.provider,
-            cfg.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+            &self.cfg.provider,
+            self.cfg
+                .reasoning
+                .as_ref()
+                .and_then(|r| r.effort.as_deref()),
         );
 
         if thinkingEnabled {
@@ -279,10 +338,14 @@ impl Client {
             "stream": false,
         });
 
+        if let Some(max) = self.cfg.maxTokens {
+            body["max_tokens"] = serde_json::json!(max);
+        }
+
         // OpenRouter-specific provider routing.
-        if cfg.provider == "openrouter" && !cfg.providerOrder.is_empty() {
+        if self.cfg.provider == "openrouter" && !self.cfg.providerOrder.is_empty() {
             body["provider"] = serde_json::json!({
-                "order": cfg.providerOrder,
+                "order": self.cfg.providerOrder,
                 "allow_fallbacks": false,
             });
         }
@@ -291,21 +354,21 @@ impl Client {
         // tokens when the profile wants a mechanical non-streaming call.
         // Honour the selected profile's reasoning.effort — including
         // "disabled" — so the operator can opt out.
-        if cfg.provider == "deepseek"
-            && let Some(ref settings) = cfg.reasoning
+        if self.cfg.provider == "deepseek"
+            && let Some(ref settings) = self.cfg.reasoning
             && let Some(ref effort) = settings.effort
         {
             body["thinking"] = deepseekThinking(effort);
         }
 
         tracing::debug!(
-            completionTier = %tier,
+            completionTier = %self.tier,
             model = %modelId,
             messageCount = messages.len(),
             "sending completion request"
         );
 
-        let http = http.clone();
+        let http = self.http.clone();
         let response = (|| async {
             let response = http
                 .post(&url)
@@ -370,7 +433,7 @@ impl Client {
         });
 
         tracing::debug!(
-            completionTier = %tier,
+            completionTier = %self.tier,
             model = %modelId,
             responseLen = content.len(),
             cost = ?usage.as_ref().and_then(|u| u.cost),
@@ -379,19 +442,30 @@ impl Client {
 
         Ok((content, usage))
     }
+}
 
-    async fn streamResponses(
+// ── OpenAI Responses API ──────────────────────────────────────────────
+struct ResponsesBackend {
+    tier: &'static str,
+    cfg: ModelConfig,
+    http: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for ResponsesBackend {
+    async fn stream(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         reasoning: Option<&ReasoningConfig>,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let url = format!("{}/responses", self.heavy.baseUrl);
-        let body = buildResponsesBody(&self.heavy, messages, tools, reasoning, true, None)?;
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/responses", self.cfg.baseUrl);
+        let body = buildResponsesBody(&self.cfg, messages, tools, reasoning, true, None)?;
 
         tracing::debug!(
-            provider = %self.heavy.provider,
-            model = %self.heavy.model,
+            provider = %self.cfg.provider,
+            model = %self.cfg.model,
             messageCount = messages.len(),
             toolCount = tools.len(),
             hasReasoning = reasoning.is_some(),
@@ -399,8 +473,8 @@ impl Client {
         );
         tracing::trace!(body = %body, "responses request body");
 
-        let http = self.heavyHttp.clone();
-        let cfg = self.heavy.clone();
+        let http = self.http.clone();
+        let cfg = self.cfg.clone();
         let response = (|| {
             let http = http.clone();
             let url = url.clone();
@@ -431,76 +505,26 @@ impl Client {
         Ok(rx)
     }
 
-    /// Stream from the Anthropic Messages API using subscription OAuth.
-    async fn streamMessages(
+    async fn complete(
         &self,
         messages: &[Message],
-        tools: &[ToolDef],
-        reasoning: Option<&ReasoningConfig>,
-    ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let url = format!("{}/v1/messages", self.heavy.baseUrl);
-        let body = buildMessagesBody(&self.heavy, messages, tools, reasoning, true)?;
-
-        tracing::debug!(
-            provider = %self.heavy.provider,
-            model = %self.heavy.model,
-            messageCount = messages.len(),
-            toolCount = tools.len(),
-            "sending Anthropic Messages request"
-        );
-        tracing::trace!(body = %body, "messages request body");
-
-        let http = self.heavyHttp.clone();
-        let cfg = self.heavy.clone();
-        let response = (|| {
-            let http = http.clone();
-            let url = url.clone();
-            let body = body.clone();
-            let cfg = cfg.clone();
-            async move { sendJsonRequest(http, &cfg, &url, &body).await }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_min_delay(Duration::from_secs(1))
-                .with_max_delay(Duration::from_secs(120))
-                .with_max_times(8)
-                .with_jitter(),
-        )
-        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
-        .notify(|err, dur| {
-            tracing::warn!(error = %err, delay = ?dur, "retrying Anthropic Messages request");
-        })
-        .await?;
-
-        let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(async move {
-            if let Err(e) = readMessagesStream(response, &tx).await {
-                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-            }
-        });
-
-        Ok(rx)
-    }
-
-    async fn completeResponsesWith(
-        http: reqwest::Client,
-        cfg: ModelConfig,
-        messages: &[Message],
         model: Option<&str>,
-        tier: &str,
     ) -> Result<(String, Option<TokenUsage>)> {
-        let url = format!("{}/responses", cfg.baseUrl);
-        let stream = responsesCompletionUsesStreaming(&cfg);
-        let body = buildResponsesBody(&cfg, messages, &[], None, stream, model)?;
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/responses", self.cfg.baseUrl);
+        let stream = responsesCompletionUsesStreaming(&self.cfg);
+        let body = buildResponsesBody(&self.cfg, messages, &[], None, stream, model)?;
 
         tracing::debug!(
-            completionTier = %tier,
-            provider = %cfg.provider,
-            model = %model.unwrap_or(&cfg.model),
+            completionTier = %self.tier,
+            provider = %self.cfg.provider,
+            model = %model.unwrap_or(&self.cfg.model),
             messageCount = messages.len(),
             "sending Responses completion request"
         );
 
+        let http = self.http.clone();
+        let cfg = self.cfg.clone();
         let response = (|| {
             let http = http.clone();
             let cfg = cfg.clone();
@@ -524,8 +548,8 @@ impl Client {
         if stream {
             let (content, usage) = collectResponsesStream(response).await?;
             tracing::debug!(
-                completionTier = %tier,
-                model = %model.unwrap_or(&cfg.model),
+                completionTier = %self.tier,
+                model = %model.unwrap_or(&self.cfg.model),
                 responseLen = content.len(),
                 cost = ?usage.as_ref().and_then(|u| u.cost),
                 "Responses streaming completion received"
@@ -541,11 +565,158 @@ impl Client {
         let usage = responseBody.get("usage").and_then(usageFromResponses);
 
         tracing::debug!(
-            completionTier = %tier,
-            model = %model.unwrap_or(&cfg.model),
+            completionTier = %self.tier,
+            model = %model.unwrap_or(&self.cfg.model),
             responseLen = content.len(),
             cost = ?usage.as_ref().and_then(|u| u.cost),
             "Responses completion received"
+        );
+
+        Ok((content, usage))
+    }
+}
+
+// ── Anthropic Messages API (subscription OAuth) ───────────────────────
+struct MessagesBackend {
+    tier: &'static str,
+    cfg: ModelConfig,
+    http: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for MessagesBackend {
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        reasoning: Option<&ReasoningConfig>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/v1/messages", self.cfg.baseUrl);
+        let body = buildMessagesBody(&self.cfg, messages, tools, reasoning, true)?;
+
+        tracing::debug!(
+            provider = %self.cfg.provider,
+            model = %self.cfg.model,
+            messageCount = messages.len(),
+            toolCount = tools.len(),
+            "sending Anthropic Messages request"
+        );
+        tracing::trace!(body = %body, "messages request body");
+
+        let http = self.http.clone();
+        let cfg = self.cfg.clone();
+        let response = (|| {
+            let http = http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            let cfg = cfg.clone();
+            async move { sendJsonRequest(http, &cfg, &url, &body).await }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(3))
+                .with_max_times(2)
+                .with_jitter(),
+        )
+        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
+        .notify(|err, dur| {
+            tracing::warn!(error = %err, delay = ?dur, "retrying Anthropic Messages request");
+        })
+        .await?;
+
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            if let Err(e) = readMessagesStream(response, &tx).await {
+                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
+    async fn complete(
+        &self,
+        messages: &[Message],
+        model: Option<&str>,
+    ) -> Result<(String, Option<TokenUsage>)> {
+        ensureProviderConfigured(self.tier, &self.cfg)?;
+        let url = format!("{}/v1/messages", self.cfg.baseUrl);
+        let mut body = buildMessagesBody(&self.cfg, messages, &[], None, false)?;
+        if let Some(model) = model {
+            body["model"] = serde_json::json!(model);
+        }
+
+        tracing::debug!(
+            completionTier = %self.tier,
+            provider = %self.cfg.provider,
+            model = %model.unwrap_or(&self.cfg.model),
+            messageCount = messages.len(),
+            "sending Anthropic Messages completion request"
+        );
+
+        let http = self.http.clone();
+        let cfg = self.cfg.clone();
+        let response = (|| {
+            let http = http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            let cfg = cfg.clone();
+            async move { sendJsonRequest(http, &cfg, &url, &body).await }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(3))
+                .with_max_times(2)
+                .with_jitter(),
+        )
+        .when(|e| e.downcast_ref::<PermanentApiError>().is_none())
+        .notify(|err, dur| {
+            tracing::warn!(error = %err, delay = ?dur, "retrying Anthropic Messages completion request");
+        })
+        .await?;
+
+        let responseBody: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Anthropic Messages completion response")?;
+
+        let content = responseBody
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+
+        let usage = responseBody.get("usage").map(|u| {
+            let inputTokens = usageField(u, "input_tokens");
+            let cacheReadTokens = usageField(u, "cache_read_input_tokens");
+            let cacheCreationTokens = usageField(u, "cache_creation_input_tokens");
+            let outputTokens = usageField(u, "output_tokens");
+            // Fold cached input into promptTokens — see MessagesStreamState::usage.
+            let promptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
+            TokenUsage {
+                promptTokens,
+                completionTokens: outputTokens,
+                totalTokens: promptTokens + outputTokens,
+                cost: None,
+                cacheReadTokens,
+                cacheCreationTokens,
+            }
+        });
+
+        tracing::debug!(
+            completionTier = %self.tier,
+            model = %model.unwrap_or(&self.cfg.model),
+            responseLen = content.len(),
+            "Anthropic Messages completion received"
         );
 
         Ok((content, usage))
@@ -616,6 +787,8 @@ async fn sendJsonRequest(
 // ── Anthropic Messages API transport ──────────────────────────────────
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+const ANTHROPIC_BILLING_SYSTEM: &str =
+    "x-anthropic-billing-header: cc_version=flatline; cc_entrypoint=flatline; cch=00000;";
 
 fn usesMessagesApi(provider: &str) -> bool {
     provider == "anthropic-oauth"
@@ -645,13 +818,19 @@ fn buildMessagesBody(
         "messages": msgs,
     });
 
+    let mut systemBlocks = vec![serde_json::json!({
+        "type": "text",
+        "text": ANTHROPIC_BILLING_SYSTEM,
+    })];
+
     if let Some(system) = system {
         let mut block = serde_json::json!({ "type": "text", "text": system });
         if cfg.cachingActive() {
             block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
         }
-        body["system"] = serde_json::json!([block]);
+        systemBlocks.push(block);
     }
+    body["system"] = serde_json::Value::Array(systemBlocks);
 
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools.iter().map(anthropicTool).collect());
@@ -802,10 +981,18 @@ async fn readMessagesStream(
     let mut buffer = String::new();
 
     loop {
-        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-            Ok(Some(chunk)) => chunk.context("Messages stream read error")?,
-            Ok(None) => break,
-            Err(_) => bail!("Messages stream stalled — no data received for {IDLE_TIMEOUT:?}"),
+        // Race: next chunk from stream, or receiver dropped (user cancelled).
+        let chunk = tokio::select! {
+            _ = tx.closed() => {
+                return Ok(());
+            }
+            result = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => {
+                match result {
+                    Ok(Some(chunk)) => chunk.context("Messages stream read error")?,
+                    Ok(None) => break,
+                    Err(_) => bail!("Messages stream stalled — no data received for {IDLE_TIMEOUT:?}"),
+                }
+            }
         };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -821,7 +1008,11 @@ async fn readMessagesStream(
                 match serde_json::from_str::<serde_json::Value>(data) {
                     Ok(value) => {
                         for event in parseAnthropicEvent(&mut state, value) {
+                            let done = matches!(event, StreamEvent::Done { .. });
                             if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                            if done {
                                 return Ok(());
                             }
                         }
@@ -848,10 +1039,18 @@ struct MessagesStreamState {
 
 impl MessagesStreamState {
     fn usage(&self) -> TokenUsage {
+        // Anthropic reports `input_tokens` as the uncached input only; cache
+        // reads/writes are counted separately. They all occupy the context
+        // window, so fold them into `promptTokens` here — that makes the field
+        // mean "total input tokens in context" for every provider, matching
+        // OpenAI's `prompt_tokens` (which already includes cached tokens). The
+        // separate cache counters stay for the cache-heat indicator and the
+        // caching watchdog.
+        let promptTokens = self.inputTokens + self.cacheReadTokens + self.cacheCreationTokens;
         TokenUsage {
-            promptTokens: self.inputTokens,
+            promptTokens,
             completionTokens: self.outputTokens,
-            totalTokens: self.inputTokens + self.outputTokens,
+            totalTokens: promptTokens + self.outputTokens,
             cost: None,
             cacheReadTokens: self.cacheReadTokens,
             cacheCreationTokens: self.cacheCreationTokens,
@@ -2086,6 +2285,7 @@ mod tests {
             lsp: std::collections::HashMap::new(),
             permissions: None,
             budget: crate::config::BudgetConfig::default(),
+            modules: crate::config::ModulesConfig::default(),
             projectRoot: None,
             launchDir: std::path::PathBuf::from("."),
         }

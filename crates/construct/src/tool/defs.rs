@@ -98,7 +98,8 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
                         },
                         "anchor": {
                             "type": "integer",
-                            "description": "Line number to anchor on. Expands outward based on \
+                            "minimum": 1,
+                            "description": "1-indexed line number to anchor on. Valid range is 1 to the number of lines in the file; do not use 0. Expands outward based on \
                                 indentation to return the enclosing code block. When set, \
                                 offset and limit are ignored."
                         }
@@ -455,7 +456,7 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
                         },
                         "type": {
                             "type": "string",
-                            "description": "File type filter (e.g. \"rust\", \"py\", \"js\"). Uses rg's built-in type defs."
+                            "description": "File type filter (e.g. \"rust\", \"py\", \"js\"). Uses rg's built-in type defs. Omit or pass an empty string for no type filter."
                         },
                         "output_mode": {
                             "type": "string",
@@ -794,18 +795,21 @@ pub(crate) fn builtinDefs() -> Vec<ToolDef> {
             defType: "function".into(),
             function: crate::message::FunctionDef {
                 name: "historySearch".into(),
-                description: "Search across the full original transcript by text match. \
-                    Returns matching blocks with snippets, block IDs, and topic labels. \
-                    Use this to find specific information that may have been compacted \
-                    away from the current context. Use mediaType to filter for turns \
-                    with specific attachment types (e.g. 'image')."
+                description: "Search across the full original transcript by keyword. \
+                    Uses full-text search (BM25 ranking) — queries are tokenized into \
+                    words, so multi-word queries like 'copy seeds petri_envs' find results \
+                    where those words appear anywhere in a turn, not just as one contiguous \
+                    substring. Results are ranked by relevance. Also searches tool call \
+                    arguments (file paths, commands, patterns). Use this to find specific \
+                    information that may have been compacted away from the current context. \
+                    Use mediaType to filter for turns with specific attachment types (e.g. 'image')."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Text to search for across all transcript content."
+                            "description": "Search query. Words are matched independently and ranked by relevance — use natural keyword queries rather than exact phrases."
                         },
                         "mediaType": {
                             "type": "string",
@@ -1367,6 +1371,22 @@ pub(crate) fn stripPermissionEscalationObject(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readFileAnchorSchemaStatesOneIndexedRange() {
+        let defs = super::builtinDefs();
+        let readFile = defs
+            .iter()
+            .find(|def| def.function.name == "readFile")
+            .unwrap();
+        let anchor = &readFile.function.parameters["properties"]["anchor"];
+        let description = anchor["description"].as_str().unwrap();
+
+        assert_eq!(anchor["minimum"], serde_json::json!(1));
+        assert!(description.contains("1-indexed"));
+        assert!(description.contains("Valid range is 1"));
+        assert!(description.contains("do not use 0"));
+    }
+
     #[test]
     fn stripPermissionEscalationObjectRemovesFlatlineOnlyFields() {
         let mut obj = serde_json::json!({

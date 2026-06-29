@@ -14,24 +14,6 @@ pub(super) fn normalizePath(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Extract a short snippet around the first occurrence of a query in text.
-pub(super) fn extractSnippet(text: &str, queryLower: &str) -> String {
-    let textLower = text.to_lowercase();
-    let pos = match textLower.find(queryLower) {
-        Some(p) => p,
-        None => return String::new(),
-    };
-
-    let contextChars = 80;
-    let start = pos.saturating_sub(contextChars);
-    let end = (pos + queryLower.len() + contextChars).min(text.len());
-
-    let start = text.floor_char_boundary(start);
-    let end = text.ceil_char_boundary(end);
-
-    text[start..end].replace('\n', " ")
-}
-
 /// Build an `Assistant` message for history.
 pub(super) fn buildAssistantMessage(
     content: Option<String>,
@@ -49,12 +31,14 @@ pub(super) fn buildAssistantMessage(
 pub(super) enum TurnResult {
     Done {
         promptTokens: Option<usize>,
+        completionTokens: usize,
     },
     ToolCalls {
         calls: Vec<ToolCall>,
         content: Option<String>,
         reasoning: Option<String>,
         promptTokens: Option<usize>,
+        completionTokens: usize,
     },
     Cancelled,
     /// A transient API error that can be retried (e.g. 500, 502, timeout).

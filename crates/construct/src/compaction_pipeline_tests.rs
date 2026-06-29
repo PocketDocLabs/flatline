@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::api;
 use crate::compaction::CompactionLog;
+use crate::config::ModulesConfig;
 use crate::message::{Content, FunctionCall, Message, ToolCall};
 use crate::transcript::Transcript;
 
@@ -43,6 +44,7 @@ fn dummyClient() -> api::Client {
         lsp: HashMap::new(),
         permissions: None,
         budget: BudgetConfig::default(),
+        modules: ModulesConfig::default(),
         projectRoot: None,
         launchDir: std::path::PathBuf::from("."),
     };

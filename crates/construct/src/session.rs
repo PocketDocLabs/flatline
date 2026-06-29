@@ -378,7 +378,13 @@ impl Session {
             summary: r.summary.clone(),
         });
 
-        let systemPrompt = prompt::build(interface, domains, config.heavy.promptThinking);
+        let contextOptions = crate::config::resolveContextOptions(&config.modules);
+        let systemPrompt = prompt::build(
+            interface,
+            domains,
+            config.heavy.promptThinking,
+            &contextOptions,
+        );
         let history = Vec::new();
 
         let sessionId = transcript::newSessionId();
@@ -521,7 +527,13 @@ impl Session {
         });
 
         // System prompt is rebuilt from current config, not from transcript.
-        let systemPrompt = prompt::build(interface, domains, config.heavy.promptThinking);
+        let contextOptions = crate::config::resolveContextOptions(&config.modules);
+        let systemPrompt = prompt::build(
+            interface,
+            domains,
+            config.heavy.promptThinking,
+            &contextOptions,
+        );
 
         let mut transcript = match Transcript::open(sessionId) {
             Ok(t) => t,
@@ -1154,10 +1166,14 @@ impl Session {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    TurnResult::Done { promptTokens } => {
+                    TurnResult::Done {
+                        promptTokens,
+                        completionTokens,
+                    } => {
                         retryCount = 0;
                         if let Some(tokens) = promptTokens {
-                            self.compactionTracker.updateTokens(tokens);
+                            self.compactionTracker
+                                .updateTokens(tokens + completionTokens);
                             self.checkCompactionTrigger(logTx).await;
                         }
                         // Extend turn if user queued messages during streaming.
@@ -1179,14 +1195,21 @@ impl Session {
                         content,
                         reasoning,
                         promptTokens,
+                        completionTokens,
                     } => {
                         retryCount = 0;
                         // Sync permit mode now — a toggle during streaming
                         // should affect this turn's tool permission checks.
                         self.syncPermitMode().await;
-                        // Update token count but don't trigger compaction mid-loop.
+                        // Update token count and fire compaction mid-loop.
+                        // Server-side reasoning cache (Codex o-series,
+                        // Anthropic extended thinking) silently fills the
+                        // context window during the agent loop.  Waiting
+                        // until turn boundaries causes overflow.
                         if let Some(tokens) = promptTokens {
-                            self.compactionTracker.updateTokens(tokens);
+                            self.compactionTracker
+                                .updateTokens(tokens + completionTokens);
+                            self.checkCompactionTrigger(logTx).await;
                         }
                         // Hard budget enforcement.
                         if let Some(limit) = self.maxBudgetUsd
@@ -1845,6 +1868,13 @@ impl Session {
                                                                         trigger,
                                                                     )
                                                                     .await;
+                                                                // Include partial output so the model knows what printed before detach.
+                                                                let partialOutput = shell.readTerminal(200);
+                                                                let message = if partialOutput.trim().is_empty() {
+                                                                    message
+                                                                } else {
+                                                                    format!("{message}\n\nPartial output captured before detach:\n{partialOutput}")
+                                                                };
                                                                 break crate::message::Content::text(message);
                                                             }
                                                             _ = userBgRx.recv() => {
@@ -1873,6 +1903,13 @@ impl Session {
                                                                         "you pressed Ctrl+B".to_string(),
                                                                     )
                                                                     .await;
+                                                                // Include partial output so the model knows what printed before detach.
+                                                                let partialOutput = shell.readTerminal(200);
+                                                                let message = if partialOutput.trim().is_empty() {
+                                                                    message
+                                                                } else {
+                                                                    format!("{message}\n\nPartial output captured before detach:\n{partialOutput}")
+                                                                };
                                                                 break crate::message::Content::text(message);
                                                             }
                                                             _ = cancelRx.changed() => {
@@ -2174,10 +2211,14 @@ impl Session {
             self.config.heavy.promptThinking,
         );
 
-        let mut rx = self
-            .client
-            .stream(&requestMessages, &self.tools, reasoning)
-            .await?;
+        let streamFuture = self.client.stream(&requestMessages, &self.tools, reasoning);
+        let mut rx = tokio::select! {
+            result = streamFuture => result?,
+            _ = cancelRx.changed() => {
+                tracing::info!("turn cancelled before stream started");
+                return Ok(TurnResult::Cancelled);
+            }
+        };
 
         let mut contentBuf = String::new();
         let mut reasoningBuf = String::new();
@@ -2493,6 +2534,7 @@ impl Session {
         );
 
         let reportedTokens = lastUsage.as_ref().map(|u| u.promptTokens);
+        let reportedCompletionTokens = lastUsage.as_ref().map(|u| u.completionTokens).unwrap_or(0);
 
         if !calls.is_empty() {
             // Record any text content or reasoning that accompanied the tool calls.
@@ -2532,6 +2574,7 @@ impl Session {
                 content,
                 reasoning,
                 promptTokens: reportedTokens,
+                completionTokens: reportedCompletionTokens,
             })
         } else {
             let content = if contentBuf.is_empty() {
@@ -2585,6 +2628,7 @@ impl Session {
 
             Ok(TurnResult::Done {
                 promptTokens: reportedTokens,
+                completionTokens: reportedCompletionTokens,
             })
         }
     }
