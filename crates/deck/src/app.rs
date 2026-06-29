@@ -226,6 +226,7 @@ pub(crate) enum StatusChipKind {
 /// Internal deck-update messages. Produced by tasks that await oneshot replies
 /// to `TuiRequest`s; drained by `runLoop` alongside `LogEvent`s so slash
 /// commands don't block the TUI while the session task is mid-turn.
+#[allow(clippy::large_enum_variant)]
 enum DeckUpdate {
     McpStatus(construct::control::McpStatus),
     LspStatus(construct::control::LspStatus),

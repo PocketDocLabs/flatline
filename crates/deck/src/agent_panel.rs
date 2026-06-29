@@ -2870,19 +2870,17 @@ impl AgentPanel {
             .copiedFlash
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
+            && let Some((blockId, _)) = self.copiedFlash.take()
         {
-            if let Some((blockId, _)) = self.copiedFlash.take() {
-                self.bumpEntryVersion(blockId.0);
-            }
+            self.bumpEntryVersion(blockId.0);
         }
         if self
             .toolSectionCopiedFlash
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed().as_secs() >= 2)
+            && let Some((id, _)) = self.toolSectionCopiedFlash.take()
         {
-            if let Some((id, _)) = self.toolSectionCopiedFlash.take() {
-                self.bumpEntryVersion(id.entryIndex);
-            }
+            self.bumpEntryVersion(id.entryIndex);
         }
         // Cache plain text of each visual line for scrollback copy.
         self.lastLineTexts = lines
@@ -4043,10 +4041,10 @@ impl AgentPanel {
     ) -> Vec<RenderedBlock> {
         {
             let c = cache.borrow();
-            if let Some((cw, cached)) = c.get(text) {
-                if *cw == renderWidth {
-                    return cached.clone();
-                }
+            if let Some((cw, cached)) = c.get(text)
+                && *cw == renderWidth
+            {
+                return cached.clone();
             }
         }
         let blocks = markdown::render(text, renderWidth);
@@ -4077,40 +4075,40 @@ impl AgentPanel {
             let shouldCache = Self::isStaticEntry(entry);
 
             // Try cache hit for static entries.
-            if shouldCache {
-                if let Some(ref cached) = self.entryLineCache[i] {
-                    if cached.width == width && cached.version == self.entryVersions[i] {
-                        if cached.isReasoning {
-                            reasoningHeaders.push((Some(i), offset));
-                        }
-                        lines.extend_from_slice(&cached.lines);
-                        cont.extend_from_slice(&cached.cont);
-                        for cbr in &cached.codeBlockRanges {
-                            let mut c = cbr.clone();
-                            c.startLine += offset;
-                            c.endLine += offset;
-                            codeBlockRanges.push(c);
-                        }
-                        for tsr in &cached.toolSectionRanges {
-                            let mut t = tsr.clone();
-                            t.startLine += offset;
-                            t.endLine += offset;
-                            toolSectionRanges.push(t);
-                        }
-                        for &idx in &cached.nonCopyableIndices {
-                            nonCopyable.insert(offset + idx);
-                        }
-                        if let Some(h) = cached.subagentHeaderOffset {
-                            lastSubagentHeader = Some(offset + h);
-                        }
-                        if let Some((t, e)) = cached.subagentToggleOffset {
-                            lastSubagentToggle = Some((offset + t, e));
-                        }
-                        lines.push(Line::from(""));
-                        cont.push(false);
-                        continue;
-                    }
+            if shouldCache
+                && let Some(ref cached) = self.entryLineCache[i]
+                && cached.width == width
+                && cached.version == self.entryVersions[i]
+            {
+                if cached.isReasoning {
+                    reasoningHeaders.push((Some(i), offset));
                 }
+                lines.extend_from_slice(&cached.lines);
+                cont.extend_from_slice(&cached.cont);
+                for cbr in &cached.codeBlockRanges {
+                    let mut c = cbr.clone();
+                    c.startLine += offset;
+                    c.endLine += offset;
+                    codeBlockRanges.push(c);
+                }
+                for tsr in &cached.toolSectionRanges {
+                    let mut t = tsr.clone();
+                    t.startLine += offset;
+                    t.endLine += offset;
+                    toolSectionRanges.push(t);
+                }
+                for &idx in &cached.nonCopyableIndices {
+                    nonCopyable.insert(offset + idx);
+                }
+                if let Some(h) = cached.subagentHeaderOffset {
+                    lastSubagentHeader = Some(offset + h);
+                }
+                if let Some((t, e)) = cached.subagentToggleOffset {
+                    lastSubagentToggle = Some((offset + t, e));
+                }
+                lines.push(Line::from(""));
+                cont.push(false);
+                continue;
             }
 
             // Cache miss or non-cacheable — render fresh.
@@ -4391,6 +4389,7 @@ impl AgentPanel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn renderEntry(
         &self,
         entry: &PanelEntry,
